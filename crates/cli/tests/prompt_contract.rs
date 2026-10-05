@@ -5,6 +5,74 @@
 //! all. These assertions are the guard rail: they do not judge the wording,
 //! they hold the few statements that must stay true.
 
+#[test]
+fn owner_approved_reading_guidance_is_preserved() {
+    let text = prompt();
+    for required in [
+        "READING CODE — read the symbol, never the whole file:",
+        "greppy read S1 S2 …",
+        "greppy read-smart S",
+        "any lines of a file",
+        "read tool missing or failed",
+        "— never fall back to cat",
+        "never cat, sed or head on source files",
+        "read a whole source file to find or edit one definition",
+    ] {
+        assert!(
+            text.contains(required),
+            "owner-approved reading guidance missing: {required}"
+        );
+    }
+}
+
+#[test]
+fn documented_command_rows_use_the_same_executable_prefix() {
+    let text = prompt();
+    let headings = [
+        "SEARCH:",
+        "NAVIGATE:",
+        "READ:",
+        "EDIT:",
+        "RUN:",
+        "INDEX:",
+        "PROMPT:",
+        "AGENT:",
+        "BROWSER:",
+    ];
+    let mut active = false;
+    let mut sections = std::collections::BTreeSet::new();
+    let mut rows = 0;
+    for line in text.lines() {
+        if headings.contains(&line) {
+            sections.insert(line);
+            active = true;
+        } else if line.starts_with("CHAIN") || line == "ON EVERY COMMAND:" {
+            active = false;
+        }
+        if !active || !line.starts_with("  ") || line.starts_with("    ") {
+            continue;
+        }
+        let row = line.trim_start();
+        if row.starts_with("--") || row.is_empty() {
+            continue;
+        }
+        if row.starts_with("who-calls and callees answer") {
+            assert!(row.contains("`greppy who-calls A B C`"));
+            continue;
+        }
+        assert!(
+            row.starts_with("greppy "),
+            "command row lacks executable prefix: {line}"
+        );
+        rows += 1;
+    }
+    assert_eq!(sections.len(), headings.len());
+    assert!(
+        rows >= 60,
+        "guard must cover both code and browser commands: {rows}"
+    );
+}
+
 fn prompt() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../AGENTS.md")
@@ -226,8 +294,8 @@ fn read_is_bytes_and_the_lossy_view_is_its_own_verb() {
     // folding or summarizing on it belong to read-smart and read-file only.
     let read_line_block: String = section
         .lines()
-        .skip_while(|l| !l.trim_start().starts_with("read S"))
-        .take_while(|l| !l.trim_start().starts_with("read-smart"))
+        .skip_while(|l| !l.trim_start().starts_with("greppy read S"))
+        .take_while(|l| !l.trim_start().starts_with("greppy read-smart"))
         .collect::<Vec<_>>()
         .join("\n");
     for word in ["fold", "paginat", "summar", "semantic"] {

@@ -2,8 +2,18 @@
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+// Owner-approved prompt of record: AGENTS.md @
+// e32618057b887254b2cd6aada91e128dbb3a220d. Approval dated 2026-09-30,
+// relayed in website-agent-handover.md and directly reaffirmed on 2026-10-05:
+// section 28: "ok, pass den prompt an und auch den entsprechenden guard";
+// section 29: "ok, freigabe erteilt"; section 32: "ok, erlaubnis erteilt".
+// Those approvals cover the READING CODE block, any-line and fallback rows.
+// 8a70292ca5 incorrectly removed them as unapproved; do not discard this record.
+// This historical signature does NOT approve the later callees wording,
+// prompt-export documentation, new layout or argv adapter: their complete
+// proposed diff still requires the owner's signature before building.
 pub const APPROVED_SHA256: &str =
-    "a3b4e024e7169e40b2ea27cf5c9d851ee1d6f10fd2d40d3cefa976cb7123ccf8";
+    "f5336832865582bcfe0dd851309085e8fa265dbf0138c387a446176664a8a9d1";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // That signature does not approve this new adapter. Await the owner's signature.

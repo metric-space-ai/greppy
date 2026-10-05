@@ -73,12 +73,12 @@ a trailing `test` marks one that lives in a test. A sentence after an em dash is
 generated hint, not source.
 
 SEARCH:
-  search "WHAT IT DOES"             the definitions that do what you describe: "restrict a
-                                    value to a range", "retry a failed request"
-  search-symbol NAME                the definitions whose name contains NAME
-  search-pattern REGEX [--fixed]    every place REGEX matches — comments, strings and config
-                                    included — and the definition each match sits in;
-                                    --fixed takes it as literal text
+  greppy search "WHAT IT DOES"              the definitions that do what you describe: "restrict a
+                                            value to a range", "retry a failed request"
+  greppy search-symbol NAME                 the definitions whose name contains NAME
+  greppy search-pattern REGEX [--fixed]     every place REGEX matches — comments, strings and config
+                                            included — and the definition each match sits in;
+                                            --fixed takes it as literal text
 
   --kind K          only function, method, class, struct, enum or trait results; a text match
                     counts by the definition it sits in
@@ -86,22 +86,22 @@ SEARCH:
   --all             every result instead of the first few
 
 NAVIGATE:
-  where-am-i                        the repository at one glance: layout, languages, entry
-                                    points, test roots, each module with its most used
-                                    symbols
-  who-calls S                       every place that uses S: calls, imports, type references
-  callees S                         the indexed definitions S directly calls; outgoing CALLS only
-  brief S                           what S does in one sentence, its signature, then its body
-                                    sketched: one line per step with the symbol used there and
-                                    what happens
-  impact S [--depth N] [--direction outgoing]
-                                    how far a change to S reaches, as a tree of callers, each
-                                    with what it does, tests marked; --direction outgoing
-                                    walks what S reaches instead of who reaches S
-  path --from A --to B              every call chain from A to B, as a tree of the call sites
-                                    they hang on
+  greppy where-am-i                         the repository at one glance: layout, languages, entry
+                                            points, test roots, each module with its most used
+                                            symbols
+  greppy who-calls S                        every place that uses S: calls, imports, type references
+  greppy callees S                          the indexed definitions S directly calls; outgoing CALLS only
+  greppy brief S                            what S does in one sentence, its signature, then its body
+                                            sketched: one line per step with the symbol used there and
+                                            what happens
+  greppy impact S [--depth N] [--direction outgoing]
+                                            how far a change to S reaches, as a tree of callers, each
+                                            with what it does, tests marked; --direction outgoing
+                                            walks what S reaches instead of who reaches S
+  greppy path --from A --to B               every call chain from A to B, as a tree of the call sites
+                                            they hang on
 
-  who-calls and callees answer for several symbols at once: `who-calls A B C`.
+  who-calls and callees answer for several symbols at once: `greppy who-calls A B C`.
 
   --code            also print source for who-calls, callees, brief and impact; path is a
                     bounded call-site tree and intentionally rejects --code — read a returned
@@ -109,34 +109,34 @@ NAVIGATE:
   --all             every result instead of the first few
 
 READ:
-  read S [S …]              the source code of S; --head M and --tail N for only its
-                            first M and last N lines
-  read-smart S [S …]        the source code of S, nested blocks below --depth N folded
-                            into one-line semantic descriptions; default 1
-  read-file PATH [PATH …]   the files; paginated at 400 lines unless --lines A:B or --all
+  greppy read S [S …]                       the source code of S; --head M and --tail N for only its
+                                            first M and last N lines
+  greppy read-smart S [S …]                 the source code of S, nested blocks below --depth N folded
+                                            into one-line semantic descriptions; default 1
+  greppy read-file PATH [PATH …]            the files; paginated at 400 lines unless --lines A:B or --all
 
   --handle          also print a handle naming exactly the span that was printed — if the
                     output was cut, it covers the shown part only; replace-span takes it
 
 EDIT:
-  replace S [NEW]            NEW replaces S's definition; --body: its body only
-  replace-text F OLD [NEW]   NEW replaces OLD — refused unless OLD occurs exactly
-                             once (--expect N: exactly N times; --regex: OLD is
-                             a regular expression)
-  replace-lines F A:B [NEW]  NEW replaces those lines
-  replace-span H [NEW]       NEW replaces the span H names — refused if the file
-                             changed since H was printed
-  insert-lines F N [NEW]     NEW lands after line N; 0 puts it at the top
-  delete S                   removes S's definition
-  delete-lines F A:B         removes those lines
-  patch [DIFF]               DIFF — a unified diff — lands as a whole: hunks
-                             anchor on their context lines, the @@ numbers are
-                             advisory; every file in it together, or nothing
-  write PATH [NEW]           creates or overwrites the file
-  rename S NAME              renames S and every reference to it, and reports
-                             what it could not resolve
-  undo [ID]                  reverses that edit — the last one when ID is absent;
-                             refused if a later edit touched the same span
+  greppy replace S [NEW]                    NEW replaces S's definition; --body: its body only
+  greppy replace-text F OLD [NEW]           NEW replaces OLD — refused unless OLD occurs exactly
+                                            once (--expect N: exactly N times; --regex: OLD is
+                                            a regular expression)
+  greppy replace-lines F A:B [NEW]          NEW replaces those lines
+  greppy replace-span H [NEW]               NEW replaces the span H names — refused if the file
+                                            changed since H was printed
+  greppy insert-lines F N [NEW]             NEW lands after line N; 0 puts it at the top
+  greppy delete S                           removes S's definition
+  greppy delete-lines F A:B                 removes those lines
+  greppy patch [DIFF]                       DIFF — a unified diff — lands as a whole: hunks
+                                            anchor on their context lines, the @@ numbers are
+                                            advisory; every file in it together, or nothing
+  greppy write PATH [NEW]                   creates or overwrites the file
+  greppy rename S NAME                      renames S and every reference to it, and reports
+                                            what it could not resolve
+  greppy undo [ID]                          reverses that edit — the last one when ID is absent;
+                                            refused if a later edit touched the same span
 
   NEW or DIFF absent: it is read from stdin.
 
@@ -145,22 +145,22 @@ EDIT:
                              reports the diagnostics against symbols and spans
 
 RUN:
-  bash-smart [-e REGEX] -- CMD …   runs argv directly with the same exit code;
-                             leading `VAR=value` tokens become child environment
-                             assignments. Pass shell builtins/operators as one
-                             quoted expression. Unix expressions use Bash with
-                             pipefail; Windows refuses pipelines because cmd.exe
-                             cannot provide that status contract. Line 1 is the
-                             verdict: `ok — exit 0` or `ok — exit 0, 3 warnings`
-                             or `FAILED — exit 101: 2 errors, 1 warning`. Then
-                             each error/warning block and every REGEX match is
-                             shown; the rest is compacted and expandable.
+  greppy bash-smart [-e REGEX] -- CMD …     runs argv directly with the same exit code;
+                                            leading `VAR=value` tokens become child environment
+                                            assignments. Pass shell builtins/operators as one
+                                            quoted expression. Unix expressions use Bash with
+                                            pipefail; Windows refuses pipelines because cmd.exe
+                                            cannot provide that status contract. Line 1 is the
+                                            verdict: `ok — exit 0` or `ok — exit 0, 3 warnings`
+                                            or `FAILED — exit 101: 2 errors, 1 warning`. Then
+                                            each error/warning block and every REGEX match is
+                                            shown; the rest is compacted and expandable.
 
 INDEX:
-  index [PATH]                      rebuilds the graph and meaning index for PATH; run it when
-                                    a command reports the index stale (both are built
-                                    automatically on first use). --agent-worktree indexes the
-                                    agent worktree belonging to PATH instead
+  greppy index [PATH]                       rebuilds the graph and meaning index for PATH; run it when
+                                            a command reports the index stale (both are built
+                                            automatically on first use). --agent-worktree indexes the
+                                            agent worktree belonging to PATH instead
 
 Indexing and embedding preparation are one-time work for the current source
 state, not evidence that Greppy is unavailable. If Greppy reports preparation in
@@ -173,21 +173,21 @@ inspect and report the concrete issue instead of silently abandoning the
 function.
 
 PROMPT:
-  prompt [--external] [--json]       export the complete embedded prompt with the
-                                    actual Greppy version and SHA256; --external
-                                    omits the built-in one-tool argv adaptation.
-                                    JSON's prompt field is the exact prompt; plain
-                                    output adds a diagnostic hash line before it.
+  greppy prompt [--external] [--json]       export the complete embedded prompt with the
+                                            actual Greppy version and SHA256; --external
+                                            omits the built-in one-tool argv adaptation.
+                                            JSON's prompt field is the exact prompt; plain
+                                            output adds a diagnostic hash line before it.
 
 AGENT:
-  -p "TASK" [--model M]   a built-in coding agent carries out TASK on this
-                          repository and delivers the outcome as one commit on
-                          refs/greppy/agent/<id> — nothing is edited in place.
-                          git show <ref> reviews it, git cherry-pick -n <ref>
-                          applies it. Made for subagent delegation of pure,
-                          self-contained coding tasks. Requires a local model
-                          gateway (127.0.0.1:8317); greppy -p --help has the
-                          setup.
+  greppy -p "TASK" [--model M]              a built-in coding agent carries out TASK on this
+                                            repository and delivers the outcome as one commit on
+                                            refs/greppy/agent/<id> — nothing is edited in place.
+                                            git show <ref> reviews it, git cherry-pick -n <ref>
+                                            applies it. Made for subagent delegation of pure,
+                                            self-contained coding tasks. Requires a local model
+                                            gateway (127.0.0.1:8317); greppy -p --help has the
+                                            setup.
 
 CHAIN — every command takes its input from the pipe, so one result goes straight into the next:
   greppy search-symbol NAME --json | greppy read -
@@ -214,67 +214,67 @@ Chain consecutive actions when the next steps and targets are already known.
 Stop at decision points, inspect the returned state, then start a new chain.
 Do not guess through an unknown page state just to keep one chain.
 
-  greppy web do open URL :: click TARGET :: wait COND   one chain, one session
-  greppy web open URL                     session + tab, navigate, observe
-  greppy web goto URL                     navigate the current tab
-  greppy web back                         history back
-  greppy web forward                      history forward
-  greppy web reload                       reload the current tab
+  greppy web do open URL :: click TARGET :: wait COND  one chain, one session
+  greppy web open URL                       session + tab, navigate, observe
+  greppy web goto URL                       navigate the current tab
+  greppy web back                           history back
+  greppy web forward                        history forward
+  greppy web reload                         reload the current tab
 
 SEE — QUERY is css=..., xpath=..., text=..., text~/RE/i, role=..., id=..., tag=...
 A bare argument is a CSS selector:
-  greppy web observe QUERY                the page as an agent tree
-  greppy web find QUERY                   resolve a query to nodes
-  greppy web match QUERY                  filter JSONL records from stdin
-  greppy web extract QUERY                values; named captures become fields
-  greppy web inspect TARGET               one element: html, attrs, box, styles
-  greppy web dom html QUERY               raw HTML for matching elements
-  greppy web screenshot                   the rendered page as an artifact
+  greppy web observe QUERY                  the page as an agent tree
+  greppy web find QUERY                     resolve a query to nodes
+  greppy web match QUERY                    filter JSONL records from stdin
+  greppy web extract QUERY                  values; named captures become fields
+  greppy web inspect TARGET                 one element: html, attrs, box, styles
+  greppy web dom html QUERY                 raw HTML for matching elements
+  greppy web screenshot                     the rendered page as an artifact
   greppy web screenshot --render-complete wait for complete rendering; use only
-                                          when the final pixels are required
-  greppy web events                       what happened since an action
-  greppy web console                      page console output
-  greppy web network QUERY                requests, status, sizes
-  greppy web trace start                  begin a Playwright trace
+                                            when the final pixels are required
+  greppy web events                         what happened since an action
+  greppy web console                        page console output
+  greppy web network QUERY                  requests, status, sizes
+  greppy web trace start                    begin a Playwright trace
 
 ACT — TARGET is css=..., xpath=..., text=..., role=... name=...:
-  greppy web click TARGET                 click and report the action result
-  greppy web fill TARGET VALUE            set a field; --from-env for secrets
-  greppy web type TARGET TEXT             type character by character
-  greppy web clear TARGET                 empty a field
-  greppy web select TARGET VALUE          set a select
-  greppy web check TARGET                 tick a checkbox
-  greppy web uncheck TARGET               untick it
-  greppy web press KEY                    a key press
-  greppy web hover TARGET                 hover
-  greppy web scroll --to TARGET           scroll
-  greppy web upload TARGET PATH           a file input
-  greppy web wait CONDITION               wait for a state
-  greppy web assert CONDITION             fail unless the page matches
+  greppy web click TARGET                   click and report the action result
+  greppy web fill TARGET VALUE              set a field; --from-env for secrets
+  greppy web type TARGET TEXT               type character by character
+  greppy web clear TARGET                   empty a field
+  greppy web select TARGET VALUE            set a select
+  greppy web check TARGET                   tick a checkbox
+  greppy web uncheck TARGET                 untick it
+  greppy web press KEY                      a key press
+  greppy web hover TARGET                   hover
+  greppy web scroll --to TARGET             scroll
+  greppy web upload TARGET PATH             a file input
+  greppy web wait CONDITION                 wait for a state
+  greppy web assert CONDITION               fail unless the page matches
 
 SESSIONS AND TABS — several agents may drive greppy at once, so a context is
 never shared implicitly. Name a session to share one on purpose:
-  greppy web session create               a browser context of your own
-  greppy web tab new                      a page in it
-  greppy web runtime status               the long-lived owner
-  greppy web status                       availability
-  greppy web doctor                       images, without starting engines
+  greppy web session create                 a browser context of your own
+  greppy web tab new                        a page in it
+  greppy web runtime status                 the long-lived owner
+  greppy web status                         availability
+  greppy web doctor                         images, without starting engines
 
 SCRIPTS AND RESULTS:
-  greppy web js CODE                      JavaScript in the page
-  greppy web pw CODE                      Playwright in the controller
-  greppy web run --script-file F          a Playwright script; --mode active
-                                          uses this browser, standalone its own
-  greppy web endpoint                     a native Playwright connect endpoint
+  greppy web js CODE                        JavaScript in the page
+  greppy web pw CODE                        Playwright in the controller
+  greppy web run --script-file F            a Playwright script; --mode active
+                                            uses this browser, standalone its own
+  greppy web endpoint                       a native Playwright connect endpoint
   greppy web script save NAME --file PATH store a script from your files
-  greppy web artifact list                what a session produced
-  greppy web artifacts                    artifacts of a session
-  greppy web result next CURSOR           the rest of a truncated result
-  greppy web cancel                       stop one in-flight run
-  greppy web heartbeat                    keep a busy session alive
-  greppy web read URL                     one page through the runtime
-  greppy web search QUERY                 search the public web
-  greppy web research QUERY               bounded multi-page research
+  greppy web artifact list                  what a session produced
+  greppy web artifacts                      artifacts of a session
+  greppy web result next CURSOR             the rest of a truncated result
+  greppy web cancel                         stop one in-flight run
+  greppy web heartbeat                      keep a busy session alive
+  greppy web read URL                       one page through the runtime
+  greppy web search QUERY                   search the public web
+  greppy web research QUERY                 bounded multi-page research
 
 Actions return results and session identifiers, but not always updated page
 contents. Use returned state when present; otherwise observe before deciding
