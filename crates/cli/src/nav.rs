@@ -73,13 +73,7 @@ fn where_incoming_degrees(
     store: &greppy_store::Store,
     project: &str,
 ) -> Result<std::collections::HashMap<i64, usize>> {
-    let mut degrees = std::collections::HashMap::new();
-    for edge_type in ["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"] {
-        for edge in store.list_edges_by_type(project, edge_type, i64::MAX as usize)? {
-            *degrees.entry(edge.target_id).or_default() += 1;
-        }
-    }
-    Ok(degrees)
+    Ok(store.incoming_degrees(project)?)
 }
 
 fn where_most_used(
