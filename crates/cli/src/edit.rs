@@ -49,9 +49,9 @@ pub(crate) fn dispatch_edit_inner(
             )));
         }
     }
-    // All grammar verbs share pending.json and the undo stack. Hold one
-    // workspace-store lock across planning, publication, rollback and close;
-    // file-level CAS alone cannot protect those shared transaction records.
+    // Each literal edit owns its target file through planning and publication.
+    // Disjoint files share a compatibility barrier, while workspace-wide verbs
+    // own it exclusively. Pending records are private; undo-stack append is short.
     // A dry run must remain free of journal/lock side effects.
     let dry_run = match &command {
         EditCommand::Replace { dry_run, .. }
@@ -70,24 +70,125 @@ pub(crate) fn dispatch_edit_inner(
         None
     } else {
         let journal = ensured_workspace_store_path(&root_path)?.with_file_name(EDIT_JOURNAL_DIR);
-        Some(acquire_edit_transaction_lock(&journal)?)
+        Some(acquire_edit_command_locks(&journal, &command, &file_base)?)
     };
     Ok(dispatch_edit_grammar(command, json, root, &root_path, &file_base)?.0)
 }
 
-fn acquire_edit_transaction_lock(
+struct EditCommandLocks {
+    _barrier: greppy_core::cache::FileLock,
+    _files: Vec<greppy_core::cache::FileLock>,
+}
+
+fn edit_lock_until(
     journal: &std::path::Path,
+    name: &str,
+    mode: greppy_core::cache::LockMode,
+    deadline: std::time::Instant,
 ) -> Result<greppy_core::cache::FileLock> {
-    greppy_core::cache::acquire_named_lock_in(
-        journal,
-        "transaction",
-        greppy_core::cache::LockMode::Exclusive,
-        true,
-    )
-    .map_err(|error| Error::io("acquire edit transaction lock", error))?
-    .ok_or_else(|| Error::Lock(
-        "another Greppy edit is active for this workspace; nothing written. Wait for that edit to finish, re-read the affected files, then retry".into(),
-    ))
+    loop {
+        if let Some(lock) = greppy_core::cache::acquire_named_lock_in(journal, name, mode, true)
+            .map_err(|error| Error::io("acquire edit coordination lock", error))?
+        {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Lock(format!(
+                "edit could not obtain {name} within its 120-second coordination deadline; nothing written"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+// Resolve existing aliases and normalize not-yet-created paths before naming
+// the file lock. The grammar still performs its full path/syntax/CAS checks
+// after this lock is acquired, so no pre-wait snapshot is ever published.
+fn edit_lock_identity(path: &std::path::Path) -> std::path::PathBuf {
+    // Existing paths must resolve symlinks before interpreting `..`, exactly
+    // like file reads; lexical folding first can give one target two locks.
+    if let Ok(identity) = path.canonicalize() {
+        return identity;
+    }
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    while ancestor.canonicalize().is_err() {
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let mut identity = ancestor
+        .canonicalize()
+        .unwrap_or_else(|_| ancestor.to_path_buf());
+    for name in tail.into_iter().rev() {
+        identity.push(name);
+    }
+    identity
+}
+
+fn acquire_edit_command_locks(
+    journal: &std::path::Path,
+    command: &EditCommand,
+    file_base: &std::path::Path,
+) -> Result<EditCommandLocks> {
+    let file = match command {
+        EditCommand::ReplaceText { file, .. }
+        | EditCommand::ReplaceLines { file, .. }
+        | EditCommand::DeleteLines { file, .. }
+        | EditCommand::InsertLines { file, .. } => Some(file.as_str()),
+        EditCommand::Write { path, .. } => Some(path.as_str()),
+        _ => None,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    // Old clients and workspace-wide operations take this same barrier
+    // exclusively; literal edits share it and coordinate only their target.
+    let mode = if file.is_some() {
+        greppy_core::cache::LockMode::Shared
+    } else {
+        greppy_core::cache::LockMode::Exclusive
+    };
+    let barrier = edit_lock_until(journal, "transaction", mode, deadline)?;
+    let mut files = Vec::new();
+    if let Some(file) = file {
+        let operand = file_operand_path(file_base, file);
+        // Write's resolver deliberately normalizes its create path lexically.
+        // Follow that resolver's path semantics rather than the read semantics.
+        let operand = if matches!(command, EditCommand::Write { .. }) {
+            let mut normalized = std::path::PathBuf::new();
+            for component in operand.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other.as_os_str()),
+                }
+            }
+            normalized
+        } else {
+            operand
+        };
+        let identity = edit_lock_identity(&operand);
+        let name = format!(
+            "file-{}",
+            edit_sha256_hex(identity.as_os_str().as_encoded_bytes())
+        );
+        files.push(edit_lock_until(
+            journal,
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            deadline,
+        )?);
+    }
+    Ok(EditCommandLocks {
+        _barrier: barrier,
+        _files: files,
+    })
 }
 
 pub(crate) fn edit_sha256_hex(data: &[u8]) -> String {
@@ -911,16 +1012,16 @@ pub(crate) fn edit_publish(
             rel: located.rel.clone(),
             content: Some(located.content.clone()),
         }],
-    );
+    )?;
     edit_journal_crash_hook()?;
     if let Err(error) =
         greppy_edit::publish::publish_atomic(root_path, &located.abs, &new_content, &before_sha)
     {
-        edit_journal_abort(root_path);
+        edit_journal_abort(root_path, transaction.as_deref());
         return Err(EditRefusal::new("publish_failed", error.to_string(), 16));
     }
     if let Some(id) = transaction {
-        edit_journal_close(root_path, &id);
+        edit_journal_close(root_path, &id)?;
         record.transaction_id = Some(id);
     }
     let handle = greppy_edit::EditHandle::for_range(
@@ -1414,27 +1515,70 @@ pub(crate) fn edit_journal_write(path: &std::path::Path, value: &serde_json::Val
     }
 }
 
-/// Record the pre-images and open a transaction. Anything that dies between
-/// here and [`edit_journal_close`] leaves `pending.json` behind — which is
-/// exactly what `recover` looks for.
+fn edit_pending_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let prefix = EDIT_JOURNAL_PENDING.trim_end_matches(".json");
+    dir.join(format!("{prefix}-{id}.json"))
+}
+
+fn edit_published_failure(
+    code: &'static str,
+    message: impl Into<String>,
+    exit: i32,
+) -> EditRefusal {
+    EditRefusal::new(code, message, exit).with("published", serde_json::json!(true))
+}
+
+fn edit_journal_write_checked(path: &std::path::Path, value: &serde_json::Value) -> EditResult<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        EditRefusal::new(
+            "journal_failed",
+            format!("encode edit journal: {error}"),
+            16,
+        )
+    })?;
+    greppy_core::cache::atomic_write(path, &bytes).map_err(|error| {
+        EditRefusal::new(
+            "journal_failed",
+            format!("persist edit journal {}: {error}", path.display()),
+            16,
+        )
+    })
+}
+
+/// Persist one invocation's pre-images before publication. Pending records are
+/// independent; no disjoint writer can replace or abort another writer's record.
 pub(crate) fn edit_journal_open(
     root_path: &std::path::Path,
     before: &[UndoBefore],
-) -> Option<String> {
+) -> EditResult<Option<String>> {
     if before.is_empty() {
-        return None;
+        return Ok(None);
     }
     let dir = ensured_workspace_store_path(root_path)
-        .ok()?
+        .map_err(|error| {
+            EditRefusal::new(
+                "journal_failed",
+                format!("open edit journal: {error}; nothing written"),
+                16,
+            )
+        })?
         .with_file_name(EDIT_JOURNAL_DIR);
-    std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).ok()?;
+    std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).map_err(|error| {
+        EditRefusal::new(
+            "journal_failed",
+            format!("create edit pre-image directory: {error}; nothing written"),
+            16,
+        )
+    })?;
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let seed = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let id = edit_sha256_hex(seed.as_bytes());
     let mut entries = Vec::new();
@@ -1442,23 +1586,28 @@ pub(crate) fn edit_journal_open(
         let blob = match &item.content {
             Some(bytes) => {
                 let name = format!("{id}-{index}.bin");
-                std::fs::write(dir.join(EDIT_JOURNAL_BLOBS).join(&name), bytes).ok()?;
+                std::fs::write(dir.join(EDIT_JOURNAL_BLOBS).join(&name), bytes).map_err(
+                    |error| {
+                        EditRefusal::new(
+                            "journal_failed",
+                            format!("persist edit pre-image: {error}; nothing written"),
+                            16,
+                        )
+                    },
+                )?;
                 Some(name)
             }
             None => None,
         };
         entries.push(serde_json::json!({ "path": item.rel, "blob": blob }));
     }
-    edit_journal_write(
-        &dir.join(EDIT_JOURNAL_PENDING),
+    edit_journal_write_checked(
+        &edit_pending_path(&dir, &id),
         &serde_json::json!({ "id": id, "entries": entries }),
-    );
-    Some(id)
+    )?;
+    Ok(Some(id))
 }
 
-/// Die after the journal is on disk and before anything is published, so the
-/// interrupted-edit path can be exercised without killing the process from the
-/// outside. Only ever reached when the environment variable is set.
 pub(crate) fn edit_journal_crash_hook() -> EditResult<()> {
     if std::env::var_os("GREPPY_TEST_CRASH_AFTER_JOURNAL").is_some() {
         return Err(EditRefusal::new(
@@ -1470,16 +1619,22 @@ pub(crate) fn edit_journal_crash_hook() -> EditResult<()> {
     Ok(())
 }
 
-/// Close the transaction: record what the files look like now, and push it onto
-/// the stack. The after-image is what `undo` checks against, so an edit that
-/// somebody else overwrote in the meantime cannot be reversed blindly (D3).
-pub(crate) fn edit_journal_close(root_path: &std::path::Path, id: &str) {
+pub(crate) fn edit_journal_close(root_path: &std::path::Path, id: &str) -> EditResult<()> {
     let dir = edit_journal_dir(root_path);
-    let Some(mut record) = edit_journal_read(&dir.join(EDIT_JOURNAL_PENDING)) else {
-        return;
+    let pending = edit_pending_path(&dir, id);
+    let Some(mut record) = edit_journal_read(&pending) else {
+        return Err(edit_published_failure(
+            "journal_finalize_failed",
+            "source edits were published, but their pending undo record is missing or unreadable",
+            16,
+        ));
     };
     if record["id"].as_str() != Some(id) {
-        return;
+        return Err(edit_published_failure(
+            "journal_finalize_failed",
+            "source edits were published, but their pending undo identity changed",
+            16,
+        ));
     }
     let closed: Vec<serde_json::Value> = record["entries"]
         .as_array()
@@ -1502,25 +1657,44 @@ pub(crate) fn edit_journal_close(root_path: &std::path::Path, id: &str) {
         })
         .collect();
     record["entries"] = serde_json::json!(closed);
-    let mut stack = edit_journal_read(&dir.join(EDIT_JOURNAL_STACK))
-        .and_then(|value| value["transactions"].as_array().cloned())
-        .unwrap_or_default();
+    // Only the read/append/atomic-write of the common undo stack is serialized.
+    let _stack_lock = edit_lock_until(
+        &dir,
+        "undo-stack",
+        greppy_core::cache::LockMode::Exclusive,
+        std::time::Instant::now() + std::time::Duration::from_secs(120),
+    )
+    .map_err(|error| {
+        edit_published_failure(
+            "journal_finalize_failed",
+            format!("source edits were published, but undo finalization failed: {error}"),
+            16,
+        )
+    })?;
+    let stack_path = dir.join(EDIT_JOURNAL_STACK);
+    let mut stack = if stack_path.exists() {
+        edit_journal_read(&stack_path).and_then(|value| value["transactions"].as_array().cloned())
+            .ok_or_else(|| edit_published_failure("journal_finalize_failed",
+                "source edits were published, but the existing undo stack is unreadable; pending evidence retained", 16))?
+    } else {
+        Vec::new()
+    };
     stack.push(record);
     if stack.len() > EDIT_JOURNAL_DEPTH {
         let excess = stack.len() - EDIT_JOURNAL_DEPTH;
         stack.drain(..excess);
     }
-    edit_journal_write(
-        &dir.join(EDIT_JOURNAL_STACK),
-        &serde_json::json!({ "transactions": stack }),
-    );
-    let _ = std::fs::remove_file(dir.join(EDIT_JOURNAL_PENDING));
+    edit_journal_write_checked(&stack_path, &serde_json::json!({ "transactions": stack }))
+        .map_err(|error| edit_published_failure("journal_finalize_failed",
+            format!("source edits were published, but undo finalization failed: {}; pending evidence retained", error.message), 16))?;
+    let _ = std::fs::remove_file(pending);
+    Ok(())
 }
 
-/// Abandon an open transaction without recording it. Used when the work it was
-/// opened for turned out to write nothing after all.
-pub(crate) fn edit_journal_abort(root_path: &std::path::Path) {
-    let _ = std::fs::remove_file(edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING));
+pub(crate) fn edit_journal_abort(root_path: &std::path::Path, id: Option<&str>) {
+    if let Some(id) = id {
+        let _ = std::fs::remove_file(edit_pending_path(&edit_journal_dir(root_path), id));
+    }
 }
 
 /// Put a transaction's files back the way they were. `guarded` is the D3 rule:
@@ -1885,8 +2059,19 @@ pub(crate) fn edit_refusal_json(
         "schema_version".into(),
         serde_json::json!(EDIT_RECORD_SCHEMA),
     );
-    value.insert("status".into(), serde_json::json!("refused"));
-    value.insert("published".into(), serde_json::json!(false));
+    let published = refusal
+        .extra
+        .iter()
+        .any(|(key, value)| *key == "published" && value == &serde_json::json!(true));
+    value.insert(
+        "status".into(),
+        serde_json::json!(if published {
+            "published_with_error"
+        } else {
+            "refused"
+        }),
+    );
+    value.insert("published".into(), serde_json::json!(published));
     value.insert("exit_code".into(), serde_json::json!(refusal.exit));
     value.insert("operations".into(), serde_json::json!([]));
     value.insert("error".into(), serde_json::Value::Object(error));
@@ -1984,7 +2169,7 @@ pub(crate) fn run_trained_write(
             rel: rel.clone(),
             content: before.clone(),
         }],
-    );
+    )?;
     edit_journal_crash_hook()?;
     let publish = if let Some(old) = &before {
         greppy_edit::publish::publish_atomic(root_path, &abs, &bytes, &edit_sha256_hex(old))
@@ -2000,7 +2185,7 @@ pub(crate) fn run_trained_write(
             .map_err(|error| error.to_string())
     };
     if let Err(error) = publish {
-        edit_journal_abort(root_path);
+        edit_journal_abort(root_path, transaction.as_deref());
         return Err(EditRefusal::new(
             "publish_failed",
             format!("{path}: {error}"),
@@ -2008,7 +2193,7 @@ pub(crate) fn run_trained_write(
         ));
     }
     if let Some(id) = transaction {
-        edit_journal_close(root_path, &id);
+        edit_journal_close(root_path, &id)?;
         record.transaction_id = Some(id);
     }
     if verify {
@@ -2469,7 +2654,7 @@ fn run_trained_patch_with_publish_hook(
             content: Some(content.clone()),
         })
         .collect();
-    let transaction = edit_journal_open(root_path, &before);
+    let transaction = edit_journal_open(root_path, &before)?;
     edit_journal_crash_hook()?;
     for (published_count, (_, abs, content, after, _)) in planned.iter().enumerate() {
         before_publish(published_count);
@@ -2483,8 +2668,11 @@ fn run_trained_patch_with_publish_hook(
                 }
             }
             let journal = edit_journal_dir(root_path);
-            if let Some(pending) = edit_journal_read(&journal.join(EDIT_JOURNAL_PENDING)) {
-                // Another invocation can replace pending.json. Never remove or
+            if let Some(pending) = edit_journal_read(&edit_pending_path(
+                &journal,
+                transaction.as_deref().unwrap_or_default(),
+            )) {
+                // Verify that this pending record belongs to our transaction. Never remove or
                 // restore its journal on behalf of this failed transaction.
                 if transaction
                     .as_deref()
@@ -2503,7 +2691,7 @@ fn run_trained_patch_with_publish_hook(
                             }),
                         );
                     }
-                    edit_journal_abort(root_path);
+                    edit_journal_abort(root_path, transaction.as_deref());
                 }
             }
             let recovery = if conflicts.is_empty() {
@@ -2519,7 +2707,7 @@ fn run_trained_patch_with_publish_hook(
         }
     }
     if let Some(id) = transaction {
-        edit_journal_close(root_path, &id);
+        edit_journal_close(root_path, &id)?;
         record.transaction_id = Some(id);
     }
     if verify {
@@ -3431,9 +3619,24 @@ pub(crate) fn run_trained_rename(
         ..EditRecord::default()
     };
     if certificate.published {
-        if let Some(id) = edit_journal_open(root_path, &before) {
-            edit_journal_close(root_path, &id);
-            record.transaction_id = Some(id);
+        match edit_journal_open(root_path, &before) {
+            Ok(Some(id)) => {
+                if let Err(error) = edit_journal_close(root_path, &id) {
+                    return Ok(Err(error));
+                }
+                record.transaction_id = Some(id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(Err(edit_published_failure(
+                    "journal_finalize_failed",
+                    format!(
+                        "rename source edits were published, but undo recording failed: {}",
+                        error.message
+                    ),
+                    16,
+                )))
+            }
         }
     }
     if verify && certificate.published {
@@ -4768,23 +4971,64 @@ mod patch_rollback_tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&first).unwrap(), b"before\n");
         assert_eq!(std::fs::read(&last).unwrap(), b"concurrent-success\n");
-        assert!(!edit_journal_dir(dir.path())
-            .join(EDIT_JOURNAL_PENDING)
-            .exists());
+        assert!(std::fs::read_dir(edit_journal_dir(dir.path()))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pending-")));
         // This test alone created the journal under its unique temporary root hash.
         std::fs::remove_dir_all(edit_journal_dir(dir.path())).unwrap();
     }
 
     #[test]
-    fn transaction_lock_excludes_another_writer_and_releases_on_drop() {
+    fn edit_coordination_waits_and_does_not_exclude_disjoint_files() {
         let dir = tempfile::tempdir().unwrap();
-        let first = acquire_edit_transaction_lock(dir.path()).unwrap();
-        assert!(matches!(
-            acquire_edit_transaction_lock(dir.path()),
-            Err(Error::Lock(_))
-        ));
+        let journal = dir.path().join("journal");
+        let command = |file: &str| EditCommand::ReplaceText {
+            file: file.into(),
+            old: "a".into(),
+            new: Some("b".into()),
+            expect: None,
+            regex: false,
+            dry_run: false,
+            verify: false,
+        };
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "a").unwrap();
+        let first = acquire_edit_command_locks(&journal, &command("a.txt"), dir.path()).unwrap();
+        let other = acquire_edit_command_locks(&journal, &command("b.txt"), dir.path()).unwrap();
+        drop(other);
+        let identity = edit_lock_identity(&dir.path().join("a.txt"));
+        let name = format!(
+            "file-{}",
+            edit_sha256_hex(identity.as_os_str().as_encoded_bytes())
+        );
+        let begin = std::time::Instant::now();
+        assert!(edit_lock_until(
+            &journal,
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            begin + std::time::Duration::from_millis(30)
+        )
+        .is_err());
+        assert!(begin.elapsed() >= std::time::Duration::from_millis(30));
         drop(first);
-        assert!(acquire_edit_transaction_lock(dir.path()).is_ok());
+        assert!(acquire_edit_command_locks(&journal, &command("a.txt"), dir.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_identity_resolves_symlinks_before_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("real/child")).unwrap();
+        std::fs::write(dir.path().join("real/a.txt"), "A").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real/child"), dir.path().join("link")).unwrap();
+        assert_eq!(
+            edit_lock_identity(&dir.path().join("link/../a.txt")),
+            edit_lock_identity(&dir.path().join("real/a.txt"))
+        );
     }
 
     #[test]

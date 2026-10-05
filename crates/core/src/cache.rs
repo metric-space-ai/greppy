@@ -1880,7 +1880,8 @@ fn decode_agent_base_manifest(raw: &[u8]) -> io::Result<AgentBaseManifest> {
     })
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Atomically persist private cache/journal bytes using a unique, synced staging file.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_owned_namespace(parent)?;
     }
