@@ -74,6 +74,16 @@ pub enum Command {
     /// Run an ordinary invocation through the byte-exact real-grep passthrough.
     #[command(external_subcommand)]
     Passthrough(Vec<String>),
+    /// Export the complete embedded prompt with version and hashes.
+    Prompt {
+        /// Export the shared contract without the built-in argv-tool adapter.
+        #[arg(long)]
+        external: bool,
+        /// Emit metadata and the exact prompt in the JSON `prompt` field.
+        /// Plain output adds a diagnostic hash line before the prompt.
+        #[arg(long)]
+        json: bool,
+    },
     /// Index a repository.
     #[command(
         after_help = "Storage location:\n  Set GREPPY_STORE_DIR to an absolute directory on the intended volume before\n  indexing; use the same value for status, queries and later edits. The store\n  lives under GREPPY_STORE_DIR/workspaces/. This selects a different store; it\n  does not move or delete an existing one.\n\n  TMPDIR controls temporary files, not the normal persistent index location.\n  XDG_CACHE_HOME does not select the Greppy index location.\n\n  Models and inference caches use GREPPY_SHARED_INFERENCE_ROOT when explicitly\n  set; otherwise they follow GREPPY_STORE_DIR. Use one shared inference root on\n  the intended volume to retain model/cache reuse across isolated stores.\n\n  Example (Unix):\n    GREPPY_STORE_DIR=/absolute/volume/greppy-store greppy index .\n    GREPPY_STORE_DIR=/absolute/volume/greppy-store greppy index status --json"

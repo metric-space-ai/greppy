@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, AgentConfig, Client, ClientError, ExecutionEnv, GreppyEnv,
-    LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent, ToolOutcome,
-    TurnResult, SYSTEM_PROMPT,
+    run_agent_loop_with_history, system_prompt, AgentConfig, Client, ClientError, ExecutionEnv,
+    GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent,
+    ToolOutcome, TurnResult,
 };
 use serde_json::{json, Value};
 
@@ -1056,7 +1056,7 @@ fn run_prompt(
     };
     let agent_config = AgentConfig {
         max_turns: config.max_turns,
-        system: Some(SYSTEM_PROMPT.to_string()),
+        system: Some(system_prompt()),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
         ..AgentConfig::default()

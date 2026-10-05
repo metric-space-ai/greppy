@@ -590,6 +590,7 @@ const SUBCOMMANDS: &[&str] = &[
     "agent",
     "index",
     "where-am-i",
+    "prompt",
     "cache",
     "agent",
     "workspace",
@@ -1382,6 +1383,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
         "where-am-i" => "greppy where-am-i [--json] [--root DIR]",
+        "prompt" => "greppy prompt [--external] [--json]",
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
@@ -1425,7 +1427,8 @@ fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool 
         // These commands do not need a graph. In particular, a missing file
         // must be diagnosed before unrelated cache maintenance can do writes.
         Some(
-            Command::ReadFile { .. }
+            Command::Prompt { .. }
+            | Command::ReadFile { .. }
             | Command::Cache { .. }
             | Command::ReplaceText { .. }
             | Command::ReplaceLines { .. }
@@ -1463,6 +1466,19 @@ fn literal_edits_skip_unrelated_startup_maintenance() {
     assert!(!command_skips_automatic_cache_maintenance(
         cli.command.as_ref()
     ));
+}
+
+#[test]
+fn prompt_export_skips_unrelated_startup_maintenance() {
+    for args in [
+        vec!["greppy", "prompt"],
+        vec!["greppy", "prompt", "--external", "--json"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(command_skips_automatic_cache_maintenance(
+            cli.command.as_ref()
+        ));
+    }
 }
 
 fn prune_expired_evidence_packs_in_existing_store(path: &std::path::Path, now: u64) -> usize {
@@ -2395,6 +2411,23 @@ fn dispatch_subcommand(
                     dispatch_index(path.as_deref(), root, embedding_args)
                 }
             }
+        }
+        Command::Prompt { external, json } => {
+            let metadata = greppy_agent::prompt_metadata(external);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&metadata)
+                        .map_err(|e| Error::Invalid(format!("encode prompt: {e}")))?
+                );
+            } else {
+                println!(
+                    "prompt-sha256: {}",
+                    metadata["prompt_sha256"].as_str().unwrap()
+                );
+                print!("{}", metadata["prompt"].as_str().unwrap());
+            }
+            Ok(0)
         }
         Command::WhereAmI { json } => dispatch_where_am_i(root, json),
         Command::Cache { command } => dispatch_cache(command, root),

@@ -432,8 +432,7 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // browser commands and action-result guidance to match the shipped CLI.
     // 28.09.2026: owner approved bounded preparation waits, reuse of the
     // existing job, and resumption of full Greppy functionality afterward.
-    const APPROVED_SHA256: &str =
-        "a3b4e024e7169e40b2ea27cf5c9d851ee1d6f10fd2d40d3cefa976cb7123ccf8";
+    use greppy_agent::prompt_contract::APPROVED_SHA256;
 
     let text = prompt();
     let digest = {
@@ -514,7 +513,8 @@ fn the_prompt_is_frozen_byte_for_byte() {
         digest, APPROVED_SHA256,
         "AGENTS.md changed. The system prompt is the product's contract and is \
          frozen: if this change is intended, the owner approves it by updating \
-         APPROVED_SHA256 in this test. If it is not, revert the file."
+         APPROVED_SHA256 in assets/prompts/contract.rs after reviewing the complete \
+         diff. If it is not approved, revert the file."
     );
 }
 
@@ -587,11 +587,7 @@ fn web_subcommands_from_help() -> std::collections::BTreeSet<String> {
 
 /// The canonical browser portion of both shipped prompt surfaces.
 fn beta_web_prompt() -> Option<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/prompts/web-beta.md")
-        .canonicalize()
-        .ok()?;
-    std::fs::read_to_string(path).ok()
+    Some(greppy_agent::browser_prompt().to_owned())
 }
 
 #[test]
@@ -724,7 +720,7 @@ fn public_and_builtin_browser_prompts_are_byte_identical() {
     assert_eq!(
         delimited_browser_block(&public),
         delimited_browser_block(&beta),
-        "AGENTS.md and assets/prompts/web-beta.md must expose one browser contract"
+        "public and built-in prompts must expose one canonical browser contract"
     );
 }
 
