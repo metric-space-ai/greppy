@@ -8864,7 +8864,13 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
         {
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, repo.path(), "test").unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v3'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [JS_TS_USAGE_REPAIR_KEY],
+                )
+                .unwrap();
             mark_rust_caller_edges_repaired(&base).unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
@@ -8969,7 +8975,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
         assert_eq!(raw, store.list_raw_edges("test").unwrap());
         assert!(!js_ts_usages_repaired(&store).unwrap());
         fs::write(repo.path().join("view.tsx"), source).unwrap();
-        store.conn().execute_batch("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.js_ts_usage_repair_v3' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;").unwrap();
+        store.conn().execute_batch(&format!("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='{JS_TS_USAGE_REPAIR_KEY}' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;")).unwrap();
         assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
         assert_eq!(raw, store.list_raw_edges("test").unwrap());
         assert!(!js_ts_usages_repaired(&store).unwrap());

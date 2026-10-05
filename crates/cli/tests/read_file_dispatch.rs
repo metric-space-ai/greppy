@@ -1115,14 +1115,44 @@ fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() 
     let path = repo.join("huge.txt");
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(&vec![b'x'; 65_537]).unwrap();
-    file.seek(SeekFrom::Start(8 * 1024 * 1024 * 1024)).unwrap();
+    let small_tail = 8 * 1024 * 1024;
+    file.seek(SeekFrom::Start(small_tail)).unwrap();
     file.write_all(b"\xff").unwrap();
     drop(file);
+    // Seeking beyond EOF is not sparse on every scratch filesystem. HFS+
+    // allocated the entire 8 GiB gap and stalled close before Greppy ran.
+    // Probe an 8 MiB gap first; retain the >u32::MAX fixture only when the
+    // filesystem actually stores holes. Both paths test the same bounded
+    // preview and invalid, unobserved tail without requiring a giant write.
+    #[cfg(unix)]
+    let sparse = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).unwrap().blocks().saturating_mul(512) < small_tail / 2
+    };
+    #[cfg(not(unix))]
+    let sparse = false;
+    let tail_offset = if sparse {
+        8 * 1024 * 1024 * 1024
+    } else {
+        small_tail
+    };
+    if sparse {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(tail_offset)).unwrap();
+        file.write_all(b"\xff").unwrap();
+        drop(file);
+    }
     let (code, out, err) = run(&repo, &store, &["read-file", "huge.txt"]);
     assert_eq!(code, 0, "{err}");
     assert!(out.len() < 66_500);
     assert!(out.contains("total line count unknown"));
-    assert!(out.contains("8589869057 source bytes omitted according to file size at open"));
+    assert!(out.contains(&format!(
+        "{} source bytes omitted according to file size at open",
+        tail_offset + 1 - 65_536
+    )));
     assert!(out.contains("--lines 1:1\n"));
     // Ordinary successful commands may maintain the cache GC receipt/lock.
     // That is not an initialized graph or an indexing/model job.
