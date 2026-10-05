@@ -184,13 +184,19 @@ fn parse_c_va_arg(parser: &mut Parser, source: &[u8], tree: Tree) -> Result<Tree
                     if probe_tree.root_node().has_error() {
                         continue;
                     }
-                    let Some(operand) = probe_tree
+                    let Some(mut operand) = probe_tree
                         .root_node()
                         .descendant_for_byte_range(prefix.len(), prefix.len() + range.len())
                     else {
                         continue;
                     };
                     // Require a type, rather than accepting sizeof(expression).
+                    while operand.kind() != "type_descriptor" {
+                        let Some(parent) = operand.parent() else {
+                            break;
+                        };
+                        operand = parent;
+                    }
                     if operand.kind() != "type_descriptor" {
                         continue;
                     }
