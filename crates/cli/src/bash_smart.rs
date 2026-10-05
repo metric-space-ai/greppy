@@ -3126,7 +3126,9 @@ mod tests {
         assert!(blocks[1..]
             .iter()
             .all(|block| block.kind == BlockKind::Warning));
-        let prose = split_lines(b"CMake Error handling documentation\nCMake Warning examples:\nCMake Error_count: 4\n");
+        let prose = split_lines(
+            b"CMake Error handling documentation\nCMake Warning examples:\nCMake Error_count: 4\n",
+        );
         assert!(detect_blocks(&prose, &[]).is_empty());
     }
 
