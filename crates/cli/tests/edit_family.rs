@@ -1093,14 +1093,111 @@ fn patch_marker_updates_and_advisory_counts_roundtrip() {
 }
 
 #[test]
+fn patch_marker_mixed_operations_dry_run_apply_and_undo() {
+    let fixture = Fixture::new("patch-marker-mixed");
+    std::fs::write(fixture.repo.join("update.txt"), "old\n").unwrap();
+    std::fs::write(fixture.repo.join("delete.txt"), "remove me\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            fixture.repo.join("delete.txt"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+    }
+    let diff = "*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: nested/add.txt\n+created\n+\n*** Add File: empty.txt\n*** Delete File: delete.txt\n*** End Patch\n";
+    let preview = fixture.run_with_stdin(&["patch", "--dry-run"], diff.as_bytes());
+    assert!(preview.status.success(), "{}", combined(&preview));
+    assert_file(&fixture.repo.join("update.txt"), "old\n");
+    assert_file(&fixture.repo.join("delete.txt"), "remove me\n");
+    assert!(!fixture.repo.join("nested").exists());
+    assert!(!fixture.repo.join("empty.txt").exists());
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("update.txt"), "new\n");
+    assert_file(&fixture.repo.join("nested/add.txt"), "created\n\n");
+    assert_file(&fixture.repo.join("empty.txt"), "");
+    assert!(!fixture.repo.join("delete.txt").exists());
+    let undone = fixture.run(&["undo"]);
+    assert!(undone.status.success(), "{}", combined(&undone));
+    assert_file(&fixture.repo.join("update.txt"), "old\n");
+    assert_file(&fixture.repo.join("delete.txt"), "remove me\n");
+    assert!(!fixture.repo.join("nested/add.txt").exists());
+    assert!(!fixture.repo.join("empty.txt").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(fixture.repo.join("delete.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+    }
+}
+
+#[test]
+fn patch_marker_undo_refuses_a_recreated_deletion_target() {
+    let fixture = Fixture::new("patch-marker-undo-conflict");
+    std::fs::write(fixture.repo.join("delete.txt"), "original\n").unwrap();
+    let diff = "*** Begin Patch\n*** Add File: add.txt\n+created\n*** Delete File: delete.txt\n*** End Patch\n";
+    let applied = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(applied.status.success(), "{}", combined(&applied));
+    std::fs::create_dir(fixture.repo.join("delete.txt")).unwrap();
+    let undone = fixture.run(&["undo"]);
+    assert_eq!(undone.status.code(), Some(12), "{}", combined(&undone));
+    assert_file(&fixture.repo.join("add.txt"), "created\n");
+    assert!(fixture.repo.join("delete.txt").is_dir());
+}
+
+#[test]
+fn patch_marker_late_planning_refusals_leave_existence_unchanged() {
+    let fixture = Fixture::new("patch-marker-plan-refusal");
+    std::fs::write(fixture.repo.join("update.txt"), "old\n").unwrap();
+    std::fs::write(fixture.repo.join("delete.txt"), "keep me\n").unwrap();
+    let first = "*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: nested/add.txt\n+created\n*** Delete File: delete.txt\n";
+    for suffix in [
+        "*** Delete File: missing.txt\n*** End Patch\n",
+        "*** Add File: update.txt\n+collision\n*** End Patch\n",
+        "*** Add File: invalid.rs\n+fn broken(\n*** End Patch\n",
+        "*** Add File: ../outside.txt\n+escape\n*** End Patch\n",
+        "*** Add File: nested/./add.txt\n+duplicate\n*** End Patch\n",
+    ] {
+        for dry_run in [false, true] {
+            let args = if dry_run {
+                vec!["patch", "--dry-run"]
+            } else {
+                vec!["patch"]
+            };
+            let output = fixture.run_with_stdin(&args, format!("{first}{suffix}").as_bytes());
+            assert!(!output.status.success(), "{}", combined(&output));
+            assert_file(&fixture.repo.join("update.txt"), "old\n");
+            assert_file(&fixture.repo.join("delete.txt"), "keep me\n");
+            assert!(!fixture.repo.join("nested").exists());
+            assert!(!fixture.repo.join("invalid.rs").exists());
+            assert!(!fixture.base.join("outside.txt").exists());
+        }
+    }
+}
+
+#[test]
 fn patch_marker_refusals_preserve_the_entire_transaction() {
     let fixture = Fixture::new("patch-marker-refusal");
     std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
     std::fs::write(fixture.repo.join("repeat.txt"), "repeat\nrepeat\n").unwrap();
     let first = "*** Begin Patch\n*** Update File: one.txt\n@@\n-one\n+ONE\n";
     for (suffix, status) in [
-        ("*** Add File: new.txt\n+new\n*** End Patch\n", 20),
-        ("*** Delete File: repeat.txt\n*** End Patch\n", 20),
+        (
+            "*** Add File: new.txt\nnew without prefix\n*** End Patch\n",
+            20,
+        ),
+        (
+            "*** Delete File: repeat.txt\n-unexpected payload\n*** End Patch\n",
+            20,
+        ),
         (
             "*** Update File: repeat.txt\n@@\n-repeat\n+REPEAT\n*** End Patch\n",
             13,
