@@ -2471,7 +2471,10 @@ mod tests {
         )
         .unwrap();
         let legacy = raw.payload.clone();
-        let store = greppy_store::Store::open(&dir.join("graph.db")).unwrap();
+        let store_dir =
+            std::env::temp_dir().join(format!("greppy-retention-store-{}", spool_token()));
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = greppy_store::Store::open(&store_dir.join("graph.db")).unwrap();
         let payload = store
             .retain_bash_smart_capture(&raw.payload, &raw.stdout, &raw.stderr)
             .unwrap();
@@ -2520,6 +2523,8 @@ mod tests {
             std::fs::remove_file(payload[name]["path"].as_str().unwrap()).unwrap();
         }
         std::fs::remove_dir(retained_stdout.parent().unwrap()).unwrap();
+        drop(_lease);
+        std::fs::remove_dir_all(store_dir).unwrap();
     }
 
     #[test]
