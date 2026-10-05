@@ -160,6 +160,10 @@ pub struct EmbeddingIndexOptions {
     pub start_node_offset: usize,
     pub start_chunk_idx: i64,
     pub max_documents: Option<usize>,
+    /// Maximum source bytes whose chunks may be constructed/tokenized in one
+    /// invocation. The first definition is always admitted and is itself
+    /// bounded by `max_span_bytes`, guaranteeing forward progress.
+    pub max_preparation_bytes: Option<usize>,
 }
 
 impl EmbeddingIndexOptions {
@@ -171,6 +175,7 @@ impl EmbeddingIndexOptions {
             start_node_offset: 0,
             start_chunk_idx: 0,
             max_documents: None,
+            max_preparation_bytes: None,
         }
     }
 }
@@ -266,6 +271,7 @@ pub fn count_code_embedding_documents_for_scope(
     let mut offset = options.start_node_offset;
     let mut total = 0usize;
     let mut documents = 0usize;
+    let mut preparation_bytes = 0usize;
 
     loop {
         let nodes = if store.is_overlay() && prefixes.is_empty() {
@@ -294,6 +300,20 @@ pub fn count_code_embedding_documents_for_scope(
             {
                 continue;
             }
+            let source_bytes = embedding_source_span_bytes(
+                source,
+                node.start_line,
+                node.end_line,
+                options.max_span_bytes,
+            );
+            if preparation_bytes > 0
+                && options
+                    .max_preparation_bytes
+                    .is_some_and(|limit| preparation_bytes.saturating_add(source_bytes) > limit)
+            {
+                return Ok(total);
+            }
+            preparation_bytes = preparation_bytes.saturating_add(source_bytes);
             let title = embedding_document_title(&node.qualified_name);
             let chunks = embedding_chunks(
                 source,
@@ -413,6 +433,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
     report.next_node_offset = offset;
     report.next_chunk_idx = options.start_chunk_idx;
     let mut documents = 0usize;
+    let mut preparation_bytes = 0usize;
 
     let batch_size = embed_batch_size();
     let schedule_window = embed_schedule_window(batch_size);
@@ -471,6 +492,23 @@ pub fn index_code_embeddings_for_scope_with_progress(
                 report.nodes_skipped_oversize += 1;
                 continue;
             }
+            let source_bytes = embedding_source_span_bytes(
+                source,
+                node.start_line,
+                node.end_line,
+                options.max_span_bytes,
+            );
+            if preparation_bytes > 0
+                && options
+                    .max_preparation_bytes
+                    .is_some_and(|limit| preparation_bytes.saturating_add(source_bytes) > limit)
+            {
+                report.next_node_offset = node_offset;
+                report.next_chunk_idx = 0;
+                report.budget_exhausted = true;
+                break 'pages;
+            }
+            preparation_bytes = preparation_bytes.saturating_add(source_bytes);
             let title = embedding_document_title(&node.qualified_name);
             let chunks = embedding_chunks(
                 source,
@@ -945,6 +983,32 @@ fn embedding_chunks(
         };
     }
     Ok(out)
+}
+
+fn embedding_source_span_bytes(
+    source: &str,
+    start_line: i64,
+    end_line: i64,
+    max_bytes: usize,
+) -> usize {
+    if start_line <= 0 || end_line < start_line {
+        return 0;
+    }
+    let requested_lines = if end_line > start_line {
+        usize::try_from(end_line - start_line + 1).unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
+    };
+    source
+        .lines()
+        .skip((start_line as usize).saturating_sub(1))
+        .take(requested_lines)
+        .try_fold(0usize, |total, line| {
+            let next = total.saturating_add(line.len().saturating_add(1));
+            (next < max_bytes).then_some(next)
+        })
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
 }
 
 fn prompt_fits(
@@ -1817,6 +1881,41 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn source_preparation_budget_stops_before_tokenizing_the_next_definition() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = "pub fn a() { one(); }\npub fn b() { two(); }\npub fn c() { three(); }\n";
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        let mut store = store_with_project(&root);
+        for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+            insert_node(
+                &mut store,
+                &format!("p.{name}"),
+                name,
+                "Function",
+                "src/lib.rs",
+                i64::try_from(index + 1).unwrap(),
+                i64::try_from(index + 1).unwrap(),
+            );
+        }
+        let mut provider = DeterministicProvider;
+        let mut options = EmbeddingIndexOptions::for_generation(4);
+        options.max_preparation_bytes = Some(24);
+        assert_eq!(
+            count_code_embedding_documents_for_project(&store, &root, "p", &provider, options)
+                .unwrap(),
+            1
+        );
+        let report =
+            index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
+                .unwrap();
+        assert!(report.budget_exhausted);
+        assert_eq!(report.nodes_embedded, 1);
+        assert_eq!(report.next_node_offset, 1);
+        assert_eq!(report.next_chunk_idx, 0);
     }
 
     #[test]

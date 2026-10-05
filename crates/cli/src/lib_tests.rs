@@ -1197,7 +1197,19 @@ fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
     assert_eq!(
         observe_background_embedding(Some(&chunk), false, false, false),
         BackgroundEmbeddingObservation::FollowIndex,
-        "a bounded child exit requests another admitted child without claiming readiness"
+        "a bounded child exit requests a resumable handoff without claiming readiness"
+    );
+    assert_eq!(
+        embedding_chunk_handoff(true, true),
+        EmbeddingChunkHandoff::ReturnToInheritedLease
+    );
+    assert_eq!(
+        embedding_chunk_handoff(false, true),
+        EmbeddingChunkHandoff::Yield(std::time::Duration::from_secs(65))
+    );
+    assert_eq!(
+        embedding_chunk_handoff(false, false),
+        EmbeddingChunkHandoff::Continue
     );
 }
 

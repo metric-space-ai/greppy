@@ -2494,6 +2494,7 @@ fn complete_embeddings_from_published_graph(
 }
 
 const BACKGROUND_EMBEDDING_CHUNK_DOCUMENTS: usize = 64;
+const BACKGROUND_EMBEDDING_PREPARATION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct EmbeddingResumeCursor {
@@ -2803,6 +2804,7 @@ fn index_embeddings_into_temp_store_scoped(
             }
         }
         options.max_documents = Some(BACKGROUND_EMBEDDING_CHUNK_DOCUMENTS);
+        options.max_preparation_bytes = Some(BACKGROUND_EMBEDDING_PREPARATION_BYTES);
     }
     let mut embedding_report = if let Some(job) = background_job {
         // Exact document counting tokenizes candidate spans. It does not load
