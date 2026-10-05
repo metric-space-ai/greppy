@@ -776,12 +776,42 @@ pub fn ensure_workspace_store(workspace_root: &Path) -> io::Result<PathBuf> {
     // Hold the selected path throughout initialization; late old-client stores
     // cannot redirect this operation to an unrelated cache.
     let dir = stores.join(crate::workspace::workspace_hash(workspace_root));
-    if stores != workspaces_root() {
-        validate_existing_disposable_store(&dir, workspace_root)?;
-    }
-    ensure_owned_namespace(&dir)?;
-    ensure_workspace_manifest(&dir, workspace_root)?;
+    publish_workspace_store(
+        &data_root(),
+        &dir,
+        workspace_root,
+        stores != workspaces_root(),
+    )?;
     Ok(dir)
+}
+
+/// Publication is independent of graph writer ownership: callers may already
+/// hold a lifecycle or writer lock. Never acquire those locks while holding
+/// this one. GC takes it last, nonblocking, after lifecycle and writer locks.
+/// Keep it outside the store so mkdir, atomic manifest staging and GC cannot
+/// replace the lock inode while another initializer waits.
+fn publish_workspace_store(
+    data: &Path,
+    dir: &Path,
+    workspace_root: &Path,
+    disposable: bool,
+) -> io::Result<()> {
+    let hash = crate::workspace::workspace_hash(workspace_root);
+    let _publication = acquire_named_lock_in(
+        data,
+        &format!("workspace-{hash}.publication"),
+        LockMode::Exclusive,
+        false,
+    )?
+    .ok_or_else(|| io::Error::other("blocking workspace publication lock unavailable"))?;
+    // Revalidate only after the previous publisher has finished; its temporary
+    // manifest file must not be mistaken for nonempty, unowned retained data.
+    if disposable {
+        validate_existing_disposable_store(dir, workspace_root)?;
+    }
+    ensure_owned_namespace(dir)?;
+    ensure_workspace_manifest(dir, workspace_root)?;
+    Ok(())
 }
 
 fn ensure_workspace_manifest(dir: &Path, workspace_root: &Path) -> io::Result<()> {
@@ -1491,7 +1521,16 @@ fn workspace_gc_locks_in(data: &Path, id: &str) -> io::Result<Option<Vec<FileLoc
     else {
         return Ok(None);
     };
-    Ok(Some(vec![lease, writer]))
+    let Some(publication) = acquire_named_lock_in(
+        data,
+        &format!("workspace-{id}.publication"),
+        LockMode::Exclusive,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(vec![lease, writer, publication]))
 }
 
 fn try_entry_lock(entry: &ManagedEntry) -> io::Result<Option<Vec<FileLock>>> {
@@ -2850,6 +2889,139 @@ mod tests {
             crate::workspace::workspace_hash(&repo)
         );
         let _ = fs::remove_dir_all(base);
+    }
+
+    // Invoked only by the controlled cross-process contention test below.
+    #[test]
+    fn workspace_publication_child() {
+        let Some(base) = std::env::var_os("GREPPY_PUBLICATION_TEST_ROOT") else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let repo = base.join("repo");
+        let data = base.join("data");
+        let hash = crate::workspace::workspace_hash(&repo);
+        assert!(acquire_named_lock_in(
+            &data,
+            &format!("workspace-{hash}.publication"),
+            LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none());
+        fs::write(base.join("contender-ready"), b"ready").unwrap();
+        publish_workspace_store(&data, &base.join(&hash), &repo, true).unwrap();
+        fs::write(base.join("contender-done"), b"done").unwrap();
+    }
+
+    #[test]
+    fn disposable_workspace_publication_waits_for_atomic_manifest_and_blocks_gc() {
+        let base = tempdir("publication-contention");
+        let repo = base.join("repo");
+        let data = base.join("data");
+        fs::create_dir_all(&repo).unwrap();
+        let hash = crate::workspace::workspace_hash(&repo);
+        let dir = base.join(&hash);
+        let publication = acquire_named_lock_in(
+            &data,
+            &format!("workspace-{hash}.publication"),
+            LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        fs::create_dir(&dir).unwrap();
+        // Hold the exact dangerous state: mkdir has completed and the atomic
+        // manifest temporary file exists, but the manifest is not published.
+        let staging = dir.join("store.manifest.controlled.tmp");
+        fs::write(&staging, b"manifest staging").unwrap();
+        assert!(validate_existing_disposable_store(&dir, &repo).is_err());
+        assert!(workspace_gc_locks_in(&data, &hash).unwrap().is_none());
+        // GC's failed final acquisition must release lifecycle and writer locks.
+        let lease = acquire_named_lock_in(
+            &data,
+            &format!("workspace-{hash}.lease"),
+            LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let writer = acquire_named_lock_in(
+            &data,
+            &format!("workspace-{hash}.writer"),
+            LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        drop((lease, writer));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("cache::tests::workspace_publication_child")
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env("GREPPY_PUBLICATION_TEST_ROOT", &base)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !base.join("contender-ready").exists() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("publication contender did not reach the held lock");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!base.join("contender-done").exists());
+        ensure_workspace_manifest(&dir, &repo).unwrap();
+        fs::remove_file(staging).unwrap();
+        drop(publication);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("publication contender did not finish after publication");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+        assert!(base.join("contender-done").exists());
+        assert_eq!(
+            read_store_manifest(&dir).unwrap().canonical_root,
+            canonical_root(&repo)
+        );
+        assert!(workspace_gc_locks_in(&data, &hash).unwrap().is_some());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn disposable_workspace_publication_rejects_unowned_bytes_and_wrong_identity() {
+        let base = tempdir("publication-foreign");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let data = base.join("data");
+        let dir = base.join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir(&dir).unwrap();
+        // A leftover atomic-looking name is not proof of ownership either.
+        for name in ["graph.db", "store.manifest.foreign.tmp"] {
+            let foreign = dir.join(name);
+            fs::write(&foreign, b"unowned bytes").unwrap();
+            assert!(publish_workspace_store(&data, &dir, &repo, true).is_err());
+            assert!(!dir.join(STORE_MANIFEST_FILE).exists());
+            assert_eq!(fs::read(&foreign).unwrap(), b"unowned bytes");
+            fs::remove_file(foreign).unwrap();
+        }
+        // An abandoned empty directory is still safely recoverable.
+        publish_workspace_store(&data, &dir, &repo, true).unwrap();
+        let other = base.join("other-repo");
+        fs::create_dir_all(&other).unwrap();
+        let manifest = fs::read(dir.join(STORE_MANIFEST_FILE)).unwrap();
+        assert!(publish_workspace_store(&data, &dir, &other, true).is_err());
+        assert_eq!(fs::read(dir.join(STORE_MANIFEST_FILE)).unwrap(), manifest);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
