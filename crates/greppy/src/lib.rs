@@ -127,6 +127,15 @@ pub fn run_grep(real_grep: &std::path::Path, argv: &[String]) -> Result<i32> {
 /// `argv` is the full argv (including argv[0]). Only `argv[1..]` is
 /// forwarded, matching [`run_grep`].
 pub fn run_grep_os(real_grep: &std::path::Path, argv: &[OsString]) -> Result<i32> {
+    run_grep_os_in_dir(real_grep, argv, None)
+}
+
+/// [`run_grep_os`] with an optional child-only working directory.
+pub fn run_grep_os_in_dir(
+    real_grep: &std::path::Path,
+    argv: &[OsString],
+    working_dir: Option<&std::path::Path>,
+) -> Result<i32> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty".into()));
     }
@@ -138,6 +147,9 @@ pub fn run_grep_os(real_grep: &std::path::Path, argv: &[OsString]) -> Result<i32
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
+    if let Some(working_dir) = working_dir {
+        cmd.current_dir(working_dir);
+    }
 
     let status = cmd
         .status()

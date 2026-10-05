@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use web_runtime::worker::give_child_attach_token;
@@ -340,15 +340,13 @@ fn reap_orphaned_greppy_web_temps() {
     });
 }
 
-
 #[test]
 fn temp_dir_guard_removes_dist_on_drop() {
     let path;
     {
-        let dest = TempDirGuard::at(std::env::temp_dir().join(format!(
-            "greppy-web-dist-drop-{}",
-            std::process::id()
-        )));
+        let dest = TempDirGuard::at(
+            std::env::temp_dir().join(format!("greppy-web-dist-drop-{}", std::process::id())),
+        );
         path = dest.to_path_buf();
         std::fs::create_dir_all(&*dest).unwrap();
         std::fs::write(dest.join("marker"), b"x").unwrap();
@@ -363,7 +361,7 @@ struct Supervisor {
     run_id: String,
     _deadline: Deadline,
     kill_group: bool,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl Drop for Supervisor {
@@ -415,7 +413,22 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
-        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE)
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE, true)
+    }
+
+    fn spawn_parallel(socket: &Path, run_id: &str, extra: impl FnOnce(&mut Command)) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_web-runtime"));
+        command
+            .arg("--socket")
+            .arg(socket)
+            .arg("--run-id")
+            .arg(run_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        extra(&mut command);
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE, false)
     }
 
     fn spawn_leak(socket: &Path, run_id: &str, extra: impl FnOnce(&mut Command)) -> Self {
@@ -430,7 +443,7 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
-        Self::finish_spawn(socket, run_id, command, LEAK_TEST_DEADLINE)
+        Self::finish_spawn(socket, run_id, command, LEAK_TEST_DEADLINE, true)
     }
 
     fn spawn_from_dist(socket: &Path, run_id: &str, dist: &Path) -> Self {
@@ -446,7 +459,7 @@ impl Supervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .process_group(0);
-        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE)
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE, true)
     }
 
     fn finish_spawn(
@@ -454,11 +467,14 @@ impl Supervisor {
         run_id: &str,
         mut command: Command,
         deadline: Duration,
+        serialize: bool,
     ) -> Self {
         reap_orphaned_greppy_web_temps();
-        let lock = supervisor_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let lock = serialize.then(|| {
+            supervisor_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        });
         let mut bytes = [0_u8; 16];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut file| {
@@ -598,7 +614,13 @@ fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
     let own = this_web_runtime_image();
     let exe = env!("CARGO_BIN_EXE_web-runtime");
     let mut found = Vec::new();
-    for pattern in [exe, own.to_str().unwrap_or(exe), "internal-role", "run_cliparent", "cliparent"] {
+    for pattern in [
+        exe,
+        own.to_str().unwrap_or(exe),
+        "internal-role",
+        "run_cliparent",
+        "cliparent",
+    ] {
         let output = Command::new("pgrep")
             .args(["-lf", pattern])
             .output()
@@ -628,17 +650,14 @@ fn leftover_web_runtime_processes() -> Vec<(u32, String)> {
     found
 }
 
-
 #[test]
 fn leftover_matches_this_image_ignores_other_trees_and_copy_scripts() {
     let own = Path::new("/Users/me/greppy/crates/web-runtime/target/debug/web-runtime");
-    assert!(
-        leftover_matches_this_image(
-            "web-runtime",
-            "/Users/me/greppy/crates/web-runtime/target/debug/web-runtime --internal-role content",
-            own
-        )
-    );
+    assert!(leftover_matches_this_image(
+        "web-runtime",
+        "/Users/me/greppy/crates/web-runtime/target/debug/web-runtime --internal-role content",
+        own
+    ));
     assert!(
         !leftover_matches_this_image(
             "web-runtime",
@@ -646,13 +665,11 @@ fn leftover_matches_this_image_ignores_other_trees_and_copy_scripts() {
             own
         )
     );
-    assert!(
-        !leftover_matches_this_image(
-            "zsh",
-            "zsh -c cp /Users/me/greppy/crates/web-runtime/target/debug/web-runtime /tmp/out",
-            own
-        )
-    );
+    assert!(!leftover_matches_this_image(
+        "zsh",
+        "zsh -c cp /Users/me/greppy/crates/web-runtime/target/debug/web-runtime /tmp/out",
+        own
+    ));
 }
 
 #[test]
@@ -713,6 +730,487 @@ fn serve_fixture(html: &'static str) -> String {
         }
     });
     format!("http://{address}/")
+}
+
+fn decode_chunked_body(mut encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded.windows(2).position(|part| part == b"\r\n")?;
+        let size_text = std::str::from_utf8(&encoded[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            return Some(decoded);
+        }
+        if encoded.len() < size + 2 || &encoded[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[size + 2..];
+    }
+}
+
+fn serve_form_post_fixture(redirect_post: bool) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind form post fixture");
+    let address = listener.local_addr().expect("form post addr");
+    let (body_sender, body_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let (header_end, content_length, chunked) = loop {
+                let size = stream.read(&mut chunk).unwrap_or(0);
+                if size == 0 {
+                    break (request.len(), 0, false);
+                }
+                request.extend_from_slice(&chunk[..size]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let header_end = header_end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let chunked = headers.lines().any(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("transfer-encoding:")
+                            .is_some_and(|value| value.trim() == "chunked")
+                    });
+                    break (header_end, content_length, chunked);
+                }
+            };
+            while if chunked {
+                decode_chunked_body(&request[header_end..]).is_none()
+            } else {
+                request.len() < header_end + content_length
+            } {
+                let size = stream.read(&mut chunk).unwrap_or(0);
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let request_line = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let posted = request_line.starts_with("POST /login ")
+                || request_line.starts_with("POST /complete ");
+            let response_body = if posted {
+                let body = if chunked {
+                    decode_chunked_body(&request[header_end..]).unwrap()
+                } else {
+                    request[header_end..header_end + content_length].to_vec()
+                };
+                body_sender.send(body).unwrap();
+                "<!doctype html><title>submitted</title><body>submitted</body>"
+            } else {
+                "<!doctype html><title>login</title><form method='post' action='/login'><input id='username' name='username'><input id='password' name='password'><button id='submit' type='submit'>Login</button></form>"
+            };
+            let response = if redirect_post && request_line.starts_with("POST /login ") {
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /complete\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{address}/"), body_receiver)
+}
+
+fn serve_cookie_isolation_fixture() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind cookie isolation fixture");
+    let address = listener.local_addr().expect("cookie isolation addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let cookie = request
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Cookie: ")
+                        .or_else(|| line.strip_prefix("cookie: "))
+                })
+                .unwrap_or("");
+            let body = format!("<!doctype html><title>cookie</title><body>{cookie}</body>");
+            let set_cookie = if path == "/set" {
+                "Set-Cookie: isolation=A; Path=/; Max-Age=3600; HttpOnly\r\n"
+            } else {
+                ""
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{set_cookie}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    format!("http://{address}")
+}
+
+struct ResetServer {
+    url: String,
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ResetServer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_reset_server() -> ResetServer {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking failure port");
+    let url = format!(
+        "http://{}/transport-failure",
+        listener.local_addr().unwrap()
+    );
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || loop {
+        if stopped.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // An abortive close makes the accepted-then-closed failure a
+                // deterministic TCP reset on Linux and macOS. A plain close
+                // can be interpreted as an empty orderly response by the
+                // networking stack and would not test the same failure path.
+                use std::os::fd::AsRawFd;
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                let result = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        std::ptr::addr_of!(linger).cast(),
+                        std::mem::size_of_val(&linger) as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0, "set abortive TCP close");
+                drop(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    });
+    ResetServer {
+        url,
+        stop,
+        worker: Some(worker),
+    }
+}
+
+fn serve_status_fixture() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status fixture");
+    let address = listener.local_addr().expect("status fixture addr");
+    thread::spawn(move || {
+        let repeated = std::sync::atomic::AtomicUsize::new(0);
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..count]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            if path == "/jump" {
+                let location = format!("http://{address}/landed");
+                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                continue;
+            }
+            if path == "/jump-empty" {
+                let location = format!("http://{address}/empty");
+                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                continue;
+            }
+            if path == "/chunked" {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+                continue;
+            }
+            let (status, body) = match path {
+                "/missing" => ("404 Not Found", b"missing".as_slice()),
+                "/repeat" => {
+                    if repeated.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ("200 OK", b"repeated ok".as_slice())
+                    } else {
+                        ("404 Not Found", b"repeated missing".as_slice())
+                    }
+                }
+                "/empty" => ("204 No Content", b"".as_slice()),
+                "/landed" => ("200 OK", b"landed".as_slice()),
+                _ => ("200 OK", b"ok".as_slice()),
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{address}/")
+}
+
+struct NavigationLifecycleFixture {
+    origin: String,
+    events: std::sync::mpsc::Receiver<String>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
+    releases: Arc<(Mutex<HashSet<String>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
+    handlers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+}
+
+impl NavigationLifecycleFixture {
+    fn release(&self, path: &str) {
+        let (released, wake) = &*self.releases;
+        released.lock().unwrap().insert(path.to_owned());
+        wake.notify_all();
+    }
+
+    fn wait_for(&self, path: &str) {
+        self.wait_for_all(&[path]);
+    }
+
+    fn wait_for_all(&self, paths: &[&str]) {
+        let mut pending = paths.iter().copied().collect::<HashSet<_>>();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = self
+                .events
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| {
+                    let diagnostics = self.diagnostics.lock().unwrap().clone();
+                    panic!(
+                        "waiting for fixture requests {pending:?}: {error}; fixture diagnostics: {diagnostics:?}"
+                    )
+                });
+            pending.remove(event.as_str());
+        }
+    }
+
+    fn assert_not_requested(&self, path: &str, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.events.recv_timeout(remaining) {
+                Ok(event) => assert_ne!(event, path, "unexpected fixture request {path}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+                Err(error) => {
+                    let diagnostics = self.diagnostics.lock().unwrap().clone();
+                    panic!(
+                        "fixture event channel failed: {error}; fixture diagnostics: {diagnostics:?}"
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl Drop for NavigationLifecycleFixture {
+    fn drop(&mut self) {
+        let released = self.releases.0.lock().unwrap();
+        self.stop.store(true, Ordering::Release);
+        self.releases.1.notify_all();
+        drop(released);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        let handlers = std::mem::take(&mut *self.handlers.lock().unwrap());
+        for handler in handlers {
+            let _ = handler.join();
+        }
+    }
+}
+
+fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind lifecycle fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("set lifecycle fixture nonblocking");
+    let address = listener.local_addr().expect("lifecycle fixture addr");
+    let (events_tx, events) = std::sync::mpsc::channel();
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let server_diagnostics = Arc::clone(&diagnostics);
+    let releases = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
+    let server_releases = Arc::clone(&releases);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let handlers = Arc::new(Mutex::new(Vec::new()));
+    let server_handlers = Arc::clone(&handlers);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            let events_tx = events_tx.clone();
+            let diagnostics = Arc::clone(&server_diagnostics);
+            let releases = Arc::clone(&server_releases);
+            let handler_stop = Arc::clone(&server_stop);
+            let handler = thread::spawn(move || {
+                let mut buffer = [0_u8; 2048];
+                let n = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        diagnostics
+                            .lock()
+                            .unwrap()
+                            .push(format!("request read error: {error}"));
+                        0
+                    }
+                };
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_owned();
+                diagnostics
+                    .lock()
+                    .unwrap()
+                    .push(format!("accepted path {path}"));
+                let _ = events_tx.send(path.clone());
+                if path.contains("-gate.") {
+                    let (released, wake) = &*releases;
+                    let mut released = released.lock().unwrap();
+                    while !released.contains(&path) && !handler_stop.load(Ordering::Acquire) {
+                        released = wake.wait(released).unwrap();
+                    }
+                    if handler_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+                if path == "/redirect" {
+                    if let Err(error) = stream.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /landed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ) {
+                        diagnostics
+                            .lock()
+                            .unwrap()
+                            .push(format!("write redirect for {path}: {error}"));
+                    }
+                    return;
+                }
+                let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
+                    path if path == "/landed" || path.starts_with("/landed?") => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head><title>Landed</title></head><body><p id='landed'>landed</p></body></html>".to_vec(),
+                    ),
+                    "/parser" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head></head><body><script src='/parser-gate.js'></script><p id='late'>parser-finished</p></body></html>".to_vec(),
+                    ),
+                    "/defer" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><script>window.addEventListener('DOMContentLoaded', event => event.stopImmediatePropagation(), true); try { window.__greppyDOMContentLoaded = true; } catch (_) {} document.dispatchEvent(new Event('DOMContentLoaded'));</script><p id='parsed'>parser-finished</p></body></html>".to_vec(),
+                    ),
+                    "/load" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p id='parsed'>parser-finished</p><img src='/load-gate.png'></body></html>".to_vec(),
+                    ),
+                    "/dcl-before-load" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p id='parsed'>dom-content-loaded</p><img src='/dcl-load-gate.png'></body></html>".to_vec(),
+                    ),
+                    "/phrase" => (
+                        "text/html; charset=utf-8",
+                        b"<!DOCTYPE html><html><head><title>Quoted documentation</title></head><body><p>Documentation may say: Could not load the requested page.</p><p id=loaded>ordinary-page-loaded</p></body></html>".to_vec(),
+                    ),
+                    "/dcl-returned" => ("text/plain", b"ok".to_vec()),
+                    "/load-returned" => ("text/plain", b"ok".to_vec()),
+                    path if path.ends_with(".js") => ("text/javascript", b"void 0;".to_vec()),
+                    path if path.ends_with(".png") => ("image/png", Vec::new()),
+                    _ => ("text/plain", b"not found".to_vec()),
+                };
+                // These navigation controls count document requests. A fresh document
+                // may otherwise reuse cached bytes without contacting this fixture.
+                let cache_control = if path == "/landed" || path.starts_with("/landed?") {
+                    "Cache-Control: no-store\r\n"
+                } else {
+                    ""
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{cache_control}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if let Err(error) = stream.write_all(header.as_bytes()) {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push(format!("write headers for {path}: {error}"));
+                }
+                if let Err(error) = stream.write_all(&body) {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push(format!("write body for {path}: {error}"));
+                }
+            });
+            server_handlers.lock().unwrap().push(handler);
+        }
+    });
+    NavigationLifecycleFixture {
+        origin: format!("http://{address}"),
+        events,
+        diagnostics,
+        releases,
+        stop,
+        server: Some(server),
+        handlers,
+    }
 }
 
 fn serve_site() -> String {
@@ -801,6 +1299,58 @@ fn run_playwright_source(
     ran
 }
 
+fn run_playwright_source_async(
+    socket: PathBuf,
+    run_id: &str,
+    source: String,
+) -> (
+    std::sync::mpsc::Receiver<greppy_web_client::Response>,
+    thread::JoinHandle<()>,
+) {
+    let run_id = run_id.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                &run_id,
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("create async navigation session");
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session_id = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut run = Request::new(
+            &run_id,
+            "web.run",
+            json!({
+                "session_id": session_id.clone(),
+                "script_source": "inline",
+                "script_text": source,
+            }),
+        );
+        run.deadline_ms = 30_000;
+        let response = unix_request(&socket, &run, Duration::from_secs(35))
+            .expect("run async navigation script");
+        let _ = unix_request(
+            &socket,
+            &Request::new(
+                &run_id,
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        );
+        let _ = tx.send(response);
+    });
+    (rx, worker)
+}
+
 fn run_playwright_source_with_limits(
     socket: &Path,
     run_id: &str,
@@ -854,7 +1404,6 @@ fn fixture_source(name: &str) -> (PathBuf, String) {
     let source = std::fs::read_to_string(&path).unwrap();
     (path, source)
 }
-
 
 fn write_receipt_preserving_provenance(path: PathBuf, receipt: &serde_json::Value) {
     let mut receipt = receipt.clone();
@@ -940,8 +1489,7 @@ fn session_create_run_close_over_unix_socket() {
 
 #[test]
 fn two_agents_same_run_cannot_close_each_others_session() {
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-lease-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-lease-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_lease", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
@@ -971,9 +1519,12 @@ fn two_agents_same_run_cannot_close_each_others_session() {
     )
     .expect("list");
     assert_eq!(listed.status, "ok", "{listed:?}");
-    let rows = listed.result.as_ref().unwrap()["sessions"].as_array().unwrap();
+    let rows = listed.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .unwrap();
     assert!(
-        rows.iter().all(|row| row["session_id"].as_str() != Some(&session_id)),
+        rows.iter()
+            .all(|row| row["session_id"].as_str() != Some(&session_id)),
         "agent-b must not see agent-a session: {listed:?}"
     );
     let denied = unix_request(
@@ -1484,7 +2035,10 @@ fn content_worker_crash_is_recovered_without_hanging() {
         snapshot.display()
     );
     let snapshot_body = std::fs::read_to_string(&snapshot).unwrap();
-    assert!(snapshot_body.contains("ready"), "session.json {snapshot_body}");
+    assert!(
+        snapshot_body.contains("ready"),
+        "session.json {snapshot_body}"
+    );
 
     let created_again = unix_request(
         &socket,
@@ -1520,7 +2074,10 @@ fn greppy_cli_parent_survives_content_worker_kill() {
             file.read_exact(&mut token_bytes)
         })
         .expect("urandom");
-    let token: String = token_bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let token: String = token_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let _shutdown = CliparentShutdown {
         run_id: run_id.clone(),
         token: token.clone(),
@@ -1546,6 +2103,60 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         .and_then(|rest| rest.split('"').next())
         .expect("session_id in create stdout")
         .to_owned();
+    let (parent, socket) =
+        web_runtime_supervisor_for_run(&run_id).expect("created session has a detached supervisor");
+    register_attach_token(&socket, token.clone());
+    let listed = unix_request(
+        &socket,
+        &Request::new(&run_id, "web.session.list", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("list before run");
+    let content = listed.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == session_id)
+        .and_then(|session| session["content_pid"].as_u64())
+        .filter(|pid| *pid > 1)
+        .expect("bound session content worker");
+    // The supervisor also owns a warm engine pair. Killing its first content
+    // child may leave the actual session untouched and falsely report success.
+    // Arm only once the bound page has made an owned fixture request.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    struct OwnedFixture(Option<thread::JoinHandle<()>>);
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            if let Some(thread) = self.0.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let mut fixture = OwnedFixture(Some(thread::spawn(move || {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = [0_u8; 1024];
+                    stream.read(&mut request).unwrap();
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\narmed").unwrap();
+                    let _ = armed_tx.send(());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("owned fixture accept failed: {error}"),
+            }
+        }
+    })));
     let mut child_cmd = Command::new(&greppy);
     child_cmd
         .args([
@@ -1566,34 +2177,53 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let _run_pass = give_child_attach_token(&mut child_cmd, &token).expect("run attach token");
-    let mut child = child_cmd.spawn().expect("greppy web run");
+    struct OwnedChild(std::process::Child);
+    impl std::ops::Deref for OwnedChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for OwnedChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(child_cmd.spawn().expect("greppy web run"));
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().expect("stdin");
         stdin
             .write_all(
-                b"import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.waitForTimeout(15_000);\nawait browser.close();\n",
+                format!("import {{ chromium }} from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto({});\nawait page.waitForTimeout(15_000);\nawait browser.close();\n", serde_json::to_string(&url).unwrap()).as_bytes(),
             )
             .unwrap();
     }
     drop(child.stdin.take());
-    let deadline_pid = Instant::now() + Duration::from_secs(12);
-    let (parent, socket) = loop {
-        if let Some(found) = web_runtime_supervisor_for_run(&run_id) {
-            break found;
-        }
-        if Instant::now() >= deadline_pid {
-            let _ = child.kill();
-            panic!("detached web-runtime supervisor not found for {run_id}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-    register_attach_token(&socket, token.clone());
-    if let Some(content) = content_worker_pid(parent) {
-        let _ = Command::new("kill")
+    armed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("bound page armed");
+    fixture.0.take().unwrap().join().unwrap();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "run must still be active at kill"
+    );
+    assert!(
+        Command::new("kill")
             .args(["-KILL", &content.to_string()])
-            .status();
-    }
+            .status()
+            .unwrap()
+            .success(),
+        "kill bound content worker"
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         match child.try_wait() {
@@ -1601,6 +2231,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 panic!("greppy parent did not exit after content kill");
             }
             Err(error) => panic!("{error}"),
@@ -1728,6 +2359,12 @@ fn web_status_reports_observability_fields() {
             "missing web.status field {key}: {status:?}"
         );
     }
+    assert_eq!(
+        result["runtime_build_id"],
+        greppy_web_client::runtime_image_id(Path::new(env!("CARGO_BIN_EXE_web-runtime")))
+            .expect("runtime executable identity"),
+        "status must expose the image identity captured by the running supervisor"
+    );
     assert_eq!(result["playwright_compatibility_version"], "1.62.1");
     assert_eq!(result["inventory_entries"], 1354);
     assert_eq!(result["unsupported_capability_count"], 500);
@@ -1921,7 +2558,10 @@ fn one_thousand_session_create_run_close_cycles() {
         .unwrap_or_else(|error| panic!("close {i}: {error}"));
         assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
         if i % 50 == 0 {
-            eprintln!("web-runtime: leak-cycle {i}/1000 elapsed_ms={}", started.elapsed().as_millis());
+            eprintln!(
+                "web-runtime: leak-cycle {i}/1000 elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
         }
     }
 }
@@ -1932,7 +2572,9 @@ fn local_package_contains_exactly_one_runtime_executable() {
         .join("..")
         .join("scripts")
         .join("package-web-runtime.sh");
-    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-{}", std::process::id())));
+    let dest = TempDirGuard::at(
+        std::env::temp_dir().join(format!("greppy-web-dist-{}", std::process::id())),
+    );
     let status = Command::new("sh")
         .arg(&script)
         .arg(&dest)
@@ -2290,7 +2932,8 @@ fn package_and_uninstall_refuse_hostile_destinations() {
     );
 
     let pid = std::process::id();
-    let canary_dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-canary-{pid}")));
+    let canary_dir =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-canary-{pid}")));
     let _ = std::fs::remove_dir_all(&canary_dir);
     std::fs::create_dir_all(&canary_dir).unwrap();
     let canary = canary_dir.join("DO_NOT_DELETE");
@@ -2333,8 +2976,10 @@ fn package_and_uninstall_refuse_hostile_destinations() {
 #[test]
 fn install_upgrade_rollback_roundtrip() {
     let pid = std::process::id();
-    let packaged = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-pkg-{pid}")));
-    let installed = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-inst-{pid}")));
+    let packaged =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-pkg-{pid}")));
+    let installed =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-inst-{pid}")));
     let _ = std::fs::remove_dir_all(&packaged);
     let _ = std::fs::remove_dir_all(&installed);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&packaged));
@@ -2441,7 +3086,8 @@ fn install_upgrade_rollback_refuse_hostile_destinations() {
 fn package_refuses_bin_directory_symlink_and_preserves_canaries() {
     let pid = std::process::id();
     let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-binsym-{pid}")));
-    let canary = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-bins-{pid}")));
+    let canary =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-bins-{pid}")));
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
@@ -2478,8 +3124,10 @@ fn package_refuses_bin_directory_symlink_and_preserves_canaries() {
 fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
     let pid = std::process::id();
     let src = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-prevsrc-{pid}")));
-    let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-prevdst-{pid}")));
-    let canary = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-prev-{pid}")));
+    let dest =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-prevdst-{pid}")));
+    let canary =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-prev-{pid}")));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
@@ -2519,7 +3167,8 @@ fn upgrade_refuses_previous_directory_symlink_and_preserves_canaries() {
 fn packaging_refuses_later_member_symlink_without_partial_erase() {
     let pid = std::process::id();
     let dest = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-late-{pid}")));
-    let canary = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-late-{pid}")));
+    let canary =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-canary-late-{pid}")));
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&canary);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dest));
@@ -2687,15 +3336,1232 @@ fn route_fulfill_overrides_http_body() {
 }
 
 #[test]
+fn bound_page_uses_immutable_session_network_profile() {
+    let origin = serve_fixture("bound profile");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-bound-profile-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_bound_profile", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    let create = |profile: &str| {
+        let response = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_profile",
+                "web.session.create",
+                json!({ "profile": profile }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("create profile session");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let run = |session_id: &str| {
+        let mut request = Request::new(
+            "run_bound_profile",
+            "web.run",
+            json!({
+                "session_id": session_id,
+                "script_source": "inline",
+                "script_text": format!(r#"
+await page.goto({origin:?});
+console.log(JSON.stringify({{
+  url: page.url(),
+  body: await page.locator('body').textContent(),
+}}));
+"#),
+                "bind_session_page": true,
+            }),
+        );
+        request.deadline_ms = 60_000;
+        unix_request(&socket, &request, Duration::from_secs(60)).expect("bound web.run")
+    };
+
+    let project = create("project");
+    for phase in ["fresh project page", "reused project page"] {
+        let response = run(&project);
+        assert_eq!(response.status, "ok", "{phase}: {response:?}");
+        let stdout = response.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(stdout.contains(&origin), "{phase}: {response:?}");
+        assert!(stdout.contains("bound profile"), "{phase}: {response:?}");
+    }
+
+    let research = create("research");
+    let denied = run(&research);
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert!(
+        denied
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("research profile denies loopback")),
+        "{denied:?}"
+    );
+
+    let restored = run(&project);
+    assert_eq!(
+        restored.status, "ok",
+        "project after research: {restored:?}"
+    );
+    let stdout = restored.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(
+        stdout.contains(&origin),
+        "project after research: {restored:?}"
+    );
+    assert!(
+        stdout.contains("bound profile"),
+        "project after research: {restored:?}"
+    );
+}
+
+#[test]
+fn network_query_filters_enriched_response_records() {
+    let origin = serve_fixture("unused");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-query.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_network_query", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_query",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+            "bind_session_page": true,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network");
+    assert_eq!(filtered.status, "ok", "{filtered:?}");
+    let requests = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("network requests");
+    assert_eq!(requests.len(), 1, "{filtered:?}");
+    assert!(
+        requests[0]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/same")),
+        "{filtered:?}"
+    );
+    assert_eq!(requests[0]["status"], 404);
+    assert_eq!(requests[0]["ok"], false);
+    assert_eq!(requests[0]["byteLength"], 7);
+
+    let successful = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status=200 url~/same$/" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network successful occurrence");
+    let successes = successful.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("successful network requests");
+    assert_eq!(successes.len(), 1, "{successful:?}");
+    assert_ne!(
+        successes[0]["requestId"], requests[0]["requestId"],
+        "repeated URL occurrences must retain distinct response identities"
+    );
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "filter": "failed" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network failed records");
+    let failures = failed.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("failed network requests");
+    assert_eq!(failures.len(), 2, "{failed:?}");
+    let transport = failures
+        .iter()
+        .find(|record| {
+            record["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/failed"))
+        })
+        .expect("failed transport record");
+    assert!(transport.get("status").is_none(), "{transport:?}");
+    assert!(
+        transport["failure"]["errorText"].is_string(),
+        "{transport:?}"
+    );
+}
+
+#[test]
+fn network_query_filters_real_http_and_https_responses() {
+    let origin = serve_status_fixture();
+    let https = spawn_tls_origin("network-status-origin.py");
+    let https_origin = format!("https://{}/", https.addr);
+    let failed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    let failed_origin = format!(
+        "http://{}/transport-failure",
+        failed_listener.local_addr().unwrap()
+    );
+    thread::spawn(move || {
+        if let Ok((stream, _)) = failed_listener.accept() {
+            drop(stream);
+        }
+    });
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-http-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-http-status.mjs");
+    let source = format!(
+        "globalThis.httpsFixtureUrl = {};\nglobalThis.failedFixtureUrl = {};\n{}",
+        serde_json::to_string(&https_origin).unwrap(),
+        serde_json::to_string(&failed_origin).unwrap(),
+        std::fs::read_to_string(&script).unwrap(),
+    );
+    let _guard = Supervisor::spawn(&socket, "run_network_http_query", |command| {
+        command
+            .arg("--fixture-url")
+            .arg(&origin)
+            .env("GREPPY_WEB_TEST_IGNORE_CERTS", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_http_query",
+        "web.run",
+        json!({
+            "session_id": session_id, "script_source": "file",
+            "script_file": script.display().to_string(), "script_text": source,
+            "bind_session_page": true,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("filtered network");
+    let failures = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .unwrap();
+    assert_eq!(failures.len(), 4, "{filtered:?}");
+    for scheme in ["http://", "https://"] {
+        assert!(
+            failures.iter().any(|row| row["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(scheme) && url.ends_with("/missing"))
+                && row["status"] == 404
+                && row["byteLength"] == 7),
+            "{scheme}: {filtered:?}"
+        );
+        assert!(
+            failures.iter().any(|row| row["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(scheme) && url.ends_with("/repeat"))
+                && row["status"] == 404
+                && row["byteLength"] == 16),
+            "{scheme}: {filtered:?}"
+        );
+    }
+
+    let all = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("all network");
+    let records = all.result.as_ref().unwrap()["requests"].as_array().unwrap();
+    for base in [&origin, &https_origin] {
+        let repeated = records
+            .iter()
+            .filter(|row| {
+                row["url"]
+                    .as_str()
+                    .is_some_and(|url| url == format!("{base}repeat"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 2, "{base}: {all:?}");
+        assert_ne!(repeated[0]["requestId"], repeated[1]["requestId"]);
+        assert_eq!(
+            (
+                repeated[0]["status"].as_u64(),
+                repeated[0]["byteLength"].as_u64()
+            ),
+            (Some(200), Some(11))
+        );
+        assert_eq!(
+            (
+                repeated[1]["status"].as_u64(),
+                repeated[1]["byteLength"].as_u64()
+            ),
+            (Some(404), Some(16))
+        );
+        for (path, status, bytes) in [
+            ("jump", 302, 0),
+            ("landed", 200, 6),
+            ("chunked", 200, 11),
+            ("empty", 204, 0),
+        ] {
+            let row = records
+                .iter()
+                .find(|row| {
+                    row["url"]
+                        .as_str()
+                        .is_some_and(|url| url == format!("{base}{path}"))
+                })
+                .unwrap_or_else(|| panic!("missing {base}{path}: {all:?}"));
+            assert_eq!(
+                (row["status"].as_u64(), row["byteLength"].as_u64()),
+                (Some(status), Some(bytes)),
+                "{base}{path}: {all:?}"
+            );
+        }
+    }
+    let failed = records
+        .iter()
+        .find(|row| row["url"] == failed_origin)
+        .unwrap_or_else(|| panic!("missing transport failure: {all:?}"));
+    assert!(failed.get("status").is_none(), "{failed:?}");
+    assert!(failed["failure"]["errorText"].is_string(), "{failed:?}");
+    let failed_only = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id, "filter": "failed" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("failed network filter");
+    assert!(
+        failed_only.result.as_ref().unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["url"] == failed_origin && row["failure"]["errorText"].is_string()),
+        "{failed_only:?}"
+    );
+}
+
+#[test]
+fn native_transport_failure_is_typed_without_classifying_page_words() {
+    let reset = spawn_reset_server();
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let refused_url = format!(
+        "http://{}/transport-failure",
+        closed_listener.local_addr().unwrap()
+    );
+    drop(closed_listener);
+    let legitimate_html = Box::leak(format!(
+        "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='refused' href='{refused_url}'>Refused transport</a><a id='reset' href='{}'>Reset transport</a></body>",
+        reset.url,
+    ).into_boxed_str());
+    let legitimate = serve_fixture(legitimate_html);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-navigation-failure-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_navigation_failure", |command| {
+        command.arg("--fixture-url").arg(&legitimate);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_navigation_failure", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("navigation request")
+    };
+
+    for selector in ["#refused", "#reset"] {
+        let ordinary = call("web.session.create", json!({ "profile": "project" }));
+        let ordinary_id = ordinary.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call(
+            "web.goto",
+            json!({ "session_id": ordinary_id, "url": legitimate }),
+        );
+        assert_eq!(
+            opened.status, "ok",
+            "ordinary page words are content: {opened:?}"
+        );
+        let observed = call("web.observe", json!({ "session_id": ordinary_id }));
+        assert_eq!(
+            observed.status, "ok",
+            "ordinary page words are observable: {observed:?}"
+        );
+        let clicked = call(
+            "web.click",
+            json!({
+                "session_id": ordinary_id,
+                "selector": { "type": "css", "value": selector },
+            }),
+        );
+        assert_eq!(
+            clicked.status, "error",
+            "{selector} must be typed: {clicked:?}"
+        );
+        assert_eq!(
+            clicked.error.as_ref().unwrap().code,
+            "engine_error",
+            "{clicked:?}"
+        );
+        let receipt = clicked.result.as_ref().expect("partial click receipt");
+        assert_eq!(receipt["partial"], true);
+        assert_eq!(receipt["ok"], false);
+        assert!(
+            receipt.get("dispatch").is_some(),
+            "click dispatch provenance: {receipt}"
+        );
+        assert_eq!(receipt["session_id"], ordinary_id);
+        assert!(receipt["tab_id"].is_string());
+        assert!(clicked
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("request_id="));
+    }
+
+    let failed = call("web.session.create", json!({ "profile": "project" }));
+    let failed_id = failed.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let navigation = call(
+        "web.goto",
+        json!({ "session_id": failed_id, "url": refused_url }),
+    );
+    assert_eq!(
+        navigation.status, "error",
+        "transport navigation must fail: {navigation:?}"
+    );
+    assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
+}
+
+#[test]
+fn top_level_204_terminates_without_replacing_the_document() {
+    let status_origin = serve_status_fixture();
+    let prior =
+        serve_fixture("<!doctype html><title>Prior</title><p id='prior'>preserved document</p>");
+    let subresource = serve_fixture(Box::leak(
+        format!(
+            "<!doctype html><p id='ready'>subresource page</p><img src='{status_origin}empty'>"
+        )
+        .into_boxed_str(),
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-no-document-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_no_document", |command| {
+        command.arg("--fixture-url").arg(&prior);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_no_document", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("no-document request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = call("web.goto", json!({"session_id":session,"url":prior}));
+    assert_eq!(opened.status, "ok", "prior document: {opened:?}");
+
+    for path in ["empty", "jump-empty"] {
+        let started = Instant::now();
+        let response = call(
+            "web.goto",
+            json!({"session_id":session,"url":format!("{status_origin}{path}")}),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "204 navigation waited for a nonexistent document: {response:?}"
+        );
+        assert_eq!(response.status, "error", "{path}: {response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, "engine_error");
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("kind=no_document"),
+            "{response:?}"
+        );
+        assert!(
+            !response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("timed out"),
+            "{response:?}"
+        );
+        let preserved = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":"document.getElementById('prior')?.textContent"}),
+        );
+        assert_eq!(preserved.status, "ok", "{preserved:?}");
+        assert_eq!(
+            preserved.result.as_ref().unwrap()["value"],
+            "preserved document"
+        );
+    }
+
+    for (path, status) in [("landed", 200), ("missing", 404)] {
+        let response = call(
+            "web.goto",
+            json!({"session_id":session,"url":format!("{status_origin}{path}")}),
+        );
+        assert_eq!(response.status, "ok", "{path}: {response:?}");
+        assert_eq!(response.result.as_ref().unwrap()["status"], status);
+    }
+
+    let subresource_session = call("web.session.create", json!({"profile":"project"}));
+    let subresource_session = subresource_session.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let subresource_loaded = call(
+        "web.goto",
+        json!({"session_id":subresource_session,"url":subresource}),
+    );
+    assert_eq!(
+        subresource_loaded.status, "ok",
+        "subresource 204 must not poison its page: {subresource_loaded:?}"
+    );
+    let observed = call("web.observe", json!({"session_id":subresource_session}));
+    assert_eq!(observed.status, "ok", "subresource isolation: {observed:?}");
+
+    let controller_session = call("web.session.create", json!({"profile":"project"}));
+    let controller_session = controller_session.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let controller_opened = call(
+        "web.goto",
+        json!({"session_id":controller_session,"url":prior}),
+    );
+    assert_eq!(controller_opened.status, "ok", "{controller_opened:?}");
+    let controller = call(
+        "web.run",
+        json!({
+            "session_id": controller_session,
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": format!(r#"
+let failure;
+try {{ await page.goto('{status_origin}empty'); }} catch (error) {{ failure = error.message; }}
+const missing = await page.goto('{status_origin}missing');
+const recovered = await page.goto('{status_origin}landed');
+console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: recovered.status() }}));
+"#),
+        }),
+    );
+    assert_eq!(controller.status, "ok", "{controller:?}");
+    let stdout = controller.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(stdout.contains("kind=no_document"), "{controller:?}");
+    assert!(stdout.contains("\"missing\":404"), "{controller:?}");
+    assert!(stdout.contains("\"recovered\":200"), "{controller:?}");
+}
+
+#[test]
+fn fresh_sessions_submit_complete_form_post_bodies() {
+    let (fixture, posted_bodies) = serve_form_post_fixture(false);
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-form-post-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_form_post", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_form_post", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("form post request")
+    };
+
+    for _ in 0..3 {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "{opened:?}");
+        for (selector, value) in [("#username", "admin"), ("#password", "secret")] {
+            let filled = call(
+                "web.fill",
+                json!({
+                    "session_id":session,
+                    "selector":{"type":"css","value":selector},
+                    "value":value,
+                }),
+            );
+            assert_eq!(filled.status, "ok", "{filled:?}");
+        }
+        let submitted = call(
+            "web.click",
+            json!({
+                "session_id":session,
+                "selector":{"type":"css","value":"#submit"},
+            }),
+        );
+        assert_eq!(submitted.status, "ok", "{submitted:?}");
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"username=admin&password=secret"
+        );
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(posted_bodies.try_recv().is_err());
+}
+
+#[test]
+fn materialized_form_post_body_replays_across_temporary_redirect() {
+    let (fixture, posted_bodies) = serve_form_post_fixture(true);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-form-post-redirect-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_form_post_redirect", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_form_post_redirect", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("redirected form post request")
+    };
+
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    for (selector, value) in [("#username", "admin"), ("#password", "secret")] {
+        let filled = call(
+            "web.fill",
+            json!({
+                "session_id":session,
+                "selector":{"type":"css","value":selector},
+                "value":value,
+            }),
+        );
+        assert_eq!(filled.status, "ok", "{filled:?}");
+    }
+    let submitted = call(
+        "web.click",
+        json!({
+            "session_id":session,
+            "selector":{"type":"css","value":"#submit"},
+        }),
+    );
+    assert_eq!(submitted.status, "ok", "{submitted:?}");
+    for _ in 0..2 {
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"username=admin&password=secret"
+        );
+    }
+    let body_state = call(
+        "web.run",
+        json!({
+            "session_id":session,
+            "script_source":"inline",
+            "bind_session_page":true,
+            "script_text":r#"
+const state = await page.evaluate(async () => {
+  const request = new Request('/complete', { method: 'POST', body: 'body=once' });
+  const rawBody = request.body;
+  const before = request.bodyUsed;
+  const response = await fetch(request);
+  const after = request.bodyUsed;
+  const rawRead = await rawBody.getReader().read();
+  let reuseError = '';
+  try { await fetch(request); } catch (error) { reuseError = error.name; }
+  const source = new Request('/complete', { method: 'POST', body: 'body=source' });
+  const constructed = new Request(source);
+  const constructedResponse = await fetch(constructed);
+  const locked = new Request('/complete', { method: 'POST', body: 'body=locked' });
+  const reader = locked.body.getReader();
+  let lockedError = '';
+  try { new Request(locked); } catch (error) { lockedError = error.name; }
+  reader.releaseLock();
+  const lockedResponse = await fetch(locked);
+  const consumed = new Request('/complete', { method: 'POST', body: 'body=old' });
+  await consumed.text();
+  const replacement = new Request(consumed, { body: 'body=replacement' });
+  const replacementResponse = await fetch(replacement);
+  const streamed = new Request('/complete', {
+    method: 'POST',
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('body=streamed'));
+        controller.close();
+      },
+    }),
+    duplex: 'half',
+  });
+  const streamedResponse = await fetch(streamed);
+  const cloneSource = new Request('/complete', { method: 'POST', body: 'body=cloned' });
+  const cloned = cloneSource.clone();
+  const cloneSourceResponse = await fetch(cloneSource);
+  const clonedResponse = await fetch(cloned);
+  return {
+    before,
+    after,
+    reuseError,
+    status: response.status,
+    rawBodyDone: rawRead.done,
+    sourceUsed: source.bodyUsed,
+    constructedStatus: constructedResponse.status,
+    lockedError,
+    lockedStatus: lockedResponse.status,
+    consumedUsed: consumed.bodyUsed,
+    replacementStatus: replacementResponse.status,
+    streamedUsed: streamed.bodyUsed,
+    streamedStatus: streamedResponse.status,
+    cloneSourceUsed: cloneSource.bodyUsed,
+    clonedUsed: cloned.bodyUsed,
+    cloneSourceStatus: cloneSourceResponse.status,
+    clonedStatus: clonedResponse.status,
+  };
+});
+console.log(JSON.stringify(state));
+"#,
+        }),
+    );
+    assert_eq!(body_state.status, "ok", "{body_state:?}");
+    let stdout = body_state.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(state["before"], false, "{state:#}");
+    assert_eq!(state["after"], true, "{state:#}");
+    assert_eq!(state["reuseError"], "TypeError", "{state:#}");
+    assert_eq!(state["status"], 200, "{state:#}");
+    assert_eq!(state["rawBodyDone"], true, "{state:#}");
+    assert_eq!(state["sourceUsed"], true, "{state:#}");
+    assert_eq!(state["constructedStatus"], 200, "{state:#}");
+    assert_eq!(state["lockedError"], "TypeError", "{state:#}");
+    assert_eq!(state["lockedStatus"], 200, "{state:#}");
+    assert_eq!(state["consumedUsed"], true, "{state:#}");
+    assert_eq!(state["replacementStatus"], 200, "{state:#}");
+    assert_eq!(state["streamedUsed"], true, "{state:#}");
+    assert_eq!(state["streamedStatus"], 200, "{state:#}");
+    assert_eq!(state["cloneSourceUsed"], true, "{state:#}");
+    assert_eq!(state["clonedUsed"], true, "{state:#}");
+    assert_eq!(state["cloneSourceStatus"], 200, "{state:#}");
+    assert_eq!(state["clonedStatus"], 200, "{state:#}");
+    for body in [
+        b"body=once".as_slice(),
+        b"body=source".as_slice(),
+        b"body=locked".as_slice(),
+        b"body=replacement".as_slice(),
+        b"body=streamed".as_slice(),
+        b"body=cloned".as_slice(),
+        b"body=cloned".as_slice(),
+    ] {
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            body
+        );
+    }
+    let closed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
+
+    for clone_first in [false, true] {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(created.status, "ok", "{created:?}");
+        let clone_session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call(
+            "web.goto",
+            json!({"session_id":clone_session,"url":fixture}),
+        );
+        assert_eq!(opened.status, "ok", "{opened:?}");
+        let clone_state = call(
+            "web.run",
+            json!({
+                "session_id":clone_session,
+                "script_source":"inline",
+                "bind_session_page":true,
+                "script_text":format!(r#"
+const state = await page.evaluate(async () => {{
+  const source = new Request('/complete', {{
+    method:'POST',
+    body:new ReadableStream({{start(controller) {{
+      controller.enqueue(new TextEncoder().encode('body=cloned'));
+      controller.close();
+    }}}}),
+    duplex:'half',
+  }});
+  const clone = source.clone();
+  const first = {} ? clone : source;
+  const second = {} ? source : clone;
+  const stagedFetch = async (stage, request) => {{
+    try {{ return await fetch(request); }}
+    catch (error) {{ throw new Error(`stage=${{stage}}: ${{error.name}}: ${{error.message}}`); }}
+  }};
+  const firstResponse = await stagedFetch('first-fetch', first);
+  const secondResponse = await stagedFetch('second-fetch', second);
+  let sourceReuseError = '';
+  let cloneReuseError = '';
+  try {{ await fetch(source); }} catch (error) {{ sourceReuseError = error.name; }}
+  try {{ await fetch(clone); }} catch (error) {{ cloneReuseError = error.name; }}
+  return {{sourceUsed:source.bodyUsed, cloneUsed:clone.bodyUsed,
+    firstStatus:firstResponse.status, secondStatus:secondResponse.status,
+    sourceReuseError, cloneReuseError}};
+}});
+console.log(JSON.stringify(state));
+"#, clone_first, clone_first),
+            }),
+        );
+        assert_eq!(
+            clone_state.status, "ok",
+            "clone_first={clone_first}: {clone_state:?}"
+        );
+        let stdout = clone_state.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        assert_eq!(
+            state["sourceUsed"], true,
+            "clone_first={clone_first}: {state:#}"
+        );
+        assert_eq!(
+            state["cloneUsed"], true,
+            "clone_first={clone_first}: {state:#}"
+        );
+        assert_eq!(
+            state["firstStatus"], 200,
+            "clone_first={clone_first}: {state:#}"
+        );
+        assert_eq!(
+            state["secondStatus"], 200,
+            "clone_first={clone_first}: {state:#}"
+        );
+        assert_eq!(
+            state["sourceReuseError"], "TypeError",
+            "clone_first={clone_first}: {state:#}"
+        );
+        assert_eq!(
+            state["cloneReuseError"], "TypeError",
+            "clone_first={clone_first}: {state:#}"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+                b"body=cloned",
+                "clone_first={clone_first}"
+            );
+        }
+        let closed = call("web.session.close", json!({"session_id":clone_session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(posted_bodies.try_recv().is_err());
+}
+
+#[test]
+fn click_navigation_wait_handles_redirect_reload_and_bounds_delayed_javascript() {
+    let destination = serve_status_fixture();
+    let redirect_page = serve_fixture(Box::leak(
+        format!("<!doctype html><a id='go' href='{destination}jump'>Redirect</a>").into_boxed_str(),
+    ));
+    let same_page = serve_fixture(Box::leak(
+        "<!doctype html><a id='same' href='/'>Same URL</a>"
+            .to_owned()
+            .into_boxed_str(),
+    ));
+    let delayed_page = serve_fixture(Box::leak(format!(
+        "<!doctype html><button id='later' onclick=\"setTimeout(() => location.href='{destination}landed', 50)\">Later</button>"
+    ).into_boxed_str()));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-click-navigation-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_click_navigation", |command| {
+        command.arg("--fixture-url").arg(&redirect_page);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_click_navigation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("click navigation request")
+    };
+    let click_from = |url: &str, selector: &str| {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call("web.goto", json!({"session_id":session,"url":url}));
+        assert_eq!(opened.status, "ok", "open click source: {opened:?}");
+        call(
+            "web.click",
+            json!({
+                "session_id": session,
+                "selector": {"type":"css","value":selector},
+                "timeout": 5_000,
+            }),
+        )
+    };
+
+    let redirected = click_from(&redirect_page, "#go");
+    assert_eq!(redirected.status, "ok", "redirect chain: {redirected:?}");
+    assert!(
+        redirected.result.as_ref().unwrap()["page_state"]["snapshot"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/landed")),
+        "{redirected:?}"
+    );
+
+    let reloaded = click_from(&same_page, "#same");
+    assert_eq!(reloaded.status, "ok", "same URL navigation: {reloaded:?}");
+
+    let delayed = click_from(&delayed_page, "#later");
+    // The timer starts after the click returns, so this only verifies that a
+    // future script navigation does not make the originating action hang.
+    assert_eq!(
+        delayed.status, "ok",
+        "delayed JavaScript navigation: {delayed:?}"
+    );
+}
+
+#[test]
+fn click_abort_and_policy_denial_finish_with_partial_receipts() {
+    let fixture = serve_fixture(
+        "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='policy' href='http://169.254.169.254/latest/meta-data/'>Policy</a>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-click-terminal-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_click_terminal", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_click_terminal", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("terminal click request")
+    };
+    let open_session = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open terminal fixture: {opened:?}");
+        session
+    };
+
+    let aborted_session = open_session();
+    let routed = call(
+        "web.run",
+        json!({
+            "session_id": aborted_session.clone(),
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.route('**/aborted', route => route.abort());",
+        }),
+    );
+    assert_eq!(routed.status, "ok", "install abort route: {routed:?}");
+    for (session, selector, kind, code) in [
+        (aborted_session, "#abort", "route_aborted", "engine_error"),
+        (open_session(), "#policy", "policy_denied", "policy_denied"),
+    ] {
+        let started = Instant::now();
+        let clicked = call(
+            "web.click",
+            json!({
+                "session_id": session,
+                "selector": {"type":"css","value":selector},
+                "timeout": 5_000,
+            }),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "known terminal navigation exhausted its action deadline: {clicked:?}"
+        );
+        assert_eq!(clicked.status, "error", "{kind}: {clicked:?}");
+        assert_eq!(clicked.error.as_ref().unwrap().code, code);
+        assert!(
+            clicked
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(&format!("kind={kind}")),
+            "{clicked:?}"
+        );
+        let receipt = clicked.result.as_ref().expect("partial action receipt");
+        assert_eq!(receipt["partial"], true);
+        assert_eq!(receipt["ok"], false);
+        assert!(receipt.get("dispatch").is_some(), "{clicked:?}");
+        assert_eq!(receipt["session_id"], session);
+        assert!(receipt["tab_id"].is_string());
+    }
+}
+
+#[test]
+fn workflow_click_terminal_failures_stop_before_expectations_or_later_steps() {
+    let fixture = serve_fixture(
+        "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='policy' href='http://169.254.169.254/latest/meta-data/'>Policy</a><button id='later'>Later</button>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-workflow-terminal-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_workflow_terminal", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_terminal", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("terminal workflow request")
+    };
+    let open_session = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open workflow fixture: {opened:?}");
+        session
+    };
+
+    let aborted_session = open_session();
+    let routed = call(
+        "web.run",
+        json!({
+            "session_id": aborted_session.clone(),
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.route('**/aborted', route => route.abort());",
+        }),
+    );
+    assert_eq!(routed.status, "ok", "install workflow route: {routed:?}");
+    for (session, selector, kind, code, trailing) in [
+        (
+            aborted_session,
+            "#abort",
+            "route_aborted",
+            "engine_error",
+            json!({"action":{"operation":"click","selector":{"type":"css","value":"#later"}}}),
+        ),
+        (
+            open_session(),
+            "#policy",
+            "policy_denied",
+            "policy_denied",
+            json!({"expect":{"condition":{"query":"css=#later"},"timeout_ms":1000}}),
+        ),
+    ] {
+        let response = call(
+            "web.workflow",
+            json!({
+                "version": 1,
+                "session_id": session,
+                "steps": [
+                    {"action":{"operation":"click","selector":{"type":"css","value":selector}}},
+                    trailing,
+                ],
+            }),
+        );
+        assert_eq!(response.status, "error", "{kind}: {response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(&format!("kind={kind}")),
+            "{response:?}"
+        );
+        let detail = response.result.as_ref().unwrap();
+        assert_eq!(detail["failed_step"], 1, "{response:?}");
+        assert_eq!(detail["actions_attempted"], 1, "{response:?}");
+        assert_eq!(detail["steps"].as_array().unwrap().len(), 1, "{response:?}");
+        assert_eq!(detail["steps"][0]["action"]["receipt"]["partial"], true);
+        assert_eq!(detail["steps"][0]["action"]["receipt"]["ok"], false);
+        assert!(
+            detail["steps"][0]["action"]["receipt"]
+                .get("dispatch")
+                .is_some(),
+            "{response:?}"
+        );
+    }
+}
+
+#[test]
+fn denied_iframe_navigation_does_not_poison_top_level_actions() {
+    let fixture = serve_fixture(
+        "<!doctype html><button id='top' onclick=\"window.topClicked=true;const frame=document.createElement('iframe');frame.src='http://169.254.169.254/latest/meta-data/';document.body.appendChild(frame)\">Top control</button><script>window.topClicked=false</script>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-denied-iframe-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_denied_iframe", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_denied_iframe", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("denied iframe request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(opened.status, "ok", "top page remains usable: {opened:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(
+        observed.status, "ok",
+        "iframe denial is not top failure: {observed:?}"
+    );
+    let clicked = call(
+        "web.click",
+        json!({
+            "session_id": session,
+            "selector": {"type":"css","value":"#top"},
+        }),
+    );
+    assert_eq!(clicked.status, "ok", "benign top click: {clicked:?}");
+    let observed_after = call("web.observe", json!({"session_id":session}));
+    assert_eq!(
+        observed_after.status, "ok",
+        "denied iframe created by click is not a top failure: {observed_after:?}"
+    );
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"window.topClicked"}),
+    );
+    assert_eq!(state.status, "ok", "top state: {state:?}");
+    assert_eq!(state.result.as_ref().unwrap()["value"], true, "{state:?}");
+}
+
+#[test]
 fn oracle_skip_receipt_when_chromium_pin_missing() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("scripts")
         .join("oracle-skip.sh");
-    let receipt = std::env::temp_dir().join(format!(
-        "greppy-oracle-skip-{}.json",
-        std::process::id()
-    ));
+    let receipt =
+        std::env::temp_dir().join(format!("greppy-oracle-skip-{}.json", std::process::id()));
     let status = Command::new("sh")
         .arg(&script)
         .arg(&receipt)
@@ -2750,7 +4616,9 @@ fn download_is_recorded_from_fulfilled_binary() {
 fn file_chooser_accepts_set_input_files() {
     // Component evidence only: worker-visible path storage. Compatibility
     // requires file_chooser_populates_dom_filelist_and_change_events.
-    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-upload-{}", std::process::id())));
+    let dir = TempDirGuard::at(
+        std::env::temp_dir().join(format!("greppy-web-upload-{}", std::process::id())),
+    );
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("sample.txt");
     std::fs::write(&file, b"upload-bytes").unwrap();
@@ -2793,10 +4661,21 @@ fn file_chooser_accepts_set_input_files() {
 
 #[test]
 fn file_chooser_populates_dom_filelist_and_change_events() {
-    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-upload-dom-{}", std::process::id())));
+    let dir = TempDirGuard::at(
+        std::env::temp_dir().join(format!("greppy-web-upload-dom-{}", std::process::id())),
+    );
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("sample.txt");
     std::fs::write(&file, b"upload-bytes").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000)),
+        )
+        .unwrap();
     let socket =
         std::env::temp_dir().join(format!("greppy-web-filedom-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
@@ -2883,7 +4762,8 @@ fn native_alert_does_not_corrupt_protocol() {
 
 #[test]
 fn script_console_log_does_not_corrupt_protocol() {
-    let socket = std::env::temp_dir().join(format!("greppy-web-conlog-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-conlog-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let (path, source) = fixture_source("console-log-stdout.mjs");
     let _guard = Supervisor::spawn(&socket, "run_conlog", |_| {});
@@ -2998,7 +4878,12 @@ await browser.close();
     .expect("status");
     assert_eq!(status.status, "ok", "{status:?}");
     assert!(
-        status.result.as_ref().unwrap().get("discarded_engine_results").is_some(),
+        status
+            .result
+            .as_ref()
+            .unwrap()
+            .get("discarded_engine_results")
+            .is_some(),
         "web.status must expose discarded_engine_results: {status:?}"
     );
     let _ = unix_request(
@@ -3014,8 +4899,10 @@ await browser.close();
 
 #[test]
 fn page_url_is_sync_string_and_goto_returns_response_status() {
-    let fixture = serve_fixture("<!DOCTYPE html><html><body><p class=\"p\">Lokal</p></body></html>");
-    let socket = std::env::temp_dir().join(format!("greppy-web-urlstat-{}.sock", std::process::id()));
+    let fixture =
+        serve_fixture("<!DOCTYPE html><html><body><p class=\"p\">Lokal</p></body></html>");
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-urlstat-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_urlstat", |command| {
         command.arg("--fixture-url").arg(&fixture);
@@ -3066,7 +4953,8 @@ await browser.close();
 #[test]
 fn web_screenshot_returns_inline_png_bytes() {
     let fixture = serve_fixture("<!DOCTYPE html><html><body><p>shot</p></body></html>");
-    let socket = std::env::temp_dir().join(format!("greppy-web-pngb64-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-pngb64-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_pngb64", |command| {
         command.arg("--fixture-url").arg(&fixture);
@@ -3114,7 +5002,9 @@ fn web_screenshot_returns_inline_png_bytes() {
         elapsed < Duration::from_secs(3),
         "page.screenshot on a 1-paragraph fixture must not cost ~5s of readiness wait; elapsed={elapsed:?}"
     );
-    let b64 = shot.result.as_ref().unwrap()["png_base64"].as_str().unwrap_or("");
+    let b64 = shot.result.as_ref().unwrap()["png_base64"]
+        .as_str()
+        .unwrap_or("");
     assert!(b64.len() > 32, "png_base64 missing: {shot:?}");
     let digest = shot.result.as_ref().unwrap()["digest"]
         .as_str()
@@ -3203,6 +5093,536 @@ fn web_goto_navigates_a_fixture() {
         ),
         Duration::from_secs(5),
     );
+}
+
+#[test]
+fn bound_web_run_uses_only_the_named_sessions_active_page() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><head><title>Bound Session Page</title></head><body><input id=\"marker\" value=\"initial\"></body></html>",
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-bound-page-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_bound_page", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    let create = |label: &str| {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("create {label}: {error}"));
+        assert_eq!(created.status, "ok", "{label}: {created:?}");
+        created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let session_a = create("a");
+    let session_b = create("b");
+    for (session, marker) in [(&session_a, "session-a"), (&session_b, "session-b")] {
+        let went = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.goto",
+                json!({ "session_id": session, "url": fixture }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("goto");
+        assert_eq!(went.status, "ok", "{went:?}");
+        let seeded = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.evaluate",
+                json!({
+                    "session_id": session,
+                    "source": format!(
+                        "document.getElementById('marker').value = {marker:?}"
+                    )
+                }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("seed marker");
+        assert_eq!(seeded.status, "ok", "{seeded:?}");
+    }
+
+    let run = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": session_a,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": r##"
+const input = page.locator("#marker");
+const before = await input.inputValue();
+await input.fill("mutated-a");
+console.log(JSON.stringify({
+  before,
+  after: await input.inputValue(),
+  url: page.url(),
+  title: await page.title(),
+  pages: context.pages().length,
+  contexts: browser.contexts().length,
+}));
+"##,
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("bound web.run");
+    assert_eq!(run.status, "ok", "{run:?}");
+    let stdout = run.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap_or("");
+    assert!(stdout.contains("session-a"), "{run:?}");
+    assert!(stdout.contains("mutated-a"), "{run:?}");
+    assert!(stdout.contains(&fixture), "{run:?}");
+    assert!(stdout.contains("Bound Session Page"), "{run:?}");
+    assert!(stdout.contains("\"pages\":1"), "{run:?}");
+    assert!(stdout.contains("\"contexts\":1"), "{run:?}");
+
+    for (session, expected) in [(&session_a, "mutated-a"), (&session_b, "session-b")] {
+        let value = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.evaluate",
+                json!({
+                    "session_id": session,
+                    "source": "document.getElementById('marker').value"
+                }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("read marker");
+        assert_eq!(value.status, "ok", "{value:?}");
+        assert_eq!(
+            value.result.as_ref().unwrap()["value"],
+            expected,
+            "{value:?}"
+        );
+    }
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": session_a,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": "throw new Error('intentional-bound-failure');",
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("failing bound web.run");
+    assert_eq!(failed.status, "error", "{failed:?}");
+    let after_failure = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.evaluate",
+            json!({
+                "session_id": session_a,
+                "source": "document.getElementById('marker').value"
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("read marker after failure");
+    assert_eq!(
+        after_failure.result.as_ref().unwrap()["value"],
+        "mutated-a",
+        "{after_failure:?}"
+    );
+
+    let fresh = create("fresh");
+    let fresh_run = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": fresh,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": "console.log(page.url());",
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("fresh bound web.run");
+    assert_eq!(fresh_run.status, "ok", "{fresh_run:?}");
+    assert!(
+        fresh_run.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("about:blank"),
+        "{fresh_run:?}"
+    );
+
+    for session in [session_a, session_b, fresh] {
+        let _ = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.session.close",
+                json!({ "session_id": session }),
+            ),
+            Duration::from_secs(5),
+        );
+    }
+}
+
+#[test]
+fn controller_locator_click_consumes_only_its_navigation_failure() {
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let refused = format!("http://{}/refused", closed_listener.local_addr().unwrap());
+    drop(closed_listener);
+    let destination = serve_status_fixture();
+    let fixture = serve_fixture(Box::leak(
+        format!(
+            "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='refused' href='{refused}'>Refused</a><a id='redirect' href='{destination}jump'>Redirect</a><button id='clean' onclick='window.__controllerCleanClicks=(window.__controllerCleanClicks||0)+1'>Clean</button>"
+        )
+        .into_boxed_str(),
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-controller-navigation-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_controller_navigation", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_controller_navigation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("controller navigation request")
+    };
+    let create_page = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open controller fixture: {opened:?}");
+        session
+    };
+    for (selector, expected_kind, install_route) in [
+        ("#abort", "route_aborted", true),
+        ("#refused", "transport", false),
+    ] {
+        let session = create_page();
+        let script = format!(
+            r#"
+{route}
+let failure;
+try {{
+  await page.locator({selector:?}).click();
+}} catch (error) {{
+  failure = {{ name:error.name, code:error.code, kind:error.kind, requestId:error.requestId, url:error.url, message:error.message }};
+}}
+{restore_page}
+await page.locator('#clean').click();
+console.log(JSON.stringify({{ failure, clean: await page.evaluate(() => window.__controllerCleanClicks) }}));
+"#,
+            restore_page = if install_route {
+                String::new()
+            } else {
+                // A real transport failure commits the engine error document;
+                // recover to a known page before targeting its clean button.
+                format!("await page.goto({fixture:?});")
+            },
+            route = if install_route {
+                "await page.route('**/aborted', route => route.abort());"
+            } else {
+                ""
+            },
+        );
+        let run = call(
+            "web.run",
+            json!({
+                "session_id": session,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": script,
+            }),
+        );
+        assert_eq!(run.status, "ok", "{selector}: {run:?}");
+        let stdout = run.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains(&format!("\"kind\":\"{expected_kind}\"")),
+            "{run:?}"
+        );
+        assert!(stdout.contains("\"requestId\":"), "{run:?}");
+        assert!(stdout.contains("\"url\":"), "{run:?}");
+        assert!(stdout.contains("\"clean\":1"), "{run:?}");
+    }
+
+    let session = create_page();
+    let redirected = call(
+        "web.run",
+        json!({
+            "session_id": session,
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.locator('#redirect').click(); console.log(page.url());",
+        }),
+    );
+    assert_eq!(redirected.status, "ok", "redirect: {redirected:?}");
+    assert!(
+        redirected.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("/landed"),
+        "{redirected:?}"
+    );
+}
+
+#[test]
+fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let url = format!("{}/phrase", fixture.origin);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-goto-error-phrase-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_goto_error_phrase", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_goto_error_phrase",
+        &format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({url:?});
+const marker = await page.locator('#loaded').textContent();
+if (marker !== "ordinary-page-loaded") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
+await browser.close();
+"#
+        ),
+        None,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        ran.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ordinary-page-loaded"),
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn page_goto_redirecting_to_current_url_waits_for_the_new_document() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-current-url-redirect-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_current_url_redirect", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_current_url_redirect",
+        &format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const origin = {origin:?};
+await page.goto(origin + "/landed");
+await page.evaluate(() => window.__redirectRegression = true);
+await page.goto(origin + "/redirect", {{ timeout: 5000 }});
+const redirectDestination = await page.url();
+if (redirectDestination !== origin + "/landed") throw new Error(`wrong redirect destination: ${{redirectDestination}}; expected ${{origin}}/landed`);
+if (await page.evaluate(() => typeof window.__redirectRegression) !== "undefined") {{
+  throw new Error("goto returned the previous document after redirect");
+}}
+await page.evaluate(() => window.__reloadRegression = true);
+await page.goto(origin + "/landed", {{ timeout: 5000 }});
+if (await page.evaluate(() => typeof window.__reloadRegression) !== "undefined") {{
+  throw new Error("same-URL goto returned the previous document");
+}}
+await page.evaluate(() => window.__queryRegression = true);
+await page.goto(origin + "/landed?v=2", {{ timeout: 5000 }});
+if (await page.url() !== origin + "/landed?v=2") throw new Error("query navigation was lost");
+if (await page.evaluate(() => typeof window.__queryRegression) !== "undefined") {{
+  throw new Error("query-only goto returned the previous document");
+}}
+console.log("redirect-reloaded-current-url");
+await browser.close();
+"#,
+            origin = fixture.origin,
+        ),
+        None,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        ran.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("redirect-reloaded-current-url"),
+        "{ran:?}"
+    );
+    let paths: Vec<_> = fixture.events.try_iter().collect();
+    assert!(paths.iter().any(|path| path == "/redirect"), "{paths:?}");
+    assert!(
+        paths
+            .iter()
+            .filter(|path| path.as_str() == "/landed")
+            .count()
+            >= 3,
+        "{paths:?}"
+    );
+    assert!(paths.iter().any(|path| path == "/landed?v=2"), "{paths:?}");
+}
+
+#[test]
+fn page_goto_observes_domcontentloaded_and_load_separately() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-navigation-lifecycle-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_navigation_lifecycle", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    for (name, path, gate, wait_until, marker) in [
+        (
+            "parser",
+            "/parser",
+            "/parser-gate.js",
+            "domcontentloaded",
+            "#late",
+        ),
+        (
+            "defer",
+            "/defer",
+            "/defer-gate.js",
+            "domcontentloaded",
+            "#parsed",
+        ),
+        ("load", "/load", "/load-gate.png", "load", "#parsed"),
+    ] {
+        let (navigation, worker) = run_playwright_source_async(
+            socket.clone(),
+            "run_navigation_lifecycle",
+            format!(
+                r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: {:?} }});
+const marker = await page.locator({marker:?}).textContent();
+if (marker !== "parser-finished") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
+"#,
+                format!("{}{path}", fixture.origin),
+                wait_until,
+            ),
+        );
+        fixture.wait_for(gate);
+        assert!(
+            matches!(
+                navigation.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "{wait_until} returned before gated {name} lifecycle work completed"
+        );
+        fixture.release(gate);
+        let completed = navigation
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("{name} navigation did not complete: {error}"));
+        assert_eq!(completed.status, "ok", "{completed:?}");
+        assert!(
+            completed.result.as_ref().unwrap()["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains("parser-finished"),
+            "{completed:?}"
+        );
+        worker.join().expect("join async navigation run");
+    }
+
+    let (navigation, worker) = run_playwright_source_async(
+        socket.clone(),
+        "run_navigation_lifecycle",
+        format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: "domcontentloaded" }});
+const marker = await page.locator('#parsed').textContent();
+await page.evaluate((url) => fetch(url).then(() => true), {:?});
+await page.waitForLoadState("load");
+await page.evaluate((url) => fetch(url).then(() => true), {:?});
+if (marker !== "dom-content-loaded") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
+"#,
+            format!("{}/dcl-before-load", fixture.origin),
+            format!("{}/dcl-returned", fixture.origin),
+            format!("{}/load-returned", fixture.origin),
+        ),
+    );
+    fixture.wait_for_all(&["/dcl-load-gate.png", "/dcl-returned"]);
+    fixture.assert_not_requested("/load-returned", Duration::from_millis(300));
+    assert!(
+        matches!(
+            navigation.recv_timeout(Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "waitForLoadState(load) returned while the image response was still gated"
+    );
+    fixture.release("/dcl-load-gate.png");
+    fixture.wait_for("/load-returned");
+    let completed = navigation
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|error| panic!("load-state navigation did not complete: {error}"));
+    assert_eq!(completed.status, "ok", "{completed:?}");
+    assert!(
+        completed.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("dom-content-loaded"),
+        "{completed:?}"
+    );
+    worker.join().expect("join async load-state run");
 }
 
 #[test]
@@ -3323,8 +5743,7 @@ document.getElementById('go').addEventListener('click', function() {\
 </script>\
 </body></html>",
     );
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-act-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-act-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_act", |command| {
         command.arg("--fixture-url").arg(&fixture);
@@ -3434,10 +5853,7 @@ box.addEventListener('change', function() { changes += 1; render(); });\
 </script>\
 </body></html>",
     );
-    let socket = std::env::temp_dir().join(format!(
-        "greppy-web-check-{}.sock",
-        std::process::id()
-    ));
+    let socket = std::env::temp_dir().join(format!("greppy-web-check-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_check", |command| {
         command.arg("--fixture-url").arg(&fixture);
@@ -3559,14 +5975,109 @@ box.addEventListener('change', function() { changes += 1; render(); });\
 }
 
 #[test]
+fn observed_refs_renew_after_history_restoration() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-history-refs-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_history_refs", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |operation: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_history_refs", operation, payload),
+            Duration::from_secs(30),
+        )
+        .expect("history request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let first =
+        "data:text/html,%3Ctitle%3EHistoryA%3C/title%3E%3Cinput%20id='marker'%20value='A'%3E";
+    let second =
+        "data:text/html,%3Ctitle%3EHistoryB%3C/title%3E%3Cinput%20id='marker'%20value='B'%3E";
+    let opened = call("web.goto", json!({"session_id":session,"url":first}));
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let old_ref = observed.result.as_ref().unwrap()["actionables"][0]["ref"]
+        .as_str()
+        .unwrap();
+    let old_number: u64 = old_ref.trim_start_matches('@').parse().unwrap();
+    let moved = call("web.goto", json!({"session_id":session,"url":second}));
+    assert_eq!(moved.status, "ok", "{moved:?}");
+    for (operation, title, value) in [
+        ("web.back", "HistoryA", "A"),
+        ("web.forward", "HistoryB", "B"),
+        ("web.back", "HistoryA", "A"),
+    ] {
+        let moved = call(operation, json!({"session_id":session}));
+        assert_eq!(moved.status, "ok", "{moved:?}");
+        let receipt = &moved.result.as_ref().unwrap()["page_state"];
+        assert_eq!(
+            receipt["status"], "available",
+            "history must return usable page state: {moved:?}"
+        );
+        assert_eq!(receipt["snapshot"]["title"], title, "{moved:?}");
+        let observed = call(
+            "web.observe",
+            json!({"session_id":session,"query":"css=#marker"}),
+        );
+        assert_eq!(
+            observed.status, "ok",
+            "restored scope must stay observable: {observed:?}"
+        );
+        let node = &observed.result.as_ref().unwrap()["actionables"][0];
+        assert_eq!(node["value"], value, "{observed:?}");
+        assert_ne!(
+            node["ref"], old_ref,
+            "navigation must not revive expired handles"
+        );
+    }
+    let stale = call(
+        "web.fill",
+        json!({"session_id":session,
+        "selector":{"type":"ref","value":old_number},"value":"must-not-write"}),
+    );
+    assert_ne!(
+        stale.status, "ok",
+        "expired pre-navigation ref must fail: {stale:?}"
+    );
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let fresh = observed.result.as_ref().unwrap()["actionables"][0]["ref"]
+        .as_str()
+        .unwrap();
+    let fresh_number: u64 = fresh.trim_start_matches('@').parse().unwrap();
+    let filled = call(
+        "web.fill",
+        json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_number},"value":"restored-write"}),
+    );
+    assert_eq!(
+        filled.status, "ok",
+        "new restored-page ref must work: {filled:?}"
+    );
+    let verified = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"document.getElementById('marker').value"}),
+    );
+    assert_eq!(verified.status, "ok", "{verified:?}");
+    assert_eq!(verified.result.as_ref().unwrap()["value"], "restored-write");
+    let closed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
+}
+
+#[test]
 fn observed_refs_drive_locators_and_expire_on_navigation() {
     let fixture = serve_fixture(
         "<!DOCTYPE html><html><body><input id=\"name\" value=\"\"><button onclick=\"document.body.setAttribute('data-clicked','yes')\">go</button></body></html>",
     );
-    let socket = std::env::temp_dir().join(format!(
-        "greppy-web-refs-{}.sock",
-        std::process::id()
-    ));
+    let socket = std::env::temp_dir().join(format!("greppy-web-refs-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_refs", |command| {
         command.arg("--fixture-url").arg(&fixture);
@@ -3956,11 +6467,26 @@ fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
     let refreshed = call("web.observe", json!({"session_id":session}));
     assert_eq!(refreshed.status, "ok", "{refreshed:?}");
     let fresh_ref = refreshed.result.as_ref().unwrap()["actionables"][0]["ref"]
-        .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap();
-    assert_ne!(fresh_ref, 1, "replacement must not inherit the original ref");
+        .as_str()
+        .unwrap()
+        .strip_prefix('@')
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_ne!(
+        fresh_ref, 1,
+        "replacement must not inherit the original ref"
+    );
     assert_eq!(inspect(session).error.as_ref().unwrap().code, "STALE_REF");
-    assert_eq!(call("web.inspect", json!({"session_id":session,
-        "selector":{"type":"ref","value":fresh_ref}})).status, "ok");
+    assert_eq!(
+        call(
+            "web.inspect",
+            json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_ref}})
+        )
+        .status,
+        "ok"
+    );
     let reloaded = call("web.reload", json!({"session_id":session}));
     assert_eq!(reloaded.status, "ok", "{reloaded:?}");
     let navigated = inspect(session);
@@ -3976,8 +6502,8 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
     let fixture = serve_fixture(
         r#"<!doctype html><html><body><label for="choice">Choice</label><input id="choice" type="checkbox" value="before"></body></html>"#,
     );
-    let socket = std::env::temp_dir()
-        .join(format!("greppy-ref-identity-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-ref-identity-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_ref_identity", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
@@ -3992,38 +6518,67 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let observe = || {
         let response = call("web.observe", json!({"session_id":session}));
         assert_eq!(response.status, "ok", "{response:?}");
         response.result.unwrap()["actionables"][0]["ref"]
-            .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap()
+            .as_str()
+            .unwrap()
+            .strip_prefix('@')
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
     };
     let inspect = |reference: u64| {
-        call("web.inspect", json!({"session_id":session,
-            "selector":{"type":"ref","value":reference}}))
+        call(
+            "web.inspect",
+            json!({"session_id":session,
+            "selector":{"type":"ref","value":reference}}),
+        )
     };
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
     let original = observe();
-    let changed = call("web.evaluate", json!({"session_id":session,"source":
-        "(() => { const node = document.getElementById('choice'); node.value = 'after'; node.checked = true; node.focus(); return node.checked && node.value === 'after' && document.activeElement === node; })()"
-    }));
+    let changed = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":
+            "(() => { const node = document.getElementById('choice'); node.value = 'after'; node.checked = true; node.focus(); return node.checked && node.value === 'after' && document.activeElement === node; })()"
+        }),
+    );
     assert_eq!(changed.status, "ok", "{changed:?}");
     assert_eq!(changed.result.as_ref().unwrap()["value"], true);
-    assert_eq!(observe(), original, "same node must keep its ref after property changes");
+    assert_eq!(
+        observe(),
+        original,
+        "same node must keep its ref after property changes"
+    );
     let same_node = inspect(original);
     assert_eq!(same_node.status, "ok", "{same_node:?}");
-    assert_eq!(same_node.result.as_ref().unwrap()["value"]["node"]["value"], "after");
+    assert_eq!(
+        same_node.result.as_ref().unwrap()["value"]["node"]["value"],
+        "after"
+    );
 
-    let replaced = call("web.evaluate", json!({"session_id":session,"source":
-        "(() => { const node = document.getElementById('choice'); node.replaceWith(node.cloneNode(true)); return true; })()"
-    }));
+    let replaced = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":
+            "(() => { const node = document.getElementById('choice'); node.replaceWith(node.cloneNode(true)); return true; })()"
+        }),
+    );
     assert_eq!(replaced.status, "ok", "{replaced:?}");
     let replacement = observe();
-    assert_ne!(replacement, original, "new snapshot must not recycle the replaced node's ref");
-    let refused = call("web.click", json!({"session_id":session,
-        "selector":{"type":"ref","value":original}}));
+    assert_ne!(
+        replacement, original,
+        "new snapshot must not recycle the replaced node's ref"
+    );
+    let refused = call(
+        "web.click",
+        json!({"session_id":session,
+        "selector":{"type":"ref","value":original}}),
+    );
     assert_eq!(refused.status, "error", "{refused:?}");
     let error = refused.error.as_ref().unwrap();
     assert_eq!(error.code, "STALE_REF", "{refused:?}");
@@ -4031,11 +6586,20 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
     assert!(!error.next_action.contains("greppy web observe"));
     let state = &refused.result.as_ref().unwrap()["page_state"];
     assert_eq!(state["status"], "available", "{refused:?}");
-    assert_eq!(state["snapshot"]["actionables"][0]["ref"], format!("@{replacement}"));
-    let unchanged = call("web.evaluate", json!({"session_id":session,"source":
-        "document.getElementById('choice').checked"}));
-    assert_eq!(unchanged.result.as_ref().unwrap()["value"], true,
-        "a rejected old ref must not toggle the replacement");
+    assert_eq!(
+        state["snapshot"]["actionables"][0]["ref"],
+        format!("@{replacement}")
+    );
+    let unchanged = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":
+        "document.getElementById('choice').checked"}),
+    );
+    assert_eq!(
+        unchanged.result.as_ref().unwrap()["value"],
+        true,
+        "a rejected old ref must not toggle the replacement"
+    );
     let stale = inspect(original);
     assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
     let fresh = inspect(replacement);
@@ -4045,7 +6609,10 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
     assert_eq!(navigated.status, "ok", "{navigated:?}");
     let new_document = observe();
     assert_ne!(new_document, original);
-    assert_ne!(new_document, replacement, "navigation must not recycle refs after observation");
+    assert_ne!(
+        new_document, replacement,
+        "navigation must not recycle refs after observation"
+    );
     for old in [original, replacement] {
         let stale = inspect(old);
         assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
@@ -4056,31 +6623,42 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
 
 #[test]
 fn observed_working_scope_distinguishes_native_modal_declaration_and_open_dialog() {
-    let fixture = serve_fixture(r#"<!doctype html><html><body>
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
       <button id="background">Background</button>
       <dialog id="reservation" aria-labelledby="title"><h2 id="title">Reserve Ember</h2>
         <form id="form" aria-label="Reservation"><label>Quantity <input id="quantity" type="number" value="1"></label>
           <button type="button">Confirm</button><button type="button">Cancel</button>
         </form>
       </dialog>
-      </body></html>"#);
-    let socket = std::env::temp_dir()
-        .join(format!("greppy-working-scope-{}.sock", std::process::id()));
+      </body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-working-scope-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_working_scope", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_working_scope", method, payload),
-            Duration::from_secs(30)).expect("working scope request")
+        unix_request(
+            &socket,
+            &Request::new("run_working_scope", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("working scope request")
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
     let evaluate = |source: &str| {
-        let response = call("web.evaluate", json!({"session_id":session,"source":source}));
+        let response = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":source}),
+        );
         assert_eq!(response.status, "ok", "{response:?}");
         response.result.unwrap()["value"].clone()
     };
@@ -4090,7 +6668,10 @@ fn observed_working_scope_distinguishes_native_modal_declaration_and_open_dialog
         response.result.unwrap()
     };
 
-    assert_eq!(evaluate("(() => { reservation.show(); quantity.focus(); return reservation.open; })()"), true);
+    assert_eq!(
+        evaluate("(() => { reservation.show(); quantity.focus(); return reservation.open; })()"),
+        true
+    );
     let nonmodal = observe();
     assert_eq!(nonmodal["working_scope"]["kind"], "page", "{nonmodal}");
     assert!(nonmodal["working_scope"]["provenance"].is_null());
@@ -4107,26 +6688,47 @@ fn observed_working_scope_distinguishes_native_modal_declaration_and_open_dialog
     assert_eq!(scope["background_count"], 1);
     assert_eq!(scope["background_returned"], 1);
     assert_eq!(scope["actionable_refs"].as_array().unwrap().len(), 3);
-    assert_eq!(modal["actionables"].as_array().unwrap().len(), 4,
-        "background must remain available, not disappear from the snapshot");
-    let quantity = modal["actionables"].as_array().unwrap().iter()
-        .find(|node| node["name"] == "Quantity").unwrap();
+    assert_eq!(
+        modal["actionables"].as_array().unwrap().len(),
+        4,
+        "background must remain available, not disappear from the snapshot"
+    );
+    let quantity = modal["actionables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "Quantity")
+        .unwrap();
     assert_eq!(scope["focus_ref"], quantity["ref"]);
     assert_eq!(scope["ancestry"][0]["role"], "dialog");
     assert_eq!(scope["ancestry"][1]["role"], "form");
     assert_eq!(scope["ancestry"][1]["name"], "Reservation");
-    let scope_ref = scope["scope_ref"].as_str().unwrap()
-        .strip_prefix('@').unwrap().parse::<u64>().unwrap();
-    let inspected = call("web.inspect", json!({"session_id":session,
-        "selector":{"type":"ref","value":scope_ref}}));
-    assert_eq!(inspected.status, "ok", "scope refs must resolve: {inspected:?}");
+    let scope_ref = scope["scope_ref"]
+        .as_str()
+        .unwrap()
+        .strip_prefix('@')
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let inspected = call(
+        "web.inspect",
+        json!({"session_id":session,
+        "selector":{"type":"ref","value":scope_ref}}),
+    );
+    assert_eq!(
+        inspected.status, "ok",
+        "scope refs must resolve: {inspected:?}"
+    );
     let again = observe();
     assert_eq!(again["working_scope"]["scope_ref"], scope["scope_ref"]);
     assert_eq!(again["working_scope"]["focus_ref"], scope["focus_ref"]);
 
     assert_eq!(evaluate("(() => { reservation.close(); reservation.show(); reservation.setAttribute('aria-modal','true'); quantity.focus(); return true; })()"), true);
     let declared = observe();
-    assert_eq!(declared["working_scope"]["provenance"], "declared_aria_modal");
+    assert_eq!(
+        declared["working_scope"]["provenance"],
+        "declared_aria_modal"
+    );
     assert_eq!(declared["working_scope"]["background_count"], 1);
     assert_eq!(evaluate("(() => { reservation.removeAttribute('aria-modal'); reservation.close(); background.focus(); return true; })()"), true);
     let closed = observe();
@@ -4137,33 +6739,47 @@ fn observed_working_scope_distinguishes_native_modal_declaration_and_open_dialog
 
 #[test]
 fn explicit_observation_query_scopes_native_dom_and_preserves_ref_identity() {
-    let fixture = serve_fixture(r#"<!doctype html><html><body>
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
       <h1>BACKGROUND_SENTINEL</h1><button id="background">BACKGROUND_SENTINEL</button>
       <dialog id="reservation"><h2>Reservation</h2><a href="/help">Help</a>
         <button id="save" type="button" onclick="this.dataset.saved='true'">Save</button>
-      </dialog></body></html>"#);
-    let socket = std::env::temp_dir()
-        .join(format!("greppy-observe-query-{}.sock", std::process::id()));
+      </dialog></body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-observe-query-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_observe_query", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_observe_query", method, payload),
-            Duration::from_secs(30)).expect("scoped observation request")
+        unix_request(
+            &socket,
+            &Request::new("run_observe_query", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("scoped observation request")
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
     let evaluate = |source: &str| {
-        let response = call("web.evaluate", json!({"session_id":session,"source":source}));
+        let response = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":source}),
+        );
         assert_eq!(response.status, "ok", "{response:?}");
         response.result.unwrap()["value"].clone()
     };
     let observe = |query: &str, format: &str| {
-        call("web.observe", json!({"session_id":session,"query":query,"format":format}))
+        call(
+            "web.observe",
+            json!({"session_id":session,"query":query,"format":format}),
+        )
     };
 
     let closed = observe("role=dialog", "agent-tree");
@@ -4173,7 +6789,10 @@ fn explicit_observation_query_scopes_native_dom_and_preserves_ref_identity() {
     assert_eq!(empty["observation_scope"]["roots_returned"], 0);
     assert_eq!(empty["text"], "");
     assert_eq!(empty["actionables"], json!([]));
-    assert_eq!(evaluate("(() => { reservation.show(); return reservation.open; })()"), true);
+    assert_eq!(
+        evaluate("(() => { reservation.show(); return reservation.open; })()"),
+        true
+    );
 
     let scoped = observe("role=dialog", "agent-tree");
     assert_eq!(scoped.status, "ok", "{scoped:?}");
@@ -4182,37 +6801,188 @@ fn explicit_observation_query_scopes_native_dom_and_preserves_ref_identity() {
     assert_eq!(tree["headings"], json!(["Reservation"]));
     assert_eq!(tree["links"].as_array().unwrap().len(), 1);
     assert_eq!(tree["observation_scope"]["roots_returned"], 1);
-    let saved_ref = tree["actionables"].as_array().unwrap().iter()
-        .find(|node| node["name"] == "Save").unwrap()["ref"].as_str().unwrap().to_owned();
+    let saved_ref = tree["actionables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "Save")
+        .unwrap()["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let reference = saved_ref.strip_prefix('@').unwrap().parse::<u64>().unwrap();
-    let inspect = || call("web.inspect", json!({"session_id":session,
-        "selector":{"type":"ref","value":reference}}));
+    let inspect = || {
+        call(
+            "web.inspect",
+            json!({"session_id":session,
+        "selector":{"type":"ref","value":reference}}),
+        )
+    };
     assert_eq!(inspect().status, "ok");
     let invalid = observe("css=[", "agent-tree");
     assert_eq!(invalid.status, "error", "{invalid:?}");
-    assert_eq!(inspect().status, "ok", "invalid syntax must not invalidate prior refs");
+    assert_eq!(
+        inspect().status,
+        "ok",
+        "invalid syntax must not invalidate prior refs"
+    );
 
-    for query in ["css=#reservation", "xpath=//dialog", "id=reservation", "tag=dialog"] {
+    for query in [
+        "css=#reservation",
+        "xpath=//dialog",
+        "id=reservation",
+        "tag=dialog",
+    ] {
         for format in ["agent-tree", "text", "html"] {
             let response = observe(query, format);
             assert_eq!(response.status, "ok", "{query}/{format}: {response:?}");
             let result = response.result.unwrap();
-            assert!(!result.to_string().contains("BACKGROUND_SENTINEL"), "{result}");
+            assert!(
+                !result.to_string().contains("BACKGROUND_SENTINEL"),
+                "{result}"
+            );
             assert_eq!(result["observation_scope"]["query"], query);
             assert_eq!(result["observation_scope"]["roots_returned"], 1);
         }
     }
-    assert_eq!(evaluate("(() => { const n = save.cloneNode(true); save.replaceWith(n); return true; })()"), true);
-    assert_eq!(inspect().status, "error", "replacement must not inherit an old ref");
+    assert_eq!(
+        evaluate("(() => { const n = save.cloneNode(true); save.replaceWith(n); return true; })()"),
+        true
+    );
+    assert_eq!(
+        inspect().status,
+        "error",
+        "replacement must not inherit an old ref"
+    );
     let replaced = observe("role=dialog", "agent-tree");
     assert_eq!(replaced.status, "ok", "{replaced:?}");
-    assert!(!replaced.result.unwrap()["actionables"].as_array().unwrap().iter()
+    assert!(!replaced.result.unwrap()["actionables"]
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|node| node["ref"] == saved_ref));
-    assert_eq!(evaluate("(() => { reservation.close(); return !reservation.open; })()"), true);
-    assert_eq!(observe("role=dialog", "agent-tree").error.unwrap().code, "NO_MATCH");
+    assert_eq!(
+        evaluate("(() => { reservation.close(); return !reservation.open; })()"),
+        true
+    );
+    assert_eq!(
+        observe("role=dialog", "agent-tree").error.unwrap().code,
+        "NO_MATCH"
+    );
     let whole = call("web.observe", json!({"session_id":session}));
     assert_eq!(whole.status, "ok", "{whole:?}");
-    assert!(whole.result.unwrap()["text"].as_str().unwrap().contains("BACKGROUND_SENTINEL"));
+    assert!(whole.result.unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .contains("BACKGROUND_SENTINEL"));
+}
+
+#[test]
+fn structured_dom_queries_work_under_csp_without_trusting_page_javascript() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><head>
+      <meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'">
+      <title>Strict CSP fixture</title></head><body><div id="before"></div>
+      <span id="target" role="button" data-proof="projection">CSP_TEXT</span>
+      </body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-structured-csp-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_structured_csp", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_structured_csp", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("strict CSP request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+
+    // The typed read channel can inspect page content; ordinary caller source
+    // must retain CSP restrictions, even when it resembles a structured request.
+    for source in [
+        "document.querySelector('#target').textContent",
+        "({op:'find',query:'id=target',limit:10,fields:[]})",
+    ] {
+        let response = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":source}),
+        );
+        assert_eq!(
+            response.status, "error",
+            "caller source escaped CSP: {response:?}"
+        );
+    }
+    for query in [
+        "css=#target",
+        "div~span",
+        "xpath=//span",
+        "id=target",
+        "tag=span",
+        "role=button",
+    ] {
+        for op in ["find", "extract"] {
+            let response = call(
+                "web.structured_dom",
+                json!({
+                    "session_id":session,"op":op,"query":query,"limit":10,
+                    "fields":if op=="find" { json!([]) } else { json!(["text","id","attr:data-proof"]) },
+                }),
+            );
+            assert_eq!(response.status, "ok", "{op}/{query}: {response:?}");
+            assert_eq!(response.operation, "web.evaluate");
+            let result = response.result.unwrap();
+            assert_eq!(result["session_id"], session);
+            assert_eq!(
+                result["untrusted_content_boundary"],
+                "UNTRUSTED_PAGE_CONTENT"
+            );
+            assert!(!result["serialized"].is_null(), "raw parity: {result}");
+            assert_eq!(result["value"]["count"].as_f64(), Some(1.0), "{result}");
+            let row = &result["value"][if op == "find" { "nodes" } else { "rows" }][0];
+            assert_eq!(row["id"], "target");
+            assert_eq!(row["text"], "CSP_TEXT");
+            if op == "extract" {
+                assert_eq!(row["attr:data-proof"], "projection");
+            }
+        }
+    }
+    let invalid = call(
+        "web.structured_dom",
+        json!({
+            "session_id":session,"op":"find","query":"id=target","limit":10,
+            "fields":[],"source":"document.title='injected'",
+        }),
+    );
+    assert_eq!(
+        invalid.status, "error",
+        "extra caller source was accepted: {invalid:?}"
+    );
+    let recovered = call(
+        "web.structured_dom",
+        json!({
+            "session_id":session,"op":"extract","query":"id=target","limit":1,
+            "fields":["text"],
+        }),
+    );
+    assert_eq!(
+        recovered.status, "ok",
+        "invalid request poisoned the session: {recovered:?}"
+    );
+    assert_eq!(
+        recovered.result.unwrap()["value"]["rows"][0]["text"],
+        "CSP_TEXT"
+    );
 }
 
 #[test]
@@ -4317,11 +7087,26 @@ fn keyboard_refs_bind_the_observed_node_before_focusing() {
     let refreshed = call("web.observe", json!({"session_id":session}));
     assert_eq!(refreshed.status, "ok", "{refreshed:?}");
     let fresh_ref = refreshed.result.as_ref().unwrap()["actionables"][0]["ref"]
-        .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap();
-    assert_ne!(fresh_ref, 1, "replacement must not inherit the original ref");
+        .as_str()
+        .unwrap()
+        .strip_prefix('@')
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_ne!(
+        fresh_ref, 1,
+        "replacement must not inherit the original ref"
+    );
     assert_eq!(press_ref(session).error.as_ref().unwrap().code, "STALE_REF");
-    assert_eq!(call("web.press", json!({"session_id":session,
-        "selector":{"type":"ref","value":fresh_ref},"key":"ArrowLeft"})).status, "ok");
+    assert_eq!(
+        call(
+            "web.press",
+            json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_ref},"key":"ArrowLeft"})
+        )
+        .status,
+        "ok"
+    );
     assert_eq!(
         call("web.reload", json!({"session_id":session})).status,
         "ok"
@@ -4337,34 +7122,49 @@ fn keyboard_refs_bind_the_observed_node_before_focusing() {
 
 #[test]
 fn observed_native_labels_exclude_their_own_control_contents() {
-    let fixture = serve_fixture(r#"<!doctype html><html><body>
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
 <label>Region<select id="region"><option value="all">All regions</option><option value="eu">EU</option></select></label>
 <label>Unit <b>price</b> order<select id="price"><option value="none">Unsorted</option><option value="asc">Low to high</option></select></label>
 <label for="external">External region</label><select id="external"><option>Europe</option></select>
 <label>Ignored<select aria-label="Override"><option>Hidden option name</option></select></label>
 <label for="empty-label"></label><input id="empty-label">
 <p>Unrelated text after an empty label must not enter its accessible name.</p>
-</body></html>"#);
+</body></html>"#,
+    );
     let socket = std::env::temp_dir().join(format!("greppy-label-own-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_label_own", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_label_own", method, payload), Duration::from_secs(30))
-            .expect("native label request")
+        unix_request(
+            &socket,
+            &Request::new("run_label_own", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("native label request")
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
     let state = &went.result.as_ref().unwrap()["page_state"];
     assert_eq!(state["status"], "available");
-    let selects: Vec<_> = state["snapshot"]["actionables"].as_array().unwrap()
-        .iter().filter(|node| node["tag"] == "select").collect();
+    let selects: Vec<_> = state["snapshot"]["actionables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|node| node["tag"] == "select")
+        .collect();
     assert_eq!(selects.len(), 4);
-    assert_eq!(selects[0]["name"], "Region", "a control's own options must not enter its label");
+    assert_eq!(
+        selects[0]["name"], "Region",
+        "a control's own options must not enter its label"
+    );
     assert_eq!(selects[0]["name_source"], "label");
     assert_eq!(selects[0]["selected_options"][0]["label"], "All regions");
     assert_eq!(selects[1]["name"], "Unit price order");
@@ -4372,42 +7172,72 @@ fn observed_native_labels_exclude_their_own_control_contents() {
     assert_eq!(selects[2]["name"], "External region");
     assert_eq!(selects[3]["name"], "Override");
     assert_eq!(selects[3]["name_source"], "aria-label");
-    let empty_label = state["snapshot"]["actionables"].as_array().unwrap()
-        .iter().find(|node| node["tag"] == "input").unwrap();
-    assert_eq!(empty_label["name"], "", "empty label must terminate without reading outside its subtree");
+    let empty_label = state["snapshot"]["actionables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["tag"] == "input")
+        .unwrap();
+    assert_eq!(
+        empty_label["name"], "",
+        "empty label must terminate without reading outside its subtree"
+    );
     assert_eq!(empty_label["name_source"], "label");
-    let inspected = call("web.inspect", json!({
-        "session_id":session, "selector":{"type":"label","name":"Region"}
-    }));
-    assert_eq!(inspected.status, "ok", "the displayed label must also resolve: {inspected:?}");
-    let unchanged = call("web.evaluate", json!({
-        "session_id":session,
-        "source":"(() => { const select = document.getElementById('region'); return { labelText: select.parentElement.textContent, value: select.value, options: Array.from(select.options, option => option.textContent) }; })()"
-    }));
+    let inspected = call(
+        "web.inspect",
+        json!({
+            "session_id":session, "selector":{"type":"label","name":"Region"}
+        }),
+    );
+    assert_eq!(
+        inspected.status, "ok",
+        "the displayed label must also resolve: {inspected:?}"
+    );
+    let unchanged = call(
+        "web.evaluate",
+        json!({
+            "session_id":session,
+            "source":"(() => { const select = document.getElementById('region'); return { labelText: select.parentElement.textContent, value: select.value, options: Array.from(select.options, option => option.textContent) }; })()"
+        }),
+    );
     assert_eq!(unchanged.status, "ok", "{unchanged:?}");
-    assert_eq!(unchanged.result.as_ref().unwrap()["value"], json!({
-        "labelText":"RegionAll regionsEU", "value":"all", "options":["All regions","EU"]
-    }), "label extraction must not rewrite the live DOM: {unchanged:?}");
+    assert_eq!(
+        unchanged.result.as_ref().unwrap()["value"],
+        json!({
+            "labelText":"RegionAll regionsEU", "value":"all", "options":["All regions","EU"]
+        }),
+        "label extraction must not rewrite the live DOM: {unchanged:?}"
+    );
 }
 
 #[test]
 fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
-    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Ready</title></head><body>
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><head><title>Ready</title></head><body>
 <button id="once" onclick="window.clicks++; document.title='Clicks '+window.clicks">Once</button>
 <button id="poison" onclick="window.clicks++; Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation fixture failure')}})">Poison observation</button>
 <input type="password" value="never-disclose-this">
-<script>window.clicks=0;</script></body></html>"#);
-    let socket = std::env::temp_dir().join(format!("greppy-page-state-{}.sock", std::process::id()));
+<script>window.clicks=0;</script></body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-page-state-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_page_state", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
-    let call = |method: &str, payload| unix_request(
-        &socket, &Request::new("run_page_state", method, payload), Duration::from_secs(30),
-    ).expect("page state request");
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_page_state", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("page state request")
+    };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
     let state = &went.result.as_ref().unwrap()["page_state"];
@@ -4415,85 +7245,165 @@ fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
     assert_eq!(state["status"], "available");
     assert_eq!(state["snapshot"]["title"], "Ready");
     assert!(!state.to_string().contains("never-disclose-this"));
-    let reference = state["snapshot"]["actionables"][0]["ref"].as_str().unwrap()
-        .strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    let reference = state["snapshot"]["actionables"][0]["ref"]
+        .as_str()
+        .unwrap()
+        .strip_prefix('@')
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
     let tabs = call("web.tab.list", json!({"session_id":session}));
-    let target_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"].as_str().unwrap();
-    assert_eq!(went.result.as_ref().unwrap()["tab_id"], target_tab,
-        "implicit navigation must identify its actual native target");
+    let target_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        went.result.as_ref().unwrap()["tab_id"],
+        target_tab,
+        "implicit navigation must identify its actual native target"
+    );
     let new_tab = call("web.tab.new", json!({"session_id":session}));
     assert_eq!(new_tab.status, "ok", "{new_tab:?}");
     // Use the navigation's ref on an explicitly targeted, now inactive tab,
     // without a caller-initiated observe or an implicit active-tab switch.
-    let clicked = call("web.click", json!({"session_id":session,"tab_id":target_tab,
-        "selector":{"type":"ref","value":reference}}));
+    let clicked = call(
+        "web.click",
+        json!({"session_id":session,"tab_id":target_tab,
+        "selector":{"type":"ref","value":reference}}),
+    );
     assert_eq!(clicked.status, "ok", "{clicked:?}");
     let receipt = clicked.result.as_ref().unwrap();
     assert_eq!(receipt["session_id"], session);
-    assert_eq!(receipt["tab_id"], target_tab, "inactive explicit target must not become active-tab metadata");
-    assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
+    assert_eq!(
+        receipt["tab_id"], target_tab,
+        "inactive explicit target must not become active-tab metadata"
+    );
+    assert!(
+        receipt.get("dispatch").is_some(),
+        "dispatch receipt must survive: {receipt}"
+    );
     assert_eq!(receipt["page_state"]["status"], "available");
     assert_eq!(receipt["page_state"]["snapshot"]["title"], "Clicks 1");
-    assert_eq!(receipt["page_state"]["snapshot"]["actionables"][0]["ref"], format!("@{reference}"));
-    let poisoned = call("web.click", json!({"session_id":session,"tab_id":target_tab,
-        "selector":{"type":"css","value":"#poison"}}));
-    assert_eq!(poisoned.status, "ok", "successful click must not be recast as failure: {poisoned:?}");
+    assert_eq!(
+        receipt["page_state"]["snapshot"]["actionables"][0]["ref"],
+        format!("@{reference}")
+    );
+    let poisoned = call(
+        "web.click",
+        json!({"session_id":session,"tab_id":target_tab,
+        "selector":{"type":"css","value":"#poison"}}),
+    );
+    assert_eq!(
+        poisoned.status, "ok",
+        "successful click must not be recast as failure: {poisoned:?}"
+    );
     let receipt = poisoned.result.as_ref().unwrap();
-    assert_eq!(receipt["tab_id"], target_tab, "observation failure must retain target identity");
-    assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
+    assert_eq!(
+        receipt["tab_id"], target_tab,
+        "observation failure must retain target identity"
+    );
+    assert!(
+        receipt.get("dispatch").is_some(),
+        "dispatch receipt must survive: {receipt}"
+    );
     assert_eq!(receipt["ok"], true);
     assert_eq!(receipt["page_state"]["status"], "unavailable");
-    assert_eq!(receipt["page_state"]["error"]["code"], "OBSERVATION_UNAVAILABLE");
-    let checked = call("web.evaluate", json!({"session_id":session,"tab_id":target_tab,"source":"window.clicks"}));
+    assert_eq!(
+        receipt["page_state"]["error"]["code"],
+        "OBSERVATION_UNAVAILABLE"
+    );
+    let checked = call(
+        "web.evaluate",
+        json!({"session_id":session,"tab_id":target_tab,"source":"window.clicks"}),
+    );
     assert_eq!(checked.status, "ok", "{checked:?}");
-    assert_eq!(checked.result.as_ref().unwrap()["value"].as_f64(), Some(2.0), "no action replay");
-    assert!(checked.result.as_ref().unwrap().get("page_state").is_none(), "explicit evaluation keeps its contract");
-    let repaired = call("web.evaluate", json!({"session_id":session,"tab_id":target_tab,
-        "source":"delete document.title; document.title = 'Recovered'; true"}));
+    assert_eq!(
+        checked.result.as_ref().unwrap()["value"].as_f64(),
+        Some(2.0),
+        "no action replay"
+    );
+    assert!(
+        checked.result.as_ref().unwrap().get("page_state").is_none(),
+        "explicit evaluation keeps its contract"
+    );
+    let repaired = call(
+        "web.evaluate",
+        json!({"session_id":session,"tab_id":target_tab,
+        "source":"delete document.title; document.title = 'Recovered'; true"}),
+    );
     assert_eq!(repaired.status, "ok", "{repaired:?}");
-    let observed = call("web.observe", json!({"session_id":session,"tab_id":target_tab}));
-    assert_eq!(observed.status, "ok", "temporary observation failure must recover: {observed:?}");
+    let observed = call(
+        "web.observe",
+        json!({"session_id":session,"tab_id":target_tab}),
+    );
+    assert_eq!(
+        observed.status, "ok",
+        "temporary observation failure must recover: {observed:?}"
+    );
     assert_eq!(observed.result.as_ref().unwrap()["title"], "Recovered");
-    assert_eq!(observed.result.as_ref().unwrap()["actionables"][0]["ref"], format!("@{reference}"));
+    assert_eq!(
+        observed.result.as_ref().unwrap()["actionables"][0]["ref"],
+        format!("@{reference}")
+    );
     let active = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(active.status, "ok", "{active:?}");
-    let active_tab = active.result.as_ref().unwrap()["tab_id"].as_str()
-        .filter(|tab| !tab.is_empty()).expect("implicit action identifies current tab");
-    assert_ne!(active_tab, target_tab, "explicit inactive action must not silently switch active tab");
+    let active_tab = active.result.as_ref().unwrap()["tab_id"]
+        .as_str()
+        .filter(|tab| !tab.is_empty())
+        .expect("implicit action identifies current tab");
+    assert_ne!(
+        active_tab, target_tab,
+        "explicit inactive action must not silently switch active tab"
+    );
 }
 
 #[test]
 fn failed_native_actions_return_current_state_without_replay_or_false_success() {
-    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Before</title></head><body>
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><head><title>Before</title></head><body>
 <button class="duplicate" onclick="window.clicks++">Save</button>
 <button class="duplicate" onclick="window.clicks++">Save elsewhere</button>
 <input id="quantity" aria-label="Quantity" disabled><input type="password" value="never-disclose-this">
-<script>window.clicks=0;</script></body></html>"#);
+<script>window.clicks=0;</script></body></html>"#,
+    );
     let socket = std::env::temp_dir().join(format!("greppy-errstate-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_errstate", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_errstate", method, payload), Duration::from_secs(30))
-            .expect("failed-action request")
+        unix_request(
+            &socket,
+            &Request::new("run_errstate", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("failed-action request")
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
-    let changed = call("web.evaluate", json!({
-        "session_id":session,
-        "source":"document.title='Changed before error'; document.getElementById('quantity').disabled=false; true"
-    }));
+    let changed = call(
+        "web.evaluate",
+        json!({
+            "session_id":session,
+            "source":"document.title='Changed before error'; document.getElementById('quantity').disabled=false; true"
+        }),
+    );
     assert_eq!(changed.status, "ok", "{changed:?}");
     for (method, extra) in [
-        ("web.click", json!({})), ("web.type", json!({"text":"not typed"})),
+        ("web.click", json!({})),
+        ("web.type", json!({"text":"not typed"})),
         ("web.press", json!({"key":"Enter"})),
     ] {
-        let mut payload = json!({"session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100});
-        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let mut payload =
+            json!({"session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         let missing = call(method, payload);
         assert_eq!(missing.status, "error", "{missing:?}");
         let error = missing.error.as_ref().unwrap();
@@ -4501,43 +7411,74 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
         assert_eq!(error.exit_code, 34);
         assert!(!error.next_action.contains("narrow"));
         let state = &missing.result.as_ref().unwrap()["page_state"];
-        assert_eq!(missing.result.as_ref().unwrap()["tab_id"], went.result.as_ref().unwrap()["tab_id"],
-            "failed action diagnostic must identify its resolved target");
+        assert_eq!(
+            missing.result.as_ref().unwrap()["tab_id"],
+            went.result.as_ref().unwrap()["tab_id"],
+            "failed action diagnostic must identify its resolved target"
+        );
         assert_eq!(state["status"], "available", "{missing:?}");
-        assert_eq!(state["snapshot"]["title"], "Changed before error", "must not reuse the old goto snapshot");
-        assert!(state["snapshot"]["actionables"].as_array().unwrap().iter()
+        assert_eq!(
+            state["snapshot"]["title"], "Changed before error",
+            "must not reuse the old goto snapshot"
+        );
+        assert!(state["snapshot"]["actionables"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|node| node["name"] == "Quantity" && node["disabled"] == false));
-        assert!(!serde_json::to_string(&missing).unwrap().contains("never-disclose-this"));
+        assert!(!serde_json::to_string(&missing)
+            .unwrap()
+            .contains("never-disclose-this"));
     }
-    let ambiguous = call("web.click", json!({
-        "session_id":session,"selector":{"type":"css","value":".duplicate"},"timeout":100
-    }));
+    let ambiguous = call(
+        "web.click",
+        json!({
+            "session_id":session,"selector":{"type":"css","value":".duplicate"},"timeout":100
+        }),
+    );
     assert_eq!(ambiguous.status, "error", "{ambiguous:?}");
     assert_eq!(ambiguous.error.as_ref().unwrap().code, "AMBIGUOUS_TARGET");
-    assert_eq!(ambiguous.result.as_ref().unwrap()["page_state"]["status"], "available");
-    let poisoned = call("web.evaluate", json!({
-        "session_id":session,
-        "source":"Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"
-    }));
+    assert_eq!(
+        ambiguous.result.as_ref().unwrap()["page_state"]["status"],
+        "available"
+    );
+    let poisoned = call(
+        "web.evaluate",
+        json!({
+            "session_id":session,
+            "source":"Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"
+        }),
+    );
     assert_eq!(poisoned.status, "ok");
-    let missing = call("web.click", json!({
-        "session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100
-    }));
+    let missing = call(
+        "web.click",
+        json!({
+            "session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100
+        }),
+    );
     assert_eq!(missing.status, "error");
     assert_eq!(missing.error.as_ref().unwrap().code, "NO_MATCH");
     assert_eq!(missing.error.as_ref().unwrap().exit_code, 34);
-    assert_eq!(missing.result.as_ref().unwrap()["page_state"]["status"], "unavailable");
-    let clicks = call("web.evaluate", json!({"session_id":session,"source":"window.clicks"}));
+    assert_eq!(
+        missing.result.as_ref().unwrap()["page_state"]["status"],
+        "unavailable"
+    );
+    let clicks = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"window.clicks"}),
+    );
     assert_eq!(clicks.status, "ok", "{clicks:?}");
-    assert_eq!(clicks.result.as_ref().unwrap()["value"].as_f64(), Some(0.0), "no failed action may be replayed");
+    assert_eq!(
+        clicks.result.as_ref().unwrap()["value"].as_f64(),
+        Some(0.0),
+        "no failed action may be replayed"
+    );
 }
 
 #[test]
 fn select_option_refuses_unknown_values_without_mutation_or_false_success() {
-    let socket = std::env::temp_dir().join(format!(
-        "greppy-select-option-{}.sock",
-        std::process::id()
-    ));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-select-option-{}.sock", std::process::id()));
     let (path, source) = fixture_source("select-option-contract.mjs");
     let _guard = Supervisor::spawn(&socket, "run_select_option", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
@@ -4553,40 +7494,70 @@ fn select_option_refuses_unknown_values_without_mutation_or_false_success() {
 
 #[test]
 fn native_boolean_wait_is_strict_and_returns_fresh_bounded_state() {
-    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Before wait</title></head>
-<body><input id="ready" aria-label="Quantity" disabled><input type="password" value="wait-secret"></body></html>"#);
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><head><title>Before wait</title></head>
+<body><input id="ready" aria-label="Quantity" disabled><input type="password" value="wait-secret"></body></html>"#,
+    );
     let socket = std::env::temp_dir().join(format!("greppy-wait-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_wait", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_wait", method, payload), Duration::from_secs(30))
-            .expect("Boolean wait request")
+        unix_request(
+            &socket,
+            &Request::new("run_wait", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("Boolean wait request")
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
     for (source, code) in [
-        ("({holds:false,detail:'not ready'})", "INVALID_WAIT_PREDICATE"),
+        (
+            "({holds:false,detail:'not ready'})",
+            "INVALID_WAIT_PREDICATE",
+        ),
         ("new RegExp('[bad')", "INVALID_WAIT_SOURCE"),
-        ("(() => {throw new Error('STALE_REF: replaced node')})()", "STALE_REF"),
+        (
+            "(() => {throw new Error('STALE_REF: replaced node')})()",
+            "STALE_REF",
+        ),
         ("false", "TIMEOUT"),
     ] {
-        let response = call("web.wait", json!({"session_id":session,"source":source,"timeout_ms":250}));
+        let response = call(
+            "web.wait",
+            json!({"session_id":session,"source":source,"timeout_ms":250}),
+        );
         assert_eq!(response.status, "error", "{response:?}");
         assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
-        assert!(!response.error.as_ref().unwrap().next_action.contains("doctor"));
-        assert!(!serde_json::to_string(&response).unwrap().contains("JavaScriptErrorInfo"));
+        assert!(!response
+            .error
+            .as_ref()
+            .unwrap()
+            .next_action
+            .contains("doctor"));
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("JavaScriptErrorInfo"));
     }
     // No DOM-mutation signal is required for the property-only disabled change.
-    let changed = call("web.evaluate", json!({"session_id":session,"source":
-        "setTimeout(() => { document.getElementById('ready').disabled=false; document.title='After wait'; },50); true"}));
+    let changed = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":
+        "setTimeout(() => { document.getElementById('ready').disabled=false; document.title='After wait'; },50); true"}),
+    );
     assert_eq!(changed.status, "ok", "{changed:?}");
-    let held = call("web.wait", json!({"session_id":session,"source":
-        "!document.getElementById('ready').disabled && !document.querySelector('#absent')","timeout_ms":2000}));
+    let held = call(
+        "web.wait",
+        json!({"session_id":session,"source":
+        "!document.getElementById('ready').disabled && !document.querySelector('#absent')","timeout_ms":2000}),
+    );
     assert_eq!(held.status, "ok", "{held:?}");
     let result = held.result.as_ref().unwrap();
     assert_eq!(result["held"], true);
@@ -4595,72 +7566,267 @@ fn native_boolean_wait_is_strict_and_returns_fresh_bounded_state() {
     assert!(result["document_id"].as_str().is_some());
     assert_eq!(result["page_state"]["status"], "available", "{held:?}");
     assert_eq!(result["page_state"]["snapshot"]["title"], "After wait");
-    assert!(!serde_json::to_string(&held).unwrap().contains("wait-secret"));
-    let poisoned = call("web.evaluate", json!({"session_id":session,"source":
-        "Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"}));
+    assert!(!serde_json::to_string(&held)
+        .unwrap()
+        .contains("wait-secret"));
+    let poisoned = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":
+        "Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"}),
+    );
     assert_eq!(poisoned.status, "ok");
-    let held = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":2000}));
+    let held = call(
+        "web.wait",
+        json!({"session_id":session,"source":"true","timeout_ms":2000}),
+    );
     assert_eq!(held.status, "ok", "{held:?}");
     assert_eq!(held.result.as_ref().unwrap()["held"], true);
-    assert_eq!(held.result.as_ref().unwrap()["page_state"]["status"], "unavailable");
+    assert_eq!(
+        held.result.as_ref().unwrap()["page_state"]["status"],
+        "unavailable"
+    );
     assert!(held.result.as_ref().unwrap()["document_id"].is_null());
-    let zero = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":0}));
+    let zero = call(
+        "web.wait",
+        json!({"session_id":session,"source":"true","timeout_ms":0}),
+    );
     assert_eq!(zero.status, "error");
     assert_eq!(zero.error.as_ref().unwrap().code, "TIMEOUT");
 }
 
 #[test]
+fn false_workflow_expectation_keeps_cpu_and_explicit_tab_usable() {
+    let fixture = serve_fixture(
+        "<!doctype html><html><body><button id='reviews' onclick='window.clicks++'>Reviews</button><script>window.clicks=0</script></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-workflow-wait-cpu-{}.sock",
+        std::process::id()
+    ));
+    let supervisor = Supervisor::spawn(&socket, "run_workflow_wait_cpu", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_wait_cpu", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("workflow wait CPU request")
+    };
+    let created = call(
+        "web.session.create",
+        json!({"profile":"project","limits":{"content_cpu_ms":5_000}}),
+    );
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let tab = went.result.as_ref().unwrap()["tab_id"].as_str().unwrap();
+    let worker = content_worker_pid(supervisor.child.id()).expect("content worker");
+
+    let waited = call(
+        "web.workflow",
+        json!({
+            "version":1,
+            "session_id":session,
+            "tab_id":tab,
+            "steps":[{
+                "action":{"operation":"click","selector":{"type":"css","value":"#reviews"}},
+                "expect":{"condition":{"query":"text~/\u{00a0}/i"},"timeout_ms":2_000}
+            }]
+        }),
+    );
+    assert_eq!(waited.status, "error", "{waited:?}");
+    assert_eq!(waited.error.as_ref().unwrap().code, "TIMEOUT", "{waited:?}");
+    assert!(waited.metrics.content_cpu_ms < 5_000, "{waited:?}");
+    let detail = waited.result.as_ref().unwrap();
+    assert_eq!(detail["failed_step"], 1, "{waited:?}");
+    assert_eq!(detail["steps"][0]["action"]["status"], "ok", "{waited:?}");
+    assert_eq!(
+        content_worker_pid(supervisor.child.id()),
+        Some(worker),
+        "an ordinary false expectation must not exhaust quota and reset tabs"
+    );
+
+    let checked = call(
+        "web.evaluate",
+        json!({"session_id":session,"tab_id":tab,"source":"window.clicks"}),
+    );
+    assert_eq!(
+        checked.status, "ok",
+        "same explicit tab must survive: {checked:?}"
+    );
+    assert_eq!(
+        checked.result.as_ref().unwrap()["value"].as_f64(),
+        Some(1.0)
+    );
+}
+
+#[test]
 fn native_boolean_wait_rebinds_after_navigation_and_same_url_reload() {
-    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Navigation wait</title>
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><head><title>Navigation wait</title>
 <script>
 const loads = Number(sessionStorage.getItem('wait-loads') || 0) + 1;
 sessionStorage.setItem('wait-loads', String(loads));
 window.waitDocumentLoad = loads;
-</script></head><body>Navigation witness</body></html>"#);
+</script></head><body>Navigation witness</body></html>"#,
+    );
     let socket = std::env::temp_dir().join(format!("greppy-wait-nav-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_wait_nav", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_wait_nav", method, payload), Duration::from_secs(30))
-            .expect("navigation wait request")
+        unix_request(
+            &socket,
+            &Request::new("run_wait_nav", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("navigation wait request")
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
-    let before = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":2000}));
+    let before = call(
+        "web.wait",
+        json!({"session_id":session,"source":"true","timeout_ms":2000}),
+    );
     assert_eq!(before.status, "ok", "{before:?}");
     // Schedule from the first predicate sample: the navigation must occur
     // while this very wait is pending, never between two test RPCs.
-    let navigated = call("web.wait", json!({"session_id":session,"timeout_ms":5000,"source":
-        "(() => { if (location.search === '?wait-landed') return true; if (!window.waitNavScheduled) { window.waitNavScheduled = true; setTimeout(() => { location.search = '?wait-landed'; }, 50); } return false; })()"}));
+    let navigated = call(
+        "web.wait",
+        json!({"session_id":session,"timeout_ms":5000,"source":
+        "(() => { if (location.search === '?wait-landed') return true; if (!window.waitNavScheduled) { window.waitNavScheduled = true; setTimeout(() => { location.search = '?wait-landed'; }, 50); } return false; })()"}),
+    );
     assert_eq!(navigated.status, "ok", "{navigated:?}");
     assert_eq!(navigated.result.as_ref().unwrap()["held"], true);
-    assert_ne!(before.result.as_ref().unwrap()["document_id"], navigated.result.as_ref().unwrap()["document_id"]);
-    let current = call("web.evaluate", json!({"session_id":session,"source":"window.waitDocumentLoad"}));
+    assert_ne!(
+        before.result.as_ref().unwrap()["document_id"],
+        navigated.result.as_ref().unwrap()["document_id"]
+    );
+    let current = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"window.waitDocumentLoad"}),
+    );
     assert_eq!(current.status, "ok", "{current:?}");
     // JavaScript Number is encoded as serde's f64, including integral values.
-    let loads = current.result.as_ref().unwrap()["value"].as_f64()
+    let loads = current.result.as_ref().unwrap()["value"]
+        .as_f64()
         .unwrap_or_else(|| panic!("numeric document load counter: {current:?}"));
-    assert!(loads.is_finite() && loads.fract() == 0.0 && loads >= 2.0,
-        "both initial and navigated documents must have loaded: {current:?}");
-    let reloaded = call("web.wait", json!({"session_id":session,"timeout_ms":5000,"source":format!(
-        "(() => {{ if (window.waitDocumentLoad > {loads}) return true; if (!window.waitReloadScheduled) {{ window.waitReloadScheduled = true; setTimeout(() => location.reload(), 50); }} return false; }})()"
-    )}));
+    assert!(
+        loads.is_finite() && loads.fract() == 0.0 && loads >= 2.0,
+        "both initial and navigated documents must have loaded: {current:?}"
+    );
+    let reloaded = call(
+        "web.wait",
+        json!({"session_id":session,"timeout_ms":5000,"source":format!(
+            "(() => {{ if (window.waitDocumentLoad > {loads}) return true; if (!window.waitReloadScheduled) {{ window.waitReloadScheduled = true; setTimeout(() => location.reload(), 50); }} return false; }})()"
+        )}),
+    );
     assert_eq!(reloaded.status, "ok", "{reloaded:?}");
     assert_eq!(reloaded.result.as_ref().unwrap()["held"], true);
-    assert_ne!(navigated.result.as_ref().unwrap()["document_id"], reloaded.result.as_ref().unwrap()["document_id"]);
+    assert_ne!(
+        navigated.result.as_ref().unwrap()["document_id"],
+        reloaded.result.as_ref().unwrap()["document_id"]
+    );
+}
+
+#[test]
+fn native_boolean_completion_read_uses_remaining_deadline_without_replay() {
+    let fixture =
+        serve_fixture("<!doctype html><title>Completion budget</title><body>ready</body>");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-wait-completion-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_wait_completion", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_wait_completion", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("completion budget request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    for (predicate, expected_error) in [
+        ("true", None),
+        ("({holds:false})", Some("INVALID_WAIT_PREDICATE")),
+    ] {
+        // Delay ONLY the destructive completion read beyond its former 80ms
+        // cutoff. Predicate evaluation and the caller's 2000ms budget stay fixed.
+        let source = format!(
+            r#"(() => {{
+            window.completionPredicateCalls = (window.completionPredicateCalls || 0) + 1;
+            var key = Object.keys(window).filter(k => k.indexOf('__greppyWait_') === 0).pop();
+            var slot = window[key], done = 0;
+            Object.defineProperty(slot, 'done', {{configurable:true,
+                get() {{ var end = Date.now() + 120; while (Date.now() < end) {{}} return done; }},
+                set(value) {{ done = value; }}
+            }});
+            return {predicate};
+        }})()"#
+        );
+        let reset = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":"window.completionPredicateCalls=0"}),
+        );
+        assert_eq!(reset.status, "ok", "{reset:?}");
+        let response = call(
+            "web.wait",
+            json!({"session_id":session,"source":source,"timeout_ms":2000}),
+        );
+        if let Some(code) = expected_error {
+            assert_eq!(response.status, "error", "{response:?}");
+            assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        } else {
+            assert_eq!(response.status, "ok", "{response:?}");
+            assert_eq!(response.result.as_ref().unwrap()["held"], true);
+        }
+        let after = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":
+            "({calls:window.completionPredicateCalls, slots:Object.keys(window).filter(k => k.indexOf('__greppyWait_')===0).length})"}),
+        );
+        assert_eq!(after.status, "ok", "{after:?}");
+        assert_eq!(
+            after.result.as_ref().unwrap()["value"]["calls"].as_f64(),
+            Some(1.0),
+            "{after:?}"
+        );
+        assert_eq!(
+            after.result.as_ref().unwrap()["value"]["slots"].as_f64(),
+            Some(0.0),
+            "{after:?}"
+        );
+    }
 }
 
 #[test]
 fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
-    let fixture = serve_fixture(
-        "<!doctype html><html><body><p id='witness'>survived</p></body></html>",
-    );
-    let socket = std::env::temp_dir().join(format!("greppy-wait-limit-{}.sock", std::process::id()));
+    let fixture =
+        serve_fixture("<!doctype html><html><body><p id='witness'>survived</p></body></html>");
+    let socket =
+        std::env::temp_dir().join(format!("greppy-wait-limit-{}.sock", std::process::id()));
     let supervisor = Supervisor::spawn(&socket, "run_wait_limit", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
@@ -4675,31 +7841,49 @@ fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
     };
     let healthy = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(healthy.status, "ok", "{healthy:?}");
-    let session = healthy.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let session = healthy.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     let went = call("web.goto", json!({"session_id":session,"url":fixture}));
     assert_eq!(went.status, "ok", "{went:?}");
-    let before = call("web.wait", json!({
-        "session_id":session,"source":"true","timeout_ms":2000,
-    }));
+    let before = call(
+        "web.wait",
+        json!({
+            "session_id":session,"source":"true","timeout_ms":2000,
+        }),
+    );
     assert_eq!(before.status, "ok", "{before:?}");
     let before = before.result.as_ref().unwrap();
     let tab = before["tab_id"].as_str().unwrap();
     let document = before["document_id"].as_str().unwrap();
     let worker = content_worker_pid(supervisor.child.id()).expect("healthy content worker");
 
-    let expired = call("web.session.create", json!({
-        "profile":"project","limits":{"wall_ms":20},
-    }));
+    let expired = call(
+        "web.session.create",
+        json!({
+            "profile":"project","limits":{"wall_ms":20},
+        }),
+    );
     assert_eq!(expired.status, "ok", "{expired:?}");
-    let expired = expired.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let expired = expired.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
     // Deliberately expire the fixture's quota, not a browser-readiness workaround.
     thread::sleep(Duration::from_millis(80));
-    let rejected = call("web.wait", json!({
-        "session_id":expired,"source":"true","timeout_ms":2000,
-    }));
+    let rejected = call(
+        "web.wait",
+        json!({
+            "session_id":expired,"source":"true","timeout_ms":2000,
+        }),
+    );
     assert_eq!(rejected.status, "error", "{rejected:?}");
     assert_eq!(rejected.error.as_ref().unwrap().code, "resource_limit");
-    assert!(rejected.error.as_ref().unwrap().message.contains("wall time"));
+    assert!(rejected
+        .error
+        .as_ref()
+        .unwrap()
+        .message
+        .contains("wall time"));
     assert_eq!(content_worker_pid(supervisor.child.id()), Some(worker));
 
     // Ordinary operations must enforce the same quota without resetting the
@@ -4708,14 +7892,22 @@ fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
         let rejected = call(method, json!({"session_id":expired,"source":"true"}));
         assert_eq!(rejected.status, "error", "{rejected:?}");
         assert_eq!(rejected.error.as_ref().unwrap().code, "resource_limit");
-        assert!(rejected.error.as_ref().unwrap().message.contains("wall time"));
+        assert!(rejected
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("wall time"));
         assert_eq!(content_worker_pid(supervisor.child.id()), Some(worker));
     }
 
-    let after = call("web.wait", json!({
-        "session_id":session,"tab_id":tab,"timeout_ms":2000,
-        "source":"document.querySelector('#witness')?.textContent === 'survived'",
-    }));
+    let after = call(
+        "web.wait",
+        json!({
+            "session_id":session,"tab_id":tab,"timeout_ms":2000,
+            "source":"document.querySelector('#witness')?.textContent === 'survived'",
+        }),
+    );
     assert_eq!(after.status, "ok", "{after:?}");
     let after = after.result.as_ref().unwrap();
     assert_eq!(after["held"], true);
@@ -4725,70 +7917,134 @@ fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
 
 #[test]
 fn ref_conditions_preserve_identity_and_never_confirm_stale_absence() {
-    let fixture = serve_fixture("<!doctype html><html><body><input id='choice' aria-label='Choice'></body></html>");
-    let socket = std::env::temp_dir().join(format!("greppy-ref-condition-{}.sock", std::process::id()));
+    let fixture = serve_fixture(
+        "<!doctype html><html><body><input id='choice' aria-label='Choice'></body></html>",
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-ref-condition-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_ref_condition", |command| {
         command.arg("--fixture-url").arg(&fixture);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(&socket, &Request::new("run_ref_condition", method, payload), Duration::from_secs(30)).unwrap()
+        unix_request(
+            &socket,
+            &Request::new("run_ref_condition", method, payload),
+            Duration::from_secs(30),
+        )
+        .unwrap()
     };
     let created = call("web.session.create", json!({"profile":"project"}));
     assert_eq!(created.status, "ok", "{created:?}");
-    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
-    assert_eq!(call("web.goto", json!({"session_id":session,"url":fixture})).status, "ok");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
     let observe = || {
         let response = call("web.observe", json!({"session_id":session}));
         assert_eq!(response.status, "ok", "{response:?}");
-        response.result.unwrap()["actionables"][0]["ref"].as_str().unwrap()
-            .strip_prefix('@').unwrap().parse::<u64>().unwrap()
+        response.result.unwrap()["actionables"][0]["ref"]
+            .as_str()
+            .unwrap()
+            .strip_prefix('@')
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
     };
     let original = observe();
     for operation in ["web.evaluate", "web.wait"] {
-        let source = if operation == "web.wait" { "__greppyConditionNodes.length === 1" }
-            else { "({holds: __greppyConditionNodes.length === 1})" };
-        let response = call(operation, json!({"session_id":session,"condition_ref":{"type":"ref","value":original},"source":source,"timeout_ms":2000}));
+        let source = if operation == "web.wait" {
+            "__greppyConditionNodes.length === 1"
+        } else {
+            "({holds: __greppyConditionNodes.length === 1})"
+        };
+        let response = call(
+            operation,
+            json!({"session_id":session,"condition_ref":{"type":"ref","value":original},"source":source,"timeout_ms":2000}),
+        );
         assert_eq!(response.status, "ok", "{response:?}");
         let result = response.result.unwrap();
-        let confirmed = if operation == "web.wait" { &result["held"] } else { &result["value"]["holds"] };
+        let confirmed = if operation == "web.wait" {
+            &result["held"]
+        } else {
+            &result["value"]["holds"]
+        };
         assert_eq!(confirmed.as_bool(), Some(true));
     }
     let assert_stale = |session: &str, reference: u64| {
         for operation in ["web.evaluate", "web.wait"] {
             // Exactly the inverse/presence expression used for --absent. A
             // missing identity must throw before this can produce true.
-            let source = if operation == "web.wait" { "__greppyConditionNodes.length === 0" }
-                else { "({holds: __greppyConditionNodes.length === 0})" };
-            let response = call(operation, json!({"session_id":session,"condition_ref":{"type":"ref","value":reference},"source":source,"timeout_ms":1000}));
+            let source = if operation == "web.wait" {
+                "__greppyConditionNodes.length === 0"
+            } else {
+                "({holds: __greppyConditionNodes.length === 0})"
+            };
+            let response = call(
+                operation,
+                json!({"session_id":session,"condition_ref":{"type":"ref","value":reference},"source":source,"timeout_ms":1000}),
+            );
             assert_eq!(response.status, "error", "{response:?}");
-            assert_eq!(response.error.as_ref().unwrap().code, "STALE_REF", "{response:?}");
-            assert!(!response.error.as_ref().unwrap().next_action.contains("doctor"));
+            assert_eq!(
+                response.error.as_ref().unwrap().code,
+                "STALE_REF",
+                "{response:?}"
+            );
+            assert!(!response
+                .error
+                .as_ref()
+                .unwrap()
+                .next_action
+                .contains("doctor"));
         }
     };
     // Trigger replacement from the first predicate sample, not before the
     // wait starts: subsequent samples must revalidate identity, not cache it.
-    let replaced_during_wait = call("web.wait", json!({
-        "session_id":session,"condition_ref":{"type":"ref","value":original},
-        "source":"(function(){ if (!window.refReplacementScheduled) { window.refReplacementScheduled = true; setTimeout(() => { const old = document.getElementById('choice'); old.replaceWith(old.cloneNode(true)); }, 50); } return __greppyConditionNodes.length === 0; })()",
-        "timeout_ms":2000,
-    }));
-    assert_eq!(replaced_during_wait.error.as_ref().unwrap().code, "STALE_REF", "{replaced_during_wait:?}");
+    let replaced_during_wait = call(
+        "web.wait",
+        json!({
+            "session_id":session,"condition_ref":{"type":"ref","value":original},
+            "source":"(function(){ if (!window.refReplacementScheduled) { window.refReplacementScheduled = true; setTimeout(() => { const old = document.getElementById('choice'); old.replaceWith(old.cloneNode(true)); }, 50); } return __greppyConditionNodes.length === 0; })()",
+            "timeout_ms":2000,
+        }),
+    );
+    assert_eq!(
+        replaced_during_wait.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{replaced_during_wait:?}"
+    );
     assert_stale(session, original);
     let replacement = observe();
     assert_ne!(replacement, original);
     let other = call("web.session.create", json!({"profile":"project"}));
-    let other = other.result.as_ref().unwrap()["session_id"].as_str().unwrap();
-    assert_eq!(call("web.goto", json!({"session_id":other,"url":fixture})).status, "ok");
-    assert_eq!(call("web.observe", json!({"session_id":other})).status, "ok");
+    let other = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        call("web.goto", json!({"session_id":other,"url":fixture})).status,
+        "ok"
+    );
+    assert_eq!(
+        call("web.observe", json!({"session_id":other})).status,
+        "ok"
+    );
     assert_stale(other, replacement);
     assert_eq!(call("web.evaluate", json!({"session_id":session,"source":"document.getElementById('choice').remove(); true"})).status, "ok");
     assert_stale(session, replacement);
-    assert_eq!(call("web.goto", json!({"session_id":session,"url":fixture})).status, "ok");
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
     let after_navigation = observe();
     assert_ne!(after_navigation, replacement);
     assert_stale(session, replacement);
-    let still_usable = call("web.wait", json!({"session_id":session,"condition_ref":{"type":"ref","value":after_navigation},"source":"__greppyConditionNodes.length === 1","timeout_ms":2000}));
+    let still_usable = call(
+        "web.wait",
+        json!({"session_id":session,"condition_ref":{"type":"ref","value":after_navigation},"source":"__greppyConditionNodes.length === 1","timeout_ms":2000}),
+    );
     assert_eq!(still_usable.status, "ok", "{still_usable:?}");
 }
 
@@ -4802,7 +8058,8 @@ fn project_profile_can_load_an_allowed_http_host() {
         .into_boxed_str(),
     );
     let fixture = serve_fixture(fixture_html);
-    let socket = std::env::temp_dir().join(format!("greppy-web-egress-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-egress-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let fixture_for_spawn = fixture.clone();
     let _guard = Supervisor::spawn(&socket, "run_egress", move |command| {
@@ -4831,20 +8088,15 @@ if (text.includes("Could not load the requested page")) {
 }
 await browser.close();
 "#;
-    let ran = run_playwright_source(
-        &socket,
-        "run_egress",
-        source,
-        None,
-        Duration::from_secs(60),
-    );
+    let ran = run_playwright_source(&socket, "run_egress", source, None, Duration::from_secs(60));
     assert_eq!(ran.status, "ok", "{ran:?}");
 }
 
 #[test]
 fn web_run_reports_content_cpu_after_navigation() {
     let fixture = serve_fixture("<!DOCTYPE html><html><body><p>cpu</p></body></html>");
-    let socket = std::env::temp_dir().join(format!("greppy-web-cpumet-{}.sock", std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-cpumet-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_cpumet", |command| {
         command.arg("--fixture-url").arg(&fixture);
@@ -4957,10 +8209,8 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "candidate failed: {ran:?}");
 
-    let receipts_dir = std::env::temp_dir().join(format!(
-        "greppy-oracle-receipts-{}",
-        std::process::id()
-    ));
+    let receipts_dir =
+        std::env::temp_dir().join(format!("greppy-oracle-receipts-{}", std::process::id()));
     std::fs::create_dir_all(&receipts_dir).unwrap();
     let receipt = json!({
         "reference": {
@@ -5625,6 +8875,207 @@ fn evaluate_serializes_special_values_not_json_null() {
 }
 
 #[test]
+fn page_evaluate_awaits_primitive_object_and_async_object_results() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-evaluate-await-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_evalawait", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const primitive = await page.evaluate(() => 42);
+const object = await page.evaluate(() => ({ before: false, after: true }));
+const asyncPrimitive = await page.evaluate(async () => 7);
+const asyncString = await page.evaluate(async () => "resolved");
+const state = await page.evaluate(async () => {
+  await Promise.resolve();
+  return { before: false, after: true, reuseError: "TypeError", status: 200 };
+});
+console.log(JSON.stringify({ primitive, object, asyncPrimitive, asyncString, state }));
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_evalawait",
+        source,
+        None,
+        Duration::from_secs(60),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_evalawait", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_evalawait");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    let stdout = ran.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(value["primitive"], 42, "{value:#}");
+    assert_eq!(
+        value["object"],
+        json!({"before": false, "after": true}),
+        "{value:#}"
+    );
+    assert_eq!(value["asyncPrimitive"], 7, "{value:#}");
+    assert_eq!(value["asyncString"], "resolved", "{value:#}");
+    assert_eq!(
+        value["state"],
+        json!({"before": false, "after": true, "reuseError": "TypeError", "status": 200}),
+        "{value:#}"
+    );
+}
+
+#[test]
+fn page_evaluate_reports_rejection_and_timeout_then_recovers() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-evaluate-failure-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_evalfail", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+let rejection = "";
+try {
+  await page.evaluate(async () => { throw new Error("evaluate-boom"); });
+} catch (error) {
+  rejection = String(error && error.message ? error.message : error);
+}
+let timeout = "";
+try {
+  await page.evaluate(() => new Promise(() => {}));
+} catch (error) {
+  timeout = String(error && error.message ? error.message : error);
+}
+const recovered = await page.evaluate(async () => "usable-after-timeout");
+console.log(JSON.stringify({ rejection, timeout, recovered }));
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_evalfail",
+        source,
+        None,
+        Duration::from_secs(75),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_evalfail", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_evalfail");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    let stdout = ran.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert!(
+        value["rejection"]
+            .as_str()
+            .unwrap()
+            .contains("page.evaluate Promise rejected: evaluate-boom"),
+        "{value:#}"
+    );
+    assert!(
+        value["timeout"]
+            .as_str()
+            .unwrap()
+            .contains("timeout awaiting page.evaluate Promise"),
+        "{value:#}"
+    );
+    assert_eq!(value["recovered"], "usable-after-timeout", "{value:#}");
+}
+
+#[test]
+fn javascript_compilation_failure_is_actionable_and_session_remains_usable() {
+    let fixture = serve_fixture("<!doctype html><html><body>ready</body></html>");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-js-compilation-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_js_compilation", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_js_compilation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("JavaScript diagnostic request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
+
+    let malformed = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"lettt badsyntax = 123"}),
+    );
+    assert_eq!(malformed.status, "error", "{malformed:?}");
+    let message = &malformed.error.as_ref().unwrap().message;
+    assert!(message.contains("raised SyntaxError"), "{malformed:?}");
+    assert!(message.contains("syntax"), "{malformed:?}");
+    assert!(message.contains("simpler expression"), "{malformed:?}");
+    assert!(
+        !message.contains("line "),
+        "must not invent a source position: {malformed:?}"
+    );
+
+    let thrown_syntax = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"throw new SyntaxError('deliberate runtime exception')"}),
+    );
+    assert_eq!(thrown_syntax.status, "error", "{thrown_syntax:?}");
+    let message = &thrown_syntax.error.as_ref().unwrap().message;
+    assert!(message.contains("raised SyntaxError"), "{thrown_syntax:?}");
+    assert!(
+        message.contains("deliberate runtime exception"),
+        "{thrown_syntax:?}"
+    );
+    assert!(
+        !message.contains("could not be compiled"),
+        "{thrown_syntax:?}"
+    );
+
+    let runtime_failure = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"throw new Error('SyntaxError: user data, not a compiler diagnosis')"}),
+    );
+    assert_eq!(runtime_failure.status, "error", "{runtime_failure:?}");
+    let message = &runtime_failure.error.as_ref().unwrap().message;
+    assert!(
+        message.contains("raised Error: SyntaxError: user data"),
+        "{runtime_failure:?}"
+    );
+    assert!(
+        !message.contains("simpler expression"),
+        "{runtime_failure:?}"
+    );
+
+    let valid = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"40 + 2"}),
+    );
+    assert_eq!(valid.status, "ok", "{valid:?}");
+    assert_eq!(valid.result.as_ref().unwrap()["value"].as_f64(), Some(42.0));
+}
+
+#[test]
 fn closed_page_and_browser_throw_object_disposed() {
     run_named_fixture("object-disposed.mjs", "run_objdisp");
 }
@@ -6161,8 +9612,760 @@ fn fail_closed_clock_coverage_request_and_handles() {
 }
 
 #[test]
+fn new_page_initial_document_settles_before_async_evaluation() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-initial-page-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_initial_page", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_initial_page",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const value = await page.evaluate(() => new Promise(resolve => setTimeout(() => resolve(7), 25)));
+if (value !== 7) throw new Error("initial-page Promise returned the wrong result");
+await browser.close();"#;
+    let response = unix_request(
+        &socket,
+        &Request::new(
+            "run_initial_page",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(
+        response.result.as_ref().unwrap()["completed"],
+        true,
+        "{response:?}"
+    );
+}
+
+#[test]
+fn playwright_trace_is_context_isolated_and_daemon_stored() {
+    fn trace_entry(bytes: &[u8]) -> &str {
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+        let u16_at =
+            |offset| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        assert_eq!(u16_at(8), 0, "expected stored ZIP entry");
+        let size = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+        let name_len = u16_at(26);
+        assert_eq!(&bytes[30..30 + name_len], b"trace.trace");
+        let start = 30 + name_len + u16_at(28);
+        std::str::from_utf8(&bytes[start..start + size]).unwrap()
+    }
+    let socket = std::env::temp_dir().join(format!("greppy-web-trace-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch();
+const first = await browser.newContext(); const second = await browser.newContext();
+const firstPage = await first.newPage(); const secondPage = await second.newPage();
+await first.tracing.start(); await secondPage.content(); await firstPage.title(); await first.tracing.stop();
+await browser.close();"#;
+    let response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(response.artifacts.len(), 1, "{response:?}");
+    let id = response.artifacts[0]["id"].as_str().unwrap();
+    let path = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.artifact.path",
+            json!({"session_id":session_id,"id":id}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let bytes = std::fs::read(path.result.unwrap()["path"].as_str().unwrap()).unwrap();
+    let text = trace_entry(&bytes);
+    assert!(text.contains("page.title"), "{text}");
+    assert!(!text.contains("page.content"), "{text}");
+    assert!(text.contains("\"version\":8"), "{text}");
+    assert!(!text.contains("\"version\":10"), "{text}");
+    let events = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let context_time = events
+        .iter()
+        .find(|event| event["type"] == "context-options")
+        .unwrap()["monotonicTime"]
+        .as_f64()
+        .unwrap();
+    let before = events
+        .iter()
+        .find(|event| event["type"] == "before")
+        .unwrap();
+    let after = events
+        .iter()
+        .find(|event| event["type"] == "after")
+        .unwrap();
+    let start = before["startTime"].as_f64().unwrap();
+    let end = after["endTime"].as_f64().unwrap();
+    assert!(
+        start >= context_time && start - context_time < 40_000.0,
+        "{events:?}"
+    );
+    assert!(end >= start && end - start < 40_000.0, "{events:?}");
+
+    let failing = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start(); await page.title();
+await context.tracing.stop({ path: "failed-trace.zip" });
+await context.tracing.start(); await page.title();
+throw new Error("intentional trace fixture failure");"#;
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.run",
+            json!({"session_id":session_id,"script_text":failing}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(failed.status, "error", "{failed:?}");
+    assert_eq!(failed.error.as_ref().unwrap().code, "controller_exception");
+    assert_eq!(
+        failed.artifacts.len(),
+        2,
+        "stopped and active traces must survive script failure: {failed:?}"
+    );
+    assert!(failed
+        .artifacts
+        .iter()
+        .any(|artifact| artifact["requested_path"] == "failed-trace.zip"));
+
+    let async_source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start();
+const pending = page.evaluate(() => new Promise(resolve => setTimeout(() => resolve(7), 25)));
+await context.tracing.stop({ path: "recorder-a.zip" });
+await context.tracing.start(); await pending;
+await context.tracing.stop({ path: "recorder-b.zip" }); await browser.close();"#;
+    let async_response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.run",
+            json!({"session_id":session_id,"script_text":async_source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(async_response.status, "ok", "{async_response:?}");
+    let second_id = async_response
+        .artifacts
+        .iter()
+        .find(|artifact| artifact["requested_path"] == "recorder-b.zip")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let second_path = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.artifact.path",
+            json!({"session_id":session_id,"id":second_id}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let second_bytes =
+        std::fs::read(second_path.result.unwrap()["path"].as_str().unwrap()).unwrap();
+    // The native writer uses uncompressed ZIP entries; inspect trace.trace,
+    // allowing legitimate follow-up operations started by recorder B.
+    let trace = trace_entry(&second_bytes);
+    let mut pending = std::collections::HashSet::new();
+    for line in trace.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        match event["type"].as_str() {
+            Some("before") => {
+                assert_ne!(
+                    event["apiName"], "page.evaluate",
+                    "recorder A action leaked: {trace}"
+                );
+                assert!(pending.insert(event["callId"].as_str().unwrap().to_owned()));
+            }
+            Some("after") => {
+                assert!(
+                    pending.remove(event["callId"].as_str().unwrap()),
+                    "unmatched completion leaked from recorder A: {trace}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "recorder B did not finish its own operations: {trace}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn playwright_trace_overflow_preserves_completed_mutation() {
+    const LIMIT_ENV: &str = "GREPPY_TEST_TRACE_LIMIT_BYTES";
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-trace-overflow-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_overflow", |command| {
+        command.env(LIMIT_ENV, "512");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_overflow",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start();
+await page.evaluate(() => { globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; });
+console.log("mutation-count=" + await page.evaluate(() => globalThis.traceMutationCount));
+try { await context.tracing.stop({ path: "truncated.zip" }); }
+catch (error) { console.log("stop-error=" + error.message); }
+await browser.close();"#;
+    let response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_overflow",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    let stdout = response.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(
+        stdout.lines().any(|line| line == "mutation-count=1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("trace recording stopped after exceeding"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("stop-error=trace recording was truncated"),
+        "{stdout}"
+    );
+    assert!(
+        response.artifacts.is_empty(),
+        "truncated trace must not be archived: {response:?}"
+    );
+}
+
+fn playwright_trace_storage_quota_response(throws: bool) -> greppy_web_client::Response {
+    let socket = std::env::temp_dir().join(format!(
+        "g-w-trace-quota-{}-{}.sock",
+        std::process::id(),
+        u8::from(throws)
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_quota", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_quota",
+            "web.session.create",
+            json!({
+                "profile":"project",
+                "limits": {"max_artifact_bytes": 1500}
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ending = if throws {
+        "throw new Error(\"intentional quota fixture failure\");"
+    } else {
+        "console.log(\"mutation-count=\" + await page.evaluate(() => globalThis.traceMutationCount));"
+    };
+    let source = format!(
+        r#"import {{ chromium }} from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage();
+await page.evaluate(() => {{ globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; }});
+await context.tracing.start(); await page.title();
+await context.tracing.stop({{ path: "retained.zip" }});
+await context.tracing.start();
+for (let i = 0; i < 20; i++) await page.title();
+await context.tracing.stop({{ path: "over-quota.zip" }});
+{ending}"#
+    );
+    unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_quota",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap()
+}
+
+fn assert_partial_trace_quota_result(response: &greppy_web_client::Response) {
+    assert_eq!(response.artifacts.len(), 1, "{response:?}");
+    assert_eq!(response.artifacts[0]["requested_path"], "retained.zip");
+    let warnings = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("warnings"))
+        .and_then(|warnings| warnings.as_array())
+        .expect("bounded trace-storage warning");
+    assert_eq!(warnings.len(), 1, "{response:?}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("artifact limit exceeded"), "{warning}");
+    assert!(warning.chars().count() <= 256, "{warning}");
+}
+
+#[test]
+fn successful_script_remains_completed_when_trace_storage_hits_quota() {
+    let response = playwright_trace_storage_quota_response(false);
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(response.result.as_ref().unwrap()["completed"], true);
+    assert!(
+        response.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line == "mutation-count=1"),
+        "{response:?}"
+    );
+    assert_partial_trace_quota_result(&response);
+}
+
+#[test]
+fn script_failure_survives_partial_trace_storage_quota_failure() {
+    let response = playwright_trace_storage_quota_response(true);
+    assert_eq!(response.status, "error", "{response:?}");
+    let error = response.error.as_ref().unwrap();
+    assert_eq!(error.code, "controller_exception", "{response:?}");
+    assert!(
+        error.message.contains("intentional quota fixture failure"),
+        "{response:?}"
+    );
+    assert_partial_trace_quota_result(&response);
+}
+
+fn playwright_stopped_trace_survives_synthetic_classified_failure(message: &str, code: &str) {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-trace-failure-{}-{code}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_failure", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_failure",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = format!(
+        r#"import {{ chromium }} from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start(); await page.title();
+await context.tracing.stop({{ path: "classified-failure.zip" }});
+throw new Error({message:?});"#
+    );
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_failure",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(failed.status, "error", "{failed:?}");
+    assert_eq!(failed.error.as_ref().unwrap().code, code, "{failed:?}");
+    assert!(
+        failed
+            .artifacts
+            .iter()
+            .any(|artifact| artifact["requested_path"] == "classified-failure.zip"),
+        "stored trace must remain visible on {code}: {failed:?}"
+    );
+}
+
+#[test]
+fn playwright_stopped_trace_survives_synthetic_timeout_classification() {
+    playwright_stopped_trace_survives_synthetic_classified_failure(
+        "timed out after stopped trace fixture",
+        "timeout",
+    );
+}
+
+#[test]
+fn playwright_stopped_trace_survives_synthetic_cancel_classification() {
+    playwright_stopped_trace_survives_synthetic_classified_failure(
+        "cancelled after stopped trace fixture",
+        "cancelled",
+    );
+}
+
+#[test]
 fn locator_strict_mode_rejects_ambiguous_click() {
     run_named_fixture("strict-mode.mjs", "run_strict");
+}
+
+#[test]
+fn ordinary_sessions_isolate_cookie_state() {
+    let fixture = serve_cookie_isolation_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-cookie-isolation-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_cookie_isolation", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        let started = Instant::now();
+        eprintln!("cookie-isolation stage begin method={method}");
+        let response = unix_request(
+            &socket,
+            &Request::new("run_cookie_isolation", method, payload),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "cookie isolation request failed method={method} elapsed={:?}: {error}",
+                started.elapsed()
+            )
+        });
+        eprintln!(
+            "cookie-isolation stage end method={method} elapsed={:?} status={}",
+            started.elapsed(),
+            response.status
+        );
+        response
+    };
+    let create = || {
+        let response = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let body = |session: &str, tab: Option<&str>| {
+        let mut payload = json!({"session_id":session,"source":"document.body.innerText"});
+        if let Some(tab) = tab {
+            payload["tab_id"] = json!(tab);
+        }
+        let response = call("web.evaluate", payload);
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    let session_a = create();
+    let session_b = create();
+    let research = call("web.session.create", json!({"profile":"research"}));
+    assert_eq!(research.status, "ok", "{research:?}");
+    let research_id = research.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let early_b = call("web.tab.new", json!({"session_id":session_b}));
+    assert_eq!(early_b.status, "ok", "{early_b:?}");
+    let tab_b = early_b.result.unwrap()["tab"].as_str().unwrap().to_owned();
+    let research_page = call(
+        "web.evaluate",
+        json!({"session_id":research_id,"source":"document.title"}),
+    );
+    assert_eq!(research_page.status, "ok", "{research_page:?}");
+    let set = call(
+        "web.goto",
+        json!({"session_id":session_a,"url":format!("{fixture}/set")}),
+    );
+    assert_eq!(set.status, "ok", "{set:?}");
+    assert!(set.metrics.network_bytes > 0, "{set:?}");
+    let research_denied = call(
+        "web.goto",
+        json!({"session_id":research_id,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(research_denied.status, "error", "{research_denied:?}");
+    assert_eq!(
+        research_denied.error.as_ref().unwrap().code,
+        "policy_denied",
+        "{research_denied:?}"
+    );
+    let research_again = call(
+        "web.evaluate",
+        json!({"session_id":research_id,"source":"document.title"}),
+    );
+    assert_eq!(research_again.status, "ok", "{research_again:?}");
+    let echo_a = call(
+        "web.goto",
+        json!({"session_id":session_a,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(echo_a.status, "ok", "{echo_a:?}");
+    assert_eq!(body(&session_a, None), "isolation=A");
+    let store_a = call(
+        "web.evaluate",
+        json!({"session_id":session_a,"source":"localStorage.setItem('greppy-isolation', 'A'); localStorage.getItem('greppy-isolation')"}),
+    );
+    assert_eq!(store_a.status, "ok", "{store_a:?}");
+
+    let new_tab = call("web.tab.new", json!({"session_id":session_a}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    let tab_a = new_tab.result.unwrap()["tab"].as_str().unwrap().to_owned();
+    let tab_echo = call(
+        "web.goto",
+        json!({"session_id":session_a,"tab_id":&tab_a,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(tab_echo.status, "ok", "{tab_echo:?}");
+    assert_eq!(body(&session_a, Some(&tab_a)), "isolation=A");
+
+    let stored_a = call(
+        "web.evaluate",
+        json!({"session_id":session_a,"tab_id":&tab_a,"source":"localStorage.getItem('greppy-isolation')"}),
+    );
+    assert_eq!(stored_a.status, "ok", "{stored_a:?}");
+    assert_eq!(stored_a.result.unwrap()["value"], "A");
+
+    let echo_b = call(
+        "web.goto",
+        json!({"session_id":session_b,"tab_id":&tab_b,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(echo_b.status, "ok", "{echo_b:?}");
+    assert!(echo_b.metrics.network_bytes > 0, "{echo_b:?}");
+    assert_eq!(
+        body(&session_b, Some(&tab_b)),
+        "",
+        "simultaneous ordinary session B received A's cookie"
+    );
+    let stored_b = call(
+        "web.evaluate",
+        json!({"session_id":session_b,"tab_id":&tab_b,"source":"localStorage.getItem('greppy-isolation')"}),
+    );
+    assert_eq!(stored_b.status, "ok", "{stored_b:?}");
+    assert!(stored_b.result.unwrap()["value"].is_null());
+
+    let color_a = call(
+        "web.evaluate",
+        json!({"session_id":session_a,"source":"document.body.style.background='rgb(255, 0, 0)'; document.body.innerHTML='<div style=\"width:320px;height:240px\"></div>'; true"}),
+    );
+    assert_eq!(color_a.status, "ok", "{color_a:?}");
+    let color_b = call(
+        "web.evaluate",
+        json!({"session_id":session_b,"tab_id":&tab_b,"source":"document.body.style.background='rgb(0, 0, 255)'; document.body.innerHTML='<div style=\"width:320px;height:240px\"></div>'; true"}),
+    );
+    assert_eq!(color_b.status, "ok", "{color_b:?}");
+    let shot_a = call("web.screenshot", json!({"session_id":session_a}));
+    assert_eq!(shot_a.status, "ok", "{shot_a:?}");
+    let shot_b = call(
+        "web.screenshot",
+        json!({"session_id":session_b,"tab_id":&tab_b}),
+    );
+    assert_eq!(shot_b.status, "ok", "{shot_b:?}");
+    let digest_a = shot_a.result.as_ref().unwrap()["digest"]
+        .as_str()
+        .expect("session A screenshot digest");
+    let digest_b = shot_b.result.as_ref().unwrap()["digest"]
+        .as_str()
+        .expect("session B screenshot digest");
+    assert_ne!(
+        digest_a, digest_b,
+        "simultaneous sessions rendered through the same owning framebuffer"
+    );
+
+    for tab in [&tab_a, &session_a] {
+        let target = if tab == &session_a {
+            None
+        } else {
+            Some(tab.as_str())
+        };
+        let mut payload = json!({"session_id":session_a});
+        if let Some(target) = target {
+            payload["tab"] = json!(target);
+        }
+        let closed = call("web.tab.close", payload);
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    let reopened_a = call("web.tab.new", json!({"session_id":session_a}));
+    assert_eq!(reopened_a.status, "ok", "{reopened_a:?}");
+    let reopened_tab = reopened_a.result.unwrap()["tab"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reopened_echo = call(
+        "web.goto",
+        json!({"session_id":session_a,"tab_id":&reopened_tab,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(reopened_echo.status, "ok", "{reopened_echo:?}");
+    assert_eq!(body(&session_a, Some(&reopened_tab)), "isolation=A");
+    let closed_a = call("web.session.close", json!({"session_id":session_a}));
+    assert_eq!(closed_a.status, "ok", "{closed_a:?}");
+
+    let surviving_b = call(
+        "web.goto",
+        json!({"session_id":session_b,"tab_id":&tab_b,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(surviving_b.status, "ok", "{surviving_b:?}");
+    assert_eq!(
+        body(&session_b, Some(&tab_b)),
+        "",
+        "surviving ordinary session B received closed A's cookie"
+    );
+
+    let session_c = create();
+    let echo_c = call(
+        "web.goto",
+        json!({"session_id":session_c,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(echo_c.status, "ok", "{echo_c:?}");
+    assert_eq!(
+        body(&session_c, None),
+        "",
+        "new ordinary session C received closed A's cookie"
+    );
+
+    let persistent_name = format!(
+        "cookie-isolation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let persistent_dir = std::env::var("GREPPY_STORE_DIR")
+        .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"))
+        .join("web-runtime")
+        .join("profiles")
+        .join(&persistent_name);
+    let _ = std::fs::remove_dir_all(&persistent_dir);
+    let persistent_first = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&persistent_name}),
+    );
+    assert_eq!(persistent_first.status, "ok", "{persistent_first:?}");
+    let persistent_first_id = persistent_first.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let persistent_set = call(
+        "web.goto",
+        json!({"session_id":persistent_first_id,"url":format!("{fixture}/set")}),
+    );
+    assert_eq!(persistent_set.status, "ok", "{persistent_set:?}");
+    let persistent_first_echo = call(
+        "web.goto",
+        json!({"session_id":persistent_first_id,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(
+        persistent_first_echo.status, "ok",
+        "{persistent_first_echo:?}"
+    );
+    assert_eq!(body(&persistent_first_id, None), "isolation=A");
+    let persistent_closed = call(
+        "web.session.close",
+        json!({"session_id":persistent_first_id}),
+    );
+    assert_eq!(persistent_closed.status, "ok", "{persistent_closed:?}");
+    let persistent_second = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&persistent_name}),
+    );
+    assert_eq!(persistent_second.status, "ok", "{persistent_second:?}");
+    let persistent_second_id = persistent_second.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let persistent_echo = call(
+        "web.goto",
+        json!({"session_id":persistent_second_id,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(persistent_echo.status, "ok", "{persistent_echo:?}");
+    assert_eq!(body(&persistent_second_id, None), "isolation=A");
+    let persistent_second_closed = call(
+        "web.session.close",
+        json!({"session_id":persistent_second_id}),
+    );
+    assert_eq!(
+        persistent_second_closed.status, "ok",
+        "{persistent_second_closed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&persistent_dir);
+    for session in [session_b, session_c, research_id] {
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
 }
 
 #[test]
@@ -6224,6 +10427,251 @@ fn persistent_profile_lock_is_exclusive_until_owner_closes() {
     )
     .expect("reacquire");
     assert_eq!(third.status, "ok", "{third:?}");
+}
+
+#[test]
+fn persistent_profile_survives_content_runtime_restart() {
+    let fixture = serve_cookie_isolation_fixture();
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let store = std::env::temp_dir().join(format!("greppy-web-profile-restart-{nonce}"));
+    let profile = format!("restart{nonce}");
+
+    let run_once = |run_id: &str, socket: &std::path::Path, verify: bool| {
+        let store_for_spawn = store.clone();
+        let guard = Supervisor::spawn(socket, run_id, move |command| {
+            command.env("GREPPY_STORE_DIR", &store_for_spawn);
+        });
+        wait_for_socket(socket, Duration::from_secs(30));
+        let call = |method: &str, payload| {
+            unix_request(
+                socket,
+                &Request::new(run_id, method, payload),
+                Duration::from_secs(30),
+            )
+            .expect("persistent profile restart request")
+        };
+        let created = call(
+            "web.session.create",
+            json!({"profile":"project","persistent_profile":&profile}),
+        );
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session = created.result.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let navigated = call(
+            "web.goto",
+            json!({"session_id":&session,"url":format!("{fixture}/echo")}),
+        );
+        assert_eq!(navigated.status, "ok", "{navigated:?}");
+        if verify {
+            let state = call(
+                "web.evaluate",
+                json!({"session_id":&session,"source":"JSON.stringify({cookie: document.body.innerText, local: localStorage.getItem('restart')})"}),
+            );
+            assert_eq!(state.status, "ok", "{state:?}");
+            assert_eq!(
+                state.result.unwrap()["value"],
+                json!("{\"cookie\":\"isolation=A\",\"local\":\"preserved\"}")
+            );
+        } else {
+            let set_cookie = call(
+                "web.goto",
+                json!({"session_id":&session,"url":format!("{fixture}/set")}),
+            );
+            assert_eq!(set_cookie.status, "ok", "{set_cookie:?}");
+            let set_local = call(
+                "web.evaluate",
+                json!({"session_id":&session,"source":"localStorage.setItem('restart', 'preserved')"}),
+            );
+            assert_eq!(set_local.status, "ok", "{set_local:?}");
+        }
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+        drop(guard);
+        let _ = std::fs::remove_file(socket);
+    };
+
+    let socket_a = std::env::temp_dir().join(format!("greppy-web-profile-a-{nonce}.sock"));
+    let socket_b = std::env::temp_dir().join(format!("greppy-web-profile-b-{nonce}.sock"));
+    run_once("run_profile_restart_a", &socket_a, false);
+    run_once("run_profile_restart_b", &socket_b, true);
+
+    let profile_dir = store.join("web-runtime").join("profiles").join(&profile);
+    assert!(profile_dir.join("browser").is_dir(), "{profile_dir:?}");
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+#[test]
+fn persistent_profile_survives_content_worker_recovery() {
+    let fixture = serve_cookie_isolation_fixture();
+    let nonce = format!("{}-recovery", std::process::id());
+    let store = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}"));
+    let socket = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}.sock"));
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&socket);
+    let store_for_spawn = store.clone();
+    let supervisor = Supervisor::spawn(&socket, "run_profile_recovery", move |command| {
+        command.env("GREPPY_STORE_DIR", &store_for_spawn);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_profile_recovery", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("persistent profile recovery request")
+    };
+    let created = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&nonce}),
+    );
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let set_cookie = call(
+        "web.goto",
+        json!({"session_id":&session,"url":format!("{fixture}/set")}),
+    );
+    assert_eq!(set_cookie.status, "ok", "{set_cookie:?}");
+    let set_local = call(
+        "web.evaluate",
+        json!({"session_id":&session,"source":"localStorage.setItem('restart', 'recovered')"}),
+    );
+    assert_eq!(set_local.status, "ok", "{set_local:?}");
+    let committed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(committed.status, "ok", "{committed:?}");
+
+    let content = content_worker_pid(supervisor.child.id()).expect("content worker pid");
+    assert!(Command::new("kill")
+        .args(["-KILL", &content.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let recovered_session = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&nonce}),
+    );
+    assert_eq!(recovered_session.status, "ok", "{recovered_session:?}");
+    let recovered_session = recovered_session.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reopened = call(
+        "web.goto",
+        json!({"session_id":&recovered_session,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(reopened.status, "ok", "{reopened:?}");
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":&recovered_session,"source":"JSON.stringify({cookie: document.body.innerText, local: localStorage.getItem('restart')})"}),
+    );
+    assert_eq!(state.status, "ok", "{state:?}");
+    assert_eq!(
+        state.result.unwrap()["value"],
+        json!("{\"cookie\":\"isolation=A\",\"local\":\"recovered\"}")
+    );
+    let closed = call("web.session.close", json!({"session_id":recovered_session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    drop(supervisor);
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[test]
+fn persistent_profile_lock_contends_across_supervisors_until_close_flushes() {
+    let fixture = serve_cookie_isolation_fixture();
+    let nonce = format!("{}-lock", std::process::id());
+    let store = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}"));
+    let socket_a = std::env::temp_dir().join(format!("greppy-web-profile-a-{nonce}.sock"));
+    let socket_b = std::env::temp_dir().join(format!("greppy-web-profile-b-{nonce}.sock"));
+    let _ = std::fs::remove_dir_all(&store);
+    let store_a = store.clone();
+    let supervisor_a = Supervisor::spawn(&socket_a, "run_profile_lock_a", move |command| {
+        command.env("GREPPY_STORE_DIR", &store_a);
+    });
+    let store_b = store.clone();
+    let supervisor_b =
+        Supervisor::spawn_parallel(&socket_b, "run_profile_lock_b", move |command| {
+            command.env("GREPPY_STORE_DIR", &store_b);
+        });
+    wait_for_socket(&socket_a, Duration::from_secs(30));
+    wait_for_socket(&socket_b, Duration::from_secs(30));
+    let create = |socket: &std::path::Path, run: &str| {
+        unix_request(
+            socket,
+            &Request::new(
+                run,
+                "web.session.create",
+                json!({"profile":"project","persistent_profile":&nonce}),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("cross-supervisor profile create")
+    };
+    let first = create(&socket_a, "run_profile_lock_a");
+    assert_eq!(first.status, "ok", "{first:?}");
+    let blocked = create(&socket_b, "run_profile_lock_b");
+    assert_eq!(blocked.status, "error", "{blocked:?}");
+    assert_eq!(
+        blocked.error.as_ref().map(|error| error.code.as_str()),
+        Some("profile_in_use"),
+        "{blocked:?}"
+    );
+    let first_id = first.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = unix_request(
+        &socket_a,
+        &Request::new(
+            "run_profile_lock_a",
+            "web.goto",
+            json!({"session_id":&first_id,"url":format!("{fixture}/echo")}),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("open persistent page before close");
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    let written = unix_request(
+        &socket_a,
+        &Request::new(
+            "run_profile_lock_a",
+            "web.evaluate",
+            json!({"session_id":&first_id,"source":"localStorage.setItem('flush', 'x'.repeat(1000000))"}),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("write persistent state before close");
+    assert_eq!(written.status, "ok", "{written:?}");
+    let closed = unix_request(
+        &socket_a,
+        &Request::new(
+            "run_profile_lock_a",
+            "web.session.close",
+            json!({"session_id":first_id}),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("close and flush profile owner");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    let acquired = create(&socket_b, "run_profile_lock_b");
+    assert_eq!(acquired.status, "ok", "{acquired:?}");
+    drop(supervisor_a);
+    drop(supervisor_b);
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&socket_a);
+    let _ = std::fs::remove_file(&socket_b);
 }
 
 #[test]
@@ -6450,6 +10898,88 @@ fn relative_esm_inside_script_root_is_granted() {
 }
 
 #[test]
+fn controller_recovery_stages_sibling_import_in_replacement_sandbox() {
+    let run_id = "run_controller_import_recovery";
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-controller-import-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let supervisor = Supervisor::spawn(&socket, run_id, |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            run_id,
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let controller = child_pids(supervisor.child.id())
+        .into_iter()
+        .find(|pid| worker_comm(*pid).contains("--internal-role controller"))
+        .expect("owned controller worker");
+    assert!(Command::new("kill")
+        .args(["-KILL", &controller.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    // kill(2) returns before the victim necessarily exits. Wait for actual
+    // termination so this tests recovery of a dead controller, not death
+    // racing an already starting request.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = Command::new("ps")
+            .args(["-p", &controller.to_string(), "-o", "stat="])
+            .output()
+            .expect("owned controller status");
+        let state = String::from_utf8_lossy(&status.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "killed controller did not exit: {state}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let (path, _) = fixture_source("relative-mod.mjs");
+    let recovered = unix_request(
+        &socket,
+        &Request::new(
+            run_id,
+            "web.run",
+            json!({ "session_id": session_id, "script_file": path }),
+        ),
+        Duration::from_secs(60),
+    )
+    .expect("run after controller crash");
+    assert_eq!(
+        recovered.status, "ok",
+        "sibling import must run in the replacement controller: {recovered:?}"
+    );
+    let closed = unix_request(
+        &socket,
+        &Request::new(
+            run_id,
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("close");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    drop(supervisor);
+    assert_no_leftover_web_runtime_processes(run_id);
+}
+
+#[test]
 fn cjs_require_playwright_is_granted_and_fs_is_denied() {
     run_named_fixture("cjs-playwright.cjs", "run_cjspw");
 }
@@ -6542,21 +11072,49 @@ fn idle_supervisor_workers_are_not_cpu_hot() {
     let supervisor = Supervisor::spawn(&socket, "run_idlecpu", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     thread::sleep(Duration::from_millis(1500));
-    let parent = supervisor.child.id();
-    let workers = child_pids(parent);
+    let workers = child_pids(supervisor.child.id());
     assert!(workers.len() >= 2, "workers {workers:?}");
-    for pid in workers {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "%cpu="])
-            .output()
-            .expect("ps cpu");
-        let cpu: f64 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(100.0);
+    let cpu_seconds = |pid: u32| -> f64 {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .expect("read live worker CPU counters");
+            let (_, fields) = stat.rsplit_once(") ").expect("worker proc stat fields");
+            let fields: Vec<_> = fields.split_whitespace().collect();
+            let user: u64 = fields[11].parse().expect("worker user CPU ticks");
+            let system: u64 = fields[12].parse().expect("worker system CPU ticks");
+            let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            assert!(ticks > 0, "scheduler CPU clock is unavailable");
+            (user as f64 + system as f64) / ticks as f64
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let output = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "time="])
+                .output()
+                .expect("read live worker CPU time");
+            assert!(output.status.success(), "worker CPU time query failed");
+            let value = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !value.trim().is_empty(),
+                "worker exited during CPU sampling"
+            );
+            value.trim().split(':').fold(0.0, |total, field| {
+                total * 60.0 + field.parse::<f64>().expect("worker CPU time field")
+            })
+        }
+    };
+    let before: Vec<_> = workers.iter().map(|&pid| (pid, cpu_seconds(pid))).collect();
+    let started = std::time::Instant::now();
+    thread::sleep(Duration::from_secs(3));
+    let elapsed = started.elapsed().as_secs_f64();
+    for (pid, before) in before {
+        let after = cpu_seconds(pid);
+        assert!(after >= before, "worker {pid} CPU counters moved backwards");
+        let cpu = (after - before) / elapsed * 100.0;
         assert!(
             cpu < 25.0,
-            "worker {pid} cpu {cpu} after idle; expected a quiet event loop"
+            "worker {pid} CPU {cpu:.2}% over {elapsed:.2}s idle; expected a quiet event loop"
         );
     }
 }
@@ -7176,8 +11734,7 @@ fn viewport_reports_playwright_default_and_set_size_applies() {
 #[test]
 fn rdfa_prefix_and_json_script_do_not_abort_the_document() {
     let origin = serve_fixture(include_str!("../fixtures/rdfa-json-script.html"));
-    let socket =
-        std::env::temp_dir().join(format!("greppy-web-rdfa-{}.sock", std::process::id()));
+    let socket = std::env::temp_dir().join(format!("greppy-web-rdfa-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_rdfa", |command| {
         command.arg("--fixture-url").arg(&origin);
@@ -7300,18 +11857,12 @@ impl Drop for TlsHeaderOrigin {
     }
 }
 
-fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+fn spawn_tls_origin(script_name: &str) -> TlsHeaderOrigin {
     let dir = tempfile_tls_dir::TempDir::new();
     let cert = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
     let generated = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-        ])
+        .args(["req", "-x509", "-newkey", "rsa:2048", "-keyout"])
         .arg(&key)
         .arg("-out")
         .arg(&cert)
@@ -7332,7 +11883,9 @@ fn spawn_tls_header_origin() -> TlsHeaderOrigin {
         String::from_utf8_lossy(&generated.stderr)
     );
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extra-headers-origin.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(script_name);
     assert!(
         script.is_file(),
         "missing TLS origin fixture {}",
@@ -7381,7 +11934,9 @@ fn spawn_tls_header_origin() -> TlsHeaderOrigin {
     }
 }
 
-
+fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+    spawn_tls_origin("extra-headers-origin.py")
+}
 
 #[test]
 fn extra_http_headers_are_sent_on_goto() {
@@ -7515,7 +12070,11 @@ fn route_continue_sends_extra_headers_on_http_and_https() {
                 let _ = stream.shutdown(Shutdown::Write);
                 continue;
             }
-            let marker = if tagged { "HEADER_OK" } else { "HEADER_MISSING" };
+            let marker = if tagged {
+                "HEADER_OK"
+            } else {
+                "HEADER_MISSING"
+            };
             let body = format!(
                 "<!DOCTYPE html><html><body>{marker}<script src=\"/sub.js\"></script></body></html>"
             );
@@ -7598,6 +12157,14 @@ fn console_messages_are_captured_from_page_evaluate() {
 #[test]
 fn hydrated_spa_wait_for_function_sees_async_dom_update() {
     run_named_fixture("spa-hydrate.mjs", "run_spa");
+}
+
+#[test]
+fn public_wait_for_function_completion_read_uses_original_deadline() {
+    run_named_fixture(
+        "wait-for-function-completion-budget.mjs",
+        "run_wff_completion",
+    );
 }
 
 #[test]
@@ -8036,36 +12603,32 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_ctlcpu", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
-    let created = unix_request(
+    let source = r#"
+let total = 0;
+const until = Date.now() + 100;
+while (Date.now() < until) {
+  for (let i = 0; i < 10_000; i++) total += Math.sqrt(i);
+}
+console.log(total);
+    "#;
+    let ran = run_playwright_source_with_limits(
         &socket,
-        &Request::new(
-            "run_ctlcpu",
-            "web.session.create",
-            json!({ "profile": "project", "limits": { "controller_cpu_ms": 1 } }),
-        ),
-        Duration::from_secs(10),
-    )
-    .expect("create");
-    let session_id = created.result.as_ref().unwrap()["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let origin = serve_fixture("<p>ctlcpu</p>");
-    let read = unix_request(
-        &socket,
-        &Request::new(
-            "run_ctlcpu",
-            "web.read",
-            json!({ "session_id": session_id, "url": origin }),
-        ),
+        "run_ctlcpu",
+        source,
+        None,
         Duration::from_secs(15),
-    )
-    .expect("read");
-    assert_eq!(read.status, "error", "{read:?}");
-    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+        json!({ "controller_cpu_ms": 1 }),
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(
+        ran.error.as_ref().unwrap().code,
+        "resource_limit",
+        "{ran:?}"
+    );
+    assert!(ran.metrics.controller_cpu_ms > 0, "{ran:?}");
     assert!(
-        read.error.as_ref().unwrap().message.contains("cpu time"),
-        "{read:?}"
+        ran.error.as_ref().unwrap().message.contains("cpu time"),
+        "{ran:?}"
     );
 }
 
@@ -8073,7 +12636,8 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
 fn supervisor_starts_from_stamped_dist_without_worker_flags() {
     let pid = std::process::id();
     let dist = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-run-{pid}")));
-    let installed = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-runinst-{pid}")));
+    let installed =
+        TempDirGuard::at(std::env::temp_dir().join(format!("greppy-web-dist-runinst-{pid}")));
     let _ = std::fs::remove_dir_all(&dist);
     let _ = std::fs::remove_dir_all(&installed);
     let (code, stdout, stderr) = run_script(&package_script(), Some(&dist));

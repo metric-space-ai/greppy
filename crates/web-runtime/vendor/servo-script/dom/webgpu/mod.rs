@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+pub(crate) mod gpu;
+pub(crate) mod gpuadapter;
+pub(crate) mod gpuadapterinfo {
+    pub(crate) type GPUAdapterInfo =
+        script_webgpu::gpuadapterinfo::GPUAdapterInfo<crate::DomTypeHolder>;
+}
+pub(crate) mod gpubindgroup;
+pub(crate) mod gpubindgrouplayout;
+pub(crate) mod gpubuffer;
+pub(crate) mod gpubufferusage {
+    pub(crate) type GPUBufferUsage =
+        script_webgpu::gpubufferusage::GPUBufferUsage<crate::DomTypeHolder>;
+}
+pub(crate) mod gpucanvascontext;
+pub(crate) mod gpucolorwrite;
+pub(crate) mod gpucommandbuffer {
+    pub(crate) type GPUCommandBuffer =
+        script_webgpu::gpucommandbuffer::GPUCommandBuffer<crate::DomTypeHolder>;
+}
+pub(crate) mod gpucommandencoder;
+pub(crate) mod gpucompilationinfo {
+    pub(crate) type GPUCompilationInfo =
+        script_webgpu::gpucompilationinfo::GPUCompilationInfo<crate::DomTypeHolder>;
+}
+pub(crate) mod gpucompilationmessage {
+    pub(crate) type GPUCompilationMessage =
+        script_webgpu::gpucompilationmessage::GPUCompilationMessage<crate::DomTypeHolder>;
+}
+pub(crate) mod gpucomputepassencoder;
+pub(crate) mod gpucomputepipeline;
+pub(crate) mod gpuconvert;
+pub(crate) mod gpudevice;
+pub(crate) mod gpudevicelostinfo {
+    pub(crate) type GPUDeviceLostInfo =
+        script_webgpu::gpudevicelostinfo::GPUDeviceLostInfo<crate::DomTypeHolder>;
+}
+pub(crate) mod gpuerror;
+pub(crate) mod gpuexternaltexture;
+pub(crate) mod gpuinternalerror;
+pub(crate) mod gpumapmode {
+    pub(crate) type GPUMapMode = script_webgpu::gpumapmode::GPUMapMode<crate::DomTypeHolder>;
+}
+pub(crate) mod gpuoutofmemoryerror;
+pub(crate) mod gpupipelineerror;
+#[expect(dead_code)]
+pub(crate) mod gpupipelinelayout;
+pub(crate) mod gpuqueryset;
+pub(crate) mod gpuqueue;
+pub(crate) mod gpurenderbundle {
+    pub(crate) type GPURenderBundle =
+        script_webgpu::gpurenderbundle::GPURenderBundle<crate::DomTypeHolder>;
+}
+pub(crate) mod gpurenderbundleencoder;
+pub(crate) mod gpurenderpassencoder;
+pub(crate) mod gpurenderpipeline;
+pub(crate) mod gpusampler;
+pub(crate) mod gpushadermodule;
+pub(crate) mod gpushaderstage {
+    pub(crate) type GPUShaderStage =
+        script_webgpu::gpushaderstage::GPUShaderStage<crate::DomTypeHolder>;
+}
+pub(crate) mod gpusupportedfeatures;
+pub(crate) mod gpusupportedlimits;
+pub(crate) mod gputexture;
+pub(crate) mod gputextureusage {
+    pub(crate) type GPUTextureUsage =
+        script_webgpu::gputextureusage::GPUTextureUsage<crate::DomTypeHolder>;
+}
+pub(crate) mod gputextureview;
+pub(crate) mod gpuuncapturederrorevent;
+pub(crate) mod gpuvalidationerror;
+pub(crate) mod identityhub {
+    pub(crate) type IdentityHub = script_webgpu::identityhub::IdentityHub;
+}
+pub(crate) mod wgsllanguagefeatures;

@@ -36,6 +36,7 @@ pub enum SessionsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    #[command(visible_alias = "new")]
     Create {
         /// Network profile: research: public web; project: public web plus loopback
         /// for explicitly requested local development. LAN and cloud metadata remain blocked.
@@ -72,6 +73,28 @@ pub enum RuntimeCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+pub(super) fn requests_json(command: &SessionsCommand) -> bool {
+    match command {
+        SessionsCommand::Status { json } | SessionsCommand::Doctor { json } => *json,
+        SessionsCommand::Session { command } => match command {
+            SessionCommand::Create { json, .. }
+            | SessionCommand::List { json }
+            | SessionCommand::Close { json, .. } => *json,
+        },
+        SessionsCommand::Runtime { command } => match command {
+            RuntimeCommand::Status { json }
+            | RuntimeCommand::Stop { json }
+            | RuntimeCommand::Restart { json } => *json,
+        },
+        SessionsCommand::Tab { command } => match command {
+            TabCommand::New { json, .. }
+            | TabCommand::List { json, .. }
+            | TabCommand::Switch { json, .. }
+            | TabCommand::Close { json, .. } => *json,
+        },
+    }
 }
 
 pub(super) fn dispatch(command: SessionsCommand, root: Option<&str>) -> Result<i32> {

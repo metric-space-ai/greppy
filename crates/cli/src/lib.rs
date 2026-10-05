@@ -25,19 +25,25 @@ compile_error!("ci-test-assets is forbidden outside debug/test builds");
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A binary without a GPU backend is not buildable, the same way a binary
-/// without the embedded models is not buildable. Nothing fails at runtime when
-/// the backend is missing — the work just takes twenty times longer, measured
-/// on this repo at 7.5 s against 0.3 s for one navigation summary — so the
-/// mistake is invisible unless the compiler refuses it. Building on a platform
-/// that has no backend, or measuring against the CPU path, is
-/// `--features cpu-only`.
+#[cfg(all(feature = "cpu-only", not(greppy_debug_profile)))]
+compile_error!(
+    "the Greppy CLI cannot be built outside Cargo's debug profile with `cpu-only`; supported product targets \
+     are macOS with Metal and Linux x86_64 with CUDA/nvcc. `cpu-only` is restricted to \
+     debug and numerical-reference use"
+);
+
+#[cfg(test)]
+mod build_policy;
+
+/// Product binaries require compiled GPU implementations for both inference
+/// workloads. The CUDA constants include the build-script signal emitted only
+/// after nvcc creates the shared backend, so a requested feature is not enough.
 #[cfg(not(feature = "cpu-only"))]
 const _: () = assert!(
-    greppy_embed_native::HAS_GPU_BACKEND,
-    "no GPU backend for this target. Metal is enabled for macOS and CUDA for \
-     Linux/Windows in crates/cli/Cargo.toml; if this target genuinely has \
-     neither, build with --features cpu-only."
+    greppy_embed_native::HAS_GPU_BACKEND && greppy_qwen35_native::HAS_GPU_BACKEND,
+    "Greppy requires compiled GPU backends for both embeddings and summaries. \
+     Supported product targets are macOS with Metal and Linux x86_64 with CUDA/nvcc; \
+     `cpu-only` is restricted to debug and numerical-reference use"
 );
 
 // Route this module's stdout through one optional collector. Query commands
@@ -68,7 +74,10 @@ mod nav;
 use nav::*;
 mod inference;
 use inference::*;
+mod context_status;
 mod freshness;
+mod index_admission;
+mod query_progress;
 use freshness::*;
 mod emit;
 use emit::*;
@@ -94,6 +103,7 @@ mod context;
 mod workspace_setup;
 use context::*;
 mod agent;
+mod agent_acp;
 mod agent_clients;
 #[cfg(unix)]
 #[path = "agent_control.rs"]
@@ -177,7 +187,9 @@ const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
+const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
+const AUTOMATIC_INDEX_MAX_WORKERS: usize = 2;
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
 /// Bound the source sent to the summary daemon. Cache keys continue to use the
@@ -274,6 +286,8 @@ thread_local! {
     static CLI_JSON_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OUTPUT_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
+    static NAV_TEXT_WINDOW: std::cell::RefCell<Option<NavTextWindow>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn set_cli_inference_override(device: Option<String>, no_gpu: bool) {
@@ -311,6 +325,10 @@ fn cli_result_limit(default: usize) -> usize {
 }
 
 fn cli_result_limit_unless_all(default: usize, all: bool) -> usize {
+    // --all lifts the implicit display cap, never an explicit user budget.
+    if let Some(limit) = CLI_RESULT_LIMIT.with(std::cell::Cell::get) {
+        return limit.saturating_add(cli_result_offset());
+    }
     if all {
         usize::MAX
     } else {
@@ -385,7 +403,11 @@ pub enum CacheCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove one worktree's verified store, or every verified cache object.
+    /// Remove the selected worktree store and repository-wide shared agent Bases.
+    ///
+    /// --root also selects shared agent Bases used by linked worktrees of the
+    /// same repository. --all selects every verified cache object. Locked
+    /// stores are retained and reported; --yes is required.
     Clear {
         #[arg(long)]
         all: bool,
@@ -683,6 +705,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
     }
+    // An explicit ripgrep token owns every following option. In particular,
+    // `--json` is a valid ripgrep output flag as well as a Greppy navigation
+    // flag; diagnosing it here prevented `greppy rg --json ...` from ever
+    // reaching the byte-exact passthrough dispatcher.
+    if matches!(verb, "rg" | "ripgrep") {
+        return None;
+    }
     if let Some(flag) = rest
         .iter()
         .skip(1)
@@ -718,6 +747,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
         .filter(|command| levenshtein(verb, command) <= 2)
         .min_by_key(|command| levenshtein(verb, command))
     {
+        // A piped grep pattern can resemble a command too (e.g. `research`).
+        // Use the existing non-consuming producer grace, not a zero-time
+        // readiness check that would race a delayed pipeline producer.
+        if greppy_only_flag(&rest[1..]).is_none() && passthrough::stdin_supplies_grep_pattern(rest)
+        {
+            return None;
+        }
         return Some(format!(
             "status: invalid_invocation\ncommand: `{verb}`\nmessage: unknown greppy command; nothing was passed to grep\nnext: did you mean `greppy {command} ...`?"
         ));
@@ -753,6 +789,84 @@ pub fn startup_trace(phase: &str) {
         "startup-trace +{:.3}ms {phase}",
         t0.elapsed().as_secs_f64() * 1000.0
     );
+}
+
+/// Private contract used by the immutable Base builder to bind its staging
+/// index process to the builder's lifetime.
+pub const ENV_BASE_BUILD_OWNER_STDIN: &str = "GREPPY_INTERNAL_BASE_BUILD_OWNER_STDIN";
+
+fn watch_base_build_owner(mut owner: impl std::io::Read, owner_lost: impl FnOnce()) {
+    let mut byte = [0_u8; 1];
+    loop {
+        match owner.read(&mut byte) {
+            Ok(0) => {
+                owner_lost();
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                owner_lost();
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Installs the lifetime guard for a nested immutable Base staging index.
+///
+/// The parent holds the write side of stdin until the nested index exits. If
+/// the parent disappears, EOF stops this process before it can keep indexing a
+/// staging database that no surviving process can publish. The marker is
+/// removed before CLI dispatch so model daemons spawned by this process do not
+/// inherit the internal ownership contract.
+pub fn install_base_build_owner_watchdog() {
+    let marker = std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN);
+    if marker.is_none() {
+        return;
+    }
+    std::env::remove_var(ENV_BASE_BUILD_OWNER_STDIN);
+    if let Err(error) = std::thread::Builder::new()
+        .name("greppy-base-build-owner".into())
+        .spawn(|| {
+            watch_base_build_owner(std::io::stdin(), || std::process::exit(73));
+        })
+    {
+        eprintln!("greppy: cannot install immutable Base owner guard: {error}");
+        std::process::exit(73);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn base_build_owner_watchdog_descendant_probe() -> Option<u8> {
+    std::env::var_os("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE")
+        .map(|_| u8::from(std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN).is_some()))
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn run_base_build_owner_watchdog_test_harness() -> Option<u8> {
+    let hold_ms = std::env::var("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let descendant = std::process::Command::new(std::env::current_exe().ok()?)
+        .env("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE", "1")
+        .env_remove("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .env_remove("GREPPY_TEST_BASE_OWNER_READY")
+        .status()
+        .ok()?;
+    if !descendant.success() {
+        return Some(74);
+    }
+    if let Some(ready) = std::env::var_os("GREPPY_TEST_BASE_OWNER_READY") {
+        if std::fs::write(ready, format!("{}\n", std::process::id())).is_err() {
+            return Some(74);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    Some(0)
 }
 
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
@@ -816,7 +930,12 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
     }
-    if agent::is_agent_tui_invocation(&argv) && !is_agent_admin_invocation(&argv) {
+    let agent_help_in_agent_run =
+        std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() && agent_help_invocation(&argv);
+    if agent::is_agent_tui_invocation(&argv)
+        && !is_agent_admin_invocation(&argv)
+        && !agent_help_in_agent_run
+    {
         return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
@@ -831,7 +950,27 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         // remaining arguments are forwarded verbatim.
         let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
         full.push(std::ffi::OsString::from("greppy"));
-        full.extend_from_slice(grep_passthrough_args(&argv));
+        let rest = grep_passthrough_args(&argv);
+        // Command discovery skips leading globals, but the child still needs
+        // their root. Preserve it byte-for-byte until dispatch consumes it;
+        // other leading globals retain their existing passthrough behavior.
+        let mut prefix = argv[1..argv.len() - rest.len()].iter();
+        while let Some(arg) = prefix.next() {
+            if arg == "--root" {
+                full.push(arg.clone());
+                if let Some(value) = prefix.next() {
+                    full.push(value.clone());
+                }
+            } else if arg.as_encoded_bytes().starts_with(b"--root=") {
+                full.push(arg.clone());
+            } else if matches!(
+                arg.to_str(),
+                Some("--device" | "--limit" | "--max" | "--max-bytes" | "--offset")
+            ) {
+                prefix.next();
+            }
+        }
+        full.extend_from_slice(rest);
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
             Err(Error::Invalid(msg)) => {
@@ -883,6 +1022,23 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 );
                 println!("usage: greppy expand ID [--json] [--root DIR]");
                 return 64;
+            }
+            // read-file can open multiple files and return large payloads.
+            // Dropping an unknown option can turn its value into another path
+            // and read the preceding file without the requested bound.
+            if sub == "read-file" {
+                if let Some(unknown) = unknown_flag_name(first) {
+                    println!("invalid read-file option `{unknown}`; no files were read");
+                    if matches!(unknown.as_str(), "--head" | "--tail") {
+                        println!(
+                            "`--head` and `--tail` select symbol source with `greppy read SYMBOL`. For file lines, use `greppy read-file PATH --lines A:B`."
+                        );
+                    }
+                    println!(
+                        "usage: greppy read-file PATH [PATH …] [--lines A:B] [--all] [--json]"
+                    );
+                    return 64;
+                }
             }
             if let Some((reduced, stray)) = argv_without_stray_positional(
                 &argv,
@@ -977,6 +1133,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                          No observation was run. Use `greppy web observe QUERY` for matching visible \
                          regions, or omit QUERY for the unfiltered page."
                     );
+                } else if sub == "web"
+                    && grep_passthrough_args(&argv)
+                        .get(1)
+                        .and_then(|arg| arg.to_str())
+                        == Some("wait")
+                    && !stray.starts_with('-')
+                {
+                    println!(
+                        "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
+                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                         `greppy web wait 'text~/WORD/i'` for partial text, or \
+                         `greppy web wait --url '~/PATTERN/'` for a URL."
+                    );
                 } else if sub == "path" && stray == "--code" {
                     println!(
                         "`path` prints the bounded call-site chain and does not accept `--code`; \
@@ -1045,7 +1214,9 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         match greppy_core::cache::retain_base_build_staging_leases_from_env() {
             Ok(leases) => leases,
             Err(error) => {
-                eprintln!("greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command");
+                eprintln!(
+                    "greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command"
+                );
                 return 73;
             }
         };
@@ -1056,6 +1227,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     // store permissions; trial and web doctor remain facts-only.
     let skip_gc = is_trial_invocation(&argv)
         || is_web_doctor_invocation(&argv)
+        || command_skips_automatic_cache_maintenance(cli.command.as_ref())
         || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
     startup_trace(if skip_gc {
         "run_os.gc_skipped"
@@ -1184,7 +1356,9 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy read SYMBOL|FILE [--head M] [--tail N] [--handle] [--code] [--path PATH] [--root DIR]"
         }
         "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
-        "replace-text" => "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]",
+        "replace-text" => {
+            "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]"
+        }
         "replace-lines" => "greppy replace-lines F A:B [NEW] [--dry-run] [--verify]",
         "replace-span" => "greppy replace-span H [NEW] [--dry-run] [--verify]",
         "write" => "greppy write PATH [NEW] [--dry-run] [--verify]",
@@ -1246,6 +1420,83 @@ pub fn maybe_run_store_cleanup(root: Option<&str>) {
     }
 }
 
+fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool {
+    match command {
+        // These commands do not need a graph. In particular, a missing file
+        // must be diagnosed before unrelated cache maintenance can do writes.
+        Some(
+            Command::ReadFile { .. }
+            | Command::Cache { .. }
+            | Command::ReplaceText { .. }
+            | Command::ReplaceLines { .. }
+            | Command::ReplaceSpan { .. }
+            | Command::Write { .. }
+            | Command::DeleteLines { .. }
+            | Command::InsertLines { .. }
+            | Command::Patch { .. }
+            | Command::Undo { .. },
+        ) => true,
+        Some(Command::Index { path, .. }) if path.as_deref() == Some("status") => true,
+        #[cfg(feature = "bash-smart")]
+        Some(Command::BashSmart { .. }) => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn literal_edits_skip_unrelated_startup_maintenance() {
+    for args in [
+        vec!["greppy", "replace-lines", "note.md", "1:1", "new"],
+        vec!["greppy", "replace-text", "note.md", "old", "new"],
+        vec!["greppy", "insert-lines", "note.md", "1", "new"],
+        vec!["greppy", "delete-lines", "note.md", "1:1"],
+        vec!["greppy", "write", "note.md", "new"],
+        vec!["greppy", "patch"],
+        vec!["greppy", "undo"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(command_skips_automatic_cache_maintenance(
+            cli.command.as_ref()
+        ));
+    }
+    let cli = Cli::try_parse_from(["greppy", "replace", "some_symbol", "new"]).unwrap();
+    assert!(!command_skips_automatic_cache_maintenance(
+        cli.command.as_ref()
+    ));
+}
+
+fn prune_expired_evidence_packs_in_existing_store(path: &std::path::Path, now: u64) -> usize {
+    // Best-effort housekeeping must never create or migrate a graph, or wait
+    // behind a SQLite writer. The lifecycle and writer leases are held by the
+    // caller; only expired output records are eligible for this connection.
+    let Ok(connection) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    else {
+        return 0;
+    };
+    if connection.busy_timeout(std::time::Duration::ZERO).is_err()
+        || connection
+            .pragma_update(None, "foreign_keys", true)
+            .is_err()
+    {
+        return 0;
+    }
+    let expired = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM expand_packs WHERE expires_at <= ?1 LIMIT 1)",
+        [now as i64],
+        |row| row.get::<_, bool>(0),
+    );
+    if !matches!(expired, Ok(true)) {
+        return 0;
+    }
+    connection
+        .execute(
+            "DELETE FROM expand_packs WHERE expires_at <= ?1",
+            [now as i64],
+        )
+        .unwrap_or(0)
+}
+
 fn prune_expired_evidence_packs() {
     let Ok(status) = greppy_core::cache::cache_status() else {
         return;
@@ -1265,16 +1516,11 @@ fn prune_expired_evidence_packs() {
         ) else {
             continue;
         };
-        let path = workspace_locator::store_path(&root);
+        let path = entry.path.join("graph.db");
         let Ok(_writer) = greppy_freshness::try_acquire(&path) else {
             continue;
         };
-        let Ok(store) =
-            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())
-        else {
-            continue;
-        };
-        let _ = store.prune_expired_expand_packs();
+        let _ = prune_expired_evidence_packs_in_existing_store(&path, unix_now_secs_cli());
     }
 }
 
@@ -1648,6 +1894,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
 /// code. Use `dispatch_to_code` to run the dispatcher and translate the
 /// result into a `u8` exit code for `ExitCode::from`.
 pub fn dispatch(cli: Cli) -> Result<i32> {
+    let _query_progress = query_progress::for_command(cli.command.as_ref(), cli.root.as_deref());
     // If a recognised subcommand matched, dispatch it. Otherwise treat
     // the trailing args as a `grep` passthrough. This makes both
     //   greppy grep -R foo .
@@ -1662,7 +1909,9 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     if cli.limit == Some(0) {
         return Err(Error::Invalid("--limit/--max must be at least 1".into()));
     }
-    if cli.max_bytes == Some(0) {
+    if let Some(Command::Web { command }) = cli.command.as_ref() {
+        web::validate_output_budget(command, cli.max_bytes)?;
+    } else if cli.max_bytes == Some(0) {
         return Err(Error::Invalid("--max-bytes must be at least 1".into()));
     }
     set_cli_result_window(cli.limit, cli.offset);
@@ -1720,6 +1969,18 @@ fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
                 || token == "interrupt"
                 || token == "quit"
         })
+}
+
+fn agent_help_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let rest = grep_passthrough_args(argv);
+    let Some(args) = rest
+        .iter()
+        .map(|value| value.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    greppy_agent::greppy_env::agent_help_invocation(&args)
 }
 
 fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
@@ -1866,49 +2127,42 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             Ok(0)
         }
         WorkspaceCommand::Status { json } => {
-            let provider =
-                match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
-                    Ok(provider) => provider,
-                    Err(error) if json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "ready": false,
-                                "error": error.to_string(),
-                                "data_root": data_root
-                            }))
-                            .map_err(|error| Error::Invalid(error.to_string()))?
-                        );
-                        return Ok(EXIT_IO as i32);
-                    }
-                    Err(error) => return Err(Error::Invalid(error.to_string())),
-                };
-            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let workspaces = core
-                .list_workspaces()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let stats = core
-                .chunks()
-                .stats()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let status = match agent_workspace_status(&data_root) {
+                Ok(status) => status,
+                Err(error) if json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ready": false,
+                            "agent_workspace_ready": false,
+                            "provider_ready": false,
+                            "error": error.to_string(),
+                            "data_root": data_root
+                        }))
+                        .map_err(|error| Error::Invalid(error.to_string()))?
+                    );
+                    return Ok(EXIT_IO as i32);
+                }
+                Err(error) => return Err(Error::Invalid(error.to_string())),
+            };
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "provider": provider.manifest(),
-                        "workspaces": workspaces,
-                        "chunks": stats
-                    }))
-                    .map_err(|error| Error::Invalid(error.to_string()))?
+                    serde_json::to_string_pretty(&status)
+                        .map_err(|error| Error::Invalid(error.to_string()))?
                 );
             } else {
                 println!(
-                    "provider {:?} ready; {} workspace(s), {} chunks, {} physical bytes",
-                    provider.manifest().adapter_kind,
-                    workspaces.len(),
-                    stats.chunk_count,
-                    stats.segment_bytes
+                    "agent workspace ready ({} backend; provider {}); {} workspace(s), {} chunks, {} physical bytes",
+                    status.backend,
+                    if status.provider_ready {
+                        "ready"
+                    } else {
+                        "inactive"
+                    },
+                    status.workspaces.len(),
+                    status.chunks.chunk_count,
+                    status.chunks.segment_bytes
                 );
             }
             Ok(0)
@@ -1928,6 +2182,124 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             );
             Ok(0)
         }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AgentWorkspaceStatus {
+    ready: bool,
+    agent_workspace_ready: bool,
+    provider_ready: bool,
+    backend: &'static str,
+    provider: Option<greppy_workspace_core::ProviderManifest>,
+    data_root: std::path::PathBuf,
+    workspaces: Vec<greppy_workspace_core::WorkspaceStatus>,
+    chunks: greppy_workspace_core::ChunkStoreStats,
+}
+
+fn agent_workspace_status(
+    data_root: &std::path::Path,
+) -> std::result::Result<AgentWorkspaceStatus, greppy_workspace_core::Error> {
+    let (provider_ready, backend, provider) =
+        match greppy_workspace_core::ProviderInstallation::optional(data_root)? {
+            greppy_workspace_core::OptionalProvider::Ready(provider) => {
+                if provider
+                    .doctor_io(&format!("status-{}", std::process::id()))
+                    .is_ok()
+                {
+                    (true, "provider", Some(provider.manifest().clone()))
+                } else {
+                    (false, "ordinary", Some(provider.manifest().clone()))
+                }
+            }
+            greppy_workspace_core::OptionalProvider::Inactive => (false, "ordinary", None),
+        };
+    if !provider_ready {
+        greppy_agent::ensure_ordinary_workspace_available(data_root)
+            .map_err(|error| greppy_workspace_core::Error::AdapterUnavailable(error.to_string()))?;
+    }
+    let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))?;
+    let workspaces = core.list_workspaces()?;
+    let stats = core.chunks().stats()?;
+    Ok(AgentWorkspaceStatus {
+        ready: true,
+        agent_workspace_ready: true,
+        provider_ready,
+        backend,
+        provider,
+        data_root: data_root.into(),
+        workspaces,
+        chunks: stats,
+    })
+}
+
+#[cfg(test)]
+mod optional_workspace_status_tests {
+    use super::*;
+    use greppy_workspace_core::{
+        AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
+        PROVIDER_PROTOCOL_VERSION,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn status_reports_ordinary_workspace_ready_without_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let status = agent_workspace_status(temp.path()).unwrap();
+        assert!(status.ready);
+        assert!(status.agent_workspace_ready);
+        assert!(!status.provider_ready);
+        assert_eq!(status.backend, "ordinary");
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json["chunks"].is_object());
+        assert!(json["provider"].is_null());
+        assert!(json["workspaces"].is_array());
+        assert!(json.get("chunk_count").is_none());
+    }
+
+    #[test]
+    fn status_reports_ordinary_workspace_ready_with_unmounted_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let manifest = ProviderManifest {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            adapter_version: "0.4.1-installed".into(),
+            adapter_kind: AdapterKind::FsKit,
+            state: ProviderState::Ready,
+            instance_id: "installed-not-mounted".into(),
+            data_root: data.clone(),
+            mount_root: temp.path().join("inactive-mount"),
+            heartbeat_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            capabilities: ProviderCapabilities {
+                hard_links: true,
+                symbolic_links: true,
+                byte_range_locks: true,
+                memory_maps: true,
+                atomic_rename: true,
+                case_preserving: true,
+            },
+        };
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let status = agent_workspace_status(&data).unwrap();
+        assert!(status.agent_workspace_ready);
+        assert!(!status.provider_ready);
+        assert_eq!(status.backend, "ordinary");
+    }
+
+    #[test]
+    fn status_rejects_malformed_present_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("provider.json"), b"not valid json").unwrap();
+        assert!(agent_workspace_status(temp.path()).is_err());
     }
 }
 
@@ -1979,15 +2351,25 @@ fn dispatch_subcommand(
             path,
             recovery_path,
             json,
+            diagnostics,
             agent_worktree,
         } => {
+            if diagnostics && !json {
+                return Err(Error::Invalid(
+                    "--diagnostics requires `index status --json`".into(),
+                ));
+            }
             if path.as_deref() == Some("status") {
                 if recovery_path.is_some() {
                     return Err(Error::Invalid(
                         "index status takes no repository path; use `--root PATH`".into(),
                     ));
                 }
-                dispatch_index_status(json, root)
+                dispatch_index_status(json, diagnostics, root, EmbeddingCliArgs { device, no_gpu })
+            } else if diagnostics {
+                Err(Error::Invalid(
+                    "--diagnostics requires `index status --json`".into(),
+                ))
             } else if path.as_deref() == Some("recover") {
                 if agent_worktree {
                     return Err(Error::Invalid(
@@ -2118,10 +2500,23 @@ fn dispatch_subcommand(
             lines,
             all,
             handle,
+            json,
             path_opts,
         } => {
             validate_path_filters(root, &path_opts, "--path")?;
-            dispatch_read_files(&paths, lines.as_deref(), all, handle, &path_opts, root)
+            let result = dispatch_read_files(
+                &paths,
+                lines.as_deref(),
+                all,
+                handle,
+                json,
+                &path_opts,
+                root,
+            );
+            if matches!(result, Ok(0)) {
+                context_status::attach_read_notice(root);
+            }
+            result
         }
         Command::Replace {
             symbol,
@@ -2310,7 +2705,9 @@ fn dispatch_subcommand(
         ),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
-        Command::Doctor { json } => dispatch_doctor(json, root),
+        Command::Doctor { json } => {
+            dispatch_doctor(json, root, EmbeddingCliArgs { device, no_gpu })
+        }
         Command::Web { command } => web::dispatch(command, root),
         Command::WhoCalls {
             symbols,
@@ -3158,6 +3555,8 @@ fn nav_counts_json(
         all,
         hits,
         None,
+        &crate::nav::UnresolvedReceiverReport::none(),
+        None,
     )
 }
 
@@ -3174,6 +3573,8 @@ fn nav_counts_json_with_expand(
     all: bool,
     hits: Vec<serde_json::Value>,
     expand: Option<&ExpandHandle>,
+    unresolved_receivers: &crate::nav::UnresolvedReceiverReport,
+    unresolved_factories: Option<&crate::nav::FactoryReceiverPage>,
 ) -> Result<()> {
     let omitted = total_exact.saturating_sub(shown);
     let freshness = nav_freshness_json(store, root, project);
@@ -3181,7 +3582,7 @@ fn nav_counts_json_with_expand(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
     // Rule 3: a one-symbol answer is a batch of one. The caller parses ONE
     // shape — `targets` plus per-hit attribution — however many symbols it
     // named.
@@ -3213,6 +3614,18 @@ fn nav_counts_json_with_expand(
         "all": all,
         "hits": hits,
     });
+    if let Some(unresolved) = unresolved_factories.filter(|page| page.total > 0) {
+        v["unresolved_factory_receivers"] = serde_json::json!(unresolved.rows);
+        v["unresolved_factory_total"] = serde_json::json!(unresolved.total);
+        v["unresolved_factory_omitted"] = serde_json::json!(unresolved.omitted);
+        v["unresolved_factory_truncated"] = serde_json::json!(unresolved.omitted > 0);
+        v["callees_incomplete"] = serde_json::json!(true);
+        v["next"] = serde_json::json!(format!("greppy read {symbol}"));
+        v["targets"][0]["callees_incomplete"] = serde_json::json!(true);
+        v["targets"][0]["unresolved_factory_total"] = serde_json::json!(unresolved.total);
+        v["targets"][0]["unresolved_factory_omitted"] = serde_json::json!(unresolved.omitted);
+        v["targets"][0]["unresolved_factory_truncated"] = serde_json::json!(unresolved.omitted > 0);
+    }
     if !symbol_found {
         let miss = symbol_miss_json(store, project, symbol);
         v["suggestions"] = miss["suggestions"].clone();
@@ -3220,6 +3633,29 @@ fn nav_counts_json_with_expand(
     }
     if let Some(expand) = expand {
         v["expand"] = expand.json_value();
+    }
+    if unresolved_receivers.incomplete() {
+        if !unresolved_receivers.rows.is_empty() {
+            v["unresolved_receivers"] = serde_json::json!(unresolved_receivers.rows);
+        }
+        v["callers_incomplete"] = serde_json::json!(true);
+        v["unresolved_omitted"] = serde_json::json!(unresolved_receivers.omitted);
+        v["unresolved_truncated"] = serde_json::json!(unresolved_receivers.truncated);
+        if let Some(targets) = v.get_mut("targets").and_then(|value| value.as_array_mut()) {
+            for target in targets {
+                if let Some(entry) = target.as_object_mut() {
+                    entry.insert("callers_incomplete".into(), serde_json::json!(true));
+                    entry.insert(
+                        "unresolved_omitted".into(),
+                        serde_json::json!(unresolved_receivers.omitted),
+                    );
+                    entry.insert(
+                        "unresolved_truncated".into(),
+                        serde_json::json!(unresolved_receivers.truncated),
+                    );
+                }
+            }
+        }
     }
     println!(
         "{}",
@@ -3233,11 +3669,33 @@ fn incomplete_provider_json(
     store: &greppy_store::Store,
     project: &str,
 ) -> Result<Vec<serde_json::Value>> {
+    incomplete_provider_json_for_edges(store, project, &[])
+}
+
+/// Provider completeness for a graph answer is scoped to the relations that
+/// answer actually reads. A provider may be broadly partial because it omits
+/// semantic, infrastructure, or history edges while still fully covering a
+/// navigation command's CALLS/USAGE union. File failures remain relevant for
+/// every relation because they can remove otherwise-supported edges.
+fn incomplete_provider_json_for_edges(
+    store: &greppy_store::Store,
+    project: &str,
+    required_edge_classes: &[&str],
+) -> Result<Vec<serde_json::Value>> {
     Ok(store
         .list_provider_states(project)?
         .into_iter()
-        .filter(greppy_store::ProviderState::is_incomplete)
         .filter(|p| !is_noncode_provider(&p.status, &p.language))
+        .filter(|p| {
+            p.files_failed > 0
+                || if required_edge_classes.is_empty() {
+                    p.is_incomplete()
+                } else {
+                    required_edge_classes
+                        .iter()
+                        .any(|class| !p.supports_edge_class(class))
+                }
+        })
         .map(|p| {
             // Agent responses only need to know which language is partial.
             // Per-edge-class and per-file diagnostics belong to doctor and
@@ -3248,6 +3706,55 @@ fn incomplete_provider_json(
             })
         })
         .collect())
+}
+
+const WHO_CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls", "usages"];
+const CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls"];
+
+fn provider_edge_classes_for_command(command: &str) -> &'static [&'static str] {
+    match command {
+        // dispatch_who_calls and the batched equivalent both read the incoming
+        // union of CALLS and USAGE edges.
+        "who-calls" => WHO_CALLS_PROVIDER_EDGE_CLASSES,
+        "callees" => CALLS_PROVIDER_EDGE_CLASSES,
+        _ => &[],
+    }
+}
+
+fn provider_edge_classes_for_graph_edges(edge_types: &[&str]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    for edge_type in edge_types {
+        let class = match *edge_type {
+            "CALLS" => "calls",
+            "USAGE" | "USES" => "usages",
+            "TYPE_REF" => "type_refs",
+            "IMPORTS" => "imports",
+            // Unknown/custom graph relations have no trustworthy provider
+            // capability mapping, so retain broad completeness semantics.
+            _ => return Vec::new(),
+        };
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
+}
+
+fn query_incomplete_provider_json(
+    store: &greppy_store::Store,
+    project: &str,
+    command: &str,
+) -> Result<Vec<serde_json::Value>> {
+    incomplete_provider_json_for_edges(store, project, provider_edge_classes_for_command(command))
+}
+
+fn graph_edge_incomplete_provider_json(
+    store: &greppy_store::Store,
+    project: &str,
+    edge_types: &[&str],
+) -> Result<Vec<serde_json::Value>> {
+    let required = provider_edge_classes_for_graph_edges(edge_types);
+    incomplete_provider_json_for_edges(store, project, &required)
 }
 
 /// A provider row is "non-code noise" when it exists only because the indexer
@@ -3263,17 +3770,6 @@ fn is_noncode_provider(status: &str, language: &str) -> bool {
     status == "unsupported"
         || language.starts_with("file extension .")
         || language == "no file extension"
-}
-
-/// Compact incomplete-provider metadata, excluding non-code snapshot/fixture
-/// providers (see [`is_noncode_provider`]) so the reported
-/// `incomplete_provider_count` / `provider_complete` reflects only real code
-/// callers, not `.stderr` / `.snap` files.
-fn code_incomplete_provider_json(
-    store: &greppy_store::Store,
-    project: &str,
-) -> Result<Vec<serde_json::Value>> {
-    incomplete_provider_json(store, project)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3422,9 +3918,10 @@ fn impact_counts_json_with_expand(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    // Only real code providers count toward impact completeness; `.stderr` /
-    // `.snap` snapshot files are not callers (see `code_incomplete_provider_json`).
-    let incomplete_providers = code_incomplete_provider_json(store, project)?;
+    // Only providers for the relations impact actually reads count toward
+    // completeness; non-code snapshot rows are filtered by the shared helper.
+    let incomplete_providers =
+        graph_edge_incomplete_provider_json(store, project, meta.edge_types)?;
     // Rule 3: the one-symbol answer has the same shape as a batch of several.
     let mut hits = hits;
     for hit in &mut hits {
@@ -3699,7 +4196,8 @@ fn path_counts_json(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers =
+        graph_edge_incomplete_provider_json(store, project, &[meta.edge_type])?;
     let steps: Vec<_> = path
         .map(|p| p.rows.iter().map(graph_row_json).collect())
         .unwrap_or_default();
@@ -3744,6 +4242,23 @@ fn nav_freshness_json(
     store: &greppy_store::Store,
     root: Option<&str>,
     project: &str,
+) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, false)
+}
+
+fn nav_freshness_json_uncached(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, true)
+}
+
+fn nav_freshness_json_with_policy(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    force_uncached: bool,
 ) -> serde_json::Value {
     let overrides = match discover_overrides_from_env() {
         Ok(overrides) => overrides,
@@ -3840,13 +4355,25 @@ fn nav_freshness_json(
             }
         }
     }
-    match greppy_freshness::check_files_report_with_overrides(
-        store,
-        &root_path,
-        project,
-        NAV_FRESHNESS_BUDGET,
-        &overrides,
-    ) {
+    let report = if force_uncached {
+        greppy_freshness::check_files_report_with_ttl(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+            std::time::Duration::ZERO,
+        )
+    } else {
+        greppy_freshness::check_files_report_with_overrides(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+        )
+    };
+    match report {
         Ok(report) => {
             let (fresh, state_name, reasons) = match report.state.outcome {
                 greppy_freshness::FreshnessOutcome::Fresh => (true, "fresh", Vec::<String>::new()),
@@ -3861,7 +4388,7 @@ fn nav_freshness_json(
                     (false, "unknown", reasons)
                 }
             };
-            serde_json::json!({
+            let mut freshness = serde_json::json!({
                 "fresh": fresh,
                 "state": state_name,
                 "reasons": reasons,
@@ -3878,7 +4405,21 @@ fn nav_freshness_json(
                     "include": ENV_DISCOVER_INCLUDE,
                     "exclude": ENV_DISCOVER_EXCLUDE,
                 },
-            })
+            });
+            // An active writer prevents persisting a metadata-only fingerprint
+            // update, not reading content-equivalent graph rows. The completed
+            // inventory proof above must establish zero changed files and no
+            // root, scope, indexer-version or unknown-state drift. Keep the
+            // pending metadata visible rather than pretending it was persisted.
+            if metadata_only_fingerprint_drift(&freshness) && workspace_writer_active(root) {
+                freshness["metadata_drift_reasons"] = freshness["reasons"].clone();
+                freshness["metadata_refresh_pending"] = serde_json::json!(true);
+                freshness["source"] = serde_json::json!("verified_published_snapshot");
+                freshness["fresh"] = serde_json::json!(true);
+                freshness["state"] = serde_json::json!("fresh");
+                freshness["reasons"] = serde_json::json!([]);
+            }
+            freshness
         }
         Err(e) => serde_json::json!({
             "fresh": false,
@@ -4000,7 +4541,70 @@ fn metadata_only_fingerprint_drift(freshness: &serde_json::Value) -> bool {
         })
 }
 
-fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json::Value {
+fn index_status_command_for_root(root: &std::path::Path) -> String {
+    let command = format!(
+        "greppy --root {} index status --json",
+        shell_quote_cli(&root.to_string_lossy())
+    );
+    match std::env::var("GREPPY_STORE_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        Some(store) => format!("GREPPY_STORE_DIR={} {command}", shell_quote_cli(&store)),
+        None => command,
+    }
+}
+
+fn preparation_refusal_diagnostics(
+    mut freshness: serde_json::Value,
+    root: Option<&str>,
+) -> serde_json::Value {
+    if freshness_json_is_fresh(&freshness) {
+        return freshness;
+    }
+    let Ok(effective_root) = resolve_root(root) else {
+        return freshness;
+    };
+    let failure = if freshness.get("state").and_then(serde_json::Value::as_str) == Some("failed") {
+        read_background_job(&background_job_path(&effective_root))
+            .filter(|job| job.get("state").and_then(serde_json::Value::as_str) == Some("failed"))
+            .and_then(|job| {
+                job.get("last_error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        None
+    };
+    if let Some(object) = freshness.as_object_mut() {
+        object.insert("root_path".into(), serde_json::json!(effective_root));
+        object.insert(
+            "diagnostics_command".into(),
+            serde_json::json!(index_status_command_for_root(&effective_root)),
+        );
+        if let Some(error) = failure {
+            let deferred = error.starts_with(
+                "Automatic indexing deferred by shared host admission; no index work started.",
+            );
+            object.insert(
+                "preparation_failure_kind".into(),
+                serde_json::json!(if deferred {
+                    "admission_deferred"
+                } else {
+                    "preparation_failed"
+                }),
+            );
+            object.insert("preparation_error".into(), serde_json::json!(error));
+        }
+    }
+    freshness
+}
+
+fn refresh_state_for_query(
+    root: Option<&str>,
+    mut freshness: serde_json::Value,
+    started: bool,
+) -> serde_json::Value {
     if let Some(object) = freshness.as_object_mut() {
         object.insert(
             "state".into(),
@@ -4008,27 +4612,247 @@ fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json:
         );
         object.insert("fresh".into(), serde_json::json!(false));
     }
-    freshness
+    preparation_refusal_diagnostics(freshness, root)
 }
 
 /// Whether the vector query path may self-heal a stale index via the
 /// atomic auto-reindex: only when the embedding model is resolvable, because
 /// an existing vector generation must be rebuilt as part of the snapshot.
 fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
-    match embedding_config_optional(args) {
-        Ok(Some(cfg)) => embedding_model_source_exists(&cfg.source),
-        Ok(None) | Err(_) => false,
-    }
+    // Product assets are embedded. Admission and the index child own their
+    // extraction; probing a cold query must not write models on this thread.
+    !test_inference_skipped()
+        && embedding_config_for_daemon_probe(args)
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 /// Atomically published status for the one allowed background index job.
 const BACKGROUND_JOB_FILE: &str = "index.job";
+const ENV_BACKGROUND_DEMAND_LOCK: &str = "GREPPY_BACKGROUND_DEMAND_LOCK";
+static DELEGATED_BASE_OWNER: std::sync::Mutex<Option<std::process::ChildStdin>> =
+    std::sync::Mutex::new(None);
+static DELEGATED_BASE_STARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BACKGROUND_DEMAND_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn begin_delegated_base_owner() {
+    DELEGATED_BASE_STARTING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn register_delegated_base_owner(owner: std::process::ChildStdin) {
+    *DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(owner);
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn clear_delegated_base_owner() {
+    DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn delegated_base_owner_starting() -> bool {
+    DELEGATED_BASE_STARTING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn cancel_delegated_base_owner(demand_cancelled: bool) -> bool {
+    let owner = DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if owner.is_none() {
+        return false;
+    }
+    // Publish the terminal reason before dropping the pipe writer. EOF wakes
+    // the delegated child and can make the indexing thread reach `fail()`
+    // immediately; recording cancellation afterwards races with that path and
+    // mislabels a demand-driven stop as a background-index failure.
+    if demand_cancelled {
+        BACKGROUND_DEMAND_CANCELLED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    drop(owner);
+    true
+}
+
+/// Initialization must consume this returned path, rather than caching a locator
+/// lookup that can change before the workspace ownership manifest is published.
+fn ensured_workspace_store_path(root: &std::path::Path) -> Result<std::path::PathBuf> {
+    greppy_core::cache::ensure_workspace_store(root)
+        .map(|directory| directory.join("graph.db"))
+        .map_err(|error| {
+            Error::io(
+                format!("create workspace store for {}", root.display()),
+                error,
+            )
+        })
+}
 
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
     workspace_locator::store_path(root)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(BACKGROUND_JOB_FILE)
+}
+
+fn background_job_demand_name(root: &std::path::Path) -> String {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    format!("workspace-{hash}.query-demand")
+}
+
+fn acquire_background_job_demand(
+    root: &std::path::Path,
+) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    greppy_core::cache::acquire_named_lock(
+        &background_job_demand_name(root),
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+}
+
+fn start_background_demand_monitor(
+    job_path: &std::path::Path,
+    terminal: std::sync::Arc<std::sync::Mutex<bool>>,
+    expected_pid: u32,
+    expected_generation: u64,
+) {
+    let Some(lock_name) = std::env::var_os(ENV_BACKGROUND_DEMAND_LOCK) else {
+        return;
+    };
+    let lock_name = lock_name.to_string_lossy().into_owned();
+    let job_path = job_path.to_owned();
+    let monitor_path = job_path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("greppy-query-demand".into())
+        .spawn(move || loop {
+            match greppy_core::cache::acquire_named_lock(
+                &lock_name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            ) {
+                Ok(Some(_exclusive)) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    if cancel_delegated_base_owner(true) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("cancelled");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(
+                                "automatic index stopped after its last query waiter exited"
+                            );
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(
+                        &job_path,
+                        "cancelled",
+                        "automatic index stopped after its last query waiter exited",
+                        130,
+                    );
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    let message = format!("automatic index demand monitor failed: {error}");
+                    if cancel_delegated_base_owner(false) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("failed");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(message.clone());
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(&job_path, "failed", &message, 70);
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        let owned = read_background_job(&monitor_path).is_some_and(|job| {
+            background_demand_may_cancel(Some(&job), false, expected_pid, expected_generation)
+        });
+        if owned {
+            finish_background_demand_monitor(
+                &monitor_path,
+                "failed",
+                &format!("automatic index demand monitor could not start: {error}"),
+                70,
+            );
+        }
+        std::process::exit(70);
+    }
+}
+
+fn background_demand_may_cancel(
+    job: Option<&serde_json::Value>,
+    terminal: bool,
+    expected_pid: u32,
+    expected_generation: u64,
+) -> bool {
+    !terminal
+        && job.is_some_and(|job| {
+            job.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(expected_pid))
+                && job
+                    .get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(expected_generation)
+        })
+}
+
+fn finish_background_demand_monitor(
+    job_path: &std::path::Path,
+    state: &str,
+    detail: &str,
+    exit_code: i32,
+) -> ! {
+    if let Some(mut job) = read_background_job(job_path) {
+        job["state"] = serde_json::json!(state);
+        job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+        job["last_error"] = serde_json::json!(detail);
+        let _ = write_background_job(job_path, &job);
+    }
+    std::process::exit(exit_code);
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -4067,7 +4891,40 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+fn background_job_writer_active(root: &std::path::Path) -> bool {
+    matches!(
+        greppy_freshness::try_acquire(&workspace_locator::store_path(root)),
+        Err(greppy_freshness::LockError::Held { .. })
+    )
+}
+
+fn background_job_spawn_active(root: &std::path::Path) -> bool {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    matches!(
+        greppy_core::cache::acquire_named_lock(
+            &format!("workspace-{hash}.job-spawn"),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        ),
+        Ok(None)
+    )
+}
+
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    write_background_job_record(path, value, false)
+}
+
+// Only a launcher holding the spawn lease or an explicit index holding the
+// workspace writer lease may replace another job's identity.
+fn start_background_job_record(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    write_background_job_record(path, value, true)
+}
+
+fn write_background_job_record(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+    new_owner: bool,
+) -> Result<()> {
     use std::io::Write;
 
     let parent = path
@@ -4075,6 +4932,46 @@ fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Re
         .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| Error::io(format!("create {}", parent.display()), error))?;
+    // The index thread, its cancellation monitor and a delegated Base child
+    // can publish concurrently. Atomic rename alone permits late progress to
+    // overwrite the terminal cancellation record. Serialize the read/replace
+    // across processes and retain cancellation for this exact job identity.
+    let _publication = greppy_core::cache::acquire_named_lock_in(
+        parent,
+        "background-job-publication",
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .map_err(|error| Error::io("lock background job publication", error))?
+    .ok_or_else(|| Error::Invalid("background job publication lock unavailable".into()))?;
+    if !new_owner {
+        // Completed owners remove their journal. Late progress must not
+        // recreate it; only an authorized new launcher establishes records.
+        let Some(current) = read_background_job(path) else {
+            return Ok(());
+        };
+        let same_epoch = ["target_generation", "started_at_unix_secs"]
+            .iter()
+            .all(|key| {
+                current
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+                    && current.get(key) == value.get(key)
+            });
+        // Only the launcher may install the PID into a pid=null record;
+        // otherwise an old writer can hijack an immediate same-second retry.
+        let same_owner = current.get("pid") == value.get("pid");
+        if !same_epoch
+            || !same_owner
+            || matches!(
+                current.get("state").and_then(serde_json::Value::as_str),
+                Some("cancelled" | "failed")
+            )
+        {
+            return Ok(());
+        }
+    }
     let temp = parent.join(format!(
         ".background.job.{}.{}.tmp",
         std::process::id(),
@@ -4149,8 +5046,10 @@ struct BackgroundJobGuard {
     owner_pid: u32,
     cause: String,
     kind: String,
+    path_prefixes: Vec<String>,
     started_at_unix_secs: u64,
     target_generation: u64,
+    worker_count: Option<usize>,
     backend: Option<String>,
     device: Option<String>,
     completed_documents: usize,
@@ -4159,11 +5058,15 @@ struct BackgroundJobGuard {
     global_cache_hits: usize,
     global_cache_misses: usize,
     eta_seconds: Option<u64>,
+    eta_basis: Option<&'static str>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
+    index_phase_started: Option<std::time::Instant>,
+    index_phase_completed_base: usize,
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
+    demand_terminal: std::sync::Arc<std::sync::Mutex<bool>>,
     complete: bool,
 }
 
@@ -4175,6 +5078,7 @@ impl BackgroundJobGuard {
         let detached = direct_path.is_some();
         let delegated = direct_path.is_none() && delegated_path.is_some();
         let path = direct_path.or(delegated_path);
+        let demand_terminal = std::sync::Arc::new(std::sync::Mutex::new(false));
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
@@ -4199,22 +5103,64 @@ impl BackgroundJobGuard {
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or_else(std::process::id);
+        let inherited = published.as_ref();
+        let target_generation = inherited
+            .and_then(|job| {
+                job.get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| {
+                std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(0);
+        if detached {
+            if let Some(path) = &path {
+                start_background_demand_monitor(
+                    path,
+                    demand_terminal.clone(),
+                    // Admission wrappers publish their own PID as the job owner.
+                    // Fence cancellation against that same identity, not this child.
+                    owner_pid,
+                    target_generation,
+                );
+            }
+        }
         Self {
             path,
             detached,
             delegated,
             owner_pid,
-            cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
-                .unwrap_or_else(|_| "background-refresh".into()),
-            kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
-            started_at_unix_secs: std::env::var("GREPPY_BACKGROUND_STARTED_AT")
-                .ok()
-                .and_then(|value| value.parse().ok())
+            cause: inherited
+                .and_then(|job| job.get("cause").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| std::env::var("GREPPY_BACKGROUND_CAUSE").ok())
+                .unwrap_or_else(|| "background-refresh".into()),
+            kind: inherited
+                .and_then(|job| job.get("kind").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| std::env::var("GREPPY_BACKGROUND_KIND").ok())
+                .unwrap_or_else(|| "index".into()),
+            path_prefixes: inherited
+                .and_then(|job| job.get("path_prefixes"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default(),
+            started_at_unix_secs: inherited
+                .and_then(|job| {
+                    job.get("started_at_unix_secs")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .or_else(|| {
+                    std::env::var("GREPPY_BACKGROUND_STARTED_AT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
                 .unwrap_or_else(unix_now_secs_cli),
-            target_generation: std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            target_generation,
+            worker_count: inherited
+                .and_then(|job| job.get("worker_count").and_then(serde_json::Value::as_u64))
+                .and_then(|workers| usize::try_from(workers).ok()),
             backend: published
                 .as_ref()
                 .and_then(|job| job.get("backend"))
@@ -4239,11 +5185,15 @@ impl BackgroundJobGuard {
                 .as_ref()
                 .and_then(|job| job.get("eta_seconds"))
                 .and_then(serde_json::Value::as_u64),
+            eta_basis: None,
             rate_milli_documents_per_second: None,
             embedding_started: None,
+            index_phase_started: None,
+            index_phase_completed_base: 0,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
+            demand_terminal,
             complete: false,
         }
     }
@@ -4281,16 +5231,29 @@ impl BackgroundJobGuard {
         self.global_cache_misses = 0;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
+        self.index_phase_started = None;
         self.progress_phase = Some("embedding");
         self.rate_milli_documents_per_second = None;
         self.current_detail = None;
         self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
+        self.eta_basis = match self.eta_seconds {
+            Some(0) => Some("completed_embedding_work"),
+            Some(_) => Some("backend_prior"),
+            None => None,
+        };
         self.write_state("embedding", None);
         self.last_progress_write = Some(now);
     }
 
     fn indexing_progress(&mut self, progress: greppy_indexer::IndexBuildProgress) {
-        let phase_changed = self.progress_phase != Some(progress.phase);
+        let now = std::time::Instant::now();
+        let phase_changed = self.progress_phase != Some(progress.phase)
+            || progress.completed_files < self.completed_documents
+            || progress.total_files != self.total_documents;
+        if phase_changed {
+            self.index_phase_started = Some(now);
+            self.index_phase_completed_base = progress.completed_files;
+        }
         self.progress_phase = Some(progress.phase);
         self.completed_documents = progress.completed_files;
         self.total_documents = progress.total_files;
@@ -4300,10 +5263,29 @@ impl BackgroundJobGuard {
         self.backend = None;
         self.device = None;
         self.eta_seconds = None;
+        self.eta_basis = None;
         self.rate_milli_documents_per_second = None;
         self.embedding_started = None;
+        self.current_detail = Some(format!(
+            "{}; measured remaining time applies to this phase, not the whole index",
+            progress.phase.replace('_', " ")
+        ));
+        if let Some(started) = self.index_phase_started {
+            let elapsed_ms = u64::try_from(now.duration_since(started).as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let measured = self
+                .completed_documents
+                .saturating_sub(self.index_phase_completed_base);
+            let workload = self
+                .total_documents
+                .saturating_sub(self.index_phase_completed_base);
+            self.eta_seconds = observed_embedding_eta_seconds(measured, workload, elapsed_ms);
+            self.eta_basis = self.eta_seconds.map(|_| "observed_graph_phase");
+            self.rate_milli_documents_per_second =
+                observed_embedding_rate_milli(measured, elapsed_ms);
+        }
 
-        let now = std::time::Instant::now();
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
         let publish = phase_changed
             || finished
@@ -4326,8 +5308,11 @@ impl BackgroundJobGuard {
         self.backend = None;
         self.device = None;
         self.eta_seconds = None;
+        self.eta_basis = None;
         self.rate_milli_documents_per_second = None;
         self.embedding_started = None;
+        self.index_phase_started = None;
+        self.current_detail = Some(phase.replace('_', " "));
         self.write_state(phase, None);
         self.last_progress_write = Some(std::time::Instant::now());
     }
@@ -4343,14 +5328,28 @@ impl BackgroundJobGuard {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis())
                 .unwrap_or(u64::MAX)
                 .max(1);
-            self.eta_seconds = observed_embedding_eta_seconds(
+            // Cache copies are not measurements of GPU inference throughput.
+            // Treat unvisited documents as uncached until their reuse is proven.
+            let (inferred, inference_workload) = embedding_inference_workload(
                 self.completed_documents,
                 self.total_documents,
-                elapsed_ms,
-            )
-            .or(self.eta_seconds);
+                self.local_store_reuse,
+                self.global_cache_hits,
+            );
+            let observed = observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms);
+            self.eta_seconds = observed.or_else(|| {
+                self.backend
+                    .as_deref()
+                    .and_then(|backend| initial_embedding_eta_seconds(inference_workload, backend))
+            });
+            self.eta_basis = match (self.eta_seconds, observed) {
+                (Some(0), _) => Some("completed_embedding_work"),
+                (Some(_), Some(_)) => Some("observed_inference"),
+                (Some(_), None) => Some("backend_prior"),
+                (None, _) => None,
+            };
             self.rate_milli_documents_per_second =
-                observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+                observed_embedding_rate_milli(inferred, elapsed_ms);
         }
         let now = std::time::Instant::now();
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
@@ -4380,9 +5379,13 @@ impl BackgroundJobGuard {
         };
         let progress_unit = match self.progress_phase {
             Some("embedding") => Some("spans"),
-            Some("classifying_files" | "extracting_files" | "writing_graph" | "building_files") => {
-                Some("files")
-            }
+            Some(
+                "classifying_files"
+                | "extracting_files"
+                | "writing_graph"
+                | "building_files"
+                | "removing_previous_graph",
+            ) => Some("files"),
             Some("building_folders") => Some("folders"),
             Some("resolving_edges" | "writing_resolved_edges" | "writing_structure_edges") => {
                 Some("edges")
@@ -4393,11 +5396,13 @@ impl BackgroundJobGuard {
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
+            "path_prefixes": self.path_prefixes,
             "pid": self.owner_pid,
             "started_at_unix_secs": self.started_at_unix_secs,
             "updated_at_unix_secs": now,
             "cause": self.cause,
             "target_generation": self.target_generation,
+            "worker_count": self.worker_count,
             "state": state,
             "backend": self.backend,
             "device": self.device,
@@ -4410,15 +5415,22 @@ impl BackgroundJobGuard {
             "progress_unit": progress_unit,
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
             "eta_seconds": self.eta_seconds,
+            "eta_basis": self.eta_basis,
+            "eta_scope": self.eta_seconds.map(|_| "phase"),
             "eta_minutes": eta_minutes,
             "eta_unix_secs": eta_unix_secs,
             "current_detail": self.current_detail,
             "last_error": last_error,
         });
-        let _ = write_background_job(path, &value);
+        if state == "starting" && self.is_foreground_owner() {
+            let _ = start_background_job_record(path, &value);
+        } else {
+            let _ = write_background_job(path, &value);
+        }
     }
 
     fn complete(&mut self) {
+        self.publication_finished();
         self.complete = true;
         if self.delegated {
             self.write_state("base_graph_ready", None);
@@ -4434,8 +5446,42 @@ impl BackgroundJobGuard {
         self.path.as_deref()
     }
 
+    fn publication_finished(&self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+    }
+
+    pub(crate) fn publication_boundary<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T>,
+        committed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let mut terminal = self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = publish()?;
+        if committed(&result) {
+            *terminal = true;
+        }
+        Ok(result)
+    }
+
     fn fail(&mut self, error: &Error) {
-        self.write_state("failed", Some(&error.to_string()));
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        if BACKGROUND_DEMAND_CANCELLED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.write_state(
+                "cancelled",
+                Some("automatic index stopped after its last query waiter exited"),
+            );
+        } else {
+            self.write_state("failed", Some(&error.to_string()));
+        }
         self.complete = true;
     }
 
@@ -4444,6 +5490,10 @@ impl BackgroundJobGuard {
     /// state with the degradation reason so the next semantic query
     /// retries the remaining vectors; the published graph stays live.
     fn degraded(&mut self, reason: &str) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.write_state("failed", Some(reason));
         self.complete = true;
     }
@@ -4467,6 +5517,78 @@ mod background_progress_tests {
     use super::background_progress_should_publish;
 
     #[test]
+    fn graph_phase_forecast_is_measured_and_resets_before_new_work() {
+        let mut guard = super::BackgroundJobGuard {
+            path: None,
+            detached: false,
+            delegated: false,
+            owner_pid: 0,
+            cause: "test".into(),
+            kind: "index".into(),
+            path_prefixes: Vec::new(),
+            started_at_unix_secs: 0,
+            target_generation: 0,
+            worker_count: None,
+            backend: None,
+            device: None,
+            completed_documents: 0,
+            total_documents: 0,
+            local_store_reuse: 0,
+            global_cache_hits: 0,
+            global_cache_misses: 0,
+            eta_seconds: None,
+            eta_basis: None,
+            rate_milli_documents_per_second: None,
+            embedding_started: None,
+            index_phase_started: None,
+            index_phase_completed_base: 0,
+            last_progress_write: None,
+            progress_phase: None,
+            current_detail: None,
+            demand_terminal: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            complete: true,
+        };
+        guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+            phase: "writing_graph",
+            completed_files: 0,
+            total_files: 100,
+        });
+        assert_eq!(guard.eta_seconds, None);
+        guard.index_phase_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+            phase: "writing_graph",
+            completed_files: 10,
+            total_files: 100,
+        });
+        assert!((90..=91).contains(&guard.eta_seconds.unwrap()));
+        assert_eq!(guard.eta_basis, Some("observed_graph_phase"));
+        assert!(guard.rate_milli_documents_per_second.unwrap() > 0);
+        guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+            phase: "extracting_files",
+            completed_files: 0,
+            total_files: 100,
+        });
+        assert_eq!(guard.eta_seconds, None);
+        assert_eq!(guard.rate_milli_documents_per_second, None);
+        for (completed, total) in [(20, 100), (20, 200), (5, 200)] {
+            guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+                phase: "writing_graph",
+                completed_files: completed,
+                total_files: total,
+            });
+            assert_eq!(guard.eta_seconds, None);
+            assert_eq!(guard.rate_milli_documents_per_second, None);
+            assert_eq!(guard.index_phase_completed_base, completed);
+        }
+        guard.finalization_phase("publishing_snapshot");
+        assert_eq!(guard.eta_seconds, None);
+        assert_eq!(guard.index_phase_started, None);
+        assert_eq!(guard.current_detail.as_deref(), Some("publishing snapshot"));
+        guard.complete = true;
+    }
+
+    #[test]
     fn phase_change_bypasses_progress_throttle() {
         let now = std::time::Instant::now();
         assert!(background_progress_should_publish(
@@ -4484,8 +5606,94 @@ mod background_progress_tests {
     }
 }
 
+#[cfg(test)]
+mod background_job_status_tests {
+    use super::{read_background_job, start_background_job_record, write_background_job};
+    use serde_json::json;
+
+    #[test]
+    fn cancelled_job_cannot_be_resurrected_by_late_progress_or_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let cancelled = json!({
+            "pid": 42,
+            "target_generation": 2,
+            "started_at_unix_secs": 123,
+            "state": "cancelled",
+            "last_error": "automatic index stopped after its last query waiter exited"
+        });
+        start_background_job_record(&path, &cancelled).unwrap();
+        let mut late = cancelled.clone();
+        for phase in [
+            "preparing_base_checkout",
+            "base_graph_ready",
+            "embedding",
+            "failed",
+        ] {
+            late["state"] = json!(phase);
+            late["last_error"] = json!(null);
+            write_background_job(&path, &late).unwrap();
+            assert_eq!(read_background_job(&path).unwrap(), cancelled);
+        }
+    }
+
+    #[test]
+    fn cancelled_job_allows_a_fresh_launch_and_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let mut job = json!({
+            "pid": 42, "target_generation": 2,
+            "started_at_unix_secs": 123, "state": "cancelled"
+        });
+        start_background_job_record(&path, &job).unwrap();
+        let mut stale = job.clone();
+        stale["state"] = json!("base_graph_ready");
+        job["pid"] = json!(null);
+        job["state"] = json!("launching");
+        start_background_job_record(&path, &job).unwrap();
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        job["pid"] = json!(43);
+        job["state"] = json!("starting");
+        start_background_job_record(&path, &job).unwrap();
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        stale["target_generation"] = json!(0);
+        stale["started_at_unix_secs"] = json!(124);
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        job["state"] = json!("embedding");
+        write_background_job(&path, &job).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+    }
+
+    #[test]
+    fn failed_or_removed_job_cannot_be_revived_by_a_late_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let failed = json!({
+            "pid": 42, "target_generation": 2,
+            "started_at_unix_secs": 123, "state": "failed",
+            "last_error": "demand monitor failed"
+        });
+        start_background_job_record(&path, &failed).unwrap();
+        let mut late = failed.clone();
+        late["state"] = json!("preparing_base_checkout");
+        late["last_error"] = json!(null);
+        write_background_job(&path, &late).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), failed);
+        std::fs::remove_file(&path).unwrap();
+        write_background_job(&path, &late).unwrap();
+        assert!(!path.exists());
+    }
+}
+
 impl Drop for BackgroundJobGuard {
     fn drop(&mut self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         if self.complete {
             return;
         }
@@ -4496,18 +5704,35 @@ impl Drop for BackgroundJobGuard {
     }
 }
 
-fn initial_embedding_rate(backend: &str) -> u64 {
+fn initial_embedding_rate(backend: &str) -> Option<u64> {
     match backend {
-        "cuda" => 12,
-        "metal" => 8,
-        _ => 1,
+        "cuda" => Some(12),
+        "metal" => Some(8),
+        "cpu" => Some(1),
+        _ => None,
     }
 }
 
 fn initial_embedding_eta_seconds(total_documents: usize, backend: &str) -> Option<u64> {
     let total = u64::try_from(total_documents).ok()?;
-    let rate = initial_embedding_rate(backend).max(1);
+    if total == 0 {
+        return Some(0);
+    }
+    let rate = initial_embedding_rate(backend)?;
     Some(total.saturating_add(rate - 1) / rate)
+}
+
+fn embedding_inference_workload(
+    completed_documents: usize,
+    total_documents: usize,
+    local_store_reuse: usize,
+    global_cache_hits: usize,
+) -> (usize, usize) {
+    let inferred = completed_documents
+        .saturating_sub(local_store_reuse)
+        .saturating_sub(global_cache_hits);
+    let remaining = total_documents.saturating_sub(completed_documents);
+    (inferred, inferred.saturating_add(remaining))
 }
 
 fn observed_embedding_eta_seconds(
@@ -4562,16 +5787,27 @@ pub(crate) enum BackgroundJobLaunch {
     Owned {
         child: std::process::Child,
         path: std::path::PathBuf,
+        demand: Option<greppy_core::cache::FileLock>,
     },
     Attached {
         path: std::path::PathBuf,
+        root: std::path::PathBuf,
+        // Retaining this lease, rather than reading it, keeps shared work alive.
+        _demand: Option<greppy_core::cache::FileLock>,
     },
 }
 
 impl BackgroundJobLaunch {
     pub(crate) fn path(&self) -> &std::path::Path {
         match self {
-            Self::Owned { path, .. } | Self::Attached { path } => path,
+            Self::Owned { path, .. } | Self::Attached { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn owner_is_active(&mut self) -> std::io::Result<bool> {
+        match self {
+            Self::Owned { child, .. } => child.try_wait().map(|status| status.is_none()),
+            Self::Attached { root, .. } => Ok(background_job_writer_active(root)),
         }
     }
 }
@@ -4581,6 +5817,16 @@ fn spawn_background_job_handle(
     cause: &str,
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle_scoped(root, cause, kind, embedding_cfg, &[])
+}
+
+fn spawn_background_job_handle_scoped(
+    root: Option<&str>,
+    cause: &str,
+    kind: &str,
+    embedding_cfg: Option<&EmbeddingModelConfig>,
+    prefixes: &[String],
 ) -> Option<BackgroundJobLaunch> {
     // Integration tests use short-lived stores and explicitly opt out of
     // inference. A detached child can outlive the fixture guard, recreate the
@@ -4593,49 +5839,56 @@ fn spawn_background_job_handle(
     let Ok(root) = resolve_root(root) else {
         return None;
     };
-    if greppy_core::cache::ensure_workspace_store(&root).is_err() {
+    let store_path = ensured_workspace_store_path(&root).ok()?;
+    let demand_name = background_job_demand_name(&root);
+    let Ok(Some(demand)) = acquire_background_job_demand(&root) else {
         return None;
+    };
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_DEMAND_READY") {
+        let _ = std::fs::write(path, b"ready\n");
     }
     let hash = greppy_core::workspace::workspace_hash(&root);
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
         &format!("workspace-{hash}.job-spawn"),
         greppy_core::cache::LockMode::Exclusive,
+        // `false` is the blocking mode: concurrent first queries serialize
+        // here, then the follower observes and attaches to the active writer.
         false,
     ) else {
         return None;
     };
     let job_path = background_job_path(&root);
-    if let Some(job) = read_background_job(&job_path) {
-        if job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(process_is_alive)
-        {
-            return Some(BackgroundJobLaunch::Attached { path: job_path });
-        }
+    if background_job_writer_active(&root) {
+        return Some(BackgroundJobLaunch::Attached {
+            path: job_path,
+            root,
+            _demand: Some(demand),
+        });
     }
-    let target_generation = greppy_store::Store::open_with(
-        &workspace_locator::store_path(&root),
-        greppy_store::OpenOptions::read_only(),
-    )
-    .ok()
-    .and_then(|store| {
-        store
-            .get_workspace_state(root.to_string_lossy().as_ref())
+    let target_generation =
+        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())
             .ok()
-            .flatten()
-            .map(|state| state.graph_generation)
-    })
-    .unwrap_or(0)
-    .saturating_add(1);
+            .and_then(|store| {
+                store
+                    .get_workspace_state(root.to_string_lossy().as_ref())
+                    .ok()
+                    .flatten()
+                    .map(|state| state.graph_generation)
+            })
+            .unwrap_or(0)
+            .saturating_add(1);
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
     let started_at = unix_now_secs_cli();
     let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
         let (backend, device) = embedding_backend_plan(cfg);
-        let total = current_embedding_candidate_count(&root);
+        let total = if prefixes.is_empty() {
+            current_embedding_candidate_count(&root)
+        } else {
+            0
+        };
         let eta = initial_embedding_eta_seconds(total, &backend);
         (Some(backend), device, total, eta)
     } else {
@@ -4643,17 +5896,21 @@ fn spawn_background_job_handle(
     };
     let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
     let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    let inherited_workers = std::env::var_os("GREPPY_WORKERS");
+    let worker_count = Some(automatic_index_worker_count(inherited_workers.as_deref()));
     // Publish a launch record before spawning. Otherwise a concurrent status
     // call can observe the child-owned writer lock while background_job is
     // still null and provide no useful progress or recovery information.
     let mut value = serde_json::json!({
         "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
         "kind": kind,
+        "path_prefixes": prefixes,
         "pid": serde_json::Value::Null,
         "started_at_unix_secs": started_at,
         "updated_at_unix_secs": started_at,
         "cause": cause,
         "target_generation": target_generation,
+        "worker_count": worker_count,
         "state": "launching",
         "backend": backend,
         "device": device,
@@ -4666,10 +5923,20 @@ fn spawn_background_job_handle(
         "eta_unix_secs": eta_unix_secs,
         "last_error": serde_json::Value::Null,
     });
-    if write_background_job(&job_path, &value).is_err() {
+    if start_background_job_record(&job_path, &value).is_err() {
         return None;
     }
-    let mut command = std::process::Command::new(exe);
+    let (mut command, admission_stderr) = match index_admission::command(&exe, &job_path) {
+        Ok(command) => command,
+        Err(error) => {
+            value["state"] = serde_json::json!("failed");
+            value["last_error"] = serde_json::json!(format!(
+                "automatic {kind} admission could not start; no index work started: {error}"
+            ));
+            let _ = write_background_job(&job_path, &value);
+            return None;
+        }
+    };
     command
         .arg("index")
         .arg(&root)
@@ -4678,14 +5945,37 @@ fn spawn_background_job_handle(
         .env("GREPPY_BACKGROUND_JOB", &job_path)
         .env("GREPPY_BACKGROUND_CAUSE", cause)
         .env("GREPPY_BACKGROUND_KIND", kind)
+        .env(
+            "GREPPY_BACKGROUND_EMBED_PATHS",
+            serde_json::to_string(prefixes).ok()?,
+        )
         .env("GREPPY_BACKGROUND_STARTED_AT", started_at.to_string())
         .env(
             "GREPPY_BACKGROUND_TARGET_GENERATION",
             target_generation.to_string(),
         )
+        .env(ENV_BACKGROUND_DEMAND_LOCK, &demand_name)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    if admission_stderr.is_none() {
+        command.stderr(std::process::Stdio::null());
+    }
+    let configured_workers =
+        configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
+    debug_assert_eq!(Some(configured_workers), worker_count);
+    if matches!(
+        cause,
+        "first-use" | "structural-workspace-drift" | "rust-graph-repair"
+    ) && kind == "index"
+    {
+        command.env(ENV_STRUCTURAL_FIRST_USE, "1");
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GREPPY_TEST_BACKGROUND_SPAWN_FAIL").is_some() {
+        command = std::process::Command::new(
+            root.join("__greppy_deliberately_missing_background_indexer__"),
+        );
+    }
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
@@ -4722,15 +6012,87 @@ fn spawn_background_job_handle(
     } else {
         "refreshing"
     });
-    if write_background_job(&job_path, &value).is_err() {
+    if start_background_job_record(&job_path, &value).is_err() {
         let _ = child.kill();
         let _ = child.wait();
         return None;
     }
+    // The spawn lock remains held until the child either owns the portable
+    // workspace writer lock or has exited. A later launcher can therefore use
+    // that OS lock as the ownership identity without a PID/start-time race.
+    // There is intentionally no elapsed-time takeover: process exit and lock
+    // acquisition are the only state transitions.
+    loop {
+        if background_job_writer_active(&root) {
+            break;
+        }
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let recorded_failure = read_background_job(&job_path).is_some_and(|job| {
+                        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+                    });
+                    if !recorded_failure {
+                        value["state"] = serde_json::json!("failed");
+                        // Only the admitted runner's known EX_TEMPFAIL means
+                        // capacity denial. An index child's own failure record
+                        // or an ungated child must never be relabeled.
+                        value["preparation_failure_kind"] = serde_json::json!(if admission_stderr
+                            .is_some()
+                            && status.code() == Some(75)
+                        {
+                            "admission_deferred"
+                        } else {
+                            "preparation_failed"
+                        });
+                        value["last_error"] = serde_json::json!(
+                            index_admission::failure_detail(admission_stderr.as_deref(), status)
+                                .unwrap_or_else(|| format!(
+                                    "background {kind} exited before acquiring the workspace writer lock: {status}"
+                                ))
+                        );
+                        let _ = write_background_job(&job_path, &value);
+                    }
+                    // A rejected launch is completed, not a live publication.
+                    return None;
+                }
+                break;
+            }
+            Err(error) => {
+                value["state"] = serde_json::json!("failed");
+                value["last_error"] =
+                    serde_json::json!(format!("observe background {kind} startup: {error}"));
+                let _ = write_background_job(&job_path, &value);
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
     Some(BackgroundJobLaunch::Owned {
         child,
         path: job_path,
+        demand: Some(demand),
     })
+}
+
+fn automatic_index_worker_count(inherited: Option<&std::ffi::OsStr>) -> usize {
+    inherited
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| (1..=256).contains(workers))
+        .unwrap_or(AUTOMATIC_INDEX_MAX_WORKERS)
+        .min(AUTOMATIC_INDEX_MAX_WORKERS)
+}
+
+fn configure_automatic_index_workers(
+    command: &mut std::process::Command,
+    inherited: Option<&std::ffi::OsStr>,
+) -> usize {
+    let workers = automatic_index_worker_count(inherited);
+    command.env("GREPPY_WORKERS", workers.to_string());
+    workers
 }
 
 fn spawn_background_job(
@@ -4742,11 +6104,15 @@ fn spawn_background_job(
     let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
         return false;
     };
-    if let BackgroundJobLaunch::Owned { mut child, .. } = launch {
+    if let BackgroundJobLaunch::Owned {
+        mut child, demand, ..
+    } = launch
+    {
         // Detached refreshes still need a reaper in this long-lived process.
         let _ = std::thread::Builder::new()
             .name("greppy-index-reaper".into())
             .spawn(move || {
+                let _demand = demand;
                 let _ = child.wait();
             });
     }
@@ -4781,13 +6147,6 @@ fn format_embedding_eta(seconds: u64) -> String {
     } else {
         format!("{minutes}m {remainder}s")
     }
-}
-
-#[derive(Clone, Copy)]
-struct SemanticFallbackContext<'a> {
-    query: &'a str,
-    paths: &'a [String],
-    root: Option<&'a str>,
 }
 
 /// `--code` and `--json` compose: AGENTS.md gives `--code` as "also print each
@@ -4986,6 +6345,13 @@ fn summarize_source_cached(
     source: &str,
     unbounded: bool,
 ) -> Option<Vec<String>> {
+    // Literal source facts outrank cached/model expansions of register acronyms.
+    // Keep the trained summary prompt and complex-function path unchanged.
+    if file_path.ends_with(".rs") {
+        if let Some(fact) = greppy_parser::grounded_hint::rust_conditional_bit_writes(source) {
+            return Some(vec![fact]);
+        }
+    }
     let (cache, fallback_cache, global_cache) = caches;
     let cache_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
     let hash = greppy_store::span_hash(file_path, source);
@@ -5074,7 +6440,9 @@ fn summarize_definition_span(
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
-        let cache = greppy_store::SummaryCache::open(&workspace_locator::store_dir(root_path)).ok();
+        let cache = greppy_core::cache::ensure_workspace_store(root_path)
+            .ok()
+            .and_then(|directory| greppy_store::SummaryCache::open(&directory).ok());
         let base_cache = std::env::var_os(crate::store_cow::ENV_BASE_PATH)
             .map(std::path::PathBuf::from)
             .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
@@ -5431,18 +6799,51 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     if id.is_empty() {
         return Err(Error::Invalid("expand requires an id".into()));
     }
-    let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
     let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
-    let Some(pack) = store.get_expand_pack(&lookup_id)? else {
-        println!("expand: id not found or expired: {id}");
+    // File and command-output continuations live in the workspace-local pack
+    // store and do not depend on graph completeness. Serve them before opening
+    // a linked-worktree overlay, whose immutable Base may have been cleaned up.
+    let pack_store = open_default_store_pack_writer(root)?;
+    let Some(pack) = pack_store.get_expand_pack(&lookup_id)? else {
+        // A missing/expired handle cannot be recovered by rebuilding a graph.
+        // Report the selected pack store before any structural preparation.
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "expand_handle_not_found",
+                    "id": id,
+                    "root_path": resolve_root(root)?,
+                    "store_path": workspace_locator::store_path(&resolve_root(root)?),
+                    "next": {
+                        "action": "use_original_project",
+                        "command": format!("greppy expand {id} --root ORIGINAL_PROJECT"),
+                        "message": "Use the project and store that produced this handle. If it is absent there too, rerun the original command to obtain a new handle; rebuilding a code index cannot recover stored output.",
+                    },
+                })
+            );
+        } else {
+            println!("expand: id not found in this project or expired: {id}");
+            println!(
+                "next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT"
+            );
+            println!(
+                "next: if it is missing in the original project too, rerun the original command to obtain a new handle"
+            );
+        }
         return Ok(1);
     };
     #[cfg(feature = "bash-smart")]
     if pack.command == "bash-smart" {
-        return bash_smart::expand(&store, pack, json);
+        return bash_smart::expand(&pack_store, pack, json);
     }
-    if matches!(pack.command.as_str(), "read-smart" | "read-file") {
+    if pack.command == "read-file" {
+        return dispatch_read_expand(&pack_store, &pack, json, root);
+    }
+    drop(pack_store);
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale(&mut store, root)?;
+    if pack.command == "read-smart" {
         return dispatch_read_expand(&store, &pack, json, root);
     }
     let mut payload_text = pack.payload_text.clone();
@@ -5596,8 +6997,12 @@ fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
     Ok(if diag.is_healthy() { 0 } else { EXIT_IO as i32 })
 }
 
-fn dispatch_doctor(json: bool, root: Option<&str>) -> Result<i32> {
-    dispatch_index_health("doctor", json, root)
+fn dispatch_doctor(
+    json: bool,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    dispatch_index_health("doctor", json, root, embedding_args)
 }
 
 fn combined_inference_gpu_memory() -> u64 {
@@ -6032,6 +7437,21 @@ fn collect_piped_targets(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+// Relative and absent search filters retain grep's bounded no-match contract.
+// A canonical, existing absolute path can prove a wrong graph root before any
+// index or embedding work is started.
+fn validate_search_path_scope(root: Option<&str>, paths: &[String]) -> Result<()> {
+    let existing_absolute = paths
+        .iter()
+        .filter(|raw| {
+            let path = std::path::Path::new(raw.as_str());
+            path.is_absolute() && path.exists()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_path_filters(root, &existing_absolute, "--path")
+}
+
 /// Rule 2: `--path` is the only path filter, so a `--path` that cannot narrow
 /// anything is a mistake, not an empty scope. Answering "nothing found" would
 /// confirm a typo as a fact about the repository.
@@ -6072,7 +7492,7 @@ fn validate_path_filters(root: Option<&str>, paths: &[String], label: &str) -> R
         };
         if !canonical.starts_with(&canonical_root) {
             return Err(Error::Invalid(format!(
-                "{label} `{trimmed}` is outside the repository {}; it cannot narrow anything in it",
+                "{label} `{trimmed}` is outside the repository {}; it cannot narrow anything in it; choose --root for the repository containing the target, or use greppy read-file for a direct file read",
                 root_path.display()
             )));
         }
@@ -6324,11 +7744,48 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         ensure_unambiguous_target(&store, &req.targets[index], ids)?;
     }
     let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
+    let mut factory_cache = crate::nav::FactoryReceiverCache::default();
+    let mut factory_remaining = crate::nav::factory_receiver_limit(req.code, req.all);
+    let unresolved_factories = resolved
+        .iter()
+        .map(|ids| {
+            if req.kind == NavKind::Callees {
+                let page = factory_cache.page(&store, ids, factory_remaining, |path| {
+                    path_filters.matches(path)
+                })?;
+                factory_remaining = factory_remaining.saturating_sub(page.rows.len());
+                Ok(page)
+            } else {
+                Ok(crate::nav::FactoryReceiverPage::default())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut rows: Vec<NavRow> = Vec::new();
     let mut totals = vec![0usize; req.targets.len()];
     let mut tests: Vec<Vec<serde_json::Value>> = vec![Vec::new(); req.targets.len()];
+    let mut unresolved_by_target = Vec::with_capacity(req.targets.len());
     for (index, ids) in resolved.iter().enumerate() {
+        if req.kind == NavKind::WhoCalls {
+            let fetch_limit = unresolved_receiver_fetch_limit(req.code, req.all);
+            let mut unresolved = unresolved_option_receivers(&store, ids, fetch_limit)?;
+            unresolved.retain(|item| path_filters.matches(&item.file));
+            // Keep each filtered candidate set intact until the shared
+            // response window can be applied after resolved callers.
+            unresolved_by_target.push(UnresolvedReceiverPage {
+                total: unresolved.len(),
+                rows: unresolved,
+                omitted: 0,
+                truncated: false,
+            });
+        } else {
+            unresolved_by_target.push(UnresolvedReceiverPage {
+                rows: Vec::new(),
+                total: 0,
+                omitted: 0,
+                truncated: false,
+            });
+        }
         let mut collected = nav_rows_for_target(&store, &project, ids, index, req.kind)?;
         collected.retain(|row| path_filters.matches(&row.node.file_path));
         totals[index] = collected.len();
@@ -6340,14 +7797,31 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         rows.extend(collected);
     }
 
-    // `--offset` is applied by the shared output-budget layer, which skips the
-    // first N result rows of whatever a command emitted. Producers therefore
-    // emit `offset + limit` rows from the top of the stream — the same
-    // convention every other greppy command follows.
+    // JSON retains its prefix for the shared JSON skip. Text selects actual
+    // caller rows here; headings and unresolved diagnostics are not callers.
     let total = rows.len();
     let default_cap = if req.code { CODE_NAV_LIMIT } else { NAV_LIMIT };
-    let end = cli_result_limit_unless_all(default_cap, req.all).min(total);
-    let window = &rows[..end];
+    let offset = cli_result_offset();
+    let limit = cli_result_limit_raw().unwrap_or(if req.all { usize::MAX } else { default_cap });
+    let combined_total = total + unresolved_by_target.iter().map(|p| p.total).sum::<usize>();
+    let mut diagnostic_skip = offset.saturating_sub(total);
+    let mut diagnostic_budget = limit.saturating_sub(total.saturating_sub(offset).min(limit));
+    let mut unresolved_base = total;
+    let mut unresolved_starts = Vec::with_capacity(unresolved_by_target.len());
+    for page in &mut unresolved_by_target {
+        let start = diagnostic_skip.min(page.total);
+        unresolved_starts.push(unresolved_base + start);
+        unresolved_base += page.total;
+        diagnostic_skip = diagnostic_skip.saturating_sub(page.total);
+        let count = diagnostic_budget.min(page.total - start);
+        diagnostic_budget = diagnostic_budget.saturating_sub(count);
+        page.rows = page.rows[start..start + count].to_vec();
+        page.omitted = page.total - count;
+        page.truncated = page.omitted > 0;
+    }
+    let start = if req.json { 0 } else { offset.min(total) };
+    let end = offset.saturating_add(limit).min(total);
+    let window = &rows[start..end];
     let shown = window.len();
     let root_path = resolve_root(req.root)?;
 
@@ -6367,6 +7841,12 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                     "total_exact": totals[index],
                 });
                 entry["tests"] = serde_json::json!(tests[index]);
+                let page = &unresolved_by_target[index];
+                if page.total > 0 || page.omitted > 0 || page.truncated {
+                    entry["callers_incomplete"] = serde_json::json!(true);
+                    entry["unresolved_omitted"] = serde_json::json!(page.omitted);
+                    entry["unresolved_truncated"] = serde_json::json!(page.truncated);
+                }
                 entry
             })
             .collect();
@@ -6375,9 +7855,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             .get("fresh")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let incomplete_providers = incomplete_provider_json(&store, &project)?;
+        let incomplete_providers = query_incomplete_provider_json(&store, &project, req.command)?;
         let omitted = total.saturating_sub(shown);
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "command": req.command,
             "symbol": req.targets.join(" "),
             "targets": targets_json,
@@ -6395,12 +7875,84 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             "all": req.all,
             "hits": hits,
         });
+        let factory_rows = unresolved_factories
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rows)| {
+                rows.rows.iter().cloned().map(move |mut row| {
+                    row["target"] = serde_json::json!(req.targets[index]);
+                    row["next"] = serde_json::json!(format!("greppy read {}", req.targets[index]));
+                    row
+                })
+            })
+            .collect::<Vec<_>>();
+        let factory_total = unresolved_factories
+            .iter()
+            .map(|page| page.total)
+            .sum::<usize>();
+        let factory_omitted = unresolved_factories
+            .iter()
+            .map(|page| page.omitted)
+            .sum::<usize>();
+        if factory_total > 0 {
+            value["unresolved_factory_receivers"] = serde_json::json!(factory_rows);
+            value["unresolved_factory_total"] = serde_json::json!(factory_total);
+            value["unresolved_factory_omitted"] = serde_json::json!(factory_omitted);
+            value["unresolved_factory_truncated"] = serde_json::json!(factory_omitted > 0);
+            value["callees_incomplete"] = serde_json::json!(true);
+            for (index, page) in unresolved_factories
+                .iter()
+                .enumerate()
+                .filter(|(_, page)| page.total > 0)
+            {
+                value["targets"][index]["callees_incomplete"] = serde_json::json!(true);
+                value["targets"][index]["unresolved_factory_total"] = serde_json::json!(page.total);
+                value["targets"][index]["unresolved_factory_omitted"] =
+                    serde_json::json!(page.omitted);
+                value["targets"][index]["unresolved_factory_truncated"] =
+                    serde_json::json!(page.omitted > 0);
+            }
+        }
+        let unresolved_json = unresolved_by_target
+            .iter()
+            .enumerate()
+            .flat_map(|(index, page)| {
+                page.rows
+                    .iter()
+                    .map(move |item| unresolved_receiver_json(item, &req.targets[index]))
+            })
+            .collect::<Vec<_>>();
+        let unresolved_incomplete = unresolved_by_target
+            .iter()
+            .any(|page| page.total > 0 || page.omitted > 0 || page.truncated);
+        if unresolved_incomplete {
+            if !unresolved_json.is_empty() {
+                value["unresolved_receivers"] = serde_json::json!(unresolved_json);
+            }
+            value["callers_incomplete"] = serde_json::json!(true);
+            value["unresolved_omitted"] = serde_json::json!(unresolved_by_target
+                .iter()
+                .map(|page| page.omitted)
+                .sum::<usize>());
+            value["unresolved_truncated"] =
+                serde_json::json!(unresolved_by_target.iter().any(|page| page.truncated));
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&value)
                 .map_err(|e| Error::Invalid(format!("serialize nav JSON: {e}")))?
         );
         return Ok(0);
+    }
+
+    if OUTPUT_CAPTURE.with(|capture| capture.borrow().is_some()) {
+        NAV_TEXT_WINDOW.with(|window| {
+            *window.borrow_mut() = Some(NavTextWindow {
+                offset,
+                total: combined_total,
+                rows: Vec::new(),
+            })
+        });
     }
 
     // The multi answer is the single answer, grouped: one bare line naming
@@ -6411,24 +7963,46 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         std::collections::HashMap::new();
     let empty_word = match req.kind {
         NavKind::WhoCalls => "no callers",
-        NavKind::Callees => "no callees",
+        NavKind::Callees => {
+            "no resolved indexed callees; external, unresolved or filtered calls may still exist"
+        }
     };
     for (index, symbol) in req.targets.iter().enumerate() {
         if index > 0 {
             println!();
         }
         println!("{symbol}");
+        crate::nav::print_unresolved_factory_receivers(&unresolved_factories[index], symbol);
+        let unresolved_page = &unresolved_by_target[index];
+        let unresolved_incomplete =
+            unresolved_page.total > 0 || unresolved_page.omitted > 0 || unresolved_page.truncated;
         if totals[index] == 0 {
-            println!("{empty_word}");
+            if !unresolved_incomplete {
+                println!("{empty_word}");
+                if matches!(req.kind, NavKind::Callees) {
+                    println!("inspect source with: greppy read {symbol}");
+                }
+            } else {
+                println!("no resolved callers");
+                print_multi_unresolved_receivers(unresolved_page, unresolved_starts[index]);
+            }
             continue;
         }
         // A group whose rows all fell behind the cap must not look like an
         // empty answer: count what is missing.
         if !window.iter().any(|row| row.target == index) {
             println!("… {} below the cut", totals[index]);
+            if unresolved_incomplete {
+                print_multi_unresolved_receivers(unresolved_page, unresolved_starts[index]);
+            }
             continue;
         }
-        for row in window.iter().filter(|row| row.target == index) {
+        for (position, row) in window
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.target == index)
+        {
+            let row_start = output_capture_position();
             // Same truth as the single-symbol rows: the shared source-aware
             // test detection, not the cheaper node-only heuristic.
             let lines = sources
@@ -6452,9 +8026,17 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                     println!("handle: {handle}");
                 }
             }
+            record_nav_text_row(start + position, row_start);
+        }
+        if unresolved_incomplete {
+            print_multi_unresolved_receivers(unresolved_page, unresolved_starts[index]);
         }
     }
-    if !req.all && cli_result_offset() == 0 && end < total {
+    if !req.all
+        && cli_result_offset() == 0
+        && end < total
+        && NAV_TEXT_WINDOW.with(|window| window.borrow().is_none())
+    {
         println!(
             "… {} more — {}",
             total - end,
@@ -6850,7 +8432,6 @@ struct SearchCodeMatchLine {
 
 #[derive(Debug)]
 struct SearchCodeDefinitionEntry {
-    node_id: i64,
     qualified_name: String,
     file: String,
     start_line: i64,
@@ -6858,12 +8439,6 @@ struct SearchCodeDefinitionEntry {
     source: String,
     handle: String,
     matches: Vec<SearchCodeMatchLine>,
-}
-
-#[derive(Debug)]
-enum SearchCodeEntry {
-    Definition(SearchCodeDefinitionEntry),
-    Unenclosed(SearchCodeMatchLine),
 }
 
 fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMatchLine> {
@@ -6964,17 +8539,32 @@ fn live_grep_code_hits_pattern(
     root_path: &std::path::Path,
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
+    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default(), None)
+}
+
+fn live_grep_code_hits_pattern_scoped(
+    query: &str,
+    root_path: &std::path::Path,
+    fixed: bool,
+    path_filters: &QueryPathFilters,
+    progress: Option<&query_progress::LocalQueryProgress>,
+) -> Result<Vec<greppy_search::CodeHit>> {
     let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
+    let prefixes = path_filters.repo_prefixes();
+    let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
         root_path,
         &greppy_discover::SkipPolicy::walk_default(),
         &overrides,
+        (!path_filters.is_empty()).then_some(prefixes.as_slice()),
     )?;
     let paths = entries
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect::<Vec<_>>();
-    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed)
+    if let Some(progress) = progress {
+        progress.phase("scanning_files", paths.len(), "files");
+    }
+    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed, progress)
 }
 
 fn source_code_hits_ranked(
@@ -7005,6 +8595,7 @@ fn live_grep_search_code_paths_pattern(
     root_path: &std::path::Path,
     paths: &[String],
     fixed: bool,
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -7016,6 +8607,7 @@ fn live_grep_search_code_paths_pattern(
         ["-HnIE", "--", query]
     };
     let mut hits = Vec::new();
+    let mut completed = 0;
     for chunk in paths.chunks(128) {
         let out = std::process::Command::new("grep")
             .args(grep_args)
@@ -7025,7 +8617,7 @@ fn live_grep_search_code_paths_pattern(
         let out = match out {
             Ok(out) => out,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed => {
-                return internal_literal_search_code_paths(query, root_path, paths);
+                return internal_literal_search_code_paths(query, root_path, paths, progress);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Invalid(
@@ -7045,6 +8637,10 @@ fn live_grep_search_code_paths_pattern(
         }
         let text = String::from_utf8_lossy(&out.stdout);
         hits.extend(text.lines().filter_map(parse_grep_code_hit));
+        completed += chunk.len();
+        if let Some(progress) = progress {
+            progress.completed(completed);
+        }
     }
     Ok(hits)
 }
@@ -7057,12 +8653,16 @@ fn internal_literal_search_code_paths(
     query: &str,
     root_path: &std::path::Path,
     paths: &[String],
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
     let mut hits = Vec::new();
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(progress) = progress {
+            progress.completed(index);
+        }
         let absolute = root_path.join(path);
         let bytes = match std::fs::read(&absolute) {
             Ok(bytes) => bytes,
@@ -7081,6 +8681,9 @@ fn internal_literal_search_code_paths(
                 });
             }
         }
+    }
+    if let Some(progress) = progress {
+        progress.completed(paths.len());
     }
     Ok(hits)
 }
@@ -7259,6 +8862,31 @@ fn absolutize_path(p: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Canonicalize the deepest existing ancestor while retaining a missing
+/// lexical suffix. This keeps deleted-file filters comparable with a
+/// canonical repository root without requiring the filtered path to exist.
+fn canonicalize_with_missing_suffix(p: &std::path::Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return absolute;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
+}
+
 /// Walk up from `start` looking for a repository marker. Returns the
 /// first ancestor (including `start`) that contains a marker, or `start`
 /// itself when none is found. Pure path logic so it is unit-testable
@@ -7333,26 +8961,42 @@ impl QueryPathFilters {
             .map(|filter| filter.shown.as_str())
             .collect::<Vec<_>>())
     }
+
+    fn repo_prefixes(&self) -> Vec<String> {
+        self.filters
+            .iter()
+            .filter_map(|filter| filter.repo_prefix.clone())
+            .collect()
+    }
 }
 
 fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option<String> {
+    // Normalize both sides through their deepest existing ancestor so platform
+    // aliases (for example macOS /var -> /private/var), Windows path
+    // normalization, and deleted-file suffixes remain comparable.
+    let normalized_root = canonicalize_with_missing_suffix(root_path);
     let supplied = std::path::Path::new(raw);
     let candidate = if supplied.is_absolute() {
-        absolutize_path(supplied)
+        supplied.to_path_buf()
     } else {
-        let cwd = std::env::current_dir().ok();
+        // A caller in another checkout must not shadow a relative filter in
+        // the selected repository merely because its own path exists.
+        let cwd = std::env::current_dir()
+            .ok()
+            .filter(|cwd| canonicalize_with_missing_suffix(cwd).starts_with(&normalized_root));
         let cwd_candidate = cwd.as_ref().map(|cwd| cwd.join(supplied));
         if let Some(path) = cwd_candidate.as_ref().filter(|path| path.exists()) {
-            absolutize_path(path)
+            path.to_path_buf()
         } else if root_path.join(supplied).exists() {
-            absolutize_path(&root_path.join(supplied))
-        } else if let Some(cwd) = cwd.filter(|cwd| cwd.starts_with(root_path)) {
+            root_path.join(supplied)
+        } else if let Some(cwd) = cwd {
             cwd.join(supplied)
         } else {
             root_path.join(supplied)
         }
     };
-    let relative = candidate.strip_prefix(root_path).ok()?;
+    let candidate = canonicalize_with_missing_suffix(&candidate);
+    let relative = candidate.strip_prefix(&normalized_root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
@@ -7406,6 +9050,7 @@ fn prepare_query_path_filters(
     paths: &[String],
 ) -> Result<QueryPathFilters> {
     validate_query_root_usage(root, command, subject)?;
+    validate_search_path_scope(root, paths)?;
     Ok(QueryPathFilters::from_args(&resolve_root(root)?, paths))
 }
 
@@ -7792,30 +9437,48 @@ mod release_embedded_model_guards {
 /// makes the unchanged fast path constant-time without accepting stale or torn
 /// payloads.
 mod embeddinggemma_assets {
+    const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
+    const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
+    const GGUF_NAME: &str = "embeddinggemma-300M-Q4_K.gguf";
+    const TOK_NAME: &str = "tokenizer.json";
+
+    /// Return the eventual model paths without creating or verifying assets.
+    pub fn identity_paths() -> (String, String) {
+        let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
+        (
+            root.join(GGUF_SHA)
+                .join(GGUF_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            root.join(TOK_SHA)
+                .join(TOK_NAME)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     pub fn paths() -> Option<(String, String)> {
-        const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
-        const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
         #[cfg(not(debug_assertions))]
         {
             static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
             static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
-            let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
-            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-            return Some((gguf, tok));
+            let gguf = extract(&root, GGUF_SHA, GGUF_NAME, GGUF)?;
+            let tok = extract(&root, TOK_SHA, TOK_NAME, TOK)?;
+            Some((gguf, tok))
         }
         #[cfg(debug_assertions)]
         {
             let gguf = super::extract_repo_model_asset(
                 &root,
                 GGUF_SHA,
-                "embeddinggemma-300M-Q4_K.gguf",
+                GGUF_NAME,
                 env!("GREPPY_EMBEDDED_GGUF_PATH"),
             )?;
             let tok = super::extract_repo_model_asset(
                 &root,
                 TOK_SHA,
-                "tokenizer.json",
+                TOK_NAME,
                 env!("GREPPY_EMBEDDED_TOK_PATH"),
             )?;
             Some((gguf, tok))
@@ -7909,7 +9572,7 @@ mod qwen35_assets {
             static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
             let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
             let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-            return Some((gguf, tok));
+            Some((gguf, tok))
         }
         #[cfg(debug_assertions)]
         {
@@ -8094,7 +9757,7 @@ fn acquire_cached_model_lease(
 fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -> Result<Vec<f32>> {
     let store_dir = resolve_root(root)
         .ok()
-        .map(|r| workspace_locator::store_dir(&r));
+        .and_then(|r| greppy_core::cache::ensure_workspace_store(&r).ok());
     let cache = store_dir
         .as_ref()
         .and_then(|dir| greppy_store::QueryEmbeddingCache::open(dir).ok());
@@ -8209,16 +9872,45 @@ fn vector_exact_scan_skip_message(command: &str, total: i64, limit: i64) -> Stri
     )
 }
 
+fn preparation_recovery_message(freshness: &serde_json::Value) -> String {
+    let diagnostics = freshness
+        .get("diagnostics_command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("greppy index status --json");
+    match freshness.get("state").and_then(serde_json::Value::as_str) {
+        Some("refreshing") => format!(
+            "index publication is in progress; inspect `{diagnostics}`, then retry this command after publication"
+        ),
+        Some("unknown") => format!(
+            "freshness could not be verified; inspect `{diagnostics}` and resolve the reported freshness failure before retrying this command"
+        ),
+        Some("failed") => match freshness
+            .get("preparation_error")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(error) => format!(
+                "{error} Inspect `{diagnostics}`; retry the original command after resolving this preparation failure"
+            ),
+            None => format!(
+                "automatic index preparation failed; inspect `{diagnostics}` for the concrete failure, resolve it, then retry this command"
+            ),
+        },
+        _ => STALE_REMEDIATION.into(),
+    }
+}
+
 fn vector_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     format!(
-        "{command}: {STALE_REMEDIATION} — vector search skipped ({})",
+        "{command}: {} — vector search skipped ({})",
+        preparation_recovery_message(freshness),
         stale_freshness_reason(freshness)
     )
 }
 
 fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
+    let remediation = preparation_recovery_message(freshness);
     format!(
-        "{command}: {STALE_REMEDIATION} — indexed search skipped, \
+        "{command}: {remediation} — indexed search skipped, \
          no stale indexed hits emitted ({})",
         stale_freshness_reason(freshness)
     )
@@ -8277,37 +9969,98 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
 /// tells agents to pass `--root .` on every command. Forwarding them made real
 /// grep answer `unrecognized option '--root'`, which cost the agent a turn every
 /// time it searched — measured at 2.3 wasted turns per task, and zero in an arm
-/// that just calls grep directly. `--root DIR` also carries intent: when no path
-/// operand is present we append DIR so the search still covers what was asked.
-fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+/// that just calls grep directly. `--root DIR` selects the child search process's
+/// working directory; it must never become an additional grep path operand.
+struct GrepGlobals {
+    args: Vec<std::ffi::OsString>,
+    root: Option<std::ffi::OsString>,
+}
+
+fn passthrough_flavor(args: &[std::ffi::OsString]) -> PassthroughFlavor {
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_str().unwrap_or_default();
+        if matches!(text, "--root" | "--device") {
+            index += 2;
+            continue;
+        }
+        if args[index].as_encoded_bytes().starts_with(b"--root=")
+            || text.starts_with("--device=")
+            || matches!(text, "--no-gpu" | "--diagnostics")
+        {
+            index += 1;
+            continue;
+        }
+        return if matches!(text, "rg" | "ripgrep") {
+            PassthroughFlavor::Ripgrep
+        } else if matches!(text, "grep" | "egrep" | "fgrep" | "rgrep") {
+            PassthroughFlavor::Grep
+        } else if greppy_passthrough::is_rg_style(&args[index..]) {
+            PassthroughFlavor::Ripgrep
+        } else {
+            PassthroughFlavor::Grep
+        };
+    }
+    PassthroughFlavor::Grep
+}
+
+fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobals>> {
     const VALUE_FLAGS: [&str; 2] = ["--root", "--device"];
     const BARE_FLAGS: [&str; 2] = ["--no-gpu", "--diagnostics"];
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     let mut root: Option<std::ffi::OsString> = None;
     let mut removed = false;
+    let flavor = passthrough_flavor(args);
     let mut index = 0;
     while index < args.len() {
         let text = args[index].to_str().unwrap_or_default();
+        if text == "--" {
+            out.extend_from_slice(&args[index..]);
+            break;
+        }
+        if passthrough_option_consumes_next(&args[index], flavor) {
+            out.push(args[index].clone());
+            if let Some(value) = args.get(index + 1) {
+                out.push(value.clone());
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
         if let Some(flag) = VALUE_FLAGS.iter().find(|flag| text == **flag) {
             if let Some(value) = args.get(index + 1) {
                 if *flag == "--root" {
+                    if value.is_empty() {
+                        return Err(Error::Invalid("--root needs a directory".into()));
+                    }
                     root = Some(value.clone());
                 }
                 index += 2;
                 removed = true;
                 continue;
             }
+            if *flag == "--root" {
+                return Err(Error::Invalid("--root needs a directory".into()));
+            }
             index += 1;
             removed = true;
             continue;
         }
-        if let Some(flag) = VALUE_FLAGS
-            .iter()
-            .find(|flag| text.starts_with(&format!("{flag}=")))
-        {
-            if *flag == "--root" {
-                root = Some(std::ffi::OsString::from(&text[flag.len() + 1..]));
+        if let Some(value) = args[index].as_encoded_bytes().strip_prefix(b"--root=") {
+            if value.is_empty() {
+                return Err(Error::Invalid("--root needs a directory".into()));
             }
+            // SAFETY: these bytes came from an OsString on this platform.
+            // Splitting immediately after the known ASCII '=' preserves the
+            // self-synchronizing encoded-byte boundary required by OsString.
+            root =
+                Some(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(value.to_vec()) });
+            index += 1;
+            removed = true;
+            continue;
+        }
+        if text.starts_with("--device=") {
             index += 1;
             removed = true;
             continue;
@@ -8321,23 +10074,39 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsS
         index += 1;
     }
     if !removed {
-        return None;
+        return Ok(None);
     }
-    // A bare `--root DIR` with no path operand still means "search DIR". The
-    // first non-flag argument is the PATTERN, so a path operand only exists from
-    // the second one on — counting the pattern as a path silently searched the
-    // wrong place.
-    if let Some(root) = root {
-        let non_flags = out
-            .iter()
-            .skip(1)
-            .filter(|arg| !arg.to_str().unwrap_or_default().starts_with('-'))
-            .count();
-        if non_flags <= 1 {
-            out.push(root);
-        }
+    Ok(Some(GrepGlobals { args: out, root }))
+}
+
+fn grep_working_dir(root: Option<&std::ffi::OsStr>) -> Result<Option<std::path::PathBuf>> {
+    let Some(root) = root else { return Ok(None) };
+    let supplied = std::path::PathBuf::from(root);
+    let canonical = supplied.canonicalize().map_err(|error| {
+        Error::Invalid(format!("invalid --root `{}`: {error}", supplied.display()))
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::Invalid(format!(
+            "invalid --root `{}`: not a directory",
+            supplied.display()
+        )));
     }
-    Some(out)
+    Ok(Some(canonical))
+}
+
+fn add_root_default_path(
+    args: &[std::ffi::OsString],
+    working_dir: Option<&std::path::Path>,
+    demand: StdinDemand<'_>,
+) -> Option<Vec<std::ffi::OsString>> {
+    if working_dir.is_some() && matches!(demand, StdinDemand::WhenNonTerminal(_)) {
+        let mut rooted = Vec::with_capacity(args.len() + 1);
+        rooted.extend_from_slice(args);
+        rooted.push(std::ffi::OsString::from("."));
+        Some(rooted)
+    } else {
+        None
+    }
 }
 
 /// Greppy-only flags, with the subcommand that owns each one.
@@ -8395,8 +10164,13 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // grep-family (or rg-family) placeholder in full[1] if present so
     // `greppy grep -R foo .`, `greppy rg -S foo` and `greppy -R foo .`
     // all agree.
-    let cleaned = strip_greppy_globals(&full[1..]);
-    let args: &[std::ffi::OsString] = cleaned.as_deref().unwrap_or(&full[1..]);
+    let cleaned = strip_greppy_globals(&full[1..])?;
+    let args: &[std::ffi::OsString] = cleaned
+        .as_ref()
+        .map(|cleaned| cleaned.args.as_slice())
+        .unwrap_or(&full[1..]);
+    let working_dir =
+        grep_working_dir(cleaned.as_ref().and_then(|cleaned| cleaned.root.as_deref()))?;
     let (stripped, named_rg, named_grep): (&[std::ffi::OsString], bool, bool) = match args
         .first()
         .and_then(|s| s.to_str())
@@ -8412,14 +10186,19 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // Blindly forwarding them to real grep would be a usage error at
     // best and a silently different search at worst.
     if named_rg || greppy_passthrough::is_rg_style(stripped) {
-        return dispatch_rg_os(stripped);
+        return dispatch_rg_os(stripped, working_dir.as_deref());
     }
 
     // Ordinary grep invocations are a byte-exact delegation contract. In
     // particular, a directory operand without `-r` must keep real grep's
     // diagnostic and exit code rather than silently acquiring recursion.
     let _ = named_grep;
-    let grep_args = stripped;
+    let rooted = add_root_default_path(
+        stripped,
+        working_dir.as_deref(),
+        grep_stdin_demand(stripped),
+    );
+    let grep_args = rooted.as_deref().unwrap_or(stripped);
     if let Some((flag, owner)) = greppy_only_flag(grep_args) {
         let guidance = if owner.is_empty() {
             "it belongs to greppy's navigation commands. Drop it, or name the command it goes with"
@@ -8436,15 +10215,12 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
             "status: invalid_invocation\nargument: `{argument}`\nmessage: this is neither a recognized greppy option nor supported grep syntax; nothing was passed to grep\nnext: run `greppy --help`, or put `--` before a literal pattern that begins with `-`"
         )));
     }
-    if let Some(message) = missing_stdin_message(grep_stdin_demand(grep_args), "grep") {
-        return Err(Error::Invalid(message));
-    }
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend_from_slice(grep_args);
 
     let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep_os(&real, &rebuilt)
+    greppy_passthrough::run_grep_os_in_dir(&real, &rebuilt, working_dir.as_deref())
 }
 
 /// Route a ripgrep-style invocation: byte-exact delegation to real
@@ -8452,15 +10228,17 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
 /// real-grep call, otherwise fail loudly naming the flag and the closest
 /// alternative. Absence of ripgrep must never silently change search
 /// semantics.
-fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
-    if let Some(message) = missing_stdin_message(rg_stdin_demand(args), "ripgrep") {
-        return Err(Error::Invalid(message));
-    }
+fn dispatch_rg_os(
+    args: &[std::ffi::OsString],
+    working_dir: Option<&std::path::Path>,
+) -> Result<i32> {
+    let rooted = add_root_default_path(args, working_dir, rg_stdin_demand(args));
+    let args = rooted.as_deref().unwrap_or(args);
     if let Some(real_rg) = greppy_passthrough::discover_ripgrep()? {
         let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 1);
         rebuilt.push(std::ffi::OsString::from("rg"));
         rebuilt.extend_from_slice(args);
-        return greppy_passthrough::run_grep_os(&real_rg, &rebuilt);
+        return greppy_passthrough::run_grep_os_in_dir(&real_rg, &rebuilt, working_dir);
     }
     use std::io::IsTerminal;
     let stdin_piped = !std::io::stdin().is_terminal();
@@ -8470,7 +10248,7 @@ fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend(grep_args);
     let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep_os(&real, &rebuilt)
+    greppy_passthrough::run_grep_os_in_dir(&real, &rebuilt, working_dir)
 }
 
 fn retire_verified_legacy_store(root: &std::path::Path) {
@@ -8994,7 +10772,10 @@ fn checkpoint_store_path(path: &std::path::Path) -> Result<(i64, i64, i64)> {
     if result.0 != 0 {
         return Err(Error::Store(format!(
             "checkpoint {} remained busy after 15s (busy={}, log_frames={}, checkpointed_frames={}); no snapshot was published; retry `greppy index` after the competing reader exits",
-            path.display(), result.0, result.1, result.2
+            path.display(),
+            result.0,
+            result.1,
+            result.2
         )));
     }
     Ok(result)
@@ -9276,7 +11057,8 @@ fn command_requests_json(command: Option<&Command>) -> bool {
         | Some(Command::SearchSymbol { json, .. })
         | Some(Command::Plus { json, .. })
         | Some(Command::Search { json, .. })
-        | Some(Command::Context { json, .. }) => *json,
+        | Some(Command::Context { json, .. })
+        | Some(Command::ReadFile { json, .. }) => *json,
         _ => false,
     }
 }
@@ -9303,6 +11085,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
+        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9324,7 +11107,40 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
     })
 }
 
+#[derive(Clone)]
+struct NavTextWindow {
+    offset: usize,
+    total: usize,
+    // Absolute canonical caller index and its whole rendered block.
+    rows: Vec<(usize, usize, usize)>,
+}
+
+fn output_capture_position() -> usize {
+    OUTPUT_CAPTURE.with(|capture| capture.borrow().as_ref().map_or(0, Vec::len))
+}
+
+fn record_nav_text_row(index: usize, start: usize) {
+    let end = output_capture_position();
+    NAV_TEXT_WINDOW.with(|window| {
+        if let Some(window) = window.borrow_mut().as_mut() {
+            window.rows.push((index, start, end));
+        }
+    });
+}
+
+fn print_multi_unresolved_receivers(page: &UnresolvedReceiverPage, start: usize) {
+    for (offset, item) in page.rows.iter().enumerate() {
+        let row_start = output_capture_position();
+        println!("{}", unresolved_receiver_line(item));
+        record_nav_text_row(start + offset, row_start);
+    }
+    if page.truncated {
+        println!("… {} unresolved receivers omitted", page.omitted.max(1));
+    }
+}
+
 fn begin_output_capture() {
+    NAV_TEXT_WINDOW.with(|window| *window.borrow_mut() = None);
     OUTPUT_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
 }
 
@@ -9364,6 +11180,7 @@ const BUDGET_ARRAY_FIELDS: &[&str] = &[
     "callers",
     "references",
     "callees",
+    "candidates",
 ];
 
 fn result_item_count(value: &serde_json::Value) -> usize {
@@ -9372,6 +11189,11 @@ fn result_item_count(value: &serde_json::Value) -> usize {
         .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_array))
         .map(Vec::len)
         .sum::<usize>()
+        + value
+            .get("unresolved_receivers")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
         + value
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -9405,6 +11227,15 @@ fn skip_result_items(value: &mut serde_json::Value, mut count: usize) {
 }
 
 fn pop_result_item(value: &mut serde_json::Value) -> bool {
+    // Caller windows are ordered confirmed first, uncertain candidates last.
+    if let Some(rows) = value
+        .get_mut("unresolved_receivers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if rows.pop().is_some() {
+            return true;
+        }
+    }
     if let Some(source) = value.get_mut("source") {
         if let Some(text) = source.as_str() {
             let mut lines = text.lines().collect::<Vec<_>>();
@@ -9572,12 +11403,56 @@ fn compact_nav_json(value: &mut serde_json::Value) {
             compact.insert("targets".into(), targets);
         }
     }
-    for key in ["suggestions", "next", "warning", "hits"] {
+    for key in [
+        "suggestions",
+        "next",
+        "warning",
+        "hits",
+        "unresolved_receivers",
+        "unresolved_factory_receivers",
+        "unresolved_factory_total",
+        "unresolved_factory_omitted",
+        "unresolved_factory_truncated",
+        "callees_incomplete",
+        "callers_incomplete",
+        "unresolved_omitted",
+        "unresolved_truncated",
+    ] {
         if let Some(field) = value.get(key).cloned() {
             compact.insert(key.into(), field);
         }
     }
     *value = serde_json::Value::Object(compact);
+}
+
+#[cfg(test)]
+mod factory_diagnostic_compaction_tests {
+    #[test]
+    fn compact_callees_preserves_factory_coverage_and_budget() {
+        let rows = serde_json::json!([{"file": "src/leaf.rs", "line": 2, "method": "upsert"}]);
+        let mut value = serde_json::json!({
+            "symbol_found": true,
+            "hits": [],
+            "unresolved_factory_receivers": rows,
+            "unresolved_factory_total": 45,
+            "unresolved_factory_omitted": 44,
+            "unresolved_factory_truncated": true,
+            "callees_incomplete": true,
+            "next": "greppy read leaf"
+        });
+        super::compact_nav_json(&mut value);
+        assert_eq!(value["unresolved_factory_receivers"], rows);
+        assert_eq!(value["unresolved_factory_total"], 45);
+        assert_eq!(value["unresolved_factory_omitted"], 44);
+        assert_eq!(value["unresolved_factory_truncated"], true);
+        assert_eq!(value["callees_incomplete"], true);
+        assert_eq!(value["next"], "greppy read leaf");
+
+        let mut direct = serde_json::json!({"symbol_found": true, "hits": []});
+        super::compact_nav_json(&mut direct);
+        assert!(direct.get("callees_incomplete").is_none());
+        assert!(direct.get("unresolved_factory_receivers").is_none());
+    }
 }
 
 fn compact_search_symbol_json(value: &mut serde_json::Value) {
@@ -9685,11 +11560,45 @@ fn compact_read_json(value: &mut serde_json::Value) {
             compact.insert(key.into(), field);
         }
     }
+    // A proven coverage limitation is part of the answer, not bulk diagnostics.
+    // Ordinary misses retain their existing compact payload.
+    if value
+        .get("unsupported_definition_coverage")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|coverage| !coverage.is_empty())
+    {
+        for key in [
+            "lookup_scope",
+            "unsupported_definition_coverage",
+            "source_recovery",
+        ] {
+            if let Some(field) = value.get(key).filter(|value| !value.is_null()).cloned() {
+                compact.insert(key.into(), field);
+            }
+        }
+    }
     *value = serde_json::Value::Object(compact);
 }
 
 fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    // File reads already emit a compact typed payload. Preserve their command,
+    // file content and continuation/handle metadata across every JSON spelling.
+    if value.get("command").and_then(serde_json::Value::as_str) == Some("read-file") {
+        let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
+        rendered.push(b'\n');
+        return Some(rendered);
+    }
+    // Preparation refusals have no answer rows to compact. Preserve their
+    // typed failure and exact root/store recovery even without --diagnostics.
+    if matches!(
+        value.get("status").and_then(serde_json::Value::as_str),
+        Some("preparation_deferred" | "expand_handle_not_found")
+    ) {
+        let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
+        rendered.push(b'\n');
+        return Some(rendered);
+    }
     let command = value
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -9762,11 +11671,101 @@ fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
 
 fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    // A refused preparation has no result total or continuation to budget.
+    // Never manufacture an exact empty answer from its absent result rows.
+    if matches!(
+        value.get("status").and_then(serde_json::Value::as_str),
+        Some("preparation_deferred" | "expand_handle_not_found")
+    ) {
+        return Some(bytes.to_vec());
+    }
     let available = result_item_count(&value);
-    let total = exact_result_total(&value, available, spec.offset);
+    let confirmed_total = exact_result_total(&value, available, spec.offset);
+    let uncertain_initial = value
+        .get("unresolved_receivers")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let uncertain_total = uncertain_initial
+        + value
+            .get("unresolved_omitted")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+    let uncertain_by_target: Vec<(String, usize)> = value
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|target| {
+            let symbol = target.get("symbol")?.as_str()?;
+            if target
+                .get("callers_incomplete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return None;
+            }
+            let returned = value
+                .get("unresolved_receivers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|row| row.get("target").and_then(serde_json::Value::as_str) == Some(symbol))
+                .count();
+            Some((
+                symbol.to_owned(),
+                returned
+                    + target
+                        .get("unresolved_omitted")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as usize,
+            ))
+        })
+        .collect();
+    let total = confirmed_total.saturating_add(uncertain_total);
+    // Navigation producers already select the uncertain page at this offset;
+    // only their retained confirmed prefix is skipped here.
     skip_result_items(&mut value, spec.offset);
 
     loop {
+        if value
+            .get("callers_incomplete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let retained = value
+                .get("unresolved_receivers")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            value["unresolved_omitted"] = uncertain_total.saturating_sub(retained).into();
+            value["unresolved_truncated"] = (retained < uncertain_total).into();
+        }
+        for (symbol, initial_total) in &uncertain_by_target {
+            let retained = value
+                .get("unresolved_receivers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    row.get("target").and_then(serde_json::Value::as_str) == Some(symbol.as_str())
+                })
+                .count();
+            if let Some(targets) = value
+                .get_mut("targets")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for target in targets {
+                    if target.get("symbol").and_then(serde_json::Value::as_str)
+                        == Some(symbol.as_str())
+                    {
+                        target["unresolved_omitted"] =
+                            initial_total.saturating_sub(retained).into();
+                        target["unresolved_truncated"] = (retained < *initial_total).into();
+                    }
+                }
+            }
+        }
         let shown = result_item_count(&value);
         let end = spec.offset.saturating_add(shown).min(total);
         let truncated = end < total;
@@ -9849,13 +11848,57 @@ fn text_line_is_priority(line: &str) -> bool {
         || trimmed.starts_with("read:")
         || trimmed.starts_with("-- ")
         || trimmed.starts_with("unresolved textual candidates:")
+        || trimmed.starts_with("unresolved receiver:")
+        || trimmed.starts_with("no resolved callers")
 }
 
-fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> Vec<u8> {
-    let text = String::from_utf8_lossy(bytes);
-    if exit_code != 0 {
-        return bytes.to_vec();
+fn budget_nav_text_output(
+    bytes: &[u8],
+    spec: &OutputBudgetSpec,
+    mut window: NavTextWindow,
+) -> Vec<u8> {
+    window.rows.sort_by_key(|row| row.0);
+    let mut keep = window.rows.len();
+    loop {
+        let mut removed = window.rows[keep..].to_vec();
+        removed.sort_by_key(|row| row.1);
+        let mut rendered = Vec::new();
+        let mut cursor = 0;
+        for (_, start, end) in removed {
+            rendered.extend_from_slice(&bytes[cursor..start]);
+            cursor = end;
+        }
+        rendered.extend_from_slice(&bytes[cursor..]);
+        let next = window.offset.min(window.total).saturating_add(keep);
+        let truncated = next < window.total;
+        if truncated || window.offset > 0 {
+            rendered.extend_from_slice(
+                format!(
+                    "\nshown: {keep}\ntotal: {}\noffset: {}\ntruncated: {truncated}\n",
+                    window.total, window.offset
+                )
+                .as_bytes(),
+            );
+            if truncated {
+                rendered.extend_from_slice(
+                    format!("try: {}\n", retry_with_offset(spec.command, next)).as_bytes(),
+                );
+            }
+        }
+        // Keep one complete caller block even when the byte budget is too
+        // small, so continuation advances instead of retrying the same row.
+        if spec.max_bytes.is_none_or(|max| rendered.len() <= max) || keep <= 1 {
+            return rendered;
+        }
+        keep -= 1;
     }
+}
+
+fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, _exit_code: u8) -> Vec<u8> {
+    if let Some(window) = NAV_TEXT_WINDOW.with(|window| window.borrow_mut().take()) {
+        return budget_nav_text_output(bytes, spec, window);
+    }
+    let text = String::from_utf8_lossy(bytes);
     let mut priority = Vec::new();
     let mut content = Vec::new();
     for line in text.lines() {
@@ -9885,11 +11928,25 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
         if spec
             .max_bytes
             .is_none_or(|max_bytes| rendered.len() <= max_bytes)
-            || selected.pop().is_none()
         {
             return rendered;
         }
+        if selected.pop().is_none() {
+            return hard_cap_text_output(rendered, spec.max_bytes.unwrap_or(usize::MAX));
+        }
     }
+}
+
+fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let mut end = max_bytes;
+    while end > 0 && std::str::from_utf8(&rendered[..end]).is_err() {
+        end -= 1;
+    }
+    rendered.truncate(end);
+    rendered
 }
 
 /// Translate a `Result<i32>` into the actual exit code we should return.
@@ -9903,6 +11960,11 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
 /// hint before returning `Err`; the summary line here may then repeat the
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
+    let preparation_json = command_requests_json(cli.command.as_ref());
+    let _web_output_budget = match cli.command.as_ref() {
+        Some(Command::Web { .. }) => Some(web::human_output_budget(cli.max_bytes)),
+        _ => None,
+    };
     let budget = output_budget_spec(&cli);
     let compact_json = compact_default_json_requested(&cli);
     if budget.is_some() || compact_json {
@@ -9910,6 +11972,31 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
     }
     let code = match dispatch(cli) {
         Ok(code) => code.clamp(0, 255) as u8,
+        Err(Error::AdmissionDeferred { root, detail }) if preparation_json => {
+            let diagnostics = index_status_command_for_root(&root);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "preparation_deferred",
+                    "fresh": false,
+                    "complete": false,
+                    "freshness": {
+                        "state": "failed",
+                        "fresh": false,
+                        "root_path": root,
+                        "preparation_failure_kind": "admission_deferred",
+                        "preparation_error": detail,
+                        "diagnostics_command": diagnostics,
+                    },
+                    "next": {
+                        "action": "retry_original_command",
+                        "message": "Retry the original command when host capacity is available; no index work started and no query results were served.",
+                        "diagnostics_command": diagnostics,
+                    },
+                })
+            );
+            EXIT_TEMPFAIL
+        }
         Err(e) => {
             eprintln!("greppy: {e}");
             let mut source = std::error::Error::source(&e);
@@ -9930,7 +12017,7 @@ fn error_exit_code(error: &Error) -> u8 {
     match error {
         Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
         Error::Invalid(_) => EXIT_USAGE,
-        Error::Lock(_) => EXIT_TEMPFAIL,
+        Error::Lock(_) | Error::AdmissionDeferred { .. } => EXIT_TEMPFAIL,
         _ => EXIT_IO,
     }
 }

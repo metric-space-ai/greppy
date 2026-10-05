@@ -13,6 +13,7 @@ mod preview;
 mod redaction;
 mod render;
 mod session;
+pub(crate) use session::{ImportHistoryCommit, TurnCommit};
 mod settings;
 mod state;
 mod terminal;
@@ -43,7 +44,8 @@ pub use events::{
 pub use redaction::{redact_json, redact_text, sanitize_terminal_text};
 pub use session::{
     compact_messages, list_session_project_dirs, load_path, messages_from_protocol, new_session_id,
-    protocol_from_persisted, read_session_log_lines, SessionLogLine, SessionRecord, SessionStore,
+    protocol_from_persisted, read_session_log_lines, ImportAck, SessionLogLine, SessionRecord,
+    SessionStore,
 };
 pub use settings::AgentSettings;
 pub use state::HeaderState;
@@ -79,6 +81,10 @@ pub struct TuiOutcome {
     pub force_exit: bool,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "TUI entry point owns the session, channels, and optional control server separately"
+)]
 pub fn run(
     config: TuiConfig,
     session: SessionRecord,

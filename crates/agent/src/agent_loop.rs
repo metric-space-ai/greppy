@@ -202,6 +202,7 @@ impl From<ClientError> for LoopError {
     fn from(e: ClientError) -> Self {
         match e {
             ClientError::Transport(m) => LoopError::Transport(m),
+            ClientError::Cancelled => LoopError::Transport("turn cancelled".into()),
             ClientError::Http { status, body } => LoopError::Http { status, body },
             ClientError::Stream(m) => LoopError::Stream(m),
             ClientError::Incomplete(m) => LoopError::Incomplete(m),
@@ -323,7 +324,14 @@ pub fn run_agent_loop_with_history(
             max_tokens: config.max_tokens,
         };
 
-        let turn = stream_turn_with_retry(model, &req, on_event)?;
+        let turn = match stream_turn_with_retry(model, &req, on_event) {
+            Ok(turn) => turn,
+            Err(ClientError::Cancelled) => {
+                last_stop = LoopStop::Cancelled;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
         turns += 1;
         total_usage = sum_usage(total_usage, turn.usage);
         on_event(LoopEvent::TurnComplete {
@@ -565,7 +573,7 @@ fn stream_turn_with_retry(
     model: &mut dyn ModelStream,
     req: &ModelRequest,
     on_event: &mut dyn FnMut(LoopEvent),
-) -> Result<TurnResult, LoopError> {
+) -> Result<TurnResult, ClientError> {
     match call_model(model, req, on_event) {
         Ok(t) => Ok(t),
         Err(first) if is_retryable(&first) => {
@@ -573,9 +581,9 @@ fn stream_turn_with_retry(
             // Deviation from pi: pi's session-level auto-retry is configurable
             // and delayed; we do a single immediate retry.
             std::thread::sleep(std::time::Duration::from_secs(2));
-            call_model(model, req, on_event).map_err(LoopError::from)
+            call_model(model, req, on_event)
         }
-        Err(other) => Err(LoopError::from(other)),
+        Err(other) => Err(other),
     }
 }
 
@@ -585,6 +593,7 @@ fn is_retryable(err: &ClientError) -> bool {
         // else — transport failures, 429/5xx, mid-stream error events,
         // truncated streams — is worth one retry.
         ClientError::Http { status, .. } => *status == 429 || *status >= 500,
+        ClientError::Cancelled => false,
         _ => true,
     }
 }
@@ -1861,6 +1870,21 @@ mod tests {
         assert_eq!(model.calls, 2);
         assert_eq!(env.calls.len(), 1);
         assert_eq!(result.messages.len(), 4);
+    }
+
+    #[test]
+    fn cancelled_transport_stops_without_retry_or_tool_execution() {
+        let mut model = FakeModel::new(vec![ScriptedTurn {
+            events: vec![],
+            result: Err(ClientError::Cancelled),
+        }]);
+        let mut env = FakeEnv::new(vec![bash_tool()]);
+        let config = AgentConfig::default().with_model("mock");
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("cancelled loop");
+        assert_eq!(result.stop, LoopStop::Cancelled);
+        assert_eq!(model.calls, 1);
+        assert!(env.calls.is_empty());
+        assert_eq!(result.messages.len(), 1);
     }
 
     #[test]

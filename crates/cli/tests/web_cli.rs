@@ -84,16 +84,17 @@ fn action_expect_help_distinguishes_query_type_from_shell_quoting() {
 }
 
 #[test]
-fn session_new_refusal_names_create_and_nested_usage() {
-    let (code, stdout, stderr) = run(&["web", "session", "new", "--profile", "project"]);
-    assert_eq!(code, 64, "stdout={stdout} stderr={stderr}");
-    let text = format!("{stdout}{stderr}");
+fn session_new_alias_has_the_same_help_as_create_without_starting_runtime() {
+    let alias = run(&["web", "session", "new", "--profile", "project", "--help"]);
+    let canonical = run(&["web", "session", "create", "--profile", "project", "--help"]);
+    assert_eq!(alias.0, 0, "stdout={} stderr={}", alias.1, alias.2);
+    assert_eq!(alias, canonical, "alias and canonical help must agree");
     assert!(
-        text.contains("greppy web session create --profile project"),
-        "{text}"
+        alias.1.contains("project: public web plus loopback"),
+        "{}",
+        alias.1
     );
-    assert!(text.contains("usage: greppy web session"), "{text}");
-    assert!(!text.contains("usage: greppy web status|doctor"), "{text}");
+    assert!(!alias.1.contains("runtime_unavailable"), "{}", alias.1);
 }
 
 #[test]
@@ -173,15 +174,60 @@ fn web_runtime_is_a_subcommand() {
 
 #[test]
 fn web_runtime_status_does_not_spawn_and_reports_not_running() {
+    let dist = tempfile::Builder::new()
+        .prefix("web-status-")
+        .tempdir()
+        .unwrap();
+    std::fs::create_dir_all(dist.path().join("bin")).unwrap();
+    std::fs::write(
+        dist.path().join(".greppy-web-runtime-dist"),
+        "greppy.web-runtime.package.v1\n",
+    )
+    .unwrap();
+    let dummy = dist.path().join("bin/web-runtime");
+    std::fs::write(
+        &dummy,
+        "#!/bin/sh\necho started > \"$(dirname \"$0\")/started\"\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dummy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let started = Instant::now();
-    let (code, stdout, stderr) = run(&["web", "runtime", "status", "--json"]);
+    let output = Command::new(bin())
+        .args(["web", "runtime", "status", "--json"])
+        .env_remove("GREPPY_WEB_RUNTIME")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
+        .env("GREPPY_WEB_RUNTIME_DIST", dist.path())
+        .env("GREPPY_STORE_DIR", dist.path().join("store"))
+        .env(
+            "GREPPY_RUN_ID",
+            format!("status-no-spawn-{}", std::process::id()),
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("runtime status against installed dummy");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "runtime status must not hash/spawn the engine, elapsed={:?}",
+        "runtime status must not spawn the engine, elapsed={:?}",
         started.elapsed()
     );
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    assert!(stdout.contains("\"running\":false") || stdout.contains("\"running\": false"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(result["result"]["running"], false);
+    assert_eq!(result["result"]["owned"], false);
+    assert!(
+        !dist.path().join("bin/started").exists(),
+        "status executed the engine"
+    );
     assert!(stdout.contains("greppy.web-runtime.v1"));
 }
 
@@ -347,24 +393,39 @@ fn web_research_requires_query() {
 }
 
 #[test]
-fn web_search_requires_session() {
+fn web_search_without_session_attempts_runtime_bootstrap() {
     let (code, stdout, _stderr) = run(&["web", "search", "--query", "greppy", "--json"]);
-    assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("session"));
+    assert_eq!(code, 31, "stdout={stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "runtime_unavailable");
+    assert!(value["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("install"));
 }
 
 #[test]
-fn web_read_requires_session() {
+fn web_read_without_session_attempts_runtime_bootstrap() {
     let (code, stdout, _stderr) = run(&["web", "read", "--url", "https://example.com", "--json"]);
-    assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("session"));
+    assert_eq!(code, 31, "stdout={stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "runtime_unavailable");
+    assert!(value["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("install"));
 }
 
 #[test]
-fn web_research_requires_session() {
+fn web_research_without_session_attempts_runtime_bootstrap() {
     let (code, stdout, _stderr) = run(&["web", "research", "--query", "greppy", "--json"]);
-    assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("session"));
+    assert_eq!(code, 31, "stdout={stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "runtime_unavailable");
+    assert!(value["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("install"));
 }
 
 #[test]
@@ -653,9 +714,12 @@ fn web_doctor_json_does_not_spawn_runtime() {
         stdout.contains("\"protocol_version\"") || stdout.contains("greppy.web-runtime.v1"),
         "doctor must report handshake schema, stdout={stdout}"
     );
-    assert!(
-        stdout.contains("web-runtime-0.1.0"),
-        "doctor must report runtime_build_id, stdout={stdout}"
+    use sha2::Digest as _;
+    let expected_image = format!("sha256:{:x}", sha2::Sha256::digest(b"#!/bin/sh\nexit 1\n"));
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        result["result"]["runtime_build_id"], expected_image,
+        "doctor must report the actual executable content image, stdout={stdout}"
     );
     assert!(
         !stdout.contains("process_health") && !stdout.contains("controller_alive"),
@@ -1115,5 +1179,165 @@ fn web_goto_without_scope_is_no_session() {
     assert!(
         stdout.contains("NO_SESSION") || stdout.contains("session"),
         "stdout={stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let Some(runtime) = locate_web_runtime() else {
+        eprintln!("skipping artifact recovery CLI proof: optional web-runtime binary is not built");
+        return;
+    };
+    struct Cleanup<'a> {
+        workspace: std::path::PathBuf,
+        runtime: &'a std::path::Path,
+        run_id: String,
+        session: Option<String>,
+        server: Option<std::thread::JoinHandle<()>>,
+        address: std::net::SocketAddr,
+    }
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(session) = &self.session {
+                let _ = run_scoped(
+                    &self.workspace,
+                    self.runtime,
+                    &self.run_id,
+                    &["web", "session", "close", session, "--json"],
+                );
+            }
+            let _ = run_scoped(
+                &self.workspace,
+                self.runtime,
+                &self.run_id,
+                &["web", "runtime", "stop", "--json"],
+            );
+            let _ = std::net::TcpStream::connect(self.address);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.workspace);
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server_reads = Arc::clone(&reads);
+    let server = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0_u8; 2048];
+            let length = stream.read(&mut request).unwrap_or(0);
+            let large = String::from_utf8_lossy(&request[..length]).contains("GET /large ");
+            let body = if large {
+                server_reads.fetch_add(1, Ordering::SeqCst);
+                format!(
+                    "<html><body>{}IMMUTABLE_TAIL</body></html>",
+                    "artifact body ".repeat(100_000)
+                )
+            } else {
+                break;
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let run_id = format!("run_artifact_recovery_{}", std::process::id());
+    let workspace = std::env::temp_dir().join(&run_id);
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut cleanup = Cleanup {
+        workspace: workspace.clone(),
+        runtime: &runtime,
+        run_id: run_id.clone(),
+        session: None,
+        server: Some(server),
+        address,
+    };
+    let large = format!("http://{address}/large");
+    let (code, stdout, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "session", "create", "--profile", "project", "--json"],
+    );
+    assert_eq!(code, 0, "session create failed: {stdout} {stderr}");
+    let session_receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let session = session_receipt["result"]["session_id"]
+        .as_str()
+        .expect("created project session")
+        .to_owned();
+    cleanup.session = Some(session.clone());
+
+    let (code, output, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "read", "--url", &large, "--session", &session],
+    );
+    assert_eq!(code, 0, "read failed: {stderr}");
+    let digest = output
+        .split_once("greppy web artifact export '")
+        .and_then(|(_, tail)| tail.split_once('\''))
+        .map(|(value, _)| value)
+        .expect("exact artifact export guidance");
+    let guided_session = output
+        .split_once(" --session '")
+        .and_then(|(_, tail)| tail.split_once('\''))
+        .map(|(value, _)| value)
+        .expect("guidance session");
+    assert_eq!(
+        guided_session, &session,
+        "guidance must retain the owning session"
+    );
+    assert!(
+        output.contains("saved locally; no repeat request"),
+        "{output}"
+    );
+
+    let exported = workspace.canonicalize().unwrap().join("full-response.txt");
+    let (code, stdout, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &[
+            "web",
+            "artifact",
+            "export",
+            digest,
+            "--session",
+            guided_session,
+            "--to",
+            exported.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "export failed stdout={stdout} stderr={stderr}");
+    let bytes = std::fs::read(&exported).unwrap();
+    let expected = format!("{}IMMUTABLE_TAIL", "artifact body ".repeat(100_000));
+    assert!(
+        expected.len() > 1024 * 1024,
+        "fixture must cross the engine frame limit"
+    );
+    assert_eq!(bytes, expected.as_bytes(), "artifact is rendered page text");
+    assert!(bytes.ends_with(b"IMMUTABLE_TAIL"));
+    assert_eq!(digest, format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "export repeated the HTTP read"
     );
 }

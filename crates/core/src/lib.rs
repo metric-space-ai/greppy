@@ -31,7 +31,16 @@
 ///   worktree instead of duplicating them into SQLite by default.
 ///   v4 -> v5 (2026-09-05): Rust grammar 0.24.2 correctly parses borrows of
 ///   the contextual identifier `raw`; old extraction trees may be incomplete.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v5";
+///   v5 -> v6: resolve module-qualified Rust calls before same-file twins;
+///   existing resolved CALLS edges must not survive as a no-op incremental run.
+///   v6 -> v7: retain grouped Rust reexports and scoped function-item usages;
+///   existing ambiguous caller edges need complete re-extraction/resolution.
+///   v7 -> v8: recognize imported Effect.fn callback bindings as Functions.
+///   v8 -> v9: persist Rust declared-field and trait receiver facts required
+///   by caller repair; unchanged-source v8 nodes need full re-extraction.
+///   v9 -> v10: persist JS/TS computed, private, string and numeric methods;
+///   unchanged-source v9 graphs lack their reference-source definitions.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v10";
 
 pub mod cache;
 pub mod diag;

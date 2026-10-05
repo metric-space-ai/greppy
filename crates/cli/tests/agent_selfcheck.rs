@@ -69,6 +69,17 @@ fn init_repo(root: &Path) {
     git(root, &["commit", "-m", "initial"]);
 }
 
+fn init_hidden_only_repo(root: &Path) {
+    git(root, &["init"]);
+    git(root, &["checkout", "-b", "main"]);
+    git(root, &["config", "user.name", "fixture"]);
+    git(root, &["config", "user.email", "fixture@test.local"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(root.join(".benchmark-response-workspace"), b"fixture\n").unwrap();
+    git(root, &["add", ".benchmark-response-workspace"]);
+    git(root, &["commit", "-m", "hidden marker"]);
+}
+
 /// Minimal Anthropic Messages gateway: GET /v1/models → 200; POST /v1/messages
 /// → canned SSE text-only end_turn stream.
 fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
@@ -249,6 +260,62 @@ fn selfcheck_passes_on_healthy_fixture() {
     let _ = std::fs::remove_dir_all(&provider_root);
 }
 
+#[test]
+fn selfcheck_passes_on_healthy_hidden_only_repository() {
+    let repo = unique("hidden-only-repo");
+    init_hidden_only_repo(&repo);
+    let store = unique("hidden-only-store");
+    let provider_root = unique("hidden-only-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, handle) = spawn_stub_gateway();
+
+    let output = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .env_remove("GREPPY_SKIP_SELFCHECK")
+        .args([
+            "-p",
+            "say hi",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "2",
+            "--no-sandbox",
+            "--private-store",
+        ])
+        .output()
+        .expect("spawn greppy -p");
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("self-check ok — healthy empty index, worktree writable"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("hi from stub"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&provider_root);
+}
+
 /// `--skip-selfcheck` / GREPPY_SKIP_SELFCHECK=1 bypasses the probes entirely.
 #[test]
 fn skip_selfcheck_bypasses_probes() {
@@ -343,7 +410,7 @@ exit 1
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Empty-index census (`0 files`) is a failure even when the tool exits 0.
+/// Empty-index census remains a failure when doctor cannot verify its health.
 #[cfg(unix)]
 #[test]
 fn selfcheck_empty_index_is_failure() {
@@ -354,14 +421,18 @@ if [ "$1" = "where-am-i" ]; then
   printf '/tmp/fixture — 0 files, 0 definitions\n'
   exit 0
 fi
+if [ "$1" = "doctor" ]; then
+  printf '{"healthy":false,"project_present":false,"graph_generation":null,"stats":null,"root_path":"/tmp/fixture"}\n'
+  exit 0
+fi
 printf 'ok — exit 0\n'
 exit 0
 "#,
     );
     let mut env = GreppyEnv::with_binary(stub, root.clone()).expect("env");
     let err = run_startup_self_check(&mut env).expect_err("empty index must fail");
-    assert_eq!(err.probe, "where-am-i");
-    assert!(err.output.contains("0 files"), "output={}", err.output);
+    assert_eq!(err.probe, "doctor --json after empty where-am-i");
+    assert!(err.output.contains("healthy"), "output={}", err.output);
     let _ = std::fs::remove_dir_all(&root);
 }
 

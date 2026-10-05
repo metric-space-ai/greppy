@@ -9,7 +9,12 @@ await page.route("**/intercepted", (route) =>
     status: 200,
   }),
 );
-await page.goto(fixtureUrl + "intercepted");
+const navigationResponse = await page.goto(fixtureUrl + "intercepted");
+const navigationRequest = navigationResponse.request();
+const navigationRoundTrip = await navigationRequest.response();
+if (!navigationRoundTrip || navigationRoundTrip.status() !== 200) {
+  throw new Error("navigation request.response");
+}
 const response = await page.waitForResponse("intercepted");
 if (response.status() !== 200) throw new Error("status " + response.status());
 if (!response.ok()) throw new Error("ok");

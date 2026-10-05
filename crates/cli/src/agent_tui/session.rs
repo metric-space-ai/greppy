@@ -1,16 +1,103 @@
 //! Versioned, append-safe interactive session persistence.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use greppy_agent::{ContentPart, Message, Role, Usage};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::redaction::{redact_json, redact_text};
 
 pub const SESSION_FORMAT: u32 = 1;
+
+static NEXT_TURN_CHECKPOINT: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(not(windows))]
+fn durable_import_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn durable_import_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    // Canonical Windows paths retain the extended-length prefix. Both files
+    // already exist in the same session directory; cross-volume copy is disabled.
+    let wide = |path: &Path| -> io::Result<Vec<u16>> {
+        let value = fs::canonicalize(path)?
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        if value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains a NUL",
+            ));
+        }
+        Ok(value.into_iter().chain(std::iter::once(0)).collect())
+    };
+    let source = wide(source)?;
+    let destination = wide(destination)?;
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+    // SAFETY: both pointers address owned NUL-terminated UTF-16 buffers that
+    // remain alive for the call. Only documented same-volume move flags are used.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportHistoryCommitError {
+    source: io::Error,
+    pub renamed: bool,
+}
+
+impl From<io::Error> for ImportHistoryCommitError {
+    fn from(source: io::Error) -> Self {
+        Self {
+            source,
+            renamed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for ImportHistoryCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportAck {
+    pub id: String,
+    pub role: String,
+    pub text_hash: String,
+}
+
+impl ImportAck {
+    pub(crate) fn new(id: String, role: String, text: &str) -> Self {
+        Self {
+            id,
+            role,
+            text_hash: format!("{:x}", Sha256::digest(text.as_bytes())),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedMessage {
@@ -40,6 +127,7 @@ pub struct SessionRecord {
     pub proposal_ref: String,
     pub source: String,
     pub messages: Vec<PersistedMessage>,
+    pub import_ack: Vec<ImportAck>,
     pub usage: Usage,
     pub turns: u64,
     pub stop: String,
@@ -60,6 +148,7 @@ impl SessionRecord {
             proposal_ref: String::new(),
             source: String::new(),
             messages: Vec::new(),
+            import_ack: Vec::new(),
             usage: Usage::default(),
             turns: 0,
             stop: String::new(),
@@ -72,6 +161,21 @@ impl SessionRecord {
 pub struct SessionStore {
     root: PathBuf,
     project: String,
+}
+
+pub(crate) struct TurnCommit<'a> {
+    pub expected: &'a [PersistedMessage],
+    pub messages: &'a [PersistedMessage],
+    pub usage: &'a Usage,
+    pub stop: &'a str,
+    pub title: Option<&'a str>,
+}
+
+pub(crate) struct ImportHistoryCommit<'a> {
+    pub expected: &'a [PersistedMessage],
+    pub expected_ack: &'a [ImportAck],
+    pub messages: &'a [PersistedMessage],
+    pub acknowledgements: &'a [ImportAck],
 }
 
 impl SessionStore {
@@ -119,6 +223,7 @@ impl SessionStore {
         let project_dir = self.project_dir();
         fs::create_dir_all(&project_dir)?;
         greppy_core::cache::secure_private_directory(&project_dir)?;
+        let _lease = self.writer_lease(&record.id)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -129,11 +234,279 @@ impl SessionStore {
     }
 
     pub fn append(&self, session_id: &str, line: &Value) -> io::Result<()> {
+        let _lease = self.writer_lease(session_id)?;
         let path = self.path_for(session_id)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{line}")?;
         file.flush()?;
         Ok(())
+    }
+
+    /// Lock a stable sidecar inode, not the log replaced by commit_turn. Never
+    /// unlink this file: an open old inode would split competing writer leases.
+    fn writer_lease(&self, session_id: &str) -> io::Result<File> {
+        self.path_for(session_id)?;
+        let path = self
+            .project_dir()
+            .join(format!(".{session_id}.writer-lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        greppy_core::cache::secure_private_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "session is busy: another writer holds the session lease",
+            )),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Commit one ACP turn with load-atomic visibility using the existing JSONL
+    /// records. Readers see the old log or the complete new log after rename.
+    pub(crate) fn commit_turn(
+        &self,
+        session_id: &str,
+        turn: TurnCommit<'_>,
+        after_messages: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let TurnCommit {
+            expected,
+            messages,
+            usage,
+            stop,
+            title,
+        } = turn;
+        let _lease = self.writer_lease(session_id)?;
+        let previous = self.load(session_id)?;
+        if previous.recovered {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot commit over a corrupt session log",
+            ));
+        }
+        if previous.messages != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "saved session history changed",
+            ));
+        }
+        let total_usage = Usage {
+            input_tokens: previous
+                .usage
+                .input_tokens
+                .saturating_add(usage.input_tokens),
+            output_tokens: previous
+                .usage
+                .output_tokens
+                .saturating_add(usage.output_tokens),
+            cache_read_input_tokens: previous
+                .usage
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens),
+            cache_creation_input_tokens: previous
+                .usage
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
+        };
+        let path = self.path_for(session_id)?;
+        let temporary = self.project_dir().join(format!(
+            ".{session_id}-turn-{}-{}-{}.pending",
+            std::process::id(),
+            now_ms(),
+            NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut created = false;
+        let result = (|| {
+            let mut source = File::open(&path)?;
+            let length = source.metadata()?.len();
+            let needs_newline = if length == 0 {
+                false
+            } else {
+                source.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                source.read_exact(&mut last)?;
+                source.rewind()?;
+                last[0] != b'\n'
+            };
+            let mut target = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            created = true;
+            greppy_core::cache::secure_private_file(&temporary)?;
+            io::copy(&mut source, &mut target)?;
+            if needs_newline {
+                target.write_all(b"\n")?;
+            }
+            if let Some(added) = messages.strip_prefix(expected) {
+                for message in added {
+                    writeln!(target, "{}", message_line(message))?;
+                }
+            } else {
+                writeln!(
+                    target,
+                    "{}",
+                    json!({
+                        "v": SESSION_FORMAT, "type": "message_checkpoint",
+                        "messages": messages.iter().map(message_line).collect::<Vec<_>>()
+                    })
+                )?;
+            }
+            after_messages()?;
+            writeln!(
+                target,
+                "{}",
+                json!({
+                    "v": SESSION_FORMAT, "type": "usage",
+                    "input": total_usage.input_tokens, "output": total_usage.output_tokens,
+                    "cache_read": total_usage.cache_read_input_tokens,
+                    "cache_write": total_usage.cache_creation_input_tokens,
+                    "turns": previous.turns.saturating_add(1), "stop": stop,
+                })
+            )?;
+            if let Some(title) = title {
+                writeln!(
+                    target,
+                    "{}",
+                    json!({
+                        "v": SESSION_FORMAT, "type": "title", "title": redact_text(title),
+                    })
+                )?;
+            }
+            target.flush()?;
+            target.sync_all()?;
+            drop(target);
+            // No fallible operation follows the visible commit point.
+            fs::rename(&temporary, &path)
+        })();
+        if created && result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    /// Append imported messages and their acknowledgement at one visible commit point.
+    pub(crate) fn commit_import_history(
+        &self,
+        session_id: &str,
+        import: ImportHistoryCommit<'_>,
+        before_commit: impl FnOnce() -> io::Result<()>,
+        after_rename: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), ImportHistoryCommitError> {
+        let ImportHistoryCommit {
+            expected,
+            expected_ack,
+            messages,
+            acknowledgements,
+        } = import;
+        let _lease = self.writer_lease(session_id)?;
+        let previous = self.load(session_id)?;
+        if previous.recovered
+            || previous.messages != expected
+            || previous.import_ack != expected_ack
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "saved session history changed or is corrupt",
+            )
+            .into());
+        }
+        let added = messages.strip_prefix(expected).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "import must preserve native history",
+            )
+        })?;
+        if !acknowledgements.starts_with(expected_ack)
+            || added.len() != acknowledgements.len() - expected_ack.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "import acknowledgement does not match appended history",
+            )
+            .into());
+        }
+        let path = self.path_for(session_id)?;
+        // Unix persists the directory entry; Windows uses write-through rename
+        // and flushes the already-visible file when validating a retry.
+        #[cfg(not(windows))]
+        let directory = File::open(self.project_dir())?;
+        #[cfg(not(windows))]
+        directory.sync_all()?;
+        #[cfg(windows)]
+        OpenOptions::new().write(true).open(&path)?.sync_all()?;
+        if added.is_empty() {
+            return Ok(());
+        }
+        let temporary = self.project_dir().join(format!(
+            ".{session_id}-import-{}-{}-{}.pending",
+            std::process::id(),
+            now_ms(),
+            NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut created = false;
+        let mut renamed = false;
+        let result = (|| {
+            let mut source = File::open(&path)?;
+            let length = source.metadata()?.len();
+            let needs_newline = if length == 0 {
+                false
+            } else {
+                source.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                source.read_exact(&mut last)?;
+                source.rewind()?;
+                last[0] != b'\n'
+            };
+            let mut target = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            created = true;
+            greppy_core::cache::secure_private_file(&temporary)?;
+            io::copy(&mut source, &mut target)?;
+            if needs_newline {
+                target.write_all(b"\n")?;
+            }
+            for message in added {
+                writeln!(target, "{}", message_line(message))?;
+            }
+            writeln!(
+                target,
+                "{}",
+                json!({
+                    "v": SESSION_FORMAT, "type": "import_ack",
+                    "messages": acknowledgements.iter().map(|ack| json!({
+                        "id": ack.id, "role": ack.role, "text_hash": ack.text_hash
+                    })).collect::<Vec<_>>()
+                })
+            )?;
+            before_commit()?;
+            target.flush()?;
+            target.sync_all()?;
+            drop(target);
+            // A failed Windows write-through move can have uncertain visibility;
+            // require reload even when that API reports a failure.
+            #[cfg(windows)]
+            {
+                renamed = true;
+            }
+            durable_import_rename(&temporary, &path)?;
+            renamed = true;
+            after_rename()?;
+            #[cfg(not(windows))]
+            directory.sync_all()?;
+            Ok(())
+        })();
+        if created && result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|source| ImportHistoryCommitError { source, renamed })
     }
 
     pub fn append_messages(
@@ -444,6 +817,21 @@ pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
                     record.messages.push(message);
                 }
             }
+            Some("import_ack") => {
+                let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+                    recovered = true;
+                    break;
+                };
+                let replacement = messages
+                    .iter()
+                    .map(import_ack_from_value)
+                    .collect::<Option<Vec<_>>>();
+                let Some(replacement) = replacement else {
+                    recovered = true;
+                    break;
+                };
+                record.import_ack = replacement;
+            }
             Some("message_checkpoint") => {
                 let Some(messages) = value.get("messages").and_then(Value::as_array) else {
                     recovered = true;
@@ -643,6 +1031,24 @@ fn meta_line(record: &SessionRecord) -> Value {
         "branch": record.branch,
         "proposal_ref": record.proposal_ref,
         "source": record.source,
+    })
+}
+
+fn import_ack_from_value(value: &Value) -> Option<ImportAck> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let role = value.get("role")?.as_str()?.to_string();
+    let text_hash = value.get("text_hash")?.as_str()?.to_string();
+    if id.is_empty()
+        || !matches!(role.as_str(), "user" | "assistant")
+        || text_hash.len() != 64
+        || !text_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(ImportAck {
+        id,
+        role,
+        text_hash,
     })
 }
 

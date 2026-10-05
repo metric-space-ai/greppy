@@ -22,6 +22,7 @@ pub struct TargetOpts {
     /// Example: --expect "css=dialog[open]". Requires a workflow-capable runtime.
     /// Bare QUERY is CSS. For element text, use --expect 'text=Saved' (exact)
     /// or --expect 'text~/Saved/i' (partial); quotes alone do not change query type.
+    /// Without --expect, a returned action is dispatch only, not a verified page change.
     #[arg(long, value_name = "QUERY")]
     pub expect: Option<String>,
     /// Require QUERY to be absent; stale refs remain errors.
@@ -116,6 +117,22 @@ pub enum ActCommand {
         #[command(flatten)]
         opts: TargetOpts,
     },
+}
+
+pub(super) fn requests_json(command: &ActCommand) -> bool {
+    match command {
+        ActCommand::Click { opts, .. }
+        | ActCommand::Fill { opts, .. }
+        | ActCommand::Type { opts, .. }
+        | ActCommand::Clear { opts, .. }
+        | ActCommand::Select { opts, .. }
+        | ActCommand::Check { opts, .. }
+        | ActCommand::Uncheck { opts, .. }
+        | ActCommand::Press { opts, .. }
+        | ActCommand::Hover { opts, .. }
+        | ActCommand::Scroll { opts, .. }
+        | ActCommand::Upload { opts, .. } => opts.json,
+    }
 }
 
 pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
@@ -358,8 +375,23 @@ pub(super) fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         let target = dir.join(&name);
-        std::fs::copy(&canonical, &target)
+        // Keep the writable destination handle until timestamps are set.
+        // fs::copy restores readonly source permissions too early on Windows.
+        let mut source_file = std::fs::File::open(&canonical)
+            .map_err(|error| format!("cannot open {path}: {error}"))?;
+        let mut target_file = std::fs::File::create(&target)
             .map_err(|error| format!("cannot stage {path}: {error}"))?;
+        std::io::copy(&mut source_file, &mut target_file)
+            .map_err(|error| format!("cannot stage {path}: {error}"))?;
+        let modified = meta
+            .modified()
+            .map_err(|error| format!("cannot read modification time for {path}: {error}"))?;
+        target_file
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .map_err(|error| format!("cannot preserve modification time for {path}: {error}"))?;
+        target_file
+            .set_permissions(meta.permissions())
+            .map_err(|error| format!("cannot preserve permissions for {path}: {error}"))?;
         staged.push(target.display().to_string());
     }
     Ok(staged)

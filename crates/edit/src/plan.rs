@@ -869,7 +869,8 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             .collect();
         match apply_in_memory(snapshot, &mutations) {
             Ok(applied) => {
-                let language = greppy_parser::language_for_path(&snapshot.path);
+                let language =
+                    crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content);
                 let syntax_before = language
                     .is_supported()
                     .then(|| syntax_counts(language, &snapshot.content))

@@ -11,11 +11,11 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
-    RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
-    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
+    RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
+    WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -31,10 +31,12 @@ use url::Url;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
+const PERSISTENT_PROFILE_ROOT_ENV: &str = "GREPPY_WEB_PERSISTENT_PROFILE_ROOT";
 const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
+const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -229,6 +231,24 @@ fn alloc_wait_nonce() -> io::Result<String> {
     Ok(rnd.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// A destructive read may pump a navigation between dispatch and callback.
+/// Reject old-document results, but never retry a read which returned an error.
+fn take_wait_completion_in_document<T>(
+    generation: &Cell<u64>,
+    expected: u64,
+    take: impl FnOnce() -> io::Result<Option<T>>,
+) -> io::Result<Option<T>> {
+    if generation.get() != expected {
+        return Ok(None);
+    }
+    let completed = take()?;
+    if generation.get() != expected {
+        Ok(None)
+    } else {
+        Ok(completed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WakePoll {
     Ready,
@@ -335,6 +355,7 @@ struct Delegate {
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
+    dropped_requests: Cell<u64>,
     downloads: RefCell<Vec<serde_json::Value>>,
     popups: RefCell<Vec<(WebView, WebView)>>,
     opener_id: RefCell<Option<String>>,
@@ -349,6 +370,13 @@ struct Delegate {
     denied_navigation: RefCell<Option<String>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
+    dropped_responses: Cell<u64>,
+    current_main_frame_request: RefCell<Option<String>>,
+    main_frame_navigation_epoch: Cell<u64>,
+    navigation_intent_generation: Cell<u64>,
+    pending_navigation_intent: RefCell<Option<(u64, String, Option<String>)>>,
+    promoted_navigation_url: RefCell<Option<String>>,
+    navigation_failure: RefCell<Option<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
     /// Main-document lifecycle, owned by Servo rather than page script. A
@@ -378,6 +406,7 @@ impl Delegate {
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
+            dropped_requests: Cell::new(0),
             downloads: RefCell::new(Vec::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
@@ -391,6 +420,13 @@ impl Delegate {
             denied_navigation: RefCell::new(None),
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
+            dropped_responses: Cell::new(0),
+            current_main_frame_request: RefCell::new(None),
+            main_frame_navigation_epoch: Cell::new(0),
+            navigation_intent_generation: Cell::new(0),
+            pending_navigation_intent: RefCell::new(None),
+            promoted_navigation_url: RefCell::new(None),
+            navigation_failure: RefCell::new(None),
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
@@ -401,17 +437,57 @@ impl Delegate {
         }
     }
 
-    fn mark_request_failure(&self, url: &str, error_text: &str) {
-        if let Some(row) = self
-            .requests
-            .borrow_mut()
-            .iter_mut()
-            .rev()
-            .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url))
+    fn mark_request_failure(&self, request_id: &str, error_text: &str) {
+        if let Some(row) =
+            self.requests.borrow_mut().iter_mut().rev().find(|row| {
+                row.get("requestId").and_then(|value| value.as_str()) == Some(request_id)
+            })
         {
             row["failure"] = json!({ "errorText": error_text });
             self.wake.wake();
         }
+    }
+
+    fn record_main_frame_failure(&self, request_id: &str, url: &str, error_text: &str, kind: &str) {
+        if self.current_main_frame_request.borrow().as_deref() == Some(request_id) {
+            let preserve_specific_failure = kind == "transport"
+                && self
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|failure| {
+                        failure.get("requestId").and_then(|value| value.as_str())
+                            == Some(request_id)
+                            && failure.get("kind").and_then(|value| value.as_str())
+                                != Some("transport")
+                    });
+            if preserve_specific_failure {
+                return;
+            }
+            self.navigation_failure.replace(Some(json!({
+                "requestId": request_id,
+                "url": url,
+                "errorText": error_text,
+                "kind": kind,
+                "navigationEpoch": self.main_frame_navigation_epoch.get(),
+            })));
+            self.wake.wake();
+        }
+    }
+
+    fn navigation_failure_after(
+        &self,
+        kind: &str,
+        baseline_epoch: u64,
+    ) -> Option<serde_json::Value> {
+        let current_epoch = self.main_frame_navigation_epoch.get();
+        self.navigation_failure
+            .borrow()
+            .as_ref()
+            .filter(|failure| {
+                navigation_failure_matches_after(failure, kind, current_epoch, baseline_epoch)
+            })
+            .cloned()
     }
 
     fn note_wait_signal(&self, text: &str) {
@@ -434,7 +510,47 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
+    fn request_navigation(&self, _webview: WebView, navigation: NavigationRequest) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=intent main_frame={} url={}",
+                navigation.is_for_main_frame, navigation.url
+            );
+        }
+        if !navigation.is_for_main_frame {
+            match decide_url(self.profile.get(), navigation.url.as_str()) {
+                UrlDecision::Allow => navigation.allow(),
+                UrlDecision::Deny { .. } => navigation.deny(),
+            }
+            return;
+        }
+        let generation = self.navigation_intent_generation.get().wrapping_add(1);
+        self.navigation_intent_generation.set(generation);
+        let decision = decide_url(self.profile.get(), navigation.url.as_str());
+        let denied = match &decision {
+            UrlDecision::Deny { reason } => Some((*reason).to_owned()),
+            UrlDecision::Allow => None,
+        };
+        self.pending_navigation_intent.replace(Some((
+            generation,
+            navigation.url.to_string(),
+            denied,
+        )));
+        self.wake.wake();
+        if matches!(decision, UrlDecision::Deny { .. }) {
+            navigation.deny();
+            return;
+        }
+        navigation.allow();
+    }
+
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=load-status status={status:?} epoch={}",
+                self.main_frame_navigation_epoch.get()
+            );
+        }
         if status == LoadStatus::HeadParsed {
             self.document_generation
                 .set(self.document_generation.get().wrapping_add(1));
@@ -554,6 +670,10 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
+        let request_id = format!(
+            "{}:{}",
+            load.request.id.fetch_id, load.request.id.redirect_count
+        );
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -591,7 +711,29 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow if abort_match => Some("net::ERR_FAILED".to_owned()),
             UrlDecision::Allow => None,
         };
-        self.requests.borrow_mut().push(json!({
+        let mut requests = self.requests.borrow_mut();
+        if load.request.is_for_main_frame {
+            let promoted = self.promoted_navigation_url.borrow().as_deref() == Some(url.as_str());
+            if !load.request.is_redirect && !promoted {
+                self.main_frame_navigation_epoch
+                    .set(self.main_frame_navigation_epoch.get().wrapping_add(1));
+            }
+            if promoted {
+                self.promoted_navigation_url.replace(None);
+            }
+            self.current_main_frame_request
+                .replace(Some(request_id.clone()));
+            self.navigation_failure.replace(None);
+            if NavTrace::enabled() {
+                eprintln!(
+                    "web-runtime: nav-event phase=request request_id={request_id} redirect={} promoted={promoted} epoch={} url={url}",
+                    load.request.is_redirect,
+                    self.main_frame_navigation_epoch.get()
+                );
+            }
+        }
+        requests.push(json!({
+            "requestId": request_id,
             "url": url,
             "method": load.request.method.to_string(),
             "main_frame": load.request.is_for_main_frame,
@@ -599,10 +741,17 @@ impl WebViewDelegate for Delegate {
             "headers": headers,
             "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
+        retain_bounded(
+            &mut requests,
+            &self.dropped_requests,
+            MAX_NETWORK_RECORDS_PER_PAGE,
+        );
+        drop(requests);
         self.wake.wake();
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
+                self.record_main_frame_failure(&request_id, &url, reason, "policy_denied");
             }
             let denied_url = load.request.url.clone();
             load.intercept(WebResourceResponse::new(denied_url))
@@ -633,9 +782,15 @@ impl WebViewDelegate for Delegate {
         let request_url = load.request.url.clone();
         match action.as_str() {
             "abort" => {
-                self.mark_request_failure(&url, "net::ERR_FAILED");
+                self.mark_request_failure(&request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
+                    self.record_main_frame_failure(
+                        &request_id,
+                        &url,
+                        "net::ERR_FAILED",
+                        "route_aborted",
+                    );
                 }
                 load.intercept(WebResourceResponse::new(request_url))
                     .cancel();
@@ -658,7 +813,9 @@ impl WebViewDelegate for Delegate {
                 intercepted.finish();
                 let status_text = status_code.canonical_reason().unwrap_or("").to_owned();
                 let body_b64 = base64_encode(&body);
-                self.last_responses.borrow_mut().push(json!({
+                let mut responses = self.last_responses.borrow_mut();
+                responses.push(json!({
+                    "requestId": request_id,
                     "url": request_url.to_string(),
                     "status": status,
                     "statusText": status_text,
@@ -669,6 +826,12 @@ impl WebViewDelegate for Delegate {
                         "content-type": content_type,
                     },
                 }));
+                retain_bounded(
+                    &mut responses,
+                    &self.dropped_responses,
+                    MAX_NETWORK_RECORDS_PER_PAGE,
+                );
+                drop(responses);
                 self.wake.wake();
                 let lower = content_type.to_ascii_lowercase();
                 let is_download = lower.contains("octet-stream") || lower.contains("attachment");
@@ -701,6 +864,153 @@ impl WebViewDelegate for Delegate {
             _ => {}
         }
     }
+    fn web_resource_response_completed(
+        &self,
+        _webview: WebView,
+        response: WebResourceResponseCompleted,
+    ) {
+        let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=response-completed request_id={request_id} failure={:?} epoch={} url={}",
+                response.failure,
+                self.main_frame_navigation_epoch.get(),
+                response.url
+            );
+        }
+        let headers: serde_json::Map<String, serde_json::Value> = response
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), json!(value)))
+            })
+            .collect();
+        let mut row = json!({
+            "requestId": request_id,
+            "url": response.url.to_string(),
+            "statusText": String::from_utf8_lossy(&response.status_message),
+            "bodyBytes": response.body_bytes,
+            "byteLength": response.body_bytes,
+            "fromCache": response.from_cache,
+            "headers": headers,
+        });
+        if let Some(status) = response.status_code {
+            row["status"] = json!(status);
+            row["ok"] = json!((200..400).contains(&status));
+            if status == 204
+                && self.current_main_frame_request.borrow().as_deref() == Some(request_id.as_str())
+            {
+                self.record_main_frame_failure(
+                    &request_id,
+                    response.url.as_str(),
+                    "HTTP 204 No Content cannot create a document",
+                    "no_document",
+                );
+            }
+        }
+        if let Some(failure) = response.failure {
+            row["failure"] = json!({ "errorText": failure.clone() });
+            self.record_main_frame_failure(
+                &request_id,
+                response.url.as_str(),
+                &failure,
+                "transport",
+            );
+        }
+        let mut responses = self.last_responses.borrow_mut();
+        if let Some(existing) = responses.iter_mut().find(|existing| {
+            existing.get("requestId").and_then(|id| id.as_str()) == Some(request_id.as_str())
+        }) {
+            merge_terminal_response(existing, row);
+        } else {
+            responses.push(row);
+            retain_bounded(
+                &mut responses,
+                &self.dropped_responses,
+                MAX_NETWORK_RECORDS_PER_PAGE,
+            );
+        }
+        self.wake.wake();
+    }
+}
+
+fn retain_bounded(records: &mut Vec<serde_json::Value>, dropped: &Cell<u64>, limit: usize) {
+    let excess = records.len().saturating_sub(limit);
+    if excess != 0 {
+        records.drain(..excess);
+        dropped.set(dropped.get().saturating_add(excess as u64));
+    }
+}
+
+fn network_retention_metadata(retained: usize, dropped: u64) -> serde_json::Value {
+    json!({
+        "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+        "retained": retained,
+        "dropped": dropped,
+        "complete": dropped == 0,
+    })
+}
+
+fn response_information_score(response: &serde_json::Value) -> usize {
+    let failure = response
+        .get("failure")
+        .is_some_and(|value| !value.is_null()) as usize
+        * 1_000;
+    let status = response
+        .get("status")
+        .and_then(|value| value.as_u64())
+        .is_some() as usize
+        * 100;
+    let headers = response
+        .get("headers")
+        .and_then(|value| value.as_object())
+        .map_or(0, |value| value.len() * 10);
+    let body = response
+        .get("bodyBytes")
+        .and_then(|value| value.as_u64())
+        .is_some() as usize
+        * 10;
+    failure + status + headers + body
+}
+
+fn merge_terminal_response(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+    let existing_key = (response_information_score(existing), existing.to_string());
+    let incoming_key = (response_information_score(&incoming), incoming.to_string());
+    let (mut richer, other) = if incoming_key > existing_key {
+        (incoming, existing.clone())
+    } else {
+        (existing.clone(), incoming)
+    };
+    let Some(richer_object) = richer.as_object_mut() else {
+        return;
+    };
+    let Some(other_object) = other.as_object() else {
+        return;
+    };
+    for (key, value) in other_object {
+        let missing = richer_object.get(key).is_none_or(|current| {
+            current.is_null()
+                || current.as_str().is_some_and(str::is_empty)
+                || current.as_object().is_some_and(serde_json::Map::is_empty)
+        });
+        if missing {
+            richer_object.insert(key.clone(), value.clone());
+        }
+    }
+    for key in ["bodyBytes", "byteLength"] {
+        if let Some(maximum) = [richer_object.get(key), other_object.get(key)]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_u64)
+            .max()
+        {
+            richer_object.insert(key.to_owned(), json!(maximum));
+        }
+    }
+    *existing = richer;
 }
 
 fn extra_request_headers(extras: &[(String, String)]) -> http::HeaderMap {
@@ -766,6 +1076,7 @@ impl ObjectLife {
 enum PageSlot {
     Live {
         pair: (WebView, Rc<Delegate>),
+        bundle: Option<Rc<EngineBundle>>,
         generation: u64,
         context_id: Option<String>,
         browser_id: Option<String>,
@@ -779,16 +1090,27 @@ impl PageSlot {
     fn live(
         webview: WebView,
         delegate: Rc<Delegate>,
+        bundle: Option<Rc<EngineBundle>>,
         context_id: Option<String>,
         browser_id: Option<String>,
     ) -> Self {
         Self::Live {
             pair: (webview, delegate),
+            bundle,
             generation: 1,
             context_id,
             browser_id,
         }
     }
+}
+
+struct EngineBundle {
+    servo: Servo,
+    rendering_context: Rc<dyn RenderingContext>,
+    profile: SharedProfile,
+    wake: WakeFlag,
+    user_content: Rc<UserContentManager>,
+    _proxy: PolicyProxy,
 }
 
 fn object_disposed(kind: &str) -> io::Error {
@@ -875,20 +1197,68 @@ struct ContentEngine {
     pages: HashMap<String, PageSlot>,
     browsers: HashMap<String, ObjectLife>,
     contexts: HashMap<String, ObjectLife>,
+    context_bundles: HashMap<String, Rc<EngineBundle>>,
+    retired_network_bytes: u64,
+    session_contexts: HashMap<String, String>,
     next_id: u64,
     pump_nonce: Cell<u64>,
     pump_pending: RefCell<Vec<String>>,
+    renderer_error: RefCell<Option<String>>,
     parent_alive: Arc<AtomicBool>,
     wake: WakeFlag,
     profile: SharedProfile,
     /// Carries the Web API shims. Shared by every page, so a shim reaches
     /// frames and popups too, not just the tab the agent drove.
     user_content: Rc<UserContentManager>,
+    transfer_capability: String,
+    transfer_root: PathBuf,
     _proxy: PolicyProxy,
 }
 
+impl Drop for ContentEngine {
+    fn drop(&mut self) {
+        // Additional Servo instances borrow the process-global JS engine and
+        // embedder namespace owned by `self.servo`; drop every dependent page
+        // and bundle before Rust reaches the owner's field drop.
+        self.pages.clear();
+        self.context_bundles.clear();
+    }
+}
+
+fn authorize_text_transfer(
+    path: &Path,
+    supplied_capability: &str,
+    expected_capability: &str,
+    transfer_root: &Path,
+) -> io::Result<()> {
+    let same_length = supplied_capability.len() == expected_capability.len();
+    let difference = supplied_capability
+        .bytes()
+        .zip(expected_capability.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        });
+    if !same_length || difference != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "page.textToFile requires daemon authorization",
+        ));
+    }
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if path.parent() != Some(transfer_root) || !valid_name {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "page.textToFile destination is not daemon-owned",
+        ));
+    }
+    Ok(())
+}
+
 impl ContentEngine {
-    fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
+    fn new(parent_alive: Arc<AtomicBool>, transfer_capability: String) -> io::Result<Self> {
         trace_startup("renderer-create");
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
@@ -928,13 +1298,19 @@ impl ContentEngine {
             pages: HashMap::new(),
             browsers: HashMap::new(),
             contexts: HashMap::new(),
+            context_bundles: HashMap::new(),
+            retired_network_bytes: 0,
+            session_contexts: HashMap::new(),
             next_id: 1,
             pump_nonce: Cell::new(1),
             pump_pending: RefCell::new(Vec::new()),
+            renderer_error: RefCell::new(None),
             parent_alive,
             wake,
             profile,
             user_content,
+            transfer_capability,
+            transfer_root: std::env::temp_dir().join("transfers"),
             _proxy: proxy,
         })
     }
@@ -956,8 +1332,162 @@ impl ContentEngine {
         id
     }
 
-    fn spin_until(
+    fn build_bundle(&self, storage_key: &str) -> io::Result<Rc<EngineBundle>> {
+        let rendering_context = Rc::new(
+            SoftwareRenderingContext::new(PhysicalSize {
+                width: 1280,
+                height: 720,
+            })
+            .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
+        );
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
+        let profile = SharedProfile::new(self.profile.get());
+        let proxy = PolicyProxy::spawn(profile.clone())?;
+        let preferences = engine_preferences(&proxy.uri());
+        let wake = WakeFlag::new();
+        let mut opts = Opts::default();
+        let persistent_name = storage_key.strip_prefix("persistent-");
+        if persistent_name.is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid persistent profile storage key",
+            ));
+        }
+        let config_root = persistent_name
+            .and_then(|_| std::env::var_os(PERSISTENT_PROFILE_ROOT_ENV))
+            .or_else(|| std::env::var_os(CONTENT_CONFIG_DIR_ENV));
+        if let Some(path) = config_root {
+            let path = match persistent_name {
+                Some(name) => PathBuf::from(path).join(name).join("browser"),
+                None => PathBuf::from(path).join(storage_key),
+            };
+            std::fs::create_dir_all(&path)?;
+            opts.config_dir = Some(path);
+        }
+        // `self.servo` owns Servo's process-global SpiderMonkey setup and the
+        // embedder thread's pipeline namespace for the lifetime of this engine.
+        let servo = unsafe {
+            ServoBuilder::default()
+                .opts(opts)
+                .preferences(preferences)
+                .event_loop_waker(Box::new(wake.clone()))
+                .build_with_shared_process_state()
+        };
+        let user_content = Rc::new(UserContentManager::new(&servo));
+        user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
+        Ok(Rc::new(EngineBundle {
+            servo,
+            rendering_context,
+            profile,
+            wake,
+            user_content,
+            _proxy: proxy,
+        }))
+    }
+
+    fn spin_all_event_loops(&self) {
+        if let Err(error) = self.rendering_context.make_current() {
+            self.renderer_error
+                .borrow_mut()
+                .get_or_insert_with(|| format!("root renderer make_current failed: {error:?}"));
+            return;
+        }
+        self.servo.spin_event_loop();
+        for bundle in self.context_bundles.values() {
+            if let Err(error) = bundle.rendering_context.make_current() {
+                self.renderer_error.borrow_mut().get_or_insert_with(|| {
+                    format!("context renderer make_current failed: {error:?}")
+                });
+                return;
+            }
+            bundle.servo.spin_event_loop();
+        }
+    }
+
+    fn wake_for_webview(&self, webview: &WebView) -> WakeFlag {
+        self.pages
+            .values()
+            .find_map(|slot| match slot {
+                PageSlot::Live {
+                    pair: (candidate, _),
+                    bundle: Some(bundle),
+                    ..
+                } if candidate == webview => Some(bundle.wake.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.wake.clone())
+    }
+
+    fn profile_for_page(&self, page_id: &str) -> io::Result<NetworkProfile> {
+        match self.pages.get(page_id) {
+            Some(PageSlot::Live {
+                bundle: Some(bundle),
+                ..
+            }) => Ok(bundle.profile.get()),
+            Some(PageSlot::Live { .. }) => Ok(self.profile.get()),
+            Some(PageSlot::Disposed { generation }) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("object_disposed: Page has been closed (generation {generation})"),
+            )),
+            None => Err(object_disposed("Page")),
+        }
+    }
+
+    fn network_bytes_for(&self, params: &serde_json::Value) -> u64 {
+        if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+            return match self.pages.get(page) {
+                Some(PageSlot::Live {
+                    bundle: Some(bundle),
+                    ..
+                }) => bundle._proxy.bytes_transferred(),
+                Some(PageSlot::Live { .. }) => self._proxy.bytes_transferred(),
+                _ => 0,
+            };
+        }
+        if let Some(session) = params.get("session").and_then(|value| value.as_str()) {
+            if let Some(bundle) = self
+                .session_contexts
+                .get(session)
+                .and_then(|context| self.context_bundles.get(context))
+            {
+                return bundle._proxy.bytes_transferred();
+            }
+            return 0;
+        }
+        // Controller scripts can create several explicit contexts without a
+        // daemon-owned page. Their calls are serialized, so the before/after
+        // delta intentionally covers every context participating in that run.
+        self.context_bundles
+            .values()
+            .map(|bundle| bundle._proxy.bytes_transferred())
+            .sum::<u64>()
+            .saturating_add(self.retired_network_bytes)
+            .saturating_add(self._proxy.bytes_transferred())
+    }
+
+    fn retire_bundle(&mut self, context_id: &str) {
+        if let Some(bundle) = self.context_bundles.remove(context_id) {
+            self.retired_network_bytes = self
+                .retired_network_bytes
+                .saturating_add(bundle._proxy.bytes_transferred());
+        }
+    }
+
+    fn spin_until(&self, timeout: Duration, predicate: impl FnMut() -> bool) -> io::Result<bool> {
+        self.spin_until_on(&self.wake, timeout, predicate)
+    }
+
+    fn spin_until_on(
         &self,
+        wake: &WakeFlag,
         timeout: Duration,
         mut predicate: impl FnMut() -> bool,
     ) -> io::Result<bool> {
@@ -972,7 +1502,7 @@ impl ContentEngine {
             // Load-status and WebResourceRequested are event-loop messages.
             // Continue-with-headers waits on that same loop; a missed waker
             // must not sit on the Condvar until ACTION_TIMEOUT with status=Started.
-            self.servo.spin_event_loop();
+            self.spin_all_event_loops();
             if predicate() {
                 return Ok(true);
             }
@@ -981,7 +1511,7 @@ impl ContentEngine {
                 return Ok(false);
             }
             match poll_wake_step(
-                &self.wake,
+                wake,
                 &mut predicate,
                 remaining.min(Duration::from_millis(10)),
             ) {
@@ -992,7 +1522,7 @@ impl ContentEngine {
                     }
                 }
                 WakePoll::NeedSpin { .. } => {
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
             }
         }
@@ -1000,11 +1530,9 @@ impl ContentEngine {
 
     /// How far a navigation must get before `goto` returns.
     ///
-    /// Playwright lets the caller choose; the runtime used to wait for the
-    /// full load in every case. On a page whose sub-resource never finishes,
-    /// `readyState` stays `loading` forever, so `goto` timed out on a document
-    /// that was parsed, titled and fully readable -- three pages of the pinned
-    /// corpus fail exactly this way.
+    /// Playwright lets the caller choose. Servo's HeadParsed signal is only a
+    /// parsing progress marker, while Complete is the full-load boundary; the
+    /// document-start lifecycle receipt supplies DOMContentLoaded between them.
     fn load_committed_for(
         &self,
         webview: &WebView,
@@ -1013,31 +1541,20 @@ impl ContentEngine {
     ) -> bool {
         match (webview.load_status(), until) {
             (LoadStatus::Complete, _) => true,
-            // The document is parsed: the DOM is there and can be read, which
-            // is exactly what `domcontentloaded` promises.
-            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded) => true,
-            _ => self.load_committed(webview, last_js),
-        }
-    }
-
-    fn load_committed(&self, webview: &WebView, last_js: &mut Instant) -> bool {
-        match webview.load_status() {
-            LoadStatus::Complete => true,
-            // Poll readyState at 25ms, not 200ms. Large documents sit in
-            // HeadParsed for their whole parse; on the release build the
-            // 200ms cadence alone cost ~1.3s of a 2.1s navigation commit
-            // (nav-trace, page 044) while each evaluate costs well under a
-            // millisecond of CPU.
-            LoadStatus::HeadParsed if last_js.elapsed() >= Duration::from_millis(25) => {
+            // HeadParsed is earlier than DOMContentLoaded. In particular,
+            // readyState `interactive` is also too early while deferred
+            // scripts are still pending, so use the document-start listener
+            // installed by the user-content bundle as the lifecycle receipt.
+            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded)
+                if last_js.elapsed() >= Duration::from_millis(25) =>
+            {
                 *last_js = Instant::now();
                 match self.evaluate_until(
                     webview.clone(),
-                    "document.readyState",
+                    "globalThis.__greppyDOMContentLoaded === true",
                     Duration::from_millis(150),
                 ) {
-                    Ok(JSValue::String(state)) => {
-                        load_status_allows_navigation(LoadStatus::HeadParsed, Some(&state))
-                    }
+                    Ok(JSValue::Boolean(loaded)) => loaded,
                     _ => false,
                 }
             }
@@ -1051,7 +1568,7 @@ impl ContentEngine {
         timeout: Duration,
         url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
-        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, url_settled)
+        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, || false, url_settled)
     }
 
     fn spin_until_loaded_until(
@@ -1059,21 +1576,31 @@ impl ContentEngine {
         webview: &WebView,
         timeout: Duration,
         until: WaitUntil,
+        mut terminal_failure: impl FnMut() -> bool,
         mut url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
+        let wake = self.wake_for_webview(webview);
         let mut last_js = Instant::now() - Duration::from_millis(200);
         let mut trace = NavTrace::begin();
         loop {
             if self.parent_dead() {
                 return Err(Self::parent_gone());
             }
+            if terminal_failure() {
+                trace.finish(webview);
+                return Ok(true);
+            }
             trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
                 return Ok(true);
             }
-            self.servo.spin_event_loop();
+            self.spin_all_event_loops();
+            if terminal_failure() {
+                trace.finish(webview);
+                return Ok(true);
+            }
             trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
@@ -1081,20 +1608,22 @@ impl ContentEngine {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace.timeout(webview);
                 return Ok(false);
             }
             match poll_wake_step(
-                &self.wake,
+                &wake,
                 &mut || false,
                 remaining.min(Duration::from_millis(10)),
             ) {
                 WakePoll::Ready | WakePoll::TimedOut => {
                     if Instant::now() >= deadline {
+                        trace.timeout(webview);
                         return Ok(false);
                     }
                 }
                 WakePoll::NeedSpin { .. } => {
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
             }
         }
@@ -1225,7 +1754,7 @@ impl ContentEngine {
                 break;
             }
             webview.paint();
-            self.servo.spin_event_loop();
+            self.spin_all_event_loops();
             if Instant::now() >= next_poll {
                 let poll_budget = deadline
                     .saturating_duration_since(Instant::now())
@@ -1374,6 +1903,223 @@ impl ContentEngine {
         self.evaluate_until(webview, script, ACTION_TIMEOUT)
     }
 
+    fn evaluate_structured_dom(
+        &self,
+        webview: WebView,
+        request: &serde_json::Value,
+    ) -> io::Result<JSValue> {
+        let saved = Rc::new(RefCell::new(None));
+        let callback_slot = Rc::clone(&saved);
+        webview.evaluate_structured_dom(request.to_string(), move |result| {
+            *callback_slot.borrow_mut() = Some(result);
+        });
+        let ready = Rc::clone(&saved);
+        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some())? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out evaluating structured DOM query",
+            ));
+        }
+        let result = saved.borrow_mut().take().expect("evaluation completed");
+        result.map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
+    }
+
+    /// Playwright awaits a Promise returned by `page.evaluate`. Servo's
+    /// evaluate callback reports the Promise object itself, whose enumerable
+    /// property map is empty, so serialize it through a page-realm slot and
+    /// keep pumping the event loop until the Promise settles.
+    fn evaluate_awaited(
+        &self,
+        webview: WebView,
+        delegate: &Delegate,
+        script: &str,
+    ) -> io::Result<JSValue> {
+        self.evaluate_awaited_until(webview, delegate, script, ACTION_TIMEOUT)
+    }
+
+    fn evaluate_awaited_until(
+        &self,
+        webview: WebView,
+        delegate: &Delegate,
+        script: &str,
+        timeout: Duration,
+    ) -> io::Result<JSValue> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid evaluate timeout")
+        })?;
+        let token = alloc_wait_nonce()?;
+        let key = Self::wait_slot_key(&token);
+        let key_js = serde_json::to_string(&key).map_err(io::Error::other)?;
+        let source_js = serde_json::to_string(script).map_err(io::Error::other)?;
+        let wrapper = format!(
+            r#"(function(key, source) {{
+  var value;
+  try {{ value = eval(source); }} catch (error) {{
+    return [-1, {{ name: String(error && error.name || "Error"), message: String(error && error.message || error) }}];
+  }}
+  if (!value || typeof value.then !== "function") return [0, value];
+  var slot = {{ done: 0, status: "", value: undefined }};
+  window[key] = slot;
+  Promise.resolve(value).then(function(resolved) {{
+    slot.done = 1; slot.status = "ok"; slot.value = resolved;
+  }}, function(error) {{
+    slot.done = 1; slot.status = "error";
+    slot.value = String(error && error.message ? error.message : error);
+  }});
+  return [1, null];
+}})({key_js}, {source_js})"#
+        );
+        let document_generation = delegate.document_generation.get();
+        let first = match self.evaluate_until(
+            webview.clone(),
+            &wrapper,
+            deadline.saturating_duration_since(Instant::now()),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.drop_wait_slot(&webview, &token, None);
+                return Err(Self::evaluate_await_error(error));
+            }
+        };
+        let JSValue::Array(mut parts) = first else {
+            self.drop_wait_slot(&webview, &token, None);
+            return Err(io::Error::other(
+                "page.evaluate returned an invalid await envelope",
+            ));
+        };
+        if parts.len() < 2 {
+            self.drop_wait_slot(&webview, &token, None);
+            return Err(io::Error::other(
+                "page.evaluate returned an incomplete await envelope",
+            ));
+        }
+        let value = parts.remove(1);
+        let status = parts.remove(0);
+        if matches!(status, JSValue::Number(number) if number == -1.0) {
+            let JSValue::Object(error) = value else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an invalid error envelope",
+                ));
+            };
+            let Some(JSValue::String(name)) = error.get("name") else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an incomplete error envelope",
+                ));
+            };
+            let Some(JSValue::String(message)) = error.get("message") else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an incomplete error envelope",
+                ));
+            };
+            // eval(source) compiles inside a valid wrapper: Servo therefore
+            // reports its SyntaxError as EvaluationFailure, not CompilationFailure.
+            // Preserve the actual exception class rather than guessing from text.
+            // A script may also deliberately throw SyntaxError at runtime, so do
+            // not claim that every such exception proves compilation failed.
+            let diagnostic = if name == "SyntaxError" {
+                format!("page JavaScript raised SyntaxError: {message}; check its syntax and the runtime-supported ECMAScript features, or retry with a simpler expression")
+            } else {
+                format!("page JavaScript raised {name}: {message}")
+            };
+            return Err(io::Error::other(diagnostic));
+        }
+        let pending = match status {
+            JSValue::Number(value) => value != 0.0,
+            JSValue::Boolean(value) => value,
+            _ => false,
+        };
+        if !pending {
+            return Ok(value);
+        }
+
+        loop {
+            let completed = match self.take_completed_evaluate_slot(&webview, &token, deadline) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    self.drop_wait_slot(&webview, &token, None);
+                    return Err(Self::evaluate_await_error(error));
+                }
+            };
+            if let Some((status, value)) = completed {
+                return match status.as_str() {
+                    "ok" => Ok(value),
+                    "error" => Err(io::Error::other(match value {
+                        JSValue::String(message) => {
+                            format!("page.evaluate Promise rejected: {message}")
+                        }
+                        other => format!("page.evaluate Promise rejected: {other:?}"),
+                    })),
+                    other => Err(io::Error::other(format!(
+                        "page.evaluate Promise completed with invalid status {other:?}"
+                    ))),
+                };
+            }
+            if delegate.document_generation.get() != document_generation {
+                self.drop_wait_slot(&webview, &token, None);
+                return Err(io::Error::other(
+                    "page.evaluate Promise was interrupted by navigation",
+                ));
+            }
+            if Instant::now() >= deadline {
+                self.drop_wait_slot(&webview, &token, None);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timeout awaiting page.evaluate Promise",
+                ));
+            }
+            if !self.pump_servo(&webview, Duration::from_millis(10), deadline) {
+                self.spin_all_event_loops();
+            }
+        }
+    }
+
+    fn evaluate_await_error(error: io::Error) -> io::Error {
+        if error.kind() == io::ErrorKind::TimedOut {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout awaiting page.evaluate Promise",
+            )
+        } else {
+            error
+        }
+    }
+
+    fn take_completed_evaluate_slot(
+        &self,
+        webview: &WebView,
+        token: &str,
+        deadline: Instant,
+    ) -> io::Result<Option<(String, JSValue)>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout awaiting page.evaluate Promise",
+            ));
+        }
+        let key_js =
+            serde_json::to_string(&Self::wait_slot_key(token)).map_err(io::Error::other)?;
+        let script = format!(
+            "(function(key) {{ var slot = window[key]; if (!slot || !slot.done) return [0, '', null]; var status = String(slot.status || ''); var value = slot.value; try {{ delete window[key]; }} catch (_e) {{}} return [1, status, value]; }})({key_js})"
+        );
+        match self.evaluate_until(webview.clone(), &script, remaining)? {
+            JSValue::Array(mut items) if items.len() >= 3 => {
+                let value = items.remove(2);
+                let status = match items.remove(1) {
+                    JSValue::String(value) => value,
+                    _ => String::new(),
+                };
+                let done = match items.remove(0) {
+                    JSValue::Number(value) => value != 0.0,
+                    JSValue::Boolean(value) => value,
+                    _ => false,
+                };
+                Ok(done.then_some((status, value)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn evaluate_until(
         &self,
         webview: WebView,
@@ -1397,14 +2143,18 @@ impl ContentEngine {
         let result = saved.borrow_mut().take().expect("evaluation completed");
         result.map_err(|error| {
             let concise = match &error {
+                servo::JavaScriptEvaluationError::CompilationFailure => Some(
+                    "page JavaScript could not be compiled; check its syntax and the runtime-supported ECMAScript features, or retry with a simpler expression"
+                        .to_owned(),
+                ),
                 servo::JavaScriptEvaluationError::EvaluationFailure(Some(info)) => {
                     crate::locator_diagnostics::concise_selection_failure(&info.message)
+                        .map(str::to_owned)
                 }
                 _ => None,
             };
             io::Error::other(
                 concise
-                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("page JavaScript failed: {error:?}")),
             )
         })
@@ -1418,8 +2168,9 @@ impl ContentEngine {
         ready: impl FnMut() -> bool,
         take: impl FnMut() -> Option<T>,
     ) -> io::Result<T> {
+        let wake = self.wake_for_webview(webview);
         wait_for_recorded_loop(
-            &self.wake,
+            &wake,
             timeout,
             timeout_label,
             || {
@@ -1433,17 +2184,15 @@ impl ContentEngine {
                 if !webview.animating() {
                     return false;
                 }
-                let observed = self.wake.generation();
-                let _ = self
-                    .wake
-                    .wait_for_generation(observed, animation_frame_budget(remaining));
+                let observed = wake.generation();
+                let _ = wake.wait_for_generation(observed, animation_frame_budget(remaining));
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 true
             },
             || {
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
             },
             ready,
             take,
@@ -1473,7 +2222,10 @@ impl ContentEngine {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
+        // Cleanup keeps its legacy best-effort allowance. Destructive completion
+        // retrieval below always spends this caller deadline, including public PW.
         let io_deadline = strict_boolean.then_some(deadline);
+        let wake = self.wake_for_webview(&webview);
         let mut token = alloc_wait_nonce()?;
         let mut document_generation = delegate.document_generation.get();
         delegate.clear_wait_notice(&token);
@@ -1515,12 +2267,19 @@ impl ContentEngine {
         // installation reply is in flight. Only the installed document may
         // certify its reply; otherwise the loop rebinds before inspecting it.
         if delegate.document_generation.get() == document_generation {
-            if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-            {
+            if let Some(result) = self.finish_if_expected_nonce(
+                &webview,
+                delegate,
+                &token,
+                document_generation,
+                Some(deadline),
+                strict_boolean,
+            )? {
                 return result;
             }
-            if jsvalue_is_truthy(&first) {
+            if delegate.document_generation.get() == document_generation
+                && jsvalue_is_truthy(&first)
+            {
                 self.drop_wait_slot(&webview, &token, io_deadline);
                 if !strict_boolean {
                     self.settle_pump_tokens(&webview);
@@ -1562,12 +2321,19 @@ impl ContentEngine {
                     }
                 };
                 if delegate.document_generation.get() == document_generation {
-                    if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-                    {
+                    if let Some(result) = self.finish_if_expected_nonce(
+                        &webview,
+                        delegate,
+                        &token,
+                        document_generation,
+                        Some(deadline),
+                        strict_boolean,
+                    )? {
                         return result;
                     }
-                    if jsvalue_is_truthy(&first) {
+                    if delegate.document_generation.get() == document_generation
+                        && jsvalue_is_truthy(&first)
+                    {
                         self.drop_wait_slot(&webview, &token, io_deadline);
                         if !strict_boolean {
                             self.settle_pump_tokens(&webview);
@@ -1577,9 +2343,14 @@ impl ContentEngine {
                 }
                 continue;
             }
-            if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-            {
+            if let Some(result) = self.finish_if_expected_nonce(
+                &webview,
+                delegate,
+                &token,
+                document_generation,
+                Some(deadline),
+                strict_boolean,
+            )? {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1594,16 +2365,14 @@ impl ContentEngine {
             // callbacks are pending (`WebView::animating`). That is the rAF clock,
             // not a Rust predicate sample.
             if webview.animating() {
-                let observed = self.wake.generation();
-                let _ = self
-                    .wake
-                    .wait_for_generation(observed, animation_frame_budget(remaining));
+                let observed = wake.generation();
+                let _ = wake.wait_for_generation(observed, animation_frame_budget(remaining));
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 continue;
             }
             match poll_wake_step(
-                &self.wake,
+                &wake,
                 || {
                     delegate.wait_notice(&token).is_some()
                         || delegate.document_generation.get() != document_generation
@@ -1612,10 +2381,18 @@ impl ContentEngine {
             ) {
                 WakePoll::Ready => {}
                 WakePoll::TimedOut => {
-                    if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-                    {
+                    if let Some(result) = self.finish_if_expected_nonce(
+                        &webview,
+                        delegate,
+                        &token,
+                        document_generation,
+                        Some(deadline),
+                        strict_boolean,
+                    )? {
                         return result;
+                    }
+                    if delegate.document_generation.get() != document_generation {
+                        continue;
                     }
                     self.drop_wait_slot(&webview, &token, io_deadline);
                     return Err(io::Error::new(
@@ -1625,7 +2402,7 @@ impl ContentEngine {
                 }
                 WakePoll::NeedSpin { .. } => {
                     webview.paint();
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
             }
         }
@@ -1657,7 +2434,7 @@ impl ContentEngine {
         token: &str,
         deadline: Option<Instant>,
     ) -> io::Result<Option<(String, JSValue)>> {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
+        let budget = crate::wait_contract::wait_completion_budget(deadline);
         if budget.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1697,12 +2474,19 @@ impl ContentEngine {
         webview: &WebView,
         delegate: &Delegate,
         token: &str,
+        document_generation: u64,
         deadline: Option<Instant>,
+        strict_budget: bool,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = self.take_completed_wait_slot(webview, token, deadline)? else {
+        let Some((status, value)) = take_wait_completion_in_document(
+            &delegate.document_generation,
+            document_generation,
+            || self.take_completed_wait_slot(webview, token, deadline),
+        )?
+        else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
@@ -1719,7 +2503,7 @@ impl ContentEngine {
                 }),
                 other => WaitOutcome::Error(other.to_owned()),
             },
-            deadline.is_some(),
+            strict_budget,
         )))
     }
 
@@ -1779,10 +2563,18 @@ impl ContentEngine {
                 .and_then(|name| name.to_str())
                 .unwrap_or("upload.bin")
                 .to_owned();
+            let modified = std::fs::metadata(&path)?.modified()?;
+            let modified_ms = match modified.duration_since(std::time::UNIX_EPOCH) {
+                Ok(elapsed) => i64::try_from(elapsed.as_millis()).map_err(io::Error::other)?,
+                Err(before_epoch) => {
+                    -i64::try_from(before_epoch.duration().as_millis()).map_err(io::Error::other)?
+                }
+            };
             payloads.push(json!({
                 "name": name,
                 "type": "application/octet-stream",
                 "b64": base64_encode(&bytes),
+                "lastModified": modified_ms,
             }));
         }
         let (webview, _) = self.page(page_id)?.clone();
@@ -1805,7 +2597,7 @@ impl ContentEngine {
       var raw = atob(file.b64);
       var buf = new Uint8Array(raw.length);
       for (var i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream" }}));
+      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream", lastModified: file.lastModified }}));
     }});
     input.files = dt.files;
     var changed = 0;
@@ -1860,7 +2652,9 @@ impl ContentEngine {
         };
         self.reject_stale_objects(method, &params)?;
         self.reclaim_pump_tokens();
-        match method {
+        self.renderer_error.borrow_mut().take();
+        let result = (|| -> io::Result<serde_json::Value> {
+            match method {
             "chromium.launch" => {
                 let browser = self.alloc_id("browser");
                 self.browsers.insert(
@@ -1891,13 +2685,39 @@ impl ContentEngine {
                         parent: browser_id,
                     },
                 );
+                let bundle = self.build_bundle(&context)?;
+                self.context_bundles.insert(context.clone(), bundle);
                 Ok(json!({ "context": context, "generation": 1 }))
             }
-            "context.newPage" => {
-                let context_id = params
+            "context.newPage" | "session.ensurePage" => {
+                let mut context_id = params
                     .get("context")
                     .and_then(|value| value.as_str())
                     .map(str::to_owned);
+                if method == "session.ensurePage" {
+                    let session = required_str(&params, "session")?;
+                    context_id = match self.session_contexts.get(&session) {
+                        Some(context) => Some(context.clone()),
+                        None => {
+                            let context = self.alloc_id("session-context");
+                            let storage_key = params
+                                .get("storage_key")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(&context);
+                            let bundle = self.build_bundle(storage_key)?;
+                            self.contexts.insert(
+                                context.clone(),
+                                ObjectLife::Live {
+                                    generation: 1,
+                                    parent: None,
+                                },
+                            );
+                            self.context_bundles.insert(context.clone(), bundle);
+                            self.session_contexts.insert(session, context.clone());
+                            Some(context)
+                        }
+                    };
+                }
                 let browser_id = context_id
                     .as_deref()
                     .and_then(|id| match self.contexts.get(id) {
@@ -1911,20 +2731,45 @@ impl ContentEngine {
                     }
                 }
                 let page = self.alloc_id("page");
+                let bundle = context_id
+                    .as_deref()
+                    .and_then(|context| self.context_bundles.get(context))
+                    .cloned();
+                let (servo, rendering_context, profile, wake, user_content) = match bundle.as_ref() {
+                    Some(bundle) => (
+                        &bundle.servo,
+                        Rc::clone(&bundle.rendering_context),
+                        bundle.profile.clone(),
+                        bundle.wake.clone(),
+                        Rc::clone(&bundle.user_content),
+                    ),
+                    None => (
+                        &self.servo,
+                        Rc::clone(&self.rendering_context),
+                        self.profile.clone(),
+                        self.wake.clone(),
+                        Rc::clone(&self.user_content),
+                    ),
+                };
                 let delegate = Rc::new(Delegate::new(
-                    Rc::clone(&self.rendering_context),
-                    self.profile.clone(),
-                    self.wake.clone(),
-                    Rc::clone(&self.user_content),
+                    Rc::clone(&rendering_context),
+                    profile,
+                    wake.clone(),
+                    Rc::clone(&user_content),
                 ));
-                let webview = WebViewBuilder::new(&self.servo, Rc::clone(&self.rendering_context))
+                let webview = WebViewBuilder::new(servo, rendering_context)
                     .delegate(delegate.clone())
-                    .user_content_manager(Rc::clone(&self.user_content))
+                    .user_content_manager(user_content)
                     .build();
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                if !self.spin_until(ACTION_TIMEOUT, move || created.url().is_some())? {
+                // A URL can be visible before initial HeadParsed/Complete
+                // events settle. Publishing then makes the first async
+                // evaluation look interrupted by a navigation it never made.
+                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || {
+                    created.url().is_some() && created.load_status() == LoadStatus::Complete
+                })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out creating page",
@@ -1932,9 +2777,15 @@ impl ContentEngine {
                 }
                 self.pages.insert(
                     page.clone(),
-                    PageSlot::live(webview, delegate, context_id, browser_id),
+                    PageSlot::live(
+                        webview,
+                        delegate,
+                        bundle,
+                        context_id.clone(),
+                        browser_id,
+                    ),
                 );
-                Ok(json!({ "page": page, "generation": 1 }))
+                Ok(json!({ "page": page, "context": context_id, "generation": 1 }))
             }
             "session.setProfile" => {
                 let name = required_str(&params, "profile")?;
@@ -1944,20 +2795,104 @@ impl ContentEngine {
                         "profile must be research or project",
                     )
                 })?;
+                if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+                    if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
+                        bundle.profile.set(parsed);
+                        return Ok(json!({ "profile": bundle.profile.get().as_str() }));
+                    }
+                }
+                // Controller scripts set the default before constructing their
+                // explicit contexts. A bundled daemon page never mutates it.
                 self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
+            }
+            "session.attachPage" => {
+                let page = required_str(&params, "page")?;
+                let (page_generation, context_id, browser_id, url) =
+                    match self.pages.get(&page) {
+                        Some(PageSlot::Live {
+                            pair,
+                            generation,
+                            context_id,
+                            browser_id,
+                            ..
+                        }) => (
+                            *generation,
+                            context_id.clone(),
+                            browser_id.clone(),
+                            pair.0
+                                .url()
+                                .map(|url| url.to_string())
+                                .unwrap_or_else(|| "about:blank".to_owned()),
+                        ),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "session active page is unavailable",
+                            ))
+                        }
+                    };
+                let browser = browser_id
+                    .unwrap_or_else(|| self.alloc_id("browser"));
+                if !self.browsers.contains_key(&browser) {
+                    self.browsers.insert(
+                        browser.clone(),
+                        ObjectLife::Live {
+                            generation: 1,
+                            parent: None,
+                        },
+                    );
+                }
+                let context = context_id
+                    .unwrap_or_else(|| self.alloc_id("context"));
+                if !self.contexts.contains_key(&context) {
+                    self.contexts.insert(
+                        context.clone(),
+                        ObjectLife::Live {
+                            generation: 1,
+                            parent: Some(browser.clone()),
+                        },
+                    );
+                }
+                if let Some(PageSlot::Live {
+                    context_id,
+                    browser_id,
+                    ..
+                }) = self.pages.get_mut(&page)
+                {
+                    *context_id = Some(context.clone());
+                    *browser_id = Some(browser.clone());
+                }
+                let context_generation = match self.contexts.get(&context) {
+                    Some(ObjectLife::Live { generation, .. }) => *generation,
+                    _ => return Err(object_disposed("BrowserContext")),
+                };
+                let browser_generation = match self.browsers.get(&browser) {
+                    Some(ObjectLife::Live { generation, .. }) => *generation,
+                    _ => return Err(object_disposed("Browser")),
+                };
+                Ok(json!({
+                    "browser": browser,
+                    "browserGeneration": browser_generation,
+                    "context": context,
+                    "contextGeneration": context_generation,
+                    "page": page,
+                    "pageGeneration": page_generation,
+                    "url": url,
+                }))
             }
             "session.networkBytes" => {
                 // Real bytes relayed through the policy proxy, both
                 // directions — the metric behind web.run's network_bytes,
                 // which previously reported a fixed 4096-per-navigation
                 // accounting stub.
-                Ok(json!({ "bytes": self._proxy.bytes_transferred() }))
+                Ok(json!({ "bytes": self.network_bytes_for(&params) }))
             }
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                let page_profile = self.profile_for_page(&page_id)?;
+                if let UrlDecision::Deny { reason } = decide_url(page_profile, &url) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
@@ -1988,38 +2923,56 @@ impl ContentEngine {
                 // Extra headers ride WebResourceLoad::continue_with_headers in
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
                 // top-level navigation only and has stalled at HeadParsed.
+                delegate.navigation_failure.replace(None);
+                let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+                let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
                 let loading = webview.clone();
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
-                let until = WaitUntil::from_params(&params);
+                let until = WaitUntil::from_params(&params)?;
                 let engine = &*self;
                 let mut last_stamp = Instant::now() - Duration::from_millis(200);
-                if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || {
-                    if denied.denied_navigation.borrow().is_some() {
-                        return true;
-                    }
-                    let url_settled = loading.url().is_some_and(|current| {
-                        urls_match(&current, &expected)
-                            || previous.as_ref().is_some_and(|old| current != *old)
-                    });
-                    if !url_settled || !stamped {
-                        return url_settled;
-                    }
-                    // Poll at the same 25ms cadence the readyState probe uses.
-                    if last_stamp.elapsed() < Duration::from_millis(25) {
-                        return false;
-                    }
-                    last_stamp = Instant::now();
-                    matches!(
-                        engine.evaluate_until(
-                            loading.clone(),
-                            "typeof window.__greppyNavStamp === 'undefined'",
-                            Duration::from_millis(150),
-                        ),
-                        Ok(JSValue::Boolean(true))
-                    )
-                })? {
+                if !self.spin_until_loaded_until(
+                    &loading,
+                    call_timeout(&params),
+                    until,
+                    || {
+                        denied.denied_navigation.borrow().is_some()
+                            || denied
+                                .navigation_failure_after("no_document", navigation_epoch_before)
+                                .is_some()
+                    },
+                    || {
+                        let url_settled = loading.url().is_some_and(|current| {
+                            urls_match(&current, &expected)
+                                || previous.as_ref().is_some_and(|old| current != *old)
+                                // A redirect can commit a new document at the
+                                // previous URL. Its request and document epochs,
+                                // rather than a URL change, prove the commit.
+                                || (denied.main_frame_navigation_epoch.get()
+                                    != navigation_epoch_before
+                                    && denied.document_generation.get()
+                                        != document_generation_before)
+                        });
+                        if !url_settled || !stamped {
+                            return url_settled;
+                        }
+                        // Poll at the same 25ms cadence the readyState probe uses.
+                        if last_stamp.elapsed() < Duration::from_millis(25) {
+                            return false;
+                        }
+                        last_stamp = Instant::now();
+                        matches!(
+                            engine.evaluate_until(
+                                loading.clone(),
+                                "typeof window.__greppyNavStamp === 'undefined'",
+                                Duration::from_millis(150),
+                            ),
+                            Ok(JSValue::Boolean(true))
+                        )
+                    },
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -2035,9 +2988,29 @@ impl ContentEngine {
                         format!("policy_denied: {reason}"),
                     ));
                 }
+                let no_document = delegate
+                    .navigation_failure_after("no_document", navigation_epoch_before);
+                if let Some(failure) = no_document {
+                    delegate.navigation_failure.borrow_mut().take();
+                    let request_id = failure
+                        .get("requestId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let failure_url = failure
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let epoch = failure
+                        .get("navigationEpoch")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    return Err(io::Error::other(format!(
+                        "navigation failed: HTTP 204 No Content cannot create a document (kind=no_document, request_id={request_id}, navigation_epoch={epoch}, url={failure_url})"
+                    )));
+                }
                 if let Some(final_url) = webview.url() {
                     if let UrlDecision::Deny { reason } =
-                        decide_url(self.profile.get(), final_url.as_str())
+                        decide_url(page_profile, final_url.as_str())
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -2058,12 +3031,12 @@ impl ContentEngine {
                 webview.focus();
                 let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 // Complete is the load signal. Subresource scripts are waited
                 // by waitForFunction / init scripts on the event loop; a
                 // wall-clock sleep after every goto burned the 60s script
                 // budget without observing script start.
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 let painted_ms = goto_started.map(|t| t.elapsed().as_millis());
                 self.run_init_scripts(&page_id)?;
                 if let (Some(started), Some(loaded), Some(painted)) =
@@ -2079,12 +3052,9 @@ impl ContentEngine {
                     .url()
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| url.to_string());
+                let current_request = delegate.current_main_frame_request.borrow().clone();
                 let recorded = delegate.last_responses.borrow();
-                let matched = recorded.iter().rev().find(|row| {
-                    row.get("url")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|recorded_url| recorded_url == final_url)
-                });
+                let matched = response_for_request(&recorded, current_request.as_deref());
                 let http = url.scheme() == "http" || url.scheme() == "https";
                 let recorded_status = matched
                     .and_then(|row| row.get("status"))
@@ -2098,6 +3068,10 @@ impl ContentEngine {
                     .and_then(|row| row.get("headers"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let recorded_failure = matched
+                    .and_then(|row| row.pointer("/failure/errorText"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
                 drop(recorded);
                 // A failed probe means UNKNOWN, never "empty": on a page
                 // whose script thread is still busy (a 7.6MB spec mid-parse)
@@ -2110,10 +3084,11 @@ impl ContentEngine {
                     Ok(JSValue::String(text)) => Some(text),
                     _ => None,
                 };
-                if let Some(text) = &text {
-                    if text.contains("Could not load the requested page") {
-                        return Err(io::Error::other(format!("navigation failed: {text}")));
-                    }
+                if let Some(failure) = recorded_failure {
+                    delegate.navigation_failure.borrow_mut().take();
+                    return Err(io::Error::other(format!(
+                        "navigation failed: {failure}"
+                    )));
                 }
                 let html =
                     match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
@@ -2121,8 +3096,9 @@ impl ContentEngine {
                         _ => None,
                     };
                 // CONNECT-tunneled fetches often never match last_responses, so a
-                // missing recorded status is not proof of failure. The Servo error
-                // shell is already rejected above; accept a rendered document.
+                // missing recorded status is not proof of failure. A typed
+                // terminal transport failure is rejected above; otherwise accept
+                // a rendered document.
                 //
                 // Empty innerText plus tiny HTML is not proof either: a
                 // <frameset> page has no body at all, so its innerText is
@@ -2148,6 +3124,7 @@ impl ContentEngine {
                 }
                 let status = recorded_status.unwrap_or(200);
                 Ok(json!({
+                    "requestId": current_request,
                     "url": final_url,
                     "status": status,
                     "statusText": if status_text.is_empty() && status < 400 {
@@ -2161,8 +3138,9 @@ impl ContentEngine {
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
-                Ok(json!({ "dispatch": dispatch }))
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.tap" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -2175,9 +3153,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "page.touch.tap" => {
@@ -2186,9 +3164,9 @@ impl ContentEngine {
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 tap_at(&webview, &delegate, x, y, 0.0, 0.0, || {
-                    self.servo.spin_event_loop()
+                    self.spin_all_event_loops()
                 })?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "locator.dblclick" => {
@@ -2203,9 +3181,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 click_at(
                     &webview,
                     &delegate,
@@ -2213,9 +3191,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 let _ = self.locator_eval(
                     &params,
                     "nodes[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true",
@@ -2235,9 +3213,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 let selector = params
                     .get("selector")
                     .cloned()
@@ -2263,8 +3241,14 @@ impl ContentEngine {
             "page.evaluate" => {
                 let page_id = required_str(&params, "page")?;
                 let source = required_str(&params, "source")?;
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                evaluate_serialized(self.evaluate_awaited(webview, &delegate, &source)?)
+            }
+            "page.structuredDom" => {
+                let page_id = required_str(&params, "page")?;
+                let request = params.get("request").ok_or_else(|| io::Error::other("missing request"))?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                evaluate_serialized(self.evaluate(webview, &source)?)
+                evaluate_serialized(self.evaluate_structured_dom(webview, request)?)
             }
             "page.waitForFunction" | "page.waitForBoolean" => {
                 let page_id = required_str(&params, "page")?;
@@ -2343,7 +3327,9 @@ impl ContentEngine {
                         .collect();
                     for (id, generation) in owned {
                         self.contexts
-                            .insert(id, ObjectLife::Disposed { generation });
+                            .insert(id.clone(), ObjectLife::Disposed { generation });
+                        self.retire_bundle(&id);
+                        self.session_contexts.retain(|_, context| context != &id);
                     }
                     self.dispose_pages_owned_by_browser(browser_id);
                 } else {
@@ -2356,12 +3342,16 @@ impl ContentEngine {
                 self.dispose_page(&page_id);
                 Ok(json!({}))
             }
+            "session.closePage" => {
+                let page_id = required_str(&params, "page")?;
+                self.dispose_page(&page_id);
+                Ok(json!({}))
+            }
             "page.isClosed" => {
                 let page_id = required_str(&params, "page")?;
                 let closed = !matches!(self.pages.get(&page_id), Some(PageSlot::Live { .. }));
                 Ok(json!({ "closed": closed }))
             }
-            "session.ensurePage" => self.handle("context.newPage", params),
             "page.url" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
@@ -2385,9 +3375,78 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
             }
+            "page.textToFile" => {
+                let page_id = required_str(&params, "page")?;
+                let path = PathBuf::from(required_str(&params, "path")?);
+                let capability = required_str(&params, "capability")?;
+                authorize_text_transfer(
+                    &path,
+                    &capability,
+                    &self.transfer_capability,
+                    &self.transfer_root,
+                )?;
+                let max_bytes = params
+                    .get("max_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| io::Error::other("page.textToFile requires max_bytes"))?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let text = match self.evaluate(
+                    webview,
+                    "(document.body && document.body.innerText) || \"\"",
+                )? {
+                    JSValue::String(text) => text,
+                    other => return Err(io::Error::other(format!("text returned {other:?}"))),
+                };
+                let bytes = text.as_bytes();
+                if bytes.len() as u64 > max_bytes {
+                    return Err(io::Error::other(format!(
+                        "resource_limit: artifact limit exceeded ({} > {max_bytes})",
+                        bytes.len()
+                    )));
+                }
+                let write_result = (|| {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    std::io::Write::write_all(&mut file, bytes)?;
+                    file.sync_all()?;
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_readonly(true);
+                    std::fs::set_permissions(&path, permissions)?;
+                    Ok::<_, io::Error>(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                Ok(json!({
+                    "byte_count": bytes.len(),
+                    "digest": crate::artifacts::hex_sha256(bytes),
+                }))
+            }
+            "page.take_navigation_failure" => {
+                let page_id = required_str(&params, "page")?;
+                let expected_epoch = params
+                    .get("navigation_epoch")
+                    .and_then(serde_json::Value::as_u64);
+                let (_, delegate) = self.page(&page_id)?.clone();
+                let matches_action = delegate
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .and_then(|failure| failure.get("navigationEpoch"))
+                    .and_then(serde_json::Value::as_u64)
+                    == expected_epoch;
+                let failure = matches_action
+                    .then(|| delegate.navigation_failure.borrow_mut().take())
+                    .flatten();
+                Ok(json!({ "failure": failure }))
+            }
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
+                let expected_snapshot = params.get("expected_snapshot").and_then(|value| value.as_str());
                 let first = params
                     .get("ref_first")
                     .and_then(|value| value.as_u64())
@@ -2396,7 +3455,21 @@ impl ContentEngine {
                     .get("ref_last")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                if let Some(failure) = delegate.navigation_failure.borrow_mut().take() {
+                    let request_id = failure.get("requestId").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
+                    let kind = failure.get("kind").and_then(|value| value.as_str()).unwrap_or("transport");
+                    let detail = format!(
+                        "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
+                    );
+                    return Err(io::Error::other(if kind == "policy_denied" {
+                        format!("policy_denied: {detail}")
+                    } else {
+                        detail
+                    }));
+                }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
                     .get("include_html")
@@ -2404,7 +3477,7 @@ impl ContentEngine {
                     .unwrap_or(false);
                 match self.evaluate(
                     webview,
-                    &observe_script(snapshot, first, last, query, include_html),
+                    &observe_script(snapshot, first, last, query, include_html, expected_snapshot),
                 )? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
@@ -2414,7 +3487,7 @@ impl ContentEngine {
             }
             "page.screenshot" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let clip = params.get("clip").and_then(|value| {
                     if !value.is_object() {
                         return None;
@@ -2450,9 +3523,14 @@ impl ContentEngine {
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false)
                 {
-                    self.screenshot_png_render_complete(&webview, clip)?
+                    self.screenshot_png_render_complete(
+                        &webview,
+                        &delegate.rendering_context,
+                        &delegate.wake,
+                        clip,
+                    )?
                 } else {
-                    self.screenshot_png(&webview, clip)?
+                    self.screenshot_png(&webview, &delegate.rendering_context, clip)?
                 };
                 screenshot_engine_result(&png)
             }
@@ -2523,9 +3601,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "locator.check" | "locator.uncheck" => {
@@ -2539,14 +3617,15 @@ impl ContentEngine {
                 // assignment. Reuse the same acknowledged native click path
                 // as `locator.click` so click/input/change and framework
                 // handlers all observe one real transition (Fund 033).
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
                 let actual = self.locator_checked_state(&params)?;
                 if actual != checked {
                     return Err(io::Error::other(format!(
                         "checkbox activation did not produce the requested state: expected checked={checked}, observed checked={actual}"
                     )));
                 }
-                Ok(json!({ "dispatch": dispatch }))
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.selectOption" => {
                 let _ = self.resolve_actionable(&params)?;
@@ -2632,14 +3711,14 @@ impl ContentEngine {
             "locator.screenshot" => {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let clip = Some((
                     resolved.x.max(0.0) as u32,
                     resolved.y.max(0.0) as u32,
                     resolved.width.max(1.0) as u32,
                     resolved.height.max(1.0) as u32,
                 ));
-                let png = self.screenshot_png(&webview, clip)?;
+                let png = self.screenshot_png(&webview, &delegate.rendering_context, clip)?;
                 screenshot_engine_result(&png)
             }
             "locator.allTextContents" => {
@@ -2770,7 +3849,7 @@ impl ContentEngine {
                 );
                 self.evaluate(webview.clone(), &source)?;
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 self.run_init_scripts(&page_id)?;
                 Ok(json!({}))
             }
@@ -2784,13 +3863,23 @@ impl ContentEngine {
                 if let Some(timeout) = params.get("timeout") {
                     goto_params["timeout"] = timeout.clone();
                 }
+                if let Some(wait_until) = params.get("waitUntil") {
+                    goto_params["waitUntil"] = wait_until.clone();
+                }
                 self.handle("page.goto", goto_params)
             }
             "page.waitForLoadState" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
-                if !self.spin_until_loaded(&loading, call_timeout(&params), || true)? {
+                let until = WaitUntil::from_params(&params)?;
+                if !self.spin_until_loaded_until(
+                    &loading,
+                    call_timeout(&params),
+                    until,
+                    || false,
+                    || true,
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out waiting for load state",
@@ -2940,6 +4029,8 @@ impl ContentEngine {
                             .insert(context_id.to_owned(), ObjectLife::Disposed { generation });
                     }
                     self.dispose_pages_owned_by_context(context_id);
+                    self.retire_bundle(context_id);
+                    self.session_contexts.retain(|_, context| context != context_id);
                 }
                 Ok(json!({}))
             }
@@ -3131,13 +4222,24 @@ impl ContentEngine {
             }
             "page.requests" => {
                 let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                let retained = delegate.requests.borrow().len();
+                let dropped = delegate.dropped_requests.get();
                 Ok(json!({
-                    "requests": crate::daemon::redact_json(json!(self.page(&page_id)?.1.requests.borrow().clone()))
+                    "requests": crate::daemon::redact_json(json!(delegate.requests.borrow().clone())),
+                    "retention": network_retention_metadata(retained, dropped)
                 }))
             }
             "page.responses" => {
                 let page_id = required_str(&params, "page")?;
-                Ok(json!({ "responses": self.page(&page_id)?.1.last_responses.borrow().clone() }))
+                let delegate = &self.page(&page_id)?.1;
+                let responses = delegate.last_responses.borrow().clone();
+                let retained = responses.len();
+                let dropped = delegate.dropped_responses.get();
+                Ok(json!({
+                    "responses": responses,
+                    "retention": network_retention_metadata(retained, dropped)
+                }))
             }
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
@@ -3199,32 +4301,54 @@ impl ContentEngine {
                             _ => None,
                         })
                         .unwrap_or_else(|| page_id.clone());
-                    let (context_id, browser_id) = match self.pages.get(&opener) {
+                    let (context_id, browser_id, bundle) = match self.pages.get(&opener) {
                         Some(PageSlot::Live {
                             context_id,
                             browser_id,
+                            bundle,
                             ..
-                        }) => (context_id.clone(), browser_id.clone()),
+                        }) => (context_id.clone(), browser_id.clone(), bundle.clone()),
                         _ => match self.pages.get(&page_id) {
                             Some(PageSlot::Live {
                                 context_id,
                                 browser_id,
+                                bundle,
                                 ..
-                            }) => (context_id.clone(), browser_id.clone()),
-                            _ => (None, None),
+                            }) => (context_id.clone(), browser_id.clone(), bundle.clone()),
+                            _ => (None, None, None),
                         },
                     };
                     let id = self.alloc_id("page");
+                    let (rendering_context, profile, wake, user_content) = match bundle.as_ref() {
+                        Some(bundle) => (
+                            Rc::clone(&bundle.rendering_context),
+                            bundle.profile.clone(),
+                            bundle.wake.clone(),
+                            Rc::clone(&bundle.user_content),
+                        ),
+                        None => (
+                            Rc::clone(&self.rendering_context),
+                            self.profile.clone(),
+                            self.wake.clone(),
+                            Rc::clone(&self.user_content),
+                        ),
+                    };
                     let delegate = Rc::new(Delegate::new(
-                        Rc::clone(&self.rendering_context),
-                        self.profile.clone(),
-                        self.wake.clone(),
-                        Rc::clone(&self.user_content),
+                        rendering_context,
+                        profile,
+                        wake,
+                        user_content,
                     ));
+                    if let Some(bundle) = bundle.as_ref() {
+                        debug_assert!(Rc::ptr_eq(
+                            &delegate.rendering_context,
+                            &bundle.rendering_context
+                        ));
+                    }
                     delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(
                         id.clone(),
-                        PageSlot::live(webview, delegate, context_id, browser_id),
+                        PageSlot::live(webview, delegate, bundle, context_id, browser_id),
                     );
                     pages.push(json!({ "page": id, "opener": opener, "generation": 1 }));
                 }
@@ -3270,7 +4394,9 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                if let UrlDecision::Deny { reason } =
+                    decide_url(self.profile_for_page(&page_id)?, &url)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
@@ -3309,7 +4435,7 @@ impl ContentEngine {
                             "timed out waiting for frame navigation",
                         ));
                     }
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                     thread::sleep(Duration::from_millis(1));
                 }
                 Ok(json!({ "url": assigned }))
@@ -3334,7 +4460,7 @@ impl ContentEngine {
                     let loading = webview.clone();
                     let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
                     webview.paint();
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
                 Ok(json!({
                     "ok": ok,
@@ -3350,7 +4476,7 @@ impl ContentEngine {
                     let loading = webview.clone();
                     let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
                     webview.paint();
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
                 Ok(json!({
                     "ok": ok,
@@ -3424,7 +4550,7 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 webview.resize(PhysicalSize { width, height });
                 *delegate.viewport.borrow_mut() = (width, height);
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({ "width": width, "height": height }))
             }
             "page.viewportSize" => {
@@ -3439,9 +4565,9 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 click_at(&webview, &delegate, x, y, 0.0, 0.0, || {
-                    self.servo.spin_event_loop()
+                    self.spin_all_event_loops()
                 })?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "page.mouse.move" => {
@@ -3455,7 +4581,7 @@ impl ContentEngine {
                     &webview,
                     &delegate,
                     || InputEvent::MouseMove(MouseMoveEvent::new(point)),
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 Ok(json!({}))
             }
@@ -3476,7 +4602,7 @@ impl ContentEngine {
                             point,
                         ))
                     },
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 Ok(json!({}))
             }
@@ -3515,7 +4641,7 @@ impl ContentEngine {
                             point,
                         ))
                     },
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 let dispatch = match self.evaluate(
                     webview,
@@ -3546,7 +4672,7 @@ impl ContentEngine {
                             point,
                         ))
                     },
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 Ok(json!({}))
             }
@@ -3555,6 +4681,11 @@ impl ContentEngine {
                 format!("unsupported_playwright_operation: {other}"),
             )),
         }
+        })();
+        if let Some(error) = self.renderer_error.borrow_mut().take() {
+            return Err(io::Error::other(error));
+        }
+        result
     }
 
     /// Make `target` the only visible webview before delivering synthetic
@@ -3575,16 +4706,20 @@ impl ContentEngine {
         // hide/show travel through the constellation asynchronously; without
         // a spin the hit test can still see the old visibility and route the
         // very next input into a hidden webview (2 of 12 clicks still died).
-        self.servo.spin_event_loop();
+        self.spin_all_event_loops();
     }
 
     fn dispatch_locator_click(
         &mut self,
         params: &serde_json::Value,
         resolved: &ResolvedNode,
-    ) -> io::Result<String> {
+    ) -> io::Result<(String, Option<u64>)> {
         let page_id = required_str(params, "page")?;
         let (webview, delegate) = self.page(&page_id)?.clone();
+        let action_started = Instant::now();
+        let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+        let navigation_intent_before = delegate.navigation_intent_generation.get();
+        let document_generation_before = delegate.document_generation.get();
         let probe = format!(
             "{}-{}",
             std::process::id(),
@@ -3605,9 +4740,9 @@ impl ContentEngine {
             resolved.y,
             resolved.width,
             resolved.height,
-            || self.servo.spin_event_loop(),
+            || self.spin_all_event_loops(),
         )?;
-        self.servo.spin_event_loop();
+        self.spin_all_event_loops();
         let dispatch = match self.locator_eval(
             params,
             &format!(
@@ -3621,6 +4756,49 @@ impl ContentEngine {
             Err(_) => "document-changed".to_owned(),
             Ok(_) => "unknown".to_owned(),
         };
+        if let Some((generation, url, denied)) = delegate
+            .pending_navigation_intent
+            .borrow()
+            .clone()
+            .filter(|(generation, _, _)| *generation != navigation_intent_before)
+            .filter(|_| delegate.main_frame_navigation_epoch.get() == navigation_epoch_before)
+        {
+            let epoch = delegate.main_frame_navigation_epoch.get().wrapping_add(1);
+            delegate.main_frame_navigation_epoch.set(epoch);
+            let request_id = format!("navigation-intent:{generation}");
+            delegate
+                .current_main_frame_request
+                .replace(Some(request_id.clone()));
+            delegate.promoted_navigation_url.replace(Some(url.clone()));
+            delegate.navigation_failure.replace(None);
+            if let Some(reason) = denied {
+                delegate.record_main_frame_failure(&request_id, &url, &reason, "policy_denied");
+            }
+        }
+        let navigation_epoch_after = delegate.main_frame_navigation_epoch.get();
+        let navigation_epoch =
+            (navigation_epoch_after != navigation_epoch_before).then_some(navigation_epoch_after);
+        if let Some(expected_epoch) = navigation_epoch {
+            let remaining = call_timeout(params).saturating_sub(action_started.elapsed());
+            if !self.spin_until_loaded_until(
+                &webview,
+                remaining,
+                WaitUntil::Load,
+                || {
+                    let failure = delegate.navigation_failure.borrow();
+                    navigation_failure_belongs_to_epoch(failure.as_ref(), expected_epoch)
+                },
+                || {
+                    delegate.document_generation.get() != document_generation_before
+                        && delegate.main_frame_navigation_epoch.get() == expected_epoch
+                },
+            )? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for click navigation",
+                ));
+            }
+        }
         if let Some(selector) = params
             .get("selector")
             .and_then(|value| value.get("value"))
@@ -3628,7 +4806,7 @@ impl ContentEngine {
         {
             let _ = self.assign_pending_files(&page_id, selector);
         }
-        Ok(dispatch)
+        Ok((dispatch, navigation_epoch))
     }
 
     fn locator_checked_state(&self, params: &serde_json::Value) -> io::Result<bool> {
@@ -3790,17 +4968,22 @@ impl ContentEngine {
     fn screenshot_png_render_complete(
         &self,
         webview: &WebView,
+        rendering_context: &Rc<dyn RenderingContext>,
+        wake: &WakeFlag,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         webview.paint();
-        self.rendering_context.present();
+        rendering_context.present();
         let saved = Rc::new(RefCell::new(None));
         let callback = Rc::clone(&saved);
         webview.take_screenshot(None, move |result| {
             *callback.borrow_mut() = Some(result);
         });
         let pending = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || pending.borrow().is_some())? {
+        if !self.spin_until_on(wake, ACTION_TIMEOUT, move || pending.borrow().is_some())? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out waiting for complete rendering; retry without renderComplete for an instant screenshot",
@@ -3817,6 +5000,7 @@ impl ContentEngine {
     fn screenshot_png(
         &self,
         webview: &WebView,
+        rendering_context: &Rc<dyn RenderingContext>,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
         // An agent's screenshot means "what does the page look like NOW".
@@ -3832,8 +5016,11 @@ impl ContentEngine {
         // holds the freshly painted frame until present swaps it away. The
         // present afterwards keeps the swap chain producing frames so
         // locator actionability never sees `stable` (event_loop_stalled).
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         webview.paint();
-        let size = self.rendering_context.size2d();
+        let size = rendering_context.size2d();
         let rect = servo::DeviceIntRect::from_size(servo::DeviceIntSize::new(
             size.width as i32,
             size.height as i32,
@@ -3841,15 +5028,18 @@ impl ContentEngine {
         // `read_to_image` returns None only when nothing has rendered yet
         // (a page that has not produced its first frame). Give that first
         // frame a short window instead of the old 30s readiness wait.
-        let mut image = self.rendering_context.read_to_image(rect);
-        self.rendering_context.present();
+        let mut image = rendering_context.read_to_image(rect);
+        rendering_context.present();
         if image.is_none() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while image.is_none() && Instant::now() < deadline {
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
+                rendering_context.make_current().map_err(|error| {
+                    io::Error::other(format!("renderer make_current failed: {error:?}"))
+                })?;
                 webview.paint();
-                image = self.rendering_context.read_to_image(rect);
-                self.rendering_context.present();
+                image = rendering_context.read_to_image(rect);
+                rendering_context.present();
             }
         }
         let image = image.ok_or_else(|| {
@@ -4072,6 +5262,16 @@ impl NavTrace {
         );
         }
     }
+
+    fn timeout(&self, webview: &WebView) {
+        if self.started.is_some() {
+            eprintln!(
+                "web-runtime: nav-event phase=wait-timeout load_status={:?} url={:?}",
+                webview.load_status(),
+                webview.url().map(|url| url.to_string())
+            );
+        }
+    }
 }
 
 /// Engine preferences for a content worker reachable only through `proxy_uri`.
@@ -4236,19 +5436,43 @@ fn click_at(
     )
 }
 
-fn load_status_allows_navigation(status: LoadStatus, ready_state: Option<&str>) -> bool {
-    match status {
-        LoadStatus::Complete => true,
-        LoadStatus::HeadParsed => matches!(ready_state, Some("complete") | Some("interactive")),
-        LoadStatus::Started => false,
-    }
-}
-
 fn urls_match(current: &Url, expected: &Url) -> bool {
     current.scheme() == expected.scheme()
         && current.host() == expected.host()
         && current.port_or_known_default() == expected.port_or_known_default()
         && current.path().trim_end_matches('/') == expected.path().trim_end_matches('/')
+}
+
+fn navigation_failure_belongs_to_epoch(
+    failure: Option<&serde_json::Value>,
+    expected_epoch: u64,
+) -> bool {
+    failure
+        .and_then(|value| value.get("navigationEpoch"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(expected_epoch)
+}
+
+fn navigation_failure_matches_after(
+    failure: &serde_json::Value,
+    kind: &str,
+    current_epoch: u64,
+    baseline_epoch: u64,
+) -> bool {
+    current_epoch > baseline_epoch
+        && failure.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+        && navigation_failure_belongs_to_epoch(Some(failure), current_epoch)
+}
+
+fn response_for_request<'a>(
+    responses: &'a [serde_json::Value],
+    request_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    let request_id = request_id?;
+    responses
+        .iter()
+        .rev()
+        .find(|row| row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id))
 }
 
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {
@@ -4385,6 +5609,128 @@ mod serialize_tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn text_transfer_requires_daemon_capability_and_owned_destination() {
+        let root = PathBuf::from("/daemon-owned/transfers");
+        let owned = root.join("ab".repeat(32));
+        assert!(authorize_text_transfer(&owned, "secret", "secret", &root).is_ok());
+
+        let forged_capability = authorize_text_transfer(&owned, "forged", "secret", &root)
+            .expect_err("controller capability must not authorize transfer");
+        assert_eq!(forged_capability.kind(), io::ErrorKind::PermissionDenied);
+
+        let arbitrary = PathBuf::from("/attacker-selected").join("cd".repeat(32));
+        let forged_destination = authorize_text_transfer(&arbitrary, "secret", "secret", &root)
+            .expect_err("daemon capability must stay confined to its owned root");
+        assert_eq!(forged_destination.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn click_navigation_epoch_survives_redirect_request_id_changes() {
+        let aborted = json!({
+            "requestId": "different-fetch-uuid:2",
+            "navigationEpoch": 7,
+            "url": "http://example.test/end",
+            "errorText": "net::ERR_FAILED",
+        });
+        assert!(
+            navigation_failure_belongs_to_epoch(Some(&aborted), 7),
+            "terminal failure must settle an aborted navigation without a document commit"
+        );
+        assert!(!navigation_failure_belongs_to_epoch(Some(&aborted), 6));
+    }
+
+    #[test]
+    fn stale_completion_before_new_navigation_epoch_cannot_abort_goto() {
+        let prior_completion = json!({
+            "requestId": "prior:0",
+            "navigationEpoch": 11,
+            "kind": "no_document",
+        });
+        assert!(!navigation_failure_matches_after(
+            &prior_completion,
+            "no_document",
+            11,
+            11,
+        ));
+
+        let current_completion = json!({
+            "requestId": "current:0",
+            "navigationEpoch": 12,
+            "kind": "no_document",
+        });
+        assert!(navigation_failure_matches_after(
+            &current_completion,
+            "no_document",
+            12,
+            11,
+        ));
+        assert!(!navigation_failure_matches_after(
+            &prior_completion,
+            "no_document",
+            12,
+            11,
+        ));
+    }
+
+    #[test]
+    fn current_request_identity_beats_stale_same_url_response() {
+        let responses = vec![
+            json!({"requestId":"old:0","url":"http://example.test/same","failure":{"errorText":"stale"}}),
+            json!({"requestId":"current:0","url":"http://example.test/same","status":200}),
+        ];
+        let current = response_for_request(&responses, Some("current:0")).unwrap();
+        assert_eq!(current["status"], 200);
+        assert!(current.get("failure").is_none());
+        assert!(response_for_request(&responses, Some("missing:0")).is_none());
+    }
+
+    #[test]
+    fn terminal_response_merge_is_order_independent_and_keeps_failure_details() {
+        let streamed = json!({
+            "requestId": "fetch:0", "status": 200, "statusText": "OK",
+            "headers": { "content-type": "text/plain" },
+            "bodyBytes": 7, "byteLength": 7,
+            "failure": { "errorText": "body reset" }
+        });
+        let generic = json!({
+            "requestId": "fetch:0", "statusText": "", "headers": {},
+            "bodyBytes": 0, "byteLength": 0,
+            "failure": { "errorText": "network error" }
+        });
+        let mut first = streamed.clone();
+        merge_terminal_response(&mut first, generic.clone());
+        let mut second = generic;
+        merge_terminal_response(&mut second, streamed);
+        assert_eq!(first, second);
+        assert_eq!(first["status"], 200);
+        assert_eq!(first["byteLength"], 7);
+        assert_eq!(first["headers"]["content-type"], "text/plain");
+        assert!(first["failure"]["errorText"].is_string());
+    }
+
+    #[test]
+    fn bounded_network_retention_reports_dropped_and_retained_counts() {
+        let dropped = Cell::new(0);
+        let mut records = vec![json!(1), json!(2), json!(3)];
+        retain_bounded(&mut records, &dropped, 2);
+        assert_eq!(records, vec![json!(2), json!(3)]);
+        assert_eq!(dropped.get(), 1);
+        records.push(json!(4));
+        retain_bounded(&mut records, &dropped, 2);
+        assert_eq!(records, vec![json!(3), json!(4)]);
+        assert_eq!(dropped.get(), 2);
+        assert_eq!(
+            network_retention_metadata(records.len(), dropped.get()),
+            json!({
+                "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+                "retained": 2,
+                "dropped": 2,
+                "complete": false,
+            })
+        );
+    }
+
+    #[test]
     fn serialize_jsvalue_keeps_undefined_and_non_finite_distinct() {
         assert_eq!(
             serialize_jsvalue(JSValue::Undefined).unwrap(),
@@ -4452,25 +5798,16 @@ mod serialize_tests {
     }
 
     #[test]
-    fn headparsed_with_interactive_ready_state_commits_navigation() {
-        assert!(load_status_allows_navigation(LoadStatus::Complete, None));
-        assert!(load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("interactive")
-        ));
-        assert!(load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("complete")
-        ));
-        assert!(!load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("loading")
-        ));
-        assert!(!load_status_allows_navigation(LoadStatus::HeadParsed, None));
-        assert!(!load_status_allows_navigation(
-            LoadStatus::Started,
-            Some("complete")
-        ));
+    fn wait_until_keeps_navigation_milestones_distinct() {
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "load" })).unwrap(),
+            WaitUntil::Load
+        );
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "domcontentloaded" })).unwrap(),
+            WaitUntil::DomContentLoaded
+        );
+        assert!(WaitUntil::from_params(&json!({ "waitUntil": "commit" })).is_err());
     }
 
     #[test]
@@ -4571,6 +5908,46 @@ mod serialize_tests {
         assert!(!jsvalue_is_truthy(&JSValue::String(String::new())));
         assert!(jsvalue_is_truthy(&JSValue::String("ok".into())));
         assert!(jsvalue_is_truthy(&JSValue::Object(Default::default())));
+    }
+
+    #[test]
+    fn completion_retrieval_rejects_navigation_without_repeating_the_read() {
+        let generation = Cell::new(1);
+        let reads = Cell::new(0);
+        let old = take_wait_completion_in_document(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            generation.set(2);
+            Ok(Some("old-document completion"))
+        })
+        .unwrap();
+        assert_eq!(old, None);
+        assert_eq!(reads.get(), 1);
+        let stale = take_wait_completion_in_document(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            Ok(Some("must not read new document with old nonce"))
+        })
+        .unwrap();
+        assert_eq!(stale, None);
+        assert_eq!(reads.get(), 1);
+        let current =
+            take_wait_completion_in_document(&generation, 2, || Ok(Some("new document"))).unwrap();
+        assert_eq!(current, Some("new document"));
+    }
+
+    #[test]
+    fn consumed_completion_timeout_is_not_retried_or_hidden_by_navigation() {
+        let generation = Cell::new(1);
+        let reads = Cell::new(0);
+        let result = take_wait_completion_in_document::<()>(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            generation.set(2);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "consumed slot callback expired",
+            ))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
@@ -4959,7 +6336,7 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml) {
+const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml, expectedSnapshot) {
   __GREPPY_NATIVE_LABEL_TEXT__
   __GREPPY_SELECT_CHOICES__
   __GREPPY_WORKING_SCOPE__
@@ -4978,7 +6355,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   const referenceAttributes = [];
   let registry = null;
   if (snapshot != null) {
-    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last);
+    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last, expectedSnapshot);
     window.__greppyObservedRefs = registry;
     snapshot = registry.snapshot;
     if (document.documentElement && document.documentElement.getAttribute(snapshotAttr) !== snapshot) {
@@ -5125,7 +6502,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
     if (includeHtml) tree.scoped_html = selectedScope.roots.map(function(node) { return node.outerHTML; }).join('\n');
   }
   return JSON.stringify(tree);
-})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__)"#;
+})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__, __GREPPY_EXPECTED_SNAPSHOT__)"#;
 
 fn observe_script(
     snapshot: Option<&str>,
@@ -5133,6 +6510,7 @@ fn observe_script(
     last: u64,
     query: Option<&str>,
     include_html: bool,
+    expected_snapshot: Option<&str>,
 ) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
     OBSERVE_JS
@@ -5167,6 +6545,10 @@ fn observe_script(
         .replace("__GREPPY_REF_FIRST__", &first.to_string())
         .replace("__GREPPY_REF_LAST__", &last.to_string())
         .replace("__GREPPY_SNAPSHOT__", &encoded)
+        .replace(
+            "__GREPPY_EXPECTED_SNAPSHOT__",
+            &serde_json::to_string(&expected_snapshot).expect("expected snapshot serializes"),
+        )
         .replace(
             "__GREPPY_INCLUDE_HTML__",
             if include_html { "true" } else { "false" },
@@ -5321,11 +6703,14 @@ pub fn run() -> io::Result<()> {
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
+        std::env::var_os(PERSISTENT_PROFILE_ROOT_ENV)
+            .as_deref()
+            .map(std::path::Path::new),
     )?;
     trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
-    let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
+    let mut engine = ContentEngine::new(Arc::clone(&parent_alive), capability.clone())?;
     trace_startup("read-hello");
     match read_message(&mut protocol_in)? {
         Message::Hello {
@@ -5485,10 +6870,14 @@ enum WaitUntil {
 }
 
 impl WaitUntil {
-    fn from_params(params: &serde_json::Value) -> Self {
+    fn from_params(params: &serde_json::Value) -> io::Result<Self> {
         match params.get("waitUntil").and_then(|value| value.as_str()) {
-            Some("domcontentloaded") | Some("commit") => Self::DomContentLoaded,
-            _ => Self::Load,
+            Some("domcontentloaded") => Ok(Self::DomContentLoaded),
+            None | Some("load") => Ok(Self::Load),
+            Some(value) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported waitUntil value `{value}`"),
+            )),
         }
     }
 }

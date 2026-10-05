@@ -340,6 +340,67 @@ pub fn walk_with_policy_and_overrides(
     policy: &skip::SkipPolicy,
     overrides: &WalkOverrides,
 ) -> Result<Vec<InventoryEntry>> {
+    walk_scoped_with_policy_and_overrides(root, policy, overrides, None)
+}
+
+fn configured_store_relative_to(root: &Path) -> Result<Option<PathBuf>> {
+    let Ok(configured) = std::env::var("GREPPY_STORE_DIR") else {
+        return Ok(None);
+    };
+    let configured = PathBuf::from(configured);
+    let configured = if configured.is_absolute() {
+        configured
+    } else {
+        std::path::absolute(&configured).unwrap_or(configured)
+    };
+    // Cache setup precedes every production discovery walk, so the configured
+    // root exists here. Canonicalising both sides follows symlinked parents and
+    // avoids making a lexical path spelling into a containment boundary.
+    let Ok(store_root) = configured.canonicalize() else {
+        return Ok(None);
+    };
+    let walk_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let Ok(relative) = store_root.strip_prefix(&walk_root) else {
+        return Ok(None);
+    };
+    if relative.as_os_str().is_empty() {
+        return Err(Error::Config(
+            "GREPPY_STORE_DIR cannot be the indexed workspace itself".into(),
+        ));
+    }
+    Ok(Some(relative.to_path_buf()))
+}
+
+fn scoped_hidden_components_are_explicit(relative: &str, scopes: &[String]) -> bool {
+    let mut prefix = String::new();
+    for component in relative.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        if component.starts_with('.')
+            && component.len() > 1
+            && !scopes.iter().any(|scope| {
+                scope == &prefix
+                    || scope
+                        .strip_prefix(&prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk only the supplied root-relative files or subtrees while retaining the
+/// root's ignore files, skip policy, and symlink boundary.
+pub fn walk_scoped_with_policy_and_overrides(
+    root: &Path,
+    policy: &skip::SkipPolicy,
+    overrides: &WalkOverrides,
+    scopes: Option<&[String]>,
+) -> Result<Vec<InventoryEntry>> {
     use ignore::WalkBuilder;
 
     let mut entries = Vec::new();
@@ -349,6 +410,14 @@ pub fn walk_with_policy_and_overrides(
     // skip the vendored mirror if the workspace happens to be the
     // greppy project itself.
     builder.standard_filters(true);
+    // An explicit scope may itself live below a hidden ancestor (for example
+    // `.codex/task-evidence`). The ignore crate's hidden filter runs before
+    // `filter_entry`, so leave hidden filtering to the scope predicate for
+    // scoped walks. It admits hidden entries only when they are explicitly
+    // named scope components; ordinary hidden descendants remain excluded.
+    if scopes.is_some() {
+        builder.hidden(false);
+    }
     // Do not follow symlinks: a symlinked directory must not be descended
     // (loop / escape protection), and a symlinked file is handled by the
     // explicit per-entry check below.
@@ -364,6 +433,38 @@ pub fn walk_with_policy_and_overrides(
     builder.parents(!root.join(".git").exists());
     if !overrides.is_empty() {
         builder.overrides(build_ignore_overrides(root, overrides)?);
+    }
+    let store_relative = configured_store_relative_to(root)?;
+    if scopes.is_some() || store_relative.is_some() {
+        let root = root.to_path_buf();
+        let scopes = scopes.map(|scopes| scopes.to_vec());
+        builder.filter_entry(move |entry| {
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                return false;
+            };
+            if store_relative
+                .as_ref()
+                .is_some_and(|store| relative.starts_with(store))
+            {
+                return false;
+            }
+            let Some(scopes) = scopes.as_deref() else {
+                return true;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let in_scope = relative.is_empty()
+                || scopes.iter().any(|scope| {
+                    scope.is_empty()
+                        || relative == *scope
+                        || relative
+                            .strip_prefix(scope)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                        || scope
+                            .strip_prefix(&relative)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+            in_scope && scoped_hidden_components_are_explicit(&relative, scopes)
+        });
     }
     let walker = builder.build();
     for dent in walker {
@@ -628,6 +729,89 @@ mod tests {
         assert!(rels.contains(&"src/keep.rs"));
         assert!(!rels.iter().any(|r| r.starts_with(".vendor/")));
         assert!(!rels.iter().any(|r| r.starts_with("target/")));
+    }
+
+    #[test]
+    fn walk_excludes_configured_store_inside_workspace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+        let tmp = tempdir_via_env();
+        let root = tmp.join("repo");
+        let store = root.join("cache");
+        write(&root.join("src/lib.rs"), "fn keep() {}");
+        write(
+            &store.join("workspaces/v7/project/graph.db"),
+            "changing cache",
+        );
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &store) };
+
+        let entries = walk(&root).unwrap();
+        let rels: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect();
+        assert_eq!(rels, ["src/lib.rs"]);
+    }
+
+    #[test]
+    fn walk_allows_configured_store_in_git_metadata() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+        let tmp = tempdir_via_env();
+        let root = tmp.join("repo");
+        let store = root.join(".git/greppy-store");
+        write(&root.join("src/lib.rs"), "fn keep() {}");
+        write(
+            &store.join("workspaces/v7/project/graph.db"),
+            "changing cache",
+        );
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &store) };
+
+        let entries = walk(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel_path, "src/lib.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_store_filter_follows_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+        let tmp = tempdir_via_env();
+        let root = tmp.join("repo");
+        let inside = root.join("cache");
+        let outside = tmp.join("outside-store");
+        write(&root.join("src/lib.rs"), "fn keep() {}");
+        write(
+            &inside.join("workspaces/v7/project/graph.db"),
+            "changing cache",
+        );
+        fs::create_dir_all(&outside).unwrap();
+
+        let outside_link = tmp.join("store-link");
+        symlink(&inside, &outside_link).unwrap();
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &outside_link) };
+        let entries = walk(&root).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "external spelling must exclude its in-workspace target"
+        );
+
+        let inside_link = root.join("store-link");
+        symlink(&outside, &inside_link).unwrap();
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &inside_link) };
+        let entries = walk(&root).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "in-workspace spelling of an external target is valid"
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry.rel_path == "cache/workspaces/v7/project/graph.db"));
     }
 
     #[test]

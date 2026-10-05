@@ -1068,9 +1068,6 @@ pub(crate) fn dispatch_impact(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    // The tree's per-node hints reach the Qwen daemon; start its async model
-    // load now so the walk below overlaps the cold start.
-    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "impact", symbol.unwrap_or(""), paths)?;
     let dir = match direction.to_ascii_lowercase().as_str() {
         "incoming" | "in" | "callers" => greppy_search::ReachDirection::Incoming,
@@ -1100,22 +1097,24 @@ pub(crate) fn dispatch_impact(
         "all": false,
     });
     insert_impact_edge_meta(&mut graph_gate_extra, &edge_spec);
-    if let Some(code) = graph_stale_gate(
+    if let Some(code) = graph_stale_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra.clone(),
         "hits",
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra,
         "hits",
@@ -1231,6 +1230,8 @@ pub(crate) fn dispatch_impact(
         println!("{what}");
         return Ok(0);
     }
+    // Preparation admission and target resolution precede model work.
+    prewarm_summary_daemon();
     let total = reached.len();
     // `--all` lifts the print cap so the full transitive set is inspectable
     // in one call (the footer's "T total" was previously unreachable — clap
@@ -1530,7 +1531,6 @@ pub(crate) fn dispatch_briefs(
         return Ok(exit);
     }
 
-    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "brief", "", paths)?;
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
@@ -1576,6 +1576,7 @@ pub(crate) fn dispatch_briefs(
         ensure_unambiguous_target(&store, symbol, ids)?;
     }
 
+    prewarm_summary_daemon();
     let semantic_backend_unavailable = embedding_config_for_required_use(EmbeddingCliArgs {
         device: None,
         no_gpu: false,
@@ -1622,9 +1623,6 @@ pub(crate) fn dispatch_brief(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    // brief summarizes its definition span and its callees'; overlap the
-    // model load with resolution and store open.
-    prewarm_summary_daemon();
     let query_symbol = symbol.unwrap_or("");
     let path_filters = prepare_query_path_filters(root, "brief", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
@@ -1689,6 +1687,7 @@ pub(crate) fn dispatch_brief(
             );
             return Ok(1);
         }
+        prewarm_summary_daemon();
         let root_path = resolve_root(root)?;
         return dispatch_brief_json(
             &store,
@@ -1747,6 +1746,9 @@ pub(crate) fn dispatch_brief(
         }
         if printed > 0 {
             println!();
+        }
+        if printed == 0 {
+            prewarm_summary_daemon();
         }
         printed += 1;
         brief.print_brief(&node);
@@ -3276,6 +3278,223 @@ pub(crate) fn print_nav_rows(
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct UnresolvedReceiver {
+    pub file: String,
+    pub line: u32,
+    pub caller: String,
+    pub reasons: Vec<String>,
+}
+
+/// Incoming `UNRESOLVED_CALLS` are not callers. They are the Option `as_ref`
+/// candidates whose receiver identity was not proven.
+pub(crate) fn unresolved_option_receivers(
+    store: &greppy_store::Store,
+    target_ids: &[i64],
+    limit: usize,
+) -> Result<Vec<UnresolvedReceiver>> {
+    let mut lines = Vec::new();
+    // Fetch the indexed endpoint before filtering and paging: a display cap
+    // must not hide matching paths beyond an unrelated prefix.
+    let fetch = i64::MAX as usize;
+    let _ = limit;
+    for id in target_ids {
+        for edge in store.incoming_edges(*id, Some("UNRESOLVED_CALLS"), fetch)? {
+            let Some(node) = store.get_node(edge.source_id)? else {
+                continue;
+            };
+            if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+                continue;
+            }
+            let line = edge
+                .properties
+                .get("line")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32)
+                .unwrap_or_else(|| node.start_line.max(1) as u32);
+            let reasons = edge
+                .properties
+                .get("unresolved_reasons")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            lines.push(UnresolvedReceiver {
+                file: node.file_path.clone(),
+                line,
+                caller: nav_short_name(&node),
+                reasons,
+            });
+        }
+    }
+    lines.sort_by(|left, right| {
+        (&left.file, left.line, &left.caller, &left.reasons).cmp(&(
+            &right.file,
+            right.line,
+            &right.caller,
+            &right.reasons,
+        ))
+    });
+    lines.dedup_by(|left, right| {
+        left.file == right.file
+            && left.line == right.line
+            && left.caller == right.caller
+            && left.reasons == right.reasons
+    });
+    Ok(lines)
+}
+
+pub(crate) fn unresolved_receiver_line(item: &UnresolvedReceiver) -> String {
+    if item.reasons.is_empty() {
+        format!(
+            "unresolved receiver: {}:{} {} — Option as_ref receiver was not proven",
+            item.file, item.line, item.caller
+        )
+    } else {
+        format!(
+            "unresolved receiver: {}:{} {} — Option as_ref receiver was not proven ({})",
+            item.file,
+            item.line,
+            item.caller,
+            item.reasons.join(", ")
+        )
+    }
+}
+
+pub(crate) struct UnresolvedReceiverPage {
+    pub rows: Vec<UnresolvedReceiver>,
+    pub total: usize,
+    pub omitted: usize,
+    pub truncated: bool,
+}
+
+pub(crate) struct UnresolvedReceiverReport {
+    pub rows: Vec<serde_json::Value>,
+    pub total: usize,
+    pub omitted: usize,
+    pub truncated: bool,
+}
+
+impl UnresolvedReceiverReport {
+    pub(crate) fn none() -> Self {
+        Self {
+            rows: Vec::new(),
+            total: 0,
+            omitted: 0,
+            truncated: false,
+        }
+    }
+
+    pub(crate) fn incomplete(&self) -> bool {
+        self.total > 0 || self.omitted > 0 || self.truncated
+    }
+}
+
+pub(crate) fn unresolved_receiver_fetch_limit(code: bool, all: bool) -> usize {
+    let default = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    let limit = crate::cli_result_limit_raw().unwrap_or(if all { usize::MAX } else { default });
+    let offset = crate::cli_result_offset();
+    offset.saturating_add(limit).saturating_add(1).max(1)
+}
+
+pub(crate) fn unresolved_receiver_page(
+    items: &[UnresolvedReceiver],
+    code: bool,
+    all: bool,
+    resolved_count: usize,
+) -> UnresolvedReceiverPage {
+    let known = items.len();
+    let default = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    let offset = crate::cli_result_offset();
+    let limit = crate::cli_result_limit_raw().unwrap_or(if all { usize::MAX } else { default });
+    // One response budget: resolved caller rows precede uncertain diagnostics.
+    let resolved_shown = resolved_count.saturating_sub(offset).min(limit);
+    let start = offset.saturating_sub(resolved_count).min(known);
+    let end = start
+        .saturating_add(limit.saturating_sub(resolved_shown))
+        .min(known);
+    let shown = end - start;
+    let omitted = known - shown;
+    let truncated = omitted > 0;
+    UnresolvedReceiverPage {
+        rows: items[start..end].to_vec(),
+        total: known,
+        omitted,
+        truncated,
+    }
+}
+
+fn unresolved_page_report(page: &UnresolvedReceiverPage, target: &str) -> UnresolvedReceiverReport {
+    UnresolvedReceiverReport {
+        rows: page
+            .rows
+            .iter()
+            .map(|item| unresolved_receiver_json(item, target))
+            .collect(),
+        total: page.total,
+        omitted: page.omitted,
+        truncated: page.truncated,
+    }
+}
+
+pub(crate) fn print_unresolved_receivers(page: &UnresolvedReceiverPage) {
+    for item in &page.rows {
+        println!("{}", unresolved_receiver_line(item));
+    }
+    if page.truncated {
+        println!("… {} unresolved receivers omitted", page.omitted.max(1));
+    }
+}
+
+#[cfg(test)]
+mod unresolved_receiver_budget {
+    use super::{unresolved_receiver_page, UnresolvedReceiver};
+
+    fn row(line: u32) -> UnresolvedReceiver {
+        UnresolvedReceiver {
+            file: "src/gpu.rs".into(),
+            line,
+            caller: "load_scene".into(),
+            reasons: vec!["attribute wasm_bindgen".into()],
+        }
+    }
+
+    #[test]
+    fn unresolved_rows_honor_limit_offset_and_keep_incompleteness() {
+        let rows = (1..=5).map(row).collect::<Vec<_>>();
+        crate::set_cli_result_window(Some(2), 1);
+        let page = unresolved_receiver_page(&rows, false, false, 0);
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].line, 2);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.omitted, 3);
+        assert!(page.truncated);
+        crate::set_cli_result_window(Some(2), 10);
+        let skipped = unresolved_receiver_page(&rows, false, false, 0);
+        assert!(skipped.rows.is_empty());
+        assert!(skipped.truncated);
+        assert!(skipped.omitted > 0);
+        crate::set_cli_result_window(None, 0);
+    }
+}
+
+pub(crate) fn unresolved_receiver_json(
+    item: &UnresolvedReceiver,
+    target: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "target": target,
+        "file": item.file,
+        "line": item.line,
+        "caller": item.caller,
+        "reasons": item.reasons,
+    })
+}
+
 pub(crate) fn dispatch_who_calls(
     symbol: Option<&str>,
     paths: &[String],
@@ -3368,13 +3587,18 @@ pub(crate) fn dispatch_who_calls(
             edges.extend(store.incoming_edges(*target, Some(edge_type), 1024)?);
         }
     }
+    let fetch_limit = unresolved_receiver_fetch_limit(code, all);
+    let mut unresolved = unresolved_option_receivers(&store, &targets, fetch_limit)?;
+    unresolved.retain(|item| path_filters.matches(&item.file));
+    let unresolved_page = unresolved_receiver_page(&unresolved, code, all, 0);
+    let unresolved_report = unresolved_page_report(&unresolved_page, query_symbol);
     if edges.is_empty() {
         // The symbol IS a defined graph node but has no callers — that is a
         // valid, useful answer, not a failure. Do not fall back to content
         // search (it would just echo the definition as noise).
         if json {
             let project = project_for(root)?;
-            nav_counts_json(
+            nav_counts_json_with_expand(
                 &store,
                 root,
                 "who-calls",
@@ -3385,15 +3609,30 @@ pub(crate) fn dispatch_who_calls(
                 0,
                 all,
                 Vec::new(),
+                None,
+                &unresolved_report,
+                None,
             )?;
             return Ok(0);
         }
         // Nobody calls it. That is an answer, and it needs no packaging and no
-        // textual consolation prize.
-        if path_filters.is_empty() {
-            println!("no callers");
+        // textual consolation prize. An unresolved Option receiver is a
+        // different answer: the call exists, but its payload was not proven.
+        if !unresolved_report.incomplete() {
+            if path_filters.is_empty() {
+                println!("no callers");
+            } else {
+                println!("no callers under path filter: {}", path_filters.shown());
+            }
+        } else if path_filters.is_empty() {
+            println!("no resolved callers");
+            print_unresolved_receivers(&unresolved_page);
         } else {
-            println!("no callers under path filter: {}", path_filters.shown());
+            println!(
+                "no resolved callers under path filter: {}",
+                path_filters.shown()
+            );
+            print_unresolved_receivers(&unresolved_page);
         }
         return Ok(0);
     }
@@ -3405,9 +3644,13 @@ pub(crate) fn dispatch_who_calls(
     // Collect each reference-site line persisted in the edge properties. The
     // line locates the statement that `--code` prints for the answer row.
     let mut sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
+    let mut call_sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
     for e in &edges {
         if let Some(l) = e.properties.get("line").and_then(|v| v.as_u64()) {
             sites.entry(e.source_id).or_default().push(l as u32);
+            if e.edge_type == "CALLS" {
+                call_sites.entry(e.source_id).or_default().push(l as u32);
+            }
         }
         if !seen.insert(e.source_id) {
             continue;
@@ -3416,16 +3659,25 @@ pub(crate) fn dispatch_who_calls(
             nodes.push(n);
         }
     }
-    // A file anchor emitted on the definition itself (the C++ extractor's
-    // bookkeeping USAGE edge) is not a caller. Filter BEFORE deciding
-    // emptiness — otherwise an uncalled function prints nothing at all
-    // instead of its true answer.
-    nodes.retain(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name));
+    // A file anchor reached only through a bookkeeping USAGE edge (notably the
+    // C++ extractor's definition edge) is not a caller. A CALLS edge sourced
+    // from the anchor is different: it is a real module-scope call and must
+    // remain visible, or we would turn source evidence into a false
+    // authoritative `no callers` answer.
+    let module_callers = edges
+        .iter()
+        .filter(|edge| edge.edge_type == "CALLS")
+        .map(|edge| edge.source_id)
+        .collect::<std::collections::HashSet<_>>();
+    nodes.retain(|node| {
+        !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+            || module_callers.contains(&node.id)
+    });
     nodes.retain(|node| path_filters.matches(&node.file_path));
     if nodes.is_empty() {
         if json {
             let project = project_for(root)?;
-            nav_counts_json(
+            nav_counts_json_with_expand(
                 &store,
                 root,
                 "who-calls",
@@ -3436,19 +3688,54 @@ pub(crate) fn dispatch_who_calls(
                 0,
                 all,
                 Vec::new(),
+                None,
+                &unresolved_report,
+                None,
             )?;
             return Ok(0);
         }
-        if path_filters.is_empty() {
-            println!("no callers");
+        if !unresolved_report.incomplete() {
+            if path_filters.is_empty() {
+                println!("no callers");
+            } else {
+                println!("no callers under path filter: {}", path_filters.shown());
+            }
+        } else if path_filters.is_empty() {
+            println!("no resolved callers");
+            print_unresolved_receivers(&unresolved_page);
         } else {
-            println!("no callers under path filter: {}", path_filters.shown());
+            println!(
+                "no resolved callers under path filter: {}",
+                path_filters.shown()
+            );
+            print_unresolved_receivers(&unresolved_page);
         }
         return Ok(0);
     }
     let total = nodes.len();
+    let unresolved_page = unresolved_receiver_page(&unresolved, code, all, total);
+    let unresolved_report = unresolved_page_report(&unresolved_page, query_symbol);
     let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let shown = total.min(cap);
+    let preferred_site_lines =
+        |node_id: i64| sorted_site_lines(call_sites.get(&node_id).or_else(|| sites.get(&node_id)));
+    let repo_root = resolve_root(root)?;
+    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut evidence: std::collections::HashMap<i64, (u32, (u32, u32))> = Default::default();
+    for node in &nodes {
+        let site = preferred_site_lines(node.id)
+            .first()
+            .copied()
+            .unwrap_or_else(|| node.start_line.max(1) as u32);
+        let lines = sources
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(&repo_root, &node.file_path));
+        let span = match lines.as_ref() {
+            Some(lines) if code || json => nav_statement_span(lines, site),
+            _ => (site, site),
+        };
+        evidence.insert(node.id, (site, span));
+    }
     // The expand pack exists only for the JSON consumer now: in text mode
     // everything the pack could carry is one flag away, so offering it would be
     // a second spelling of `--all` plus a handle to remember.
@@ -3456,9 +3743,13 @@ pub(crate) fn dispatch_who_calls(
         let rows = nodes
             .iter()
             .map(|n| ExpandEvidenceNode {
-                title: display_node_name(n),
+                title: if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+                    "<module>".into()
+                } else {
+                    display_node_name(n)
+                },
                 node: n,
-                site_lines: sorted_site_lines(sites.get(&n.id)),
+                site_lines: preferred_site_lines(n.id),
                 extra_json: serde_json::json!({"role": "caller"}),
             })
             .collect::<Vec<_>>();
@@ -3476,7 +3767,30 @@ pub(crate) fn dispatch_who_calls(
     };
     if json {
         let project = project_for(root)?;
-        let hits = nodes[..shown].iter().map(node_hit_json).collect();
+        let hits = nodes[..shown]
+            .iter()
+            .map(|node| {
+                let (site, span) = evidence.get(&node.id).copied().unwrap_or_else(|| {
+                    let start = node.start_line.max(1) as u32;
+                    let end = node.end_line.max(node.start_line).max(1) as u32;
+                    (start, (start, end))
+                });
+                let module =
+                    is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name);
+                serde_json::json!({
+                    // Keep the stored graph identity so JSON piping can
+                    // resolve this row again. `<module>` is presentation,
+                    // never a replacement symbol invented by the renderer.
+                    "qualified_name": node.qualified_name.clone(),
+                    "name": if module { "<module>".into() } else { nav_short_name(node) },
+                    "file": &node.file_path,
+                    "line": site,
+                    "file_path": &node.file_path,
+                    "start_line": span.0,
+                    "end_line": span.1,
+                })
+            })
+            .collect();
         nav_counts_json_with_expand(
             &store,
             root,
@@ -3489,51 +3803,224 @@ pub(crate) fn dispatch_who_calls(
             all,
             hits,
             expand.as_ref(),
+            &unresolved_report,
+            None,
         )?;
         return Ok(0);
     }
-    let repo_root = resolve_root(root)?;
     // The caller's name answers "who"; the call site answers "where the
     // dependency sits". Both fit one line, and nothing else belongs on it.
-    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut rows = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        // A file anchor is greppy's own bookkeeping, not a symbol. `__file__`
-        // in a result list is a name the agent cannot carry anywhere.
-        if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
-            continue;
-        }
-        let site = sorted_site_lines(sites.get(&n.id))
-            .first()
-            .copied()
-            .unwrap_or_else(|| n.start_line.max(1) as u32);
-        let lines = sources
-            .entry(n.file_path.clone())
-            .or_insert_with(|| nav_file_lines(&repo_root, &n.file_path));
-        let span = match lines.as_ref() {
-            Some(lines) if code => nav_statement_span(lines, site),
-            _ => (site, site),
-        };
+        let (site, span) = evidence.get(&n.id).copied().unwrap_or_else(|| {
+            let start = n.start_line.max(1) as u32;
+            let end = n.end_line.max(n.start_line).max(1) as u32;
+            (start, (start, end))
+        });
+        let lines = sources.get(&n.file_path).and_then(Option::as_ref);
         rows.push(NavAnswerRow {
             file: n.file_path.clone(),
             line: site,
             span,
-            name: nav_short_name(n),
-            test: nav_is_test(lines.as_ref(), n),
+            name: if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+                "<module>".into()
+            } else {
+                nav_short_name(n)
+            },
+            test: nav_is_test(lines, n),
         });
     }
     print_nav_rows(&repo_root, "callers", &mut rows, code, all);
+    if unresolved_report.incomplete() {
+        print_unresolved_receivers(&unresolved_page);
+    }
     Ok(0)
 }
-/// `greppy callees S` — what `S` calls: every node reached by a direct
-/// outgoing CALLS edge from `S`. Printed as `qualified_name file:line` so
-/// an agent can jump straight to each callee's definition. Backed by the
-/// search `callees_of` helper.
-///
-/// Like who-calls, this aggregates across ALL nodes sharing the name + a
-/// primary label (e.g. a Struct and its Impl) so callees are not lost to
-/// a name resolving to the wrong single node. Output is de-duplicated and
-/// deterministically ordered by node id.
+#[derive(Default)]
+pub(crate) struct FactoryReceiverPage {
+    pub rows: Vec<serde_json::Value>,
+    pub total: usize,
+    pub omitted: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct FactoryReceiverCache {
+    by_file: std::collections::HashMap<(String, String), Vec<greppy_store::RawEdge>>,
+    #[cfg(test)]
+    file_loads: usize,
+}
+
+impl FactoryReceiverCache {
+    pub(crate) fn page(
+        &mut self,
+        store: &greppy_store::Store,
+        ids: &[i64],
+        limit: usize,
+        matches_path: impl Fn(&str) -> bool,
+    ) -> Result<FactoryReceiverPage> {
+        let mut page = FactoryReceiverPage::default();
+        for id in ids {
+            let Some(node) = store.get_node(*id)? else {
+                continue;
+            };
+            if !matches_path(&node.file_path) {
+                continue;
+            }
+            let key = (node.project.clone(), node.file_path.clone());
+            if !self.by_file.contains_key(&key) {
+                self.by_file.insert(
+                    key.clone(),
+                    store
+                        .list_raw_factory_receiver_edges_for_file(&node.project, &node.file_path)?,
+                );
+                #[cfg(test)]
+                {
+                    self.file_loads += 1;
+                }
+            }
+            for edge in self.by_file[&key]
+                .iter()
+                .filter(|edge| edge.source_qname == node.qualified_name)
+            {
+                page.total += 1;
+                if page.rows.len() >= limit {
+                    continue;
+                }
+                let line = edge
+                    .properties
+                    .get("line")
+                    .and_then(|value| value.as_u64())
+                    .filter(|line| *line > 0 && *line <= u32::MAX as u64);
+                page.rows.push(serde_json::json!({
+                    "file": edge.file_path,
+                    "line": line,
+                    "callee": edge.properties.get("callee_name").cloned().unwrap_or(serde_json::json!("")),
+                    "factory": edge.properties["receiver_factory_pattern"],
+                    "reason": "factory_pattern_owner_unproven",
+                }));
+            }
+        }
+        page.omitted = page.total.saturating_sub(page.rows.len());
+        Ok(page)
+    }
+}
+
+pub(crate) fn factory_receiver_limit(code: bool, all: bool) -> usize {
+    if all {
+        usize::MAX
+    } else {
+        cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, false)
+    }
+}
+
+pub(crate) fn print_unresolved_factory_receivers(page: &FactoryReceiverPage, symbol: &str) {
+    for row in &page.rows {
+        let location = match row["line"].as_u64() {
+            Some(line) => format!("{}:{line}", row["file"].as_str().unwrap_or("")),
+            None => format!(
+                "{} (call-site line unavailable)",
+                row["file"].as_str().unwrap_or("")
+            ),
+        };
+        println!(
+            "{location}  unresolved receiver {}; factory {} return type or pattern scope is unproven; greppy read {symbol}",
+            row["callee"].as_str().unwrap_or(""), row["factory"].as_str().unwrap_or("")
+        );
+    }
+    if page.omitted > 0 {
+        println!("… {} unresolved factory receivers omitted ({} total); callees incomplete — greppy callees {symbol} --all", page.omitted, page.total);
+    }
+}
+
+#[cfg(test)]
+mod factory_receiver_cache_tests {
+    use super::*;
+
+    #[test]
+    fn factory_receiver_pages_count_exactly_and_load_same_file_once() {
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "factory-pages".into(),
+                indexed_at: "test".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+        let nodes = ["one", "two"].map(|name| greppy_store::NewNode {
+            project: "factory-pages".into(),
+            label: "Function".into(),
+            name: name.into(),
+            qualified_name: format!("src/lib.rs::Function::{name}"),
+            file_path: "src/lib.rs".into(),
+            start_line: 1,
+            end_line: 100,
+            properties: serde_json::json!({}),
+        });
+        let ids = store.insert_nodes(&nodes).unwrap();
+        let mut facts = Vec::new();
+        for name in ["one", "two"] {
+            for line in 1..=45 {
+                facts.push(greppy_store::NewRawEdge {
+                    project: "factory-pages".into(),
+                    file_path: "src/lib.rs".into(),
+                    source_qname: format!("src/lib.rs::Function::{name}"),
+                    target_qname: "unresolved".into(),
+                    edge_type: "CALLS".into(),
+                    properties: serde_json::json!({
+                        "receiver_factory_pattern": "Writer::open", "callee_name": "upsert",
+                        "line": if name == "two" && line == 1 { None } else { Some(line) },
+                    }),
+                });
+            }
+        }
+        let mut resolved = facts[0].clone();
+        resolved.properties["receiver_owner"] = serde_json::json!("Writer");
+        facts.push(resolved);
+        let mut usage = facts[0].clone();
+        usage.edge_type = "USAGE".into();
+        facts.push(usage);
+        store.insert_raw_edges(&facts).unwrap();
+        let mut cache = FactoryReceiverCache::default();
+        let excluded = cache
+            .page(&store, &ids[..1], 40, |path| path == "src/other.rs")
+            .unwrap();
+        assert_eq!(
+            (excluded.total, excluded.rows.len(), excluded.omitted),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            cache.file_loads, 0,
+            "out-of-scope sources are rejected before hydration"
+        );
+        let one = cache.page(&store, &ids[..1], 40, |_| true).unwrap();
+        assert_eq!((one.total, one.rows.len(), one.omitted), (45, 40, 5));
+        let two_hidden = cache.page(&store, &ids[1..], 0, |_| true).unwrap();
+        assert_eq!(
+            (two_hidden.total, two_hidden.rows.len(), two_hidden.omitted),
+            (45, 0, 45)
+        );
+        let two_all = cache.page(&store, &ids[1..], usize::MAX, |_| true).unwrap();
+        assert_eq!(
+            (two_all.total, two_all.rows.len(), two_all.omitted),
+            (45, 45, 0)
+        );
+        assert!(
+            two_all.rows[0]["line"].is_null(),
+            "missing coordinates must never become file:0"
+        );
+        assert_eq!(
+            cache.file_loads, 1,
+            "a same-file batch hydrates its relevant facts once"
+        );
+        assert_eq!(
+            cache.by_file.values().next().unwrap().len(),
+            90,
+            "resolved receivers and unrelated usages were filtered before hydration"
+        );
+    }
+}
+
+/// `greppy callees S` lists resolved direct callees and retained unresolved factory receivers.
 pub(crate) fn dispatch_callees(
     symbol: Option<&str>,
     paths: &[String],
@@ -3615,6 +4102,12 @@ pub(crate) fn dispatch_callees(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
+    let unresolved_factories = FactoryReceiverCache::default().page(
+        &store,
+        &sources,
+        factory_receiver_limit(code, all),
+        |path| path_filters.matches(path),
+    )?;
     // Aggregate direct callees across the resolved source nodes, keyed on
     // the callee node id so a callee reached from both a Struct and its
     // Impl is printed once. BTreeMap keeps the output id-ordered. We keep
@@ -3633,7 +4126,7 @@ pub(crate) fn dispatch_callees(
     if callees.is_empty() {
         if json {
             let project = project_for(root)?;
-            nav_counts_json(
+            nav_counts_json_with_expand(
                 &store,
                 root,
                 "callees",
@@ -3644,13 +4137,22 @@ pub(crate) fn dispatch_callees(
                 0,
                 all,
                 Vec::new(),
+                None,
+                &UnresolvedReceiverReport::none(),
+                Some(&unresolved_factories),
             )?;
             return Ok(0);
         }
+        print_unresolved_factory_receivers(&unresolved_factories, query_symbol);
         if path_filters.is_empty() {
-            println!("no callees");
+            println!("no resolved indexed callees; external or unresolved calls may still exist");
+            println!("inspect source with: greppy read {query_symbol}");
         } else {
-            println!("no callees under path filter: {}", path_filters.shown());
+            println!(
+                "no resolved indexed callees under path filter: {}",
+                path_filters.shown()
+            );
+            println!("external, unresolved or filtered calls may still exist; inspect source with: greppy read {query_symbol}");
         }
         return Ok(0);
     }
@@ -3694,6 +4196,8 @@ pub(crate) fn dispatch_callees(
             all,
             hits,
             expand.as_ref(),
+            &UnresolvedReceiverReport::none(),
+            Some(&unresolved_factories),
         )?;
         return Ok(0);
     }
@@ -3722,6 +4226,7 @@ pub(crate) fn dispatch_callees(
         });
     }
     print_nav_rows(&repo_root, "callees", &mut rows, code, all);
+    print_unresolved_factory_receivers(&unresolved_factories, query_symbol);
     Ok(0)
 }
 
@@ -3985,7 +4490,8 @@ pub(crate) fn dispatch_path(
         return Err(Error::Invalid("path --edge must not be empty".into()));
     }
 
-    let store = open_default_store(root)?;
+    let mut store = open_default_store(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let max_hops = greppy_search::MAX_REACH_HOPS;
     let graph_gate_extra = serde_json::json!({
@@ -4001,22 +4507,24 @@ pub(crate) fn dispatch_path(
         "max_hops": max_hops,
         "hops": serde_json::Value::Null,
     });
-    if let Some(code) = graph_stale_gate(
+    if let Some(code) = graph_stale_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         graph_gate_extra.clone(),
         "steps",
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         serde_json::json!({
             "from": from,

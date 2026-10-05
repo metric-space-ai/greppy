@@ -13,6 +13,15 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum RunMode {
+    /// Start the script with its own browser, context, and page.
+    #[default]
+    Standalone,
+    /// Bind the script to the selected session's current browser, context, and page.
+    Active,
+}
+
 pub const EXIT_WEB_INVALID: i32 = 30;
 pub const EXIT_WEB_UNAVAILABLE: i32 = 31;
 #[allow(dead_code)]
@@ -92,6 +101,143 @@ pub(super) struct CurrentScope {
     pub tab: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionRoute {
+    runtime_image_id: String,
+    #[serde(default)]
+    legacy: bool,
+}
+
+fn session_route_path(root: Option<&str>, session: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(session.as_bytes());
+    let name = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    workspace_dir(root)
+        .join(".greppy/web/session-routes")
+        .join(format!("{name}.json"))
+}
+
+fn runtime_route_path(root: Option<&str>, runtime_image_id: &str, legacy: bool) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let generation = format!("{runtime_image_id}:legacy={legacy}");
+    let name = format!("{:x}.json", Sha256::digest(generation.as_bytes()));
+    workspace_dir(root)
+        .join(".greppy/web/runtime-routes")
+        .join(name)
+}
+
+fn load_session_route(root: Option<&str>, session: &str) -> Option<SessionRoute> {
+    let bytes = std::fs::read(session_route_path(root, session)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_session_route(
+    root: Option<&str>,
+    session: &str,
+    ctx: &SupervisorCtx,
+) -> std::result::Result<(), ErrorObject> {
+    let path = session_route_path(root, session);
+    let route = SessionRoute {
+        runtime_image_id: ctx.runtime_image_id.clone(),
+        legacy: ctx.legacy,
+    };
+    persist_route(&path, &route)
+}
+
+fn save_runtime_route(
+    root: Option<&str>,
+    ctx: &SupervisorCtx,
+) -> std::result::Result<(), ErrorObject> {
+    let route = SessionRoute {
+        runtime_image_id: ctx.runtime_image_id.clone(),
+        legacy: ctx.legacy,
+    };
+    persist_route(
+        &runtime_route_path(root, &ctx.runtime_image_id, ctx.legacy),
+        &route,
+    )
+}
+
+fn persist_route(path: &Path, route: &SessionRoute) -> std::result::Result<(), ErrorObject> {
+    let Some(parent) = path.parent() else {
+        return Err(unavailable("invalid runtime route path"));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| unavailable(&format!("cannot create runtime route directory: {error}")))?;
+    let bytes = serde_json::to_vec_pretty(route)
+        .map_err(|error| unavailable(&format!("cannot encode runtime route: {error}")))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| unavailable(&format!("cannot create session route: {error}")))?;
+    use std::io::Write as _;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.flush())
+        .map_err(|error| unavailable(&format!("cannot persist session route: {error}")))?;
+    temporary
+        .persist(path)
+        .map_err(|error| unavailable(&format!("cannot install session route: {}", error.error)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| unavailable(&format!("cannot protect session route: {error}")))?;
+    }
+    Ok(())
+}
+
+fn known_runtime_routes(root: Option<&str>) -> Vec<SessionRoute> {
+    let directory = workspace_dir(root).join(".greppy/web/runtime-routes");
+    std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+        .collect()
+}
+
+fn remove_session_route(root: Option<&str>, session: &str) {
+    let _ = std::fs::remove_file(session_route_path(root, session));
+}
+
+fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str, legacy: bool) {
+    let clear_scope = read_current_scope(root)
+        .session
+        .as_deref()
+        .and_then(|session| load_session_route(root, session))
+        .is_some_and(|route| route.runtime_image_id == runtime_image_id && route.legacy == legacy);
+    let _ = std::fs::remove_file(runtime_route_path(root, runtime_image_id, legacy));
+    let directory = workspace_dir(root).join(".greppy/web/session-routes");
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let matches = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SessionRoute>(&bytes).ok())
+                .is_some_and(|route| {
+                    route.runtime_image_id == runtime_image_id && route.legacy == legacy
+                });
+            if matches {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    if clear_scope {
+        let _ = std::fs::remove_file(current_scope_path(root));
+    }
+}
+
+fn select_route_capability(
+    saved_cookie: Option<String>,
+    current_token: Option<String>,
+    is_current_image: bool,
+) -> Option<String> {
+    saved_cookie.or_else(|| is_current_image.then_some(current_token).flatten())
+}
 /// Drop only the remembered session that the runtime actually rejected.
 ///
 /// A stored session belongs to a runtime that may be gone -- after a crash,
@@ -255,22 +401,56 @@ pub(super) fn runtime_run_id(root: Option<&str>) -> (String, String) {
     (run_id, identity)
 }
 
+fn runtime_identity_for_image(identity: &str, runtime_image_id: &str) -> String {
+    format!("{identity}:image:{runtime_image_id}")
+}
+
+fn valid_runtime_image_id(runtime_image_id: &str) -> bool {
+    runtime_image_id
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn valid_session_route_image(route: &SessionRoute) -> bool {
+    // Pre-generation daemons advertise their historical build tag, not a
+    // content SHA. It never selects a socket: legacy routes use only the
+    // workspace-derived legacy identity and that socket's own attach cookie.
+    // The authenticated live status must still match the saved build tag.
+    route.legacy || valid_runtime_image_id(&route.runtime_image_id)
+}
+
 pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
     let (run_id, identity) = runtime_run_id(root);
+    let runtime = match resolve_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => return emit_error(json, error),
+    };
+    let image = match greppy_web_client::runtime_image_id(&runtime.executable) {
+        Ok(image) => image,
+        Err(error) => {
+            return emit_error(
+                json,
+                unavailable(&format!("cannot identify web-runtime executable: {error}")),
+            )
+        }
+    };
+    let identity = runtime_identity_for_image(&identity, &image);
     let Some(socket) = web_runtime_socket(&identity) else {
         return emit_error(json, unavailable("cannot allocate web-runtime socket"));
     };
     let running = socket_connected(&socket);
-    let owned = match crate::web_attach::current_token().or_else(|| load_attach_cookie(&socket)) {
-        Some(capability) if running => socket_is_live(&socket, &run_id, &capability),
-        _ => false,
+    let live = match crate::web_attach::current_token().or_else(|| load_attach_cookie(&socket)) {
+        Some(capability) if running => live_runtime_status(&socket, &run_id, &capability),
+        _ => None,
     };
     let payload = json!({
         "schema": SCHEMA,
         "status": "ok",
         "result": {
             "running": running,
-            "owned": owned,
+            "owned": live.is_some(),
+            "runtime_build_id": live.as_ref().map(|status| &status.runtime_image_id),
+            "sessions": live.as_ref().map(|status| status.sessions),
             "run_id": run_id,
             "socket": socket,
         }
@@ -291,7 +471,7 @@ pub(super) fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
             unavailable(&format!("failed to claim runtime owner: {error}")),
         );
     }
-    shutdown_if_running();
+    shutdown_runtime(root);
     match ensure_supervisor(root, &SupervisorSpawn::default()) {
         Ok(ctx) => rpc_on(&ctx, json, "web.status", json!({}), None),
         Err(error) => emit_error(json, error),
@@ -306,6 +486,15 @@ pub(super) fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
     };
     crate::startup_trace("web.doctor.resolved");
     let handshake = Handshake::runtime_facts();
+    let runtime_build_id = match greppy_web_client::runtime_image_id(&runtime.executable) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return emit_error(
+                json,
+                unavailable(&format!("cannot identify web-runtime executable: {error}")),
+            )
+        }
+    };
     let stamp = runtime
         .dist
         .as_ref()
@@ -318,7 +507,7 @@ pub(super) fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
             "dist": runtime.dist,
             "stamp": stamp,
             "protocol_version": handshake.protocol_version,
-            "runtime_build_id": handshake.runtime_build_id,
+            "runtime_build_id": runtime_build_id,
             "playwright_compatibility_version": handshake.playwright_compatibility_version,
             "servo_revision": handshake.servo_revision,
             "v8_revision": handshake.v8_revision,
@@ -340,6 +529,7 @@ pub(super) fn run(
     script_file: Option<String>,
     script_stdin: bool,
     timeout: Option<u64>,
+    mode: RunMode,
     json: bool,
 ) -> Result<i32> {
     let session = match resolve_session(root, session) {
@@ -376,11 +566,122 @@ pub(super) fn run(
             invalid("web run requires --script-file FILE or --script-stdin"),
         );
     };
+    let payload = build_run_payload(
+        &session,
+        script_source,
+        script_file_field.as_deref(),
+        script_text.as_deref(),
+        timeout,
+        mode,
+    );
+    match rpc_response(root, "web.run", payload, Some(session.clone())) {
+        Err(error) => emit_error(json, error),
+        Ok(mut response) => {
+            if let Err(error) = export_trace_artifacts(root, &session, &response) {
+                if response.status == "ok" {
+                    return emit_error(json, error);
+                }
+                response.artifacts.push(json!({
+                    "kind": "trace_export_error",
+                    "code": error.code,
+                    "message": error.message,
+                    "requested_exports_preserved": true,
+                }));
+            }
+            emit_response(json, response)
+        }
+    }
+}
+
+fn export_trace_artifacts(
+    root: Option<&str>,
+    session: &str,
+    response: &Response,
+) -> std::result::Result<(), ErrorObject> {
+    let exports = trace_exports(response);
+    for export in &exports {
+        let id = export
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let destination = export
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if id.is_empty() || destination.is_empty() {
+            return Err(invalid("trace export metadata was incomplete"));
+        }
+        let artifact = rpc_response(
+            root,
+            "web.artifact.path",
+            json!({"session_id":session,"id":id}),
+            Some(session.to_owned()),
+        )?;
+        if artifact.status != "ok" {
+            return Err(artifact
+                .error
+                .unwrap_or_else(|| invalid("trace artifact path failed")));
+        }
+        let source = artifact
+            .result
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let bytes = std::fs::read(source).map_err(|error| {
+            ErrorObject::new(
+                "ARTIFACT_IO",
+                format!("cannot read trace artifact: {error}"),
+                response.request_id.clone(),
+                EXIT_WEB_ARTIFACT,
+                "retry web run",
+            )
+        })?;
+        export_regular_file(Path::new(destination), &bytes)?;
+    }
+    Ok(())
+}
+
+fn trace_exports(response: &Response) -> Vec<serde_json::Value> {
+    let mut exports = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("trace_exports"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for artifact in &response.artifacts {
+        if let (Some(id), Some(path)) = (
+            artifact.get("id").and_then(|value| value.as_str()),
+            artifact
+                .get("requested_path")
+                .and_then(|value| value.as_str()),
+        ) {
+            let duplicate = exports.iter().any(|export| {
+                export.get("id").and_then(|value| value.as_str()) == Some(id)
+                    && export.get("path").and_then(|value| value.as_str()) == Some(path)
+            });
+            if !path.is_empty() && !duplicate {
+                exports.push(json!({"id":id,"path":path}));
+            }
+        }
+    }
+    exports
+}
+
+fn build_run_payload(
+    session: &str,
+    script_source: &str,
+    script_file: Option<&str>,
+    script_text: Option<&str>,
+    timeout: Option<u64>,
+    mode: RunMode,
+) -> serde_json::Value {
     let mut payload = json!({
         "session_id": session,
         "script_source": script_source,
     });
-    if let Some(path) = script_file_field {
+    if let Some(path) = script_file {
         payload["script_file"] = json!(path);
     }
     if let Some(text) = script_text {
@@ -389,7 +690,10 @@ pub(super) fn run(
     if let Some(timeout) = timeout {
         payload["timeout_seconds"] = json!(timeout);
     }
-    rpc(root, json, "web.run", payload, Some(session))
+    if mode == RunMode::Active {
+        payload["bind_session_page"] = json!(true);
+    }
+    payload
 }
 
 pub(super) fn screenshot(
@@ -435,11 +739,11 @@ pub(super) fn screenshot(
                             "retry greppy web doctor",
                         ),
                     ),
-                    Ok(response) => {
+                    Ok(mut response) => {
                         if response.status == "ok" {
                             if let Some(dest) = output.as_deref() {
                                 if let Err(error) =
-                                    export_screenshot_artifact(&ctx.run_id, &response, dest)
+                                    export_screenshot_artifact(&ctx.run_id, &mut response, dest)
                                 {
                                     return emit_error(json, error);
                                 }
@@ -464,7 +768,7 @@ pub(super) fn artifact_store_root(run_id: &str) -> PathBuf {
 
 pub(super) fn export_screenshot_artifact(
     run_id: &str,
-    response: &Response,
+    response: &mut Response,
     dest: &str,
 ) -> std::result::Result<(), ErrorObject> {
     let object_path = response
@@ -496,7 +800,21 @@ pub(super) fn export_screenshot_artifact(
             "retry greppy web screenshot",
         )
     })?;
-    export_regular_file(Path::new(dest), &bytes)
+    export_regular_file(Path::new(dest), &bytes)?;
+    // --output delivers the image as a file. Keep its receipt and artifact
+    // identity, without duplicating the image bytes into the agent context.
+    // Only change the reply after the export succeeds.
+    if let Some(result) = response
+        .result
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        result.remove("png_base64");
+        result.remove("cursor");
+        result.remove("truncated");
+        result.insert("output_path".into(), json!(dest));
+    }
+    Ok(())
 }
 
 pub(super) fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, ErrorObject> {
@@ -612,6 +930,15 @@ pub(super) fn rpc(
     )
 }
 
+fn requested_rpc_session(payload: &serde_json::Value, fallback: Option<&str>) -> Option<String> {
+    // The runtime gives the payload priority over the envelope session.
+    payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .or(fallback)
+        .map(str::to_owned)
+}
+
 pub(super) fn rpc_with_spawn(
     root: Option<&str>,
     json_out: bool,
@@ -620,45 +947,307 @@ pub(super) fn rpc_with_spawn(
     session_id: Option<String>,
     spawn: SupervisorSpawn,
 ) -> Result<i32> {
+    rpc_with_spawn_legacy(root, json_out, operation, payload, session_id, spawn, None)
+}
+
+pub(super) fn rpc_structured_dom(
+    root: Option<&str>,
+    json_out: bool,
+    payload: serde_json::Value,
+    session_id: String,
+    legacy_source: &str,
+) -> Result<i32> {
+    rpc_with_spawn_legacy(
+        root,
+        json_out,
+        "web.structured_dom",
+        payload,
+        Some(session_id),
+        SupervisorSpawn::default(),
+        Some(legacy_source),
+    )
+}
+
+fn rpc_with_spawn_legacy(
+    root: Option<&str>,
+    json_out: bool,
+    operation: &str,
+    payload: serde_json::Value,
+    session_id: Option<String>,
+    spawn: SupervisorSpawn,
+    legacy_source: Option<&str>,
+) -> Result<i32> {
     // Match the runtime's payload-first resolution, not a user-controlled
     // error message or an unrelated currently selected session.
-    let rejected_session = payload
-        .get("session_id")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .or_else(|| session_id.clone());
-    match ensure_supervisor(root, &spawn) {
-        Ok(ctx) => match rpc_on_response(&ctx, operation, payload, session_id) {
-            Ok(response) => {
-                // A remembered session that turns out to be gone or wedged
-                // would otherwise poison every later command too. Forgetting
-                // it here means this call still reports the failure honestly
-                // and the next one starts clean, without the caller having to
-                // know that a state file exists.
-                if response.error.as_ref().is_some_and(is_missing_session) {
-                    if let Some(session) = rejected_session.as_deref() {
-                        forget_current_session(root, session);
+    let rejected_session = requested_rpc_session(&payload, session_id.as_deref());
+    match supervisor_for_session(root, &spawn, rejected_session.as_deref()) {
+        Ok(ctx) => {
+            // Older live daemons predate the typed DOM channel. Preserve
+            // their existing query implementation, under their normal CSP
+            // enforcement. Never route caller JavaScript through the trusted
+            // channel or select legacy behavior for a new image generation.
+            let (operation, payload) = match legacy_source.filter(|_| ctx.legacy) {
+                Some(source) => (
+                    "web.evaluate",
+                    json!({"session_id": rejected_session, "source": source}),
+                ),
+                None => (operation, payload),
+            };
+            match rpc_on_response(&ctx, operation, payload, session_id) {
+                Ok(response) => {
+                    // A remembered session that turns out to be gone or wedged
+                    // would otherwise poison every later command too. Forgetting
+                    // it here means this call still reports the failure honestly
+                    // and the next one starts clean, without the caller having to
+                    // know that a state file exists.
+                    if response.error.as_ref().is_some_and(is_missing_session)
+                        || operation == "web.session.close"
+                        || operation == "session.close"
+                    {
+                        if let Some(session) = rejected_session.as_deref() {
+                            forget_current_session(root, session);
+                            remove_session_route(root, session);
+                        }
+                    } else {
+                        let routed_session = response
+                            .result
+                            .as_ref()
+                            .and_then(|value| value.get("session_id"))
+                            .and_then(|value| value.as_str())
+                            .or(rejected_session.as_deref());
+                        if let Some(session) = routed_session {
+                            if let Err(error) = save_session_route(root, session, &ctx) {
+                                return emit_error(json_out, error);
+                            }
+                        }
                     }
+                    emit_response(json_out, response)
                 }
-                emit_response(json_out, response)
-            }
-            Err(error) => {
-                if is_missing_session(&error) {
-                    if let Some(session) = rejected_session.as_deref() {
-                        forget_current_session(root, session);
+                Err(error) => {
+                    if is_missing_session(&error) {
+                        if let Some(session) = rejected_session.as_deref() {
+                            forget_current_session(root, session);
+                            remove_session_route(root, session);
+                        }
                     }
+                    emit_error(json_out, error)
                 }
-                emit_error(json_out, error)
             }
-        },
+        }
         Err(error) => emit_error(json_out, error),
     }
+}
+
+/// Session creation and its first dependent request must select the same
+/// configured owner, including an explicit search endpoint or fixture.
+pub(super) fn supervisor_for_session(
+    root: Option<&str>,
+    spawn: &SupervisorSpawn,
+    session: Option<&str>,
+) -> std::result::Result<SupervisorCtx, ErrorObject> {
+    let current_image = resolve_runtime()
+        .ok()
+        .and_then(|runtime| greppy_web_client::runtime_image_id(&runtime.executable).ok());
+    if let Some(session) = session {
+        if let Some(route) = load_session_route(root, session) {
+            if !valid_session_route_image(&route) {
+                remove_session_route(root, session);
+                return Err(unavailable(
+                    "saved session route has an invalid runtime image identity",
+                ));
+            }
+            let (route_run_id, route_identity) = runtime_run_id(root);
+            let route_identity = if route.legacy {
+                route_identity
+            } else {
+                runtime_identity_for_image(&route_identity, &route.runtime_image_id)
+            };
+            let Some(route_socket) = web_runtime_socket(&route_identity) else {
+                return Err(unavailable("cannot allocate saved session runtime socket"));
+            };
+            let capability = select_route_capability(
+                load_attach_cookie(&route_socket),
+                crate::web_attach::current_token(),
+                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+            );
+            if let Some(capability) = capability {
+                if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
+                    if live.runtime_image_id == route.runtime_image_id {
+                        return Ok(SupervisorCtx {
+                            socket: route_socket,
+                            run_id: route_run_id,
+                            capability,
+                            runtime_image_id: route.runtime_image_id,
+                            legacy: route.legacy,
+                        });
+                    }
+                } else if socket_connected(&route_socket) {
+                    return Err(not_owned(
+                        "saved session belongs to a live runtime with a different attach capability",
+                    ));
+                }
+            } else if socket_connected(&route_socket) {
+                return Err(not_owned(
+                    "saved session belongs to a live runtime without an inherited attach capability",
+                ));
+            }
+            remove_session_route(root, session);
+        }
+        for route in known_runtime_routes(root) {
+            if !valid_session_route_image(&route) {
+                continue;
+            }
+            let (route_run_id, route_identity) = runtime_run_id(root);
+            let route_identity = if route.legacy {
+                route_identity
+            } else {
+                runtime_identity_for_image(&route_identity, &route.runtime_image_id)
+            };
+            let Some(route_socket) = web_runtime_socket(&route_identity) else {
+                continue;
+            };
+            let capability = select_route_capability(
+                load_attach_cookie(&route_socket),
+                crate::web_attach::current_token(),
+                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+            );
+            if let Some(capability) = capability {
+                if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
+                    if live.runtime_image_id == route.runtime_image_id
+                        && runtime_has_session(&route_socket, &route_run_id, &capability, session)
+                    {
+                        let ctx = SupervisorCtx {
+                            socket: route_socket,
+                            run_id: route_run_id,
+                            capability,
+                            runtime_image_id: route.runtime_image_id,
+                            legacy: route.legacy,
+                        };
+                        save_session_route(root, session, &ctx)?;
+                        return Ok(ctx);
+                    }
+                }
+            }
+        }
+        // Upgrade from clients which predate route files: interrogate only the
+        // authenticated legacy workspace endpoint, and adopt it only when its
+        // owner-filtered session inventory contains this exact session.
+        let (legacy_run_id, legacy_identity) = runtime_run_id(root);
+        if let Some(legacy_socket) = web_runtime_socket(&legacy_identity) {
+            let capability = load_attach_cookie(&legacy_socket);
+            if let Some(capability) = capability {
+                if let Some(live) = live_runtime_status(&legacy_socket, &legacy_run_id, &capability)
+                {
+                    if runtime_has_session(&legacy_socket, &legacy_run_id, &capability, session) {
+                        let ctx = SupervisorCtx {
+                            socket: legacy_socket,
+                            run_id: legacy_run_id,
+                            capability,
+                            runtime_image_id: live.runtime_image_id,
+                            legacy: true,
+                        };
+                        save_runtime_route(root, &ctx)?;
+                        save_session_route(root, session, &ctx)?;
+                        return Ok(ctx);
+                    }
+                } else if socket_connected(&legacy_socket) {
+                    return Err(not_owned(
+                        "legacy session runtime has a different attach capability",
+                    ));
+                }
+            } else if socket_connected(&legacy_socket) {
+                return Err(not_owned(
+                    "legacy session runtime has no inherited attach capability",
+                ));
+            }
+        }
+    }
+    ensure_supervisor(root, spawn)
+}
+
+#[cfg(not(unix))]
+fn runtime_has_session(_socket: &Path, _run_id: &str, _capability: &str, _session: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &str) -> bool {
+    let agent = std::env::var("GREPPY_WEB_AGENT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let payload = agent
+        .as_ref()
+        .map_or_else(|| json!({}), |agent| json!({ "agent_id": agent.trim() }));
+    let mut request = Request::new(run_id, "web.session.list", payload);
+    request.capability = capability.to_owned();
+    greppy_web_client::unix_request(socket, &request, Duration::from_millis(400))
+        .ok()
+        .filter(|response| response.status == "ok" && response.error.is_none())
+        .and_then(|response| response.result)
+        .and_then(|result| {
+            result
+                .get("sessions")
+                .and_then(|value| value.as_array())
+                .cloned()
+        })
+        .is_some_and(|sessions| {
+            session_inventory_contains(&sessions, session, agent.as_deref().map(str::trim))
+        })
+}
+
+fn session_inventory_contains(
+    sessions: &[serde_json::Value],
+    session: &str,
+    agent: Option<&str>,
+) -> bool {
+    sessions.iter().any(|row| {
+        row.get("session_id")
+            .or_else(|| row.get("id"))
+            .and_then(|value| value.as_str())
+            == Some(session)
+            && match agent {
+                Some(agent) => row.get("owner").and_then(|value| value.as_str()) == Some(agent),
+                None => row.get("owner").is_none_or(|value| value.is_null()),
+            }
+    })
 }
 
 pub(super) struct SupervisorCtx {
     socket: PathBuf,
     run_id: String,
     capability: String,
+    runtime_image_id: String,
+    legacy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveRuntimeStatus {
+    runtime_image_id: String,
+    sessions: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeDisposition {
+    Reuse,
+    DrainOwned,
+    RefuseUnowned,
+    Spawn,
+}
+
+fn runtime_disposition(
+    live: Option<&LiveRuntimeStatus>,
+    connected: bool,
+    expected_runtime_image_id: &str,
+) -> RuntimeDisposition {
+    match live {
+        Some(status) if status.runtime_image_id == expected_runtime_image_id => {
+            RuntimeDisposition::Reuse
+        }
+        Some(status) if status.sessions == Some(0) => RuntimeDisposition::DrainOwned,
+        Some(_) => RuntimeDisposition::RefuseUnowned,
+        None if connected => RuntimeDisposition::RefuseUnowned,
+        None => RuntimeDisposition::Spawn,
+    }
 }
 
 pub(super) fn rpc_on(
@@ -692,7 +1281,12 @@ pub(super) fn rpc_response(
     payload: serde_json::Value,
     session_id: Option<String>,
 ) -> std::result::Result<Response, ErrorObject> {
-    match ensure_supervisor(root, &SupervisorSpawn::default()) {
+    let requested_session = requested_rpc_session(&payload, session_id.as_deref());
+    match supervisor_for_session(
+        root,
+        &SupervisorSpawn::default(),
+        requested_session.as_deref(),
+    ) {
         Ok(ctx) => rpc_on_response(&ctx, operation, payload, session_id),
         Err(error) => Err(error),
     }
@@ -787,10 +1381,23 @@ pub(super) fn ensure_supervisor(
         ));
     }
     let ResolvedRuntime { dist, executable } = resolve_runtime()?;
+    let expected_runtime_image_id =
+        greppy_web_client::runtime_image_id(&executable).map_err(|error| {
+            unavailable(&format!("cannot identify web-runtime executable: {error}"))
+        })?;
     let (run_id, identity) = runtime_run_id(root);
+    let identity = runtime_identity_for_image(&identity, &expected_runtime_image_id);
     #[cfg(not(unix))]
     {
-        let _ = (root, dist, executable, run_id, identity, spawn);
+        let _ = (
+            root,
+            dist,
+            executable,
+            expected_runtime_image_id,
+            run_id,
+            identity,
+            spawn,
+        );
         return Err(unavailable("web runtime sockets require Unix"));
     }
     #[cfg(unix)]
@@ -816,13 +1423,36 @@ pub(super) fn ensure_supervisor(
                 unavailable(&format!("failed to generate attach token: {error}"))
             })?,
         };
-        if let Some(ctx) = wait_live_supervisor(&socket, &run_id, &capability) {
-            return Ok(ctx);
-        }
-        if socket_connected(&socket) {
-            return Err(not_owned(
-                "attach capability does not match the live web-runtime supervisor",
-            ));
+        let live = wait_runtime_status(&socket, &run_id, &capability);
+        match runtime_disposition(
+            live.as_ref(),
+            socket_connected(&socket),
+            &expected_runtime_image_id,
+        ) {
+            RuntimeDisposition::Reuse => {
+                let ctx = SupervisorCtx {
+                    socket,
+                    run_id,
+                    capability,
+                    runtime_image_id: expected_runtime_image_id,
+                    legacy: false,
+                };
+                save_runtime_route(root, &ctx)?;
+                return Ok(ctx);
+            }
+            RuntimeDisposition::DrainOwned => drain_stale_owned_runtime(
+                &socket,
+                &run_id,
+                &capability,
+                root,
+                live.as_ref().expect("owned runtime status"),
+            )?,
+            RuntimeDisposition::RefuseUnowned => {
+                return Err(not_owned(
+                    "attach capability does not match the live web-runtime supervisor",
+                ))
+            }
+            RuntimeDisposition::Spawn => {}
         }
         save_attach_cookie(&socket, &capability);
         let _ = std::fs::remove_file(&socket);
@@ -875,6 +1505,12 @@ pub(super) fn ensure_supervisor(
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(stderr));
             crate::inference_daemon::detach_command(&mut command);
+            if let Err(error) = crate::inference_daemon::seal_detached_child_fds(&mut command) {
+                spawn_error = Some(format!(
+                    "cannot protect detached web-runtime descriptors: {error}"
+                ));
+                return None;
+            }
             match crate::web_attach::give_child_attach_token(&mut command, &issued_for_child) {
                 Ok(pass) => attach_pass = Some(pass),
                 Err(error) => {
@@ -918,17 +1554,26 @@ pub(super) fn ensure_supervisor(
                         .unwrap_or("spawn coordination failed")
                 )));
             }
+            crate::inference_daemon::SpawnOutcome::CoordinationFailed(error) => {
+                return Err(spawn_coordination_unavailable(error));
+            }
         }
         let started = Instant::now();
         let budget = Duration::from_secs(60);
         let mut startup_exit = None;
         loop {
-            if socket_is_live(&socket, &run_id, &capability) {
-                return Ok(SupervisorCtx {
-                    socket,
-                    run_id,
-                    capability,
-                });
+            if let Some(live) = live_runtime_status(&socket, &run_id, &capability) {
+                if live.runtime_image_id == expected_runtime_image_id {
+                    let ctx = SupervisorCtx {
+                        socket,
+                        run_id,
+                        capability,
+                        runtime_image_id: expected_runtime_image_id,
+                        legacy: false,
+                    };
+                    save_runtime_route(root, &ctx)?;
+                    return Ok(ctx);
+                }
             }
             if started.elapsed() >= budget {
                 break;
@@ -967,6 +1612,16 @@ pub(super) fn ensure_supervisor(
     }
 }
 
+fn spawn_coordination_unavailable(error: String) -> ErrorObject {
+    ErrorObject::new(
+        "runtime_storage_unavailable",
+        error,
+        new_request_id(),
+        EXIT_WEB_UNAVAILABLE,
+        "fix the Greppy data-root path and ownership, then retry",
+    )
+}
+
 fn attach_cookie_path(socket: &Path) -> PathBuf {
     socket.with_extension("attach")
 }
@@ -988,22 +1643,68 @@ fn save_attach_cookie(socket: &Path, token: &str) {
     }
 }
 
-fn wait_live_supervisor(socket: &Path, run_id: &str, capability: &str) -> Option<SupervisorCtx> {
+fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> Option<LiveRuntimeStatus> {
     let started = Instant::now();
     let budget = Duration::from_secs(60);
     loop {
-        if socket_is_live(socket, run_id, capability) {
-            return Some(SupervisorCtx {
-                socket: socket.to_path_buf(),
-                run_id: run_id.to_owned(),
-                capability: capability.to_owned(),
-            });
+        if let Some(status) = live_runtime_status(socket, run_id, capability) {
+            return Some(status);
         }
         if !socket_connected(socket) || started.elapsed() >= budget {
             return None;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+#[cfg(unix)]
+fn drain_stale_owned_runtime(
+    socket: &Path,
+    run_id: &str,
+    capability: &str,
+    root: Option<&str>,
+    stale: &LiveRuntimeStatus,
+) -> std::result::Result<(), ErrorObject> {
+    // Browser DOM state is process-local and cannot cross an executable image
+    // boundary. An authenticated drain releases profile locks and worker trees;
+    // persistent project-profile cookies remain in the shared profile store.
+    // Clear only this workspace's selected ephemeral session after the old
+    // supervisor acknowledges shutdown so the replacement starts cleanly.
+    let mut request = Request::new(
+        run_id,
+        "web.shutdown",
+        json!({
+            "reason": "runtime_image_replaced",
+            "stale_runtime_image_id": &stale.runtime_image_id,
+                "session_count": stale.sessions,
+        }),
+    );
+    request.capability = capability.to_owned();
+    let response = greppy_web_client::unix_request(socket, &request, Duration::from_secs(3))
+        .map_err(|error| {
+            unavailable(&format!(
+                "owned stale web-runtime could not be drained safely: {error}"
+            ))
+        })?;
+    if let Some(error) = response.error {
+        return Err(unavailable(&format!(
+            "owned stale web-runtime refused shutdown: {}",
+            error.message
+        )));
+    }
+    if let Some(session) = read_current_scope(root).session {
+        forget_current_session(root, &session);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket_connected(socket) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if socket_connected(socket) {
+        return Err(unavailable(
+            "owned stale web-runtime acknowledged shutdown but did not release its socket",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn socket_connected(socket: &std::path::Path) -> bool {
@@ -1028,20 +1729,33 @@ pub(super) fn not_owned(message: &str) -> ErrorObject {
     )
 }
 
-pub(super) fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> bool {
+fn live_runtime_status(
+    socket: &std::path::Path,
+    run_id: &str,
+    capability: &str,
+) -> Option<LiveRuntimeStatus> {
     #[cfg(unix)]
     {
         if !socket.exists() {
-            return false;
+            return None;
         }
         let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
         probe.capability = capability.to_owned();
-        greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).is_ok()
+        let response =
+            greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).ok()?;
+        if response.status != "ok" || response.error.is_some() {
+            return None;
+        }
+        let result = response.result.as_ref()?;
+        Some(LiveRuntimeStatus {
+            runtime_image_id: result.get("runtime_build_id")?.as_str()?.to_owned(),
+            sessions: result.get("sessions").and_then(|value| value.as_u64()),
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = (socket, run_id, capability);
-        false
+        None
     }
 }
 
@@ -1053,6 +1767,13 @@ pub(super) fn shutdown_runtime(root: Option<&str>) {
     #[cfg(unix)]
     {
         let (run_id, identity) = runtime_run_id(root);
+        let Ok(runtime) = resolve_runtime() else {
+            return;
+        };
+        let Ok(image) = greppy_web_client::runtime_image_id(&runtime.executable) else {
+            return;
+        };
+        let identity = runtime_identity_for_image(&identity, &image);
         let Some(capability) = crate::web_attach::current_token().or_else(|| {
             crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
                 .and_then(|endpoint| load_attach_cookie(&PathBuf::from(endpoint.address())))
@@ -1065,7 +1786,12 @@ pub(super) fn shutdown_runtime(root: Option<&str>) {
             let socket = PathBuf::from(endpoint.address());
             let mut request = Request::new(&run_id, "web.shutdown", json!({}));
             request.capability = capability;
-            let _ = greppy_web_client::unix_request(&socket, &request, Duration::from_secs(3));
+            if greppy_web_client::unix_request(&socket, &request, Duration::from_secs(3))
+                .ok()
+                .is_some_and(|response| response.status == "ok" && response.error.is_none())
+            {
+                remove_runtime_routes(root, &image, false);
+            }
         }
     }
     #[cfg(not(unix))]
@@ -1649,6 +2375,269 @@ mod target_tests {
     use super::*;
 
     #[test]
+    fn runtime_upgrade_disposition_requires_authenticated_status() {
+        let current = LiveRuntimeStatus {
+            runtime_image_id: "image-new".into(),
+            sessions: Some(1),
+        };
+        let stale_active = LiveRuntimeStatus {
+            runtime_image_id: "image-old".into(),
+            sessions: Some(2),
+        };
+        let stale_empty = LiveRuntimeStatus {
+            runtime_image_id: "image-old".into(),
+            sessions: Some(0),
+        };
+        let stale_unknown = LiveRuntimeStatus {
+            runtime_image_id: "image-old".into(),
+            sessions: None,
+        };
+        assert_eq!(
+            runtime_disposition(Some(&current), true, "image-new"),
+            RuntimeDisposition::Reuse
+        );
+        assert_eq!(
+            runtime_disposition(Some(&stale_empty), true, "image-new"),
+            RuntimeDisposition::DrainOwned
+        );
+        assert_eq!(
+            runtime_disposition(Some(&stale_active), true, "image-new"),
+            RuntimeDisposition::RefuseUnowned,
+            "an active older runtime must remain available to its sessions"
+        );
+        assert_eq!(
+            runtime_disposition(Some(&stale_unknown), true, "image-new"),
+            RuntimeDisposition::RefuseUnowned,
+            "missing or malformed session counts must never authorize draining"
+        );
+        assert_eq!(
+            runtime_disposition(None, true, "image-new"),
+            RuntimeDisposition::RefuseUnowned,
+            "a connected runtime without an authenticated status must never be terminated"
+        );
+        assert_eq!(
+            runtime_disposition(None, false, "image-new"),
+            RuntimeDisposition::Spawn
+        );
+    }
+
+    #[test]
+    fn legacy_session_adoption_requires_exact_owner_and_session() {
+        let rows = vec![json!({ "session_id": "wrs_old", "owner": "agent-a" })];
+        assert!(session_inventory_contains(
+            &rows,
+            "wrs_old",
+            Some("agent-a")
+        ));
+        assert!(!session_inventory_contains(
+            &rows,
+            "wrs_old",
+            Some("agent-b")
+        ));
+        assert!(!session_inventory_contains(
+            &rows,
+            "wrs_other",
+            Some("agent-a")
+        ));
+        assert!(!session_inventory_contains(
+            &[json!({ "session_id": "wrs_old" })],
+            "wrs_old",
+            Some("agent-a")
+        ));
+        assert!(session_inventory_contains(
+            &[json!({ "session_id": "wrs_plain", "owner": null })],
+            "wrs_plain",
+            None
+        ));
+    }
+
+    #[test]
+    fn raw_response_and_emitted_rpc_share_payload_first_session_selection() {
+        assert_eq!(
+            requested_rpc_session(&json!({"session_id":"payload"}), Some("fallback")).as_deref(),
+            Some("payload")
+        );
+        assert_eq!(
+            requested_rpc_session(&json!({}), Some("fallback")).as_deref(),
+            Some("fallback")
+        );
+        assert_eq!(
+            requested_rpc_session(&json!({"session_id":null}), Some("fallback")).as_deref(),
+            Some("fallback")
+        );
+        assert_eq!(requested_rpc_session(&json!({}), None), None);
+    }
+
+    #[test]
+    fn legacy_build_tag_is_not_used_as_a_content_image_socket_identity() {
+        let mut route = SessionRoute {
+            runtime_image_id: "historical-build-tag".into(),
+            legacy: true,
+        };
+        assert!(valid_session_route_image(&route));
+        route.legacy = false;
+        assert!(!valid_session_route_image(&route));
+        route.runtime_image_id = format!("sha256:{}", "a".repeat(64));
+        assert!(valid_session_route_image(&route));
+        assert_eq!(
+            select_route_capability(None, Some("current-token".into()), false),
+            None
+        );
+    }
+
+    #[test]
+    fn planted_route_cannot_supply_socket_or_run_id() {
+        let route: SessionRoute = serde_json::from_value(json!({
+            "socket": "/attacker/socket",
+            "run_id": "attacker",
+            "runtime_image_id": "sha256:abc",
+            "legacy": false
+        }))
+        .unwrap();
+        let (_, workspace_identity) = runtime_run_id(Some("/trusted/workspace"));
+        assert_eq!(
+            runtime_identity_for_image(&workspace_identity, &route.runtime_image_id),
+            format!("{workspace_identity}:image:sha256:abc")
+        );
+        assert_eq!(
+            select_route_capability(None, Some("current-token".into()), false),
+            None,
+            "a recovered non-current generation without its own cookie must fail closed"
+        );
+        assert_eq!(
+            select_route_capability(None, Some("current-token".into()), true),
+            Some("current-token".into())
+        );
+    }
+
+    #[test]
+    fn stop_cleanup_removes_generation_routes_and_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let ctx = SupervisorCtx {
+            socket: PathBuf::from("/unused"),
+            run_id: "run".into(),
+            capability: "capability".into(),
+            runtime_image_id: "sha256:test".into(),
+            legacy: false,
+        };
+        save_runtime_route(Some(root_text), &ctx).unwrap();
+        save_session_route(Some(root_text), "wrs_test", &ctx).unwrap();
+        std::fs::create_dir_all(current_scope_path(Some(root_text)).parent().unwrap()).unwrap();
+        std::fs::write(
+            current_scope_path(Some(root_text)),
+            br#"{"session":"wrs_test","tab":"tab_test"}"#,
+        )
+        .unwrap();
+        remove_runtime_routes(Some(root_text), &ctx.runtime_image_id, ctx.legacy);
+        assert!(!runtime_route_path(Some(root_text), &ctx.runtime_image_id, ctx.legacy).exists());
+        assert!(!session_route_path(Some(root_text), "wrs_test").exists());
+        assert!(!current_scope_path(Some(root_text)).exists());
+    }
+
+    #[test]
+    fn stopping_other_generation_preserves_remembered_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let ctx = SupervisorCtx {
+            socket: PathBuf::from("/unused"),
+            run_id: "run".into(),
+            capability: "capability".into(),
+            runtime_image_id: format!("sha256:{}", "1".repeat(64)),
+            legacy: false,
+        };
+        save_session_route(Some(root_text), "wrs_live", &ctx).unwrap();
+        std::fs::write(
+            current_scope_path(Some(root_text)),
+            br#"{"session":"wrs_live","tab":"tab_live"}"#,
+        )
+        .unwrap();
+        remove_runtime_routes(
+            Some(root_text),
+            &format!("sha256:{}", "2".repeat(64)),
+            false,
+        );
+        assert!(current_scope_path(Some(root_text)).exists());
+        assert!(session_route_path(Some(root_text), "wrs_live").exists());
+    }
+
+    #[test]
+    fn stopping_current_generation_preserves_same_digest_legacy_session() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let digest = format!("sha256:{}", "3".repeat(64));
+        let legacy = SupervisorCtx {
+            socket: PathBuf::from("/unused"),
+            run_id: "run".into(),
+            capability: "capability".into(),
+            runtime_image_id: digest.clone(),
+            legacy: true,
+        };
+        save_runtime_route(Some(root_text), &legacy).unwrap();
+        save_session_route(Some(root_text), "wrs_legacy", &legacy).unwrap();
+        std::fs::write(
+            current_scope_path(Some(root_text)),
+            br#"{"session":"wrs_legacy","tab":"tab_legacy"}"#,
+        )
+        .unwrap();
+        remove_runtime_routes(Some(root_text), &digest, false);
+        assert!(runtime_route_path(Some(root_text), &digest, true).exists());
+        assert!(session_route_path(Some(root_text), "wrs_legacy").exists());
+        assert!(current_scope_path(Some(root_text)).exists());
+    }
+
+    #[test]
+    fn run_payload_binds_only_active_mode() {
+        let standalone = build_run_payload(
+            "wrs_1",
+            "file",
+            Some("spec.mjs"),
+            Some("await page.title()"),
+            Some(12),
+            RunMode::Standalone,
+        );
+        assert_eq!(standalone["session_id"], "wrs_1");
+        assert_eq!(standalone["script_source"], "file");
+        assert_eq!(standalone["script_file"], "spec.mjs");
+        assert_eq!(standalone["script_text"], "await page.title()");
+        assert_eq!(standalone["timeout_seconds"], 12);
+        assert!(standalone.get("bind_session_page").is_none());
+
+        let active = build_run_payload(
+            "wrs_1",
+            "stdin",
+            None,
+            Some("return await page.title()"),
+            None,
+            RunMode::Active,
+        );
+        assert_eq!(active["bind_session_page"], true);
+        assert!(active.get("script_file").is_none());
+    }
+
+    #[test]
+    fn trace_exports_keep_identical_digest_for_distinct_destinations() {
+        let request = greppy_web_client::Request::new("run", "web.run", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({"trace_exports":[{"id":"same-digest","path":"first.zip"}]}),
+        );
+        response.artifacts.extend([
+            json!({"id":"same-digest","requested_path":"first.zip"}),
+            json!({"id":"same-digest","requested_path":"second.zip"}),
+        ]);
+
+        let exports = trace_exports(&response);
+        assert_eq!(
+            exports.len(),
+            2,
+            "same bytes can have multiple requested destinations"
+        );
+        assert!(exports.iter().any(|value| value["path"] == "first.zip"));
+        assert!(exports.iter().any(|value| value["path"] == "second.zip"));
+    }
+
+    #[test]
     fn parse_css_quoted_and_nth() {
         let parsed = parse_target(r#"css="div > a""#, false, false, Some(2)).unwrap();
         assert_eq!(parsed.selector["type"], "css");
@@ -1703,6 +2692,63 @@ mod scope_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_export_returns_file_receipt_without_inline_image() {
+        let parent = artifact_store_root("placeholder")
+            .parent()
+            .unwrap()
+            .to_owned();
+        std::fs::create_dir_all(&parent).unwrap();
+        let artifacts = tempfile::Builder::new()
+            .prefix("screenshot-export-test-")
+            .tempdir_in(&parent)
+            .unwrap();
+        let run_id = artifacts.path().file_name().unwrap().to_str().unwrap();
+        let image = vec![42u8; 32_768];
+        std::fs::write(artifacts.path().join("image.png"), &image).unwrap();
+        let output = tempfile::Builder::new()
+            .prefix("screenshot-output-test-")
+            .tempdir_in(&parent)
+            .unwrap();
+        // macOS temp roots may include /var -> /private/var. This success
+        // fixture needs a canonical destination; symlink rejection is separate.
+        let dest = output.path().canonicalize().unwrap().join("saved.png");
+        let request = Request::new(run_id, "web.screenshot", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({
+                "object_path": "image.png", "digest": "test-digest",
+                "byte_count": image.len(), "media_type": "image/png",
+                "png_base64": "A".repeat(43_692),
+                "truncated": true, "cursor": "sha256:test-digest:0"
+            }),
+        );
+        response.artifacts.push(json!({"object_path": "image.png"}));
+        let original = response.clone();
+        export_screenshot_artifact(run_id, &mut response, dest.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), image);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["output_path"], dest.to_str().unwrap());
+        assert_eq!(result["byte_count"], image.len());
+        assert_eq!(result["digest"], "test-digest");
+        assert!(result.get("png_base64").is_none());
+        assert!(result.get("cursor").is_none());
+        assert!(result.get("truncated").is_none());
+        assert_eq!(response.artifacts, original.artifacts);
+        assert!(serde_json::to_vec(&response).unwrap().len() < 2_000);
+
+        // A failed export must preserve the original inline result and must
+        // not advertise an output file that was never written.
+        let mut failure = original;
+        let before = serde_json::to_value(&failure).unwrap();
+        assert!(
+            export_screenshot_artifact(run_id, &mut failure, output.path().to_str().unwrap())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&failure).unwrap(), before);
+    }
 
     #[test]
     fn page_error_text_cannot_become_a_missing_session_signal() {
@@ -1838,5 +2884,17 @@ mod scope_tests {
             assert_ne!(a, c);
             assert!(a.starts_with("run_ws_"), "{a}");
         });
+    }
+
+    #[test]
+    fn spawn_coordination_error_reports_storage_action_without_install_advice() {
+        let error = spawn_coordination_unavailable(
+            "cannot acquire daemon spawn lock: cache root is not owned".into(),
+        );
+        assert_eq!(error.code, "runtime_storage_unavailable");
+        assert_eq!(error.exit_code, EXIT_WEB_UNAVAILABLE);
+        assert!(error.message.contains("cache root is not owned"));
+        assert!(error.next_action.contains("data-root path and ownership"));
+        assert!(!error.next_action.contains("install"));
     }
 }

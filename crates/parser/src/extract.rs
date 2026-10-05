@@ -329,6 +329,1342 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
     None
 }
 
+/// Resolve an explicit binding type without inferring expression return types.
+/// Any nearer lexical binding, including destructuring/control-flow bindings,
+/// blocks parameter fallback even when its type is unknown.
+fn rust_visible_binding_type<'tree>(
+    source: &[u8],
+    callee: Node<'tree>,
+    name: &str,
+) -> Option<Node<'tree>> {
+    fn binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+        if matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+            && node_text(source, node) == name
+        {
+            return true;
+        }
+        (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .any(|child| binds(source, child, name))
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            // Value items are visible throughout their lexical block, including
+            // before their declaration. They can shadow a slice parameter.
+            for i in 0..node.named_child_count() {
+                let item = node.named_child(i)?;
+                if matches!(
+                    item.kind(),
+                    "const_item" | "static_item" | "function_item" | "struct_item" | "enum_item"
+                ) && item
+                    .child_by_field_name("name")
+                    .is_some_and(|item_name| node_text(source, item_name) == name)
+                {
+                    return None;
+                }
+            }
+            for i in (0..node.named_child_count()).rev() {
+                let binding = node.named_child(i)?;
+                if binding.kind() != "let_declaration" || binding.end_byte() > callee.start_byte() {
+                    continue;
+                }
+                let Some(pattern) = binding.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if binds(source, pattern, name) {
+                    return (node_text(source, pattern).trim() == name)
+                        .then(|| binding.child_by_field_name("type"))
+                        .flatten();
+                }
+            }
+        }
+        if matches!(
+            node.kind(),
+            "closure_expression" | "for_expression" | "match_arm"
+        ) {
+            let pattern = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"));
+            if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                return None;
+            }
+        }
+        if matches!(node.kind(), "if_expression" | "while_expression") {
+            if let Some(condition) = node.child_by_field_name("condition") {
+                fn condition_binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+                    if node.kind() == "let_condition"
+                        && node
+                            .child_by_field_name("pattern")
+                            .is_some_and(|pattern| binds(source, pattern, name))
+                    {
+                        return true;
+                    }
+                    (0..node.named_child_count())
+                        .filter_map(|i| node.named_child(i))
+                        .any(|child| condition_binds(source, child, name))
+                }
+                if condition_binds(source, condition, name) {
+                    return None;
+                }
+            }
+        }
+        if node.kind() == "function_item" {
+            let parameters = node.child_by_field_name("parameters")?;
+            for i in 0..parameters.named_child_count() {
+                let parameter = parameters.named_child(i)?;
+                let Some(pattern) = parameter.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if binds(source, pattern, name) {
+                    return (node_text(source, pattern).trim() == name)
+                        .then(|| parameter.child_by_field_name("type"))
+                        .flatten();
+                }
+            }
+            return None;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+/// A trait on a slice reference can shadow the slice's inherent `iter` during
+/// Rust method lookup. Imports, traits and item-generating macros/attributes
+/// make that lookup opaque; retain Unknown rather than guessing their contents.
+fn rust_slice_iter_lookup_is_transparent(callee: Node<'_>) -> bool {
+    let mut ancestor = callee.parent();
+    while let Some(scope) = ancestor {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            for i in 0..scope.named_child_count() {
+                let Some(item) = scope.named_child(i) else {
+                    continue;
+                };
+                if matches!(
+                    item.kind(),
+                    "use_declaration"
+                        | "extern_crate_declaration"
+                        | "trait_item"
+                        | "macro_invocation"
+                        | "attribute_item"
+                        | "inner_attribute_item"
+                ) {
+                    return false;
+                }
+                if item.kind() == "expression_statement"
+                    && (0..item.named_child_count())
+                        .filter_map(|i| item.named_child(i))
+                        .any(|child| child.kind() == "macro_invocation")
+                {
+                    return false;
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    true
+}
+
+/// Prove exactly `explicit_slice_binding.iter()`; adapters, custom containers,
+/// aliases and arbitrary return values deliberately remain unresolved.
+fn rust_slice_iterator_owner(
+    source: &[u8],
+    receiver: Node<'_>,
+    callee: Node<'_>,
+) -> Option<&'static str> {
+    if receiver.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = receiver.child_by_field_name("arguments")?;
+    if arguments.named_child_count() != 0 {
+        return None;
+    }
+    let function = receiver.child_by_field_name("function")?;
+    if function.kind() != "field_expression"
+        || node_text(source, function.child_by_field_name("field")?) != "iter"
+    {
+        return None;
+    }
+    let binding = function.child_by_field_name("value")?;
+    if binding.kind() != "identifier" {
+        return None;
+    }
+    let ty = rust_visible_binding_type(source, callee, node_text(source, binding))?;
+    if ty.kind() != "reference_type" {
+        return None;
+    }
+    // tree-sitter-rust represents slices as array_type without a length.
+    let slice = ty.child_by_field_name("type")?;
+    if slice.kind() != "array_type" || slice.child_by_field_name("length").is_some() {
+        return None;
+    }
+    if !rust_slice_iter_lookup_is_transparent(callee) {
+        return None;
+    }
+    Some("core::slice::Iter")
+}
+
+/// Value items are visible throughout a block, including before their
+/// declaration. They shadow pattern bindings even when ownership is unknown.
+fn rust_block_item_shadows_binding(source: &[u8], block: Node<'_>, name: &str) -> bool {
+    (0..block.named_child_count())
+        .filter_map(|i| block.named_child(i))
+        .any(|item| {
+            matches!(
+                item.kind(),
+                "const_item" | "static_item" | "function_item" | "struct_item" | "enum_item"
+            ) && item
+                .child_by_field_name("name")
+                .is_some_and(|ident| node_text(source, ident) == name)
+        })
+}
+
+/// Raw provenance for an unresolved if-let factory receiver. It is diagnostic
+/// evidence only: neither Some spelling nor a factory name establishes a type.
+fn rust_option_factory_pattern_path<'a>(
+    source: &'a [u8],
+    callee: Node<'_>,
+    name: &str,
+) -> Option<&'a str> {
+    fn binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+        (node.kind() == "identifier" && node_text(source, node) == name)
+            || (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .any(|child| binds(source, child, name))
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            for binding in (0..node.named_child_count()).filter_map(|i| node.named_child(i)) {
+                if binding.kind() == "let_declaration"
+                    && binding.end_byte() <= callee.start_byte()
+                    && binding
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| binds(source, pattern, name))
+                {
+                    return None;
+                }
+            }
+        }
+        if matches!(node.kind(), "closure_expression" | "for_expression") {
+            let pattern = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"));
+            if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                return None;
+            }
+        }
+        if node.kind() == "if_expression" {
+            let body = node.child_by_field_name("consequence")?;
+            if !(body.start_byte() <= callee.start_byte() && callee.end_byte() <= body.end_byte()) {
+                return None;
+            }
+            let condition = node.child_by_field_name("condition")?;
+            if condition.kind() == "let_condition" {
+                let pattern = condition.child_by_field_name("pattern")?;
+                if binds(source, pattern, name) {
+                    if pattern.kind() != "tuple_struct_pattern"
+                        || pattern.named_child_count() != 2
+                        || node_text(source, pattern.named_child(0)?) != "Some"
+                    {
+                        return None;
+                    }
+                    let text = node_text(source, pattern.named_child(1)?);
+                    if text != name && text.strip_prefix("mut ") != Some(name) {
+                        return None;
+                    }
+                    let value = condition.child_by_field_name("value")?;
+                    let call = if value.kind() == "try_expression" {
+                        value.named_child(0)?
+                    } else {
+                        value
+                    };
+                    if call.kind() != "call_expression" {
+                        return None;
+                    }
+                    let target = call.child_by_field_name("function")?;
+                    return (target.kind() == "scoped_identifier")
+                        .then(|| node_text(source, target));
+                }
+            }
+        }
+        if node.kind() == "function_item" {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+/// Ordinary imports do not erase a qualified dependency's identity. Refuse
+/// imported shadow names, and allow wildcard evidence only through an authored
+/// local module path; the indexer validates that module's source exports.
+fn rust_anyhow_factory_scope_globs(source: &[u8], callee: Node<'_>) -> Option<Vec<String>> {
+    let mut root = callee;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut modules = std::collections::HashMap::new();
+    let mut path_attribute = None;
+    for child in (0..root.named_child_count()).filter_map(|i| root.named_child(i)) {
+        if child.kind() == "attribute_item" {
+            let text = node_text(source, child)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>();
+            path_attribute = text
+                .strip_prefix("#[path=\"")
+                .and_then(|text| text.strip_suffix("\"]"))
+                .map(str::to_owned);
+            continue;
+        }
+        if child.kind() == "mod_item" {
+            if let (Some(name), Some(path)) =
+                (child.child_by_field_name("name"), path_attribute.take())
+            {
+                modules.insert(node_text(source, name), path);
+            }
+        }
+        path_attribute = None;
+    }
+    let mut files = Vec::new();
+    let mut ancestor = callee.parent();
+    while let Some(scope) = ancestor {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            for declaration in (0..scope.named_child_count()).filter_map(|i| scope.named_child(i)) {
+                if declaration.kind() != "use_declaration" {
+                    continue;
+                }
+                let mut items = Vec::new();
+                expand_use_tree_into(
+                    source,
+                    declaration.child_by_field_name("argument")?,
+                    "",
+                    &mut items,
+                );
+                for item in items {
+                    if matches!(item.imported_name.as_str(), "anyhow" | "Option" | "Some") {
+                        return None;
+                    }
+                    if item.is_glob {
+                        files.push(modules.get(item.path.as_str())?.clone());
+                    }
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    Some(files)
+}
+
+/// Prove the payload of a same-file inherent factory from its authored return
+/// signature. Only standard Option/Result (or one explicit local Result alias)
+/// are interpreted; arbitrary qualified wrappers never imply Try::Output.
+fn rust_option_factory_owner<'a>(source: &'a [u8], value: Node<'_>) -> Option<&'a str> {
+    rust_option_factory_owner_with_anyhow(source, value, false)
+}
+
+fn rust_option_factory_owner_with_anyhow<'a>(
+    source: &'a [u8],
+    value: Node<'_>,
+    allow_anyhow: bool,
+) -> Option<&'a str> {
+    let uses_try = value.kind() == "try_expression";
+    let call = if uses_try {
+        value.named_child(0)?
+    } else {
+        value
+    };
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let target = call.child_by_field_name("function")?;
+    if target.kind() != "scoped_identifier" {
+        return None;
+    }
+    let path = node_text(source, target);
+    let (factory_owner, factory_name) = path.split_once("::")?;
+    if factory_owner.is_empty() || factory_name.contains("::") {
+        return None;
+    }
+    let mut root = value;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut pending = vec![root];
+    let mut factories = Vec::new();
+    let mut aliases = Vec::new();
+    let mut owner_declarations = 0;
+    while let Some(node) = pending.pop() {
+        let declared_name = node
+            .child_by_field_name("name")
+            .map(|name| node_text(source, name));
+        if allow_anyhow
+            && ((matches!(declared_name, Some("anyhow" | "Option" | "Some"))
+                && matches!(
+                    node.kind(),
+                    "mod_item" | "type_item" | "struct_item" | "enum_item" | "type_parameter"
+                ))
+                || (matches!(node.kind(), "use_declaration" | "extern_crate_declaration") && {
+                    let text = node_text(source, node)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect::<String>();
+                    text.contains("asanyhow") || text.contains("::anyhow")
+                }))
+        {
+            return None;
+        }
+        if uses_try
+            && declared_name == Some("Result")
+            && matches!(
+                node.kind(),
+                "struct_item" | "enum_item" | "type_item" | "type_parameter" | "mod_item"
+            )
+        {
+            return None;
+        }
+        if matches!(
+            node.kind(),
+            "struct_item" | "enum_item" | "type_item" | "type_parameter" | "mod_item"
+        ) && declared_name == Some(factory_owner)
+        {
+            if !matches!(node.kind(), "struct_item" | "enum_item") {
+                return None;
+            }
+            owner_declarations += 1;
+        }
+        if node.kind() == "type_item" {
+            aliases.push(node);
+        }
+        if node.kind() == "function_item" && declared_name == Some(factory_name) {
+            let Some(body) = node
+                .parent()
+                .filter(|node| node.kind() == "declaration_list")
+            else {
+                continue;
+            };
+            let Some(implementation) = body.parent().filter(|node| node.kind() == "impl_item")
+            else {
+                continue;
+            };
+            if implementation.child_by_field_name("trait").is_none()
+                && implementation
+                    .child_by_field_name("type_parameters")
+                    .is_none()
+                && implementation
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| node_text(source, ty) == factory_owner)
+            {
+                // Attributes/macros in the factory's impl can replace or inject
+                // its signature; the call-site transparency guard is insufficient.
+                if (0..body.named_child_count())
+                    .filter_map(|i| body.named_child(i))
+                    .any(|item| {
+                        matches!(
+                            item.kind(),
+                            "attribute_item" | "macro_invocation" | "use_declaration"
+                        )
+                    })
+                {
+                    return None;
+                }
+                factories.push(node);
+            }
+        }
+        pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+    }
+    if owner_declarations != 1 || factories.len() != 1 {
+        return None;
+    }
+    let factory = factories[0];
+    if (0..factory.named_child_count())
+        .filter_map(|i| factory.named_child(i))
+        .any(|child| {
+            child.kind() == "function_modifiers"
+                && node_text(source, child)
+                    .split_whitespace()
+                    .any(|word| word == "async")
+        })
+    {
+        return None;
+    }
+    if factory.child_by_field_name("type_parameters").is_some()
+        || factory
+            .child_by_field_name("parameters")
+            .is_some_and(|parameters| {
+                (0..parameters.named_child_count())
+                    .filter_map(|i| parameters.named_child(i))
+                    .any(|item| item.kind() == "self_parameter")
+            })
+    {
+        return None;
+    }
+    let mut ty = factory.child_by_field_name("return_type")?;
+    if uses_try {
+        if ty.kind() != "generic_type" {
+            return None;
+        }
+        let wrapper = node_text(source, ty.child_by_field_name("type")?);
+        let arguments = ty.child_by_field_name("type_arguments")?;
+        if (allow_anyhow && wrapper == "anyhow::Result" && arguments.named_child_count() == 1)
+            || (wrapper == "Result" && arguments.named_child_count() == 2)
+        {
+            ty = arguments.named_child(0)?;
+        } else {
+            // A local alias is evidence only when its single generic parameter
+            // is precisely the standard Result success payload.
+            let matching = aliases
+                .iter()
+                .filter(|alias| {
+                    alias
+                        .child_by_field_name("name")
+                        .is_some_and(|name| node_text(source, name) == wrapper)
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 || arguments.named_child_count() != 1 {
+                return None;
+            }
+            let alias = *matching[0];
+            let params = alias.child_by_field_name("type_parameters")?;
+            if params.named_child_count() != 1 {
+                return None;
+            }
+            let parameter = params.named_child(0)?;
+            if parameter.kind() != "type_parameter" {
+                return None;
+            }
+            let name = node_text(source, parameter.child_by_field_name("name")?);
+            let aliased = alias.child_by_field_name("type")?;
+            if aliased.kind() != "generic_type"
+                || node_text(source, aliased.child_by_field_name("type")?) != "Result"
+            {
+                return None;
+            }
+            let args = aliased.child_by_field_name("type_arguments")?;
+            if args.named_child_count() != 2 || node_text(source, args.named_child(0)?) != name {
+                return None;
+            }
+            ty = arguments.named_child(0)?;
+        }
+    }
+    if ty.kind() != "generic_type" || node_text(source, ty.child_by_field_name("type")?) != "Option"
+    {
+        return None;
+    }
+    let args = ty.child_by_field_name("type_arguments")?;
+    if args.named_child_count() != 1 {
+        return None;
+    }
+    let payload = node_text(source, args.named_child(0)?);
+    matches!(payload, "Self").then_some(factory_owner)
+}
+
+/// Resolve only a transparent prelude Option pattern over an explicitly typed
+/// identifier. The outer Option records shadowing even when ownership is unknown.
+/// Field access, adapters (including as_ref), opaque return wrappers and custom
+/// variants remain unresolved rather than borrowing a same-named method.
+/// Same-file inherent factories require explicit unshadowed return signatures.
+fn rust_option_pattern_owner<'a>(
+    source: &'a [u8],
+    callee: Node<'_>,
+    name: &str,
+) -> Option<Option<&'a str>> {
+    fn binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+        (node.kind() == "identifier" && node_text(source, node) == name)
+            || (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .any(|child| binds(source, child, name))
+    }
+    fn owner<'a>(
+        source: &'a [u8],
+        pattern: Node<'_>,
+        value: Node<'_>,
+        name: &str,
+    ) -> Option<&'a str> {
+        if pattern.kind() == "match_pattern" {
+            return owner(source, pattern.named_child(0)?, value, name);
+        }
+        if pattern.kind() == "tuple_pattern" && value.kind() == "tuple_expression" {
+            if pattern.named_child_count() != value.named_child_count() {
+                return None;
+            }
+            for i in 0..pattern.named_child_count() {
+                let child = pattern.named_child(i)?;
+                if binds(source, child, name) {
+                    return owner(source, child, value.named_child(i)?, name);
+                }
+            }
+            return None;
+        }
+        if pattern.kind() != "tuple_struct_pattern" {
+            return None;
+        }
+        let constructor = pattern
+            .child_by_field_name("type")
+            .or_else(|| pattern.named_child(0))?;
+        if node_text(source, constructor) != "Some" || pattern.named_child_count() != 2 {
+            return None;
+        }
+        let binding = pattern.named_child(1)?;
+        let binding_text = node_text(source, binding);
+        if binding_text != name && binding_text.strip_prefix("mut ") != Some(name) {
+            return None;
+        }
+        if value.kind() != "identifier" {
+            return rust_option_factory_owner(source, value);
+        }
+        // Lookup at the scrutinee, outside the new pattern's scope.
+        let ty = rust_visible_binding_type(source, value, node_text(source, value))?;
+        if ty.kind() != "generic_type"
+            || node_text(source, ty.child_by_field_name("type")?) != "Option"
+        {
+            return None;
+        }
+        let arguments = ty.child_by_field_name("type_arguments")?;
+        if arguments.named_child_count() != 1 {
+            return None;
+        }
+        let inner = arguments.named_child(0)?;
+        if !matches!(inner.kind(), "type_identifier" | "scoped_type_identifier") {
+            return None;
+        }
+        let path = node_text(source, inner);
+        fn generic_shadow(source: &[u8], node: Node<'_>, path: &str) -> bool {
+            (node.kind() == "type_parameter"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node_text(source, name) == path))
+                || (0..node.named_child_count())
+                    .filter_map(|i| node.named_child(i))
+                    .any(|child| generic_shadow(source, child, path))
+        }
+        let mut root = value;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        (!generic_shadow(source, root, path)).then_some(path)
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            if rust_block_item_shadows_binding(source, node, name) {
+                return Some(None);
+            }
+            for i in (0..node.named_child_count()).rev() {
+                let binding = node.named_child(i)?;
+                if binding.kind() == "let_declaration" && binding.end_byte() <= callee.start_byte()
+                {
+                    if let Some(pattern) = binding.child_by_field_name("pattern") {
+                        if binds(source, pattern, name) {
+                            return (node_text(source, pattern).trim() != name).then_some(None);
+                            // The existing local resolver owns a direct nearest binding.
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(node.kind(), "closure_expression" | "for_expression") {
+            let pattern = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"));
+            if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                return Some(None);
+            }
+        }
+        let pair = if node.kind() == "match_arm" {
+            node.child_by_field_name("pattern").zip(
+                node.parent()
+                    .and_then(|body| body.parent())
+                    .and_then(|expression| expression.child_by_field_name("value")),
+            )
+        } else if matches!(node.kind(), "if_expression" | "while_expression") {
+            node.child_by_field_name("condition").and_then(|condition| {
+                // Do not expose an if-let binding to the else branch.
+                let body = node
+                    .child_by_field_name("consequence")
+                    .or_else(|| node.child_by_field_name("body"))?;
+                if !(body.start_byte() <= callee.start_byte()
+                    && callee.end_byte() <= body.end_byte())
+                {
+                    return None;
+                }
+                (condition.kind() == "let_condition")
+                    .then(|| {
+                        condition
+                            .child_by_field_name("pattern")
+                            .zip(condition.child_by_field_name("value"))
+                    })
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        if let Some((pattern, value)) = pair {
+            if binds(source, pattern, name) {
+                // Prelude names can be shadowed by imports, local items or macros.
+                fn shadows_prelude(source: &[u8], node: Node<'_>) -> bool {
+                    if matches!(
+                        node.kind(),
+                        "struct_item"
+                            | "enum_item"
+                            | "type_item"
+                            | "type_parameter"
+                            | "function_item"
+                            | "const_item"
+                            | "static_item"
+                            | "enum_variant"
+                            | "mod_item"
+                    ) && node
+                        .child_by_field_name("name")
+                        .is_some_and(|ident| matches!(node_text(source, ident), "Option" | "Some"))
+                    {
+                        return true;
+                    }
+                    (0..node.named_child_count())
+                        .filter_map(|i| node.named_child(i))
+                        .any(|child| shadows_prelude(source, child))
+                }
+                let mut root = node;
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                let transparent =
+                    rust_slice_iter_lookup_is_transparent(callee) && !shadows_prelude(source, root);
+                return Some(if transparent {
+                    owner(source, pattern, value, name)
+                } else {
+                    None
+                });
+            }
+        }
+        if node.kind() == "function_item" {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OPTION_FIELD_ROOT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn rust_push_unique(out: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+        out.push(value);
+    }
+}
+
+fn rust_attribute_is_inert(name: &str) -> bool {
+    // These attributes do not invent trait methods or rewrite the receiver
+    // expression. Unknown attributes, including `#[wasm_bindgen]`, stay opaque.
+    // A qualified path that merely ends in one of these names is not that
+    // attribute: `#[custom::allow]` can be a user macro.
+    if name.contains("::") {
+        return false;
+    }
+    matches!(
+        name,
+        "allow"
+            | "deny"
+            | "warn"
+            | "forbid"
+            | "cfg"
+            | "must_use"
+            | "doc"
+            | "inline"
+            | "cold"
+            | "test"
+            | "bench"
+            | "should_panic"
+            | "ignore"
+            | "rustfmt"
+            | "clippy"
+            | "diagnostic"
+            | "track_caller"
+            | "non_exhaustive"
+            | "repr"
+            | "automatically_derived"
+    )
+}
+
+fn rust_macro_is_expression_only(name: &str) -> bool {
+    // Only a bare name can match the expression-macro list. `helper::assert`
+    // and `my_crate::println` are not the prelude macros.
+    if name.contains("::") {
+        return false;
+    }
+    matches!(
+        name,
+        "println"
+            | "eprintln"
+            | "format"
+            | "format_args"
+            | "write"
+            | "writeln"
+            | "vec"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "todo"
+            | "unimplemented"
+            | "unreachable"
+            | "dbg"
+            | "concat"
+            | "env"
+            | "option_env"
+            | "include_str"
+            | "include_bytes"
+            | "stringify"
+            | "module_path"
+            | "line"
+            | "column"
+            | "file"
+            | "matches"
+            | "panic"
+            | "cfg"
+            | "compile_error"
+            | "pin"
+            | "try"
+            | "concat_idents"
+    )
+}
+
+fn rust_first_identifier<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> {
+    if matches!(
+        node.kind(),
+        "identifier" | "scoped_identifier" | "type_identifier"
+    ) {
+        let text = node_text(source, node).trim();
+        return (!text.is_empty()).then_some(text);
+    }
+    // Arguments such as `unused` in `#[allow(unused)]` are not the attribute.
+    if node.kind() == "token_tree" {
+        return None;
+    }
+    (0..node.named_child_count())
+        .filter_map(|index| node.named_child(index))
+        .find_map(|child| rust_first_identifier(source, child))
+}
+
+fn rust_macro_definition_name(source: &[u8], item: Node<'_>) -> String {
+    if let Some(name) = item.child_by_field_name("name") {
+        let text = node_text(source, name)
+            .trim()
+            .trim_end_matches('!')
+            .to_string();
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    let text = node_text(source, item);
+    let rest = text
+        .trim_start()
+        .trim_start_matches("macro_rules!")
+        .trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    if name.is_empty() {
+        "unparsed macro".to_string()
+    } else {
+        name
+    }
+}
+
+fn rust_macro_name(source: &[u8], node: Node<'_>) -> String {
+    node.child_by_field_name("macro")
+        .and_then(|name| rust_first_identifier(source, name))
+        .or_else(|| rust_first_identifier(source, node))
+        .unwrap_or("")
+        .trim_end_matches('!')
+        .to_string()
+}
+
+fn rust_attribute_name(source: &[u8], node: Node<'_>) -> String {
+    rust_first_identifier(source, node)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn rust_trait_as_ref_receiver(source: &[u8], trait_item: Node<'_>) -> Option<String> {
+    let body = trait_item.child_by_field_name("body")?;
+    let item = (0..body.named_child_count())
+        .filter_map(|index| body.named_child(index))
+        .find(|item| {
+            matches!(item.kind(), "function_item" | "function_signature_item")
+                && item
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node_text(source, name) == "as_ref")
+        })?;
+    let parameters = item.child_by_field_name("parameters")?;
+    let receiver = parameters.named_child(0)?;
+    Some(node_text(source, receiver).trim().to_string())
+}
+
+fn rust_trait_has_consuming_as_ref(source: &[u8], trait_item: Node<'_>) -> bool {
+    let Some(body) = trait_item.child_by_field_name("body") else {
+        return false;
+    };
+    (0..body.named_child_count())
+        .filter_map(|index| body.named_child(index))
+        .any(|item| {
+            matches!(item.kind(), "function_item" | "function_signature_item")
+                && item
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node_text(source, name) == "as_ref")
+                && item
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| {
+                        parameters.named_child_count() == 1
+                            && parameters.named_child(0).is_some_and(|receiver| {
+                                receiver.kind() == "self_parameter"
+                                    && matches!(
+                                        node_text(source, receiver).trim(),
+                                        "self" | "mut self"
+                                    )
+                            })
+                    })
+        })
+}
+
+struct RustOptionScopeLimits {
+    globs: Vec<String>,
+    imports: Vec<serde_json::Value>,
+    macros: Vec<String>,
+    attributes: Vec<String>,
+    standard_namespace_bindings: Vec<String>,
+}
+
+fn rust_record_macro(source: &[u8], node: Node<'_>, limits: &mut RustOptionScopeLimits) {
+    let name = rust_macro_name(source, node);
+    if !rust_macro_is_expression_only(&name) {
+        rust_push_unique(&mut limits.macros, name);
+    }
+}
+
+/// Scope facts that can change `Some` or `Option::as_ref`. A by-value trait
+/// method visible in this file is a hard rejection (`None`): it can replace
+/// the payload, so the declared field type is not a candidate. Wildcards,
+/// item macros, unknown attributes and named imports are recorded for the
+/// indexer; they do not by themselves invent a caller edge.
+fn rust_option_scope_limits(source: &[u8], callee: Node<'_>) -> Option<RustOptionScopeLimits> {
+    let mut limits = RustOptionScopeLimits {
+        globs: Vec::new(),
+        imports: Vec::new(),
+        macros: Vec::new(),
+        attributes: Vec::new(),
+        standard_namespace_bindings: Vec::new(),
+    };
+    let mut ancestor = callee.parent();
+    while let Some(scope) = ancestor {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            let mut pending_attributes = Vec::new();
+            for index in 0..scope.named_child_count() {
+                let Some(item) = scope.named_child(index) else {
+                    continue;
+                };
+                if item.kind() == "attribute_item" {
+                    pending_attributes.push(item);
+                    continue;
+                }
+                if item.kind() == "inner_attribute_item" {
+                    let name = rust_attribute_name(source, item);
+                    if !rust_attribute_is_inert(&name) {
+                        rust_push_unique(&mut limits.attributes, name);
+                    }
+                    pending_attributes.clear();
+                    continue;
+                }
+                let encloses = item.start_byte() <= callee.start_byte()
+                    && callee.end_byte() <= item.end_byte();
+                if encloses {
+                    for attribute in &pending_attributes {
+                        let name = rust_attribute_name(source, *attribute);
+                        if !rust_attribute_is_inert(&name) {
+                            rust_push_unique(&mut limits.attributes, name);
+                        }
+                    }
+                }
+                pending_attributes.clear();
+                if item.kind() == "trait_item" && rust_trait_has_consuming_as_ref(source, item) {
+                    return None;
+                }
+                if item.kind() == "mod_item" {
+                    if let Some(name) = item.child_by_field_name("name") {
+                        let name = node_text(source, name);
+                        if matches!(name, "std" | "core" | "alloc") {
+                            rust_push_unique(
+                                &mut limits.standard_namespace_bindings,
+                                name.to_string(),
+                            );
+                        }
+                    }
+                }
+                if item.kind() == "use_declaration" {
+                    let Some(argument) = item
+                        .child_by_field_name("argument")
+                        .or_else(|| item.named_child(0))
+                    else {
+                        rust_push_unique(&mut limits.macros, "unparsed import".to_string());
+                        continue;
+                    };
+                    let imported = expand_use_tree(source, argument, "");
+                    if imported.is_empty() {
+                        rust_push_unique(&mut limits.macros, "unparsed import".to_string());
+                        continue;
+                    }
+                    for item in imported {
+                        if item.is_glob {
+                            rust_push_unique(
+                                &mut limits.globs,
+                                item.path
+                                    .trim_end_matches('*')
+                                    .trim_end_matches("::")
+                                    .to_string(),
+                            );
+                        } else {
+                            limits.imports.push(serde_json::json!({
+                                "path": item.path,
+                                "name": item.imported_name,
+                            }));
+                        }
+                    }
+                } else if item.kind() == "extern_crate_declaration" {
+                    limits.imports.push(serde_json::json!({
+                        "path": node_text(source, item).trim(),
+                        "name": "",
+                    }));
+                } else if item.kind() == "macro_definition"
+                    || node_text(source, item)
+                        .trim_start()
+                        .starts_with("macro_rules!")
+                {
+                    // A local macro can inject `Some` or `as_ref` even when its
+                    // name matches a prelude macro. Record the definition
+                    // itself; do not treat the name as identity.
+                    rust_push_unique(&mut limits.macros, rust_macro_definition_name(source, item));
+                } else if item.kind() == "macro_invocation" {
+                    rust_record_macro(source, item, &mut limits);
+                } else if item.kind() == "expression_statement" {
+                    for child_index in 0..item.named_child_count() {
+                        if let Some(child) = item.named_child(child_index) {
+                            if child.kind() == "macro_invocation" {
+                                rust_record_macro(source, child, &mut limits);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    Some(limits)
+}
+
+fn field_option_payload_is_generic(source: &[u8], field_name: Node<'_>, declared: &str) -> bool {
+    let Some(payload) = declared
+        .trim()
+        .strip_prefix("Option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    if payload.contains(['<', '&', ' ', ':']) {
+        return false;
+    }
+    let mut ancestor = field_name.parent();
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "struct_item" | "enum_item" | "union_item") {
+            let Some(parameters) = node.child_by_field_name("type_parameters") else {
+                return false;
+            };
+            return (0..parameters.named_child_count())
+                .filter_map(|index| parameters.named_child(index))
+                .any(|parameter| {
+                    parameter.kind() == "type_parameter"
+                        && parameter
+                            .child_by_field_name("name")
+                            .is_some_and(|name| node_text(source, name) == payload)
+                });
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
+/// Preserve field provenance for a Some binding over an Option field's
+/// inherent as_ref adapter. A named import is not proof; the indexer accepts
+/// it only when the imported item cannot override Option::as_ref. Wildcard
+/// scopes, item macros and unknown attributes remain unresolved candidates.
+fn rust_direct_self_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
+    let method = callee.parent()?;
+    let access = method.child_by_field_name("value")?;
+    if access.kind() != "field_expression" {
+        return None;
+    }
+    let base = access.child_by_field_name("value")?;
+    let field = access.child_by_field_name("field")?;
+    if node_text(source, base) != "self" || field.kind() != "field_identifier" {
+        return None;
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "closure_expression" || node.kind() == "trait_item" {
+            return None;
+        }
+        if node.kind() == "function_item" {
+            let parameters = node.child_by_field_name("parameters")?;
+            if !(0..parameters.named_child_count())
+                .filter_map(|i| parameters.named_child(i))
+                .any(|parameter| parameter.kind() == "self_parameter")
+            {
+                return None;
+            }
+        }
+        if node.kind() == "impl_item" {
+            if node.child_by_field_name("trait").is_some()
+                || node.child_by_field_name("type_parameters").is_some()
+            {
+                return None;
+            }
+            let ty = node.child_by_field_name("type")?;
+            if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+                return None;
+            }
+            return Some(
+                serde_json::json!({"kind":"direct_self_field", "base_type":node_text(source, ty), "field":node_text(source, field)}),
+            );
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
+    fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+        (pattern.kind() == "identifier" && node_text(source, pattern) == name)
+            || (0..pattern.named_child_count())
+                .filter_map(|i| pattern.named_child(i))
+                .any(|child| binds(source, child, name))
+    }
+    fn selected<'t>(
+        source: &[u8],
+        pattern: Node<'t>,
+        value: Node<'t>,
+        name: &str,
+    ) -> Option<Node<'t>> {
+        if pattern.kind() == "match_pattern" {
+            return selected(source, pattern.named_child(0)?, value, name);
+        }
+        if pattern.kind() == "tuple_pattern" && value.kind() == "tuple_expression" {
+            if pattern.named_child_count() != value.named_child_count() {
+                return None;
+            }
+            for i in 0..pattern.named_child_count() {
+                let child = pattern.named_child(i)?;
+                if binds(source, child, name) {
+                    return selected(source, child, value.named_child(i)?, name);
+                }
+            }
+            return None;
+        }
+        if pattern.kind() != "tuple_struct_pattern"
+            || pattern.named_child_count() != 2
+            || node_text(
+                source,
+                pattern
+                    .child_by_field_name("type")
+                    .or_else(|| pattern.named_child(0))?,
+            ) != "Some"
+            || node_text(source, pattern.named_child(1)?) != name
+            || pattern.named_child(1)?.kind() != "identifier"
+        {
+            return None;
+        }
+        Some(value)
+    }
+    fn shadows(source: &[u8], node: Node<'_>) -> bool {
+        if matches!(
+            node.kind(),
+            "struct_item"
+                | "enum_item"
+                | "type_item"
+                | "type_parameter"
+                | "function_item"
+                | "const_item"
+                | "static_item"
+                | "enum_variant"
+                | "mod_item"
+        ) && node
+            .child_by_field_name("name")
+            .is_some_and(|ident| matches!(node_text(source, ident), "Option" | "Some"))
+        {
+            return true;
+        }
+        if node.kind() == "use_declaration"
+            && node_text(source, node)
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|part| matches!(part, "Option" | "Some"))
+        {
+            return true;
+        }
+        (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .any(|child| shadows(source, child))
+    }
+    let field = callee.parent()?;
+    if field.kind() != "field_expression" {
+        return None;
+    }
+    let receiver = field.child_by_field_name("value")?;
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(source, receiver);
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            if rust_block_item_shadows_binding(source, node, name) {
+                return None;
+            }
+            for i in (0..node.named_child_count()).rev() {
+                let binding = node.named_child(i)?;
+                if binding.kind() == "let_declaration"
+                    && binding.end_byte() <= callee.start_byte()
+                    && binding
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| binds(source, pattern, name))
+                {
+                    return None;
+                }
+            }
+        }
+        if matches!(node.kind(), "closure_expression" | "for_expression")
+            && node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"))
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return None;
+        }
+        let pair = if node.kind() == "match_arm" {
+            node.child_by_field_name("pattern").zip(
+                node.parent()
+                    .and_then(|body| body.parent())
+                    .and_then(|expression| expression.child_by_field_name("value")),
+            )
+        } else if matches!(node.kind(), "if_expression" | "while_expression") {
+            node.child_by_field_name("condition").and_then(|condition| {
+                let body = node
+                    .child_by_field_name("consequence")
+                    .or_else(|| node.child_by_field_name("body"))?;
+                if body.start_byte() > callee.start_byte() || callee.end_byte() > body.end_byte() {
+                    return None;
+                }
+                (condition.kind() == "let_condition")
+                    .then(|| {
+                        condition
+                            .child_by_field_name("pattern")
+                            .zip(condition.child_by_field_name("value"))
+                    })
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        if let Some((pattern, value)) = pair {
+            if binds(source, pattern, name) {
+                let value = selected(source, pattern, value, name)?;
+                if value.kind() != "call_expression" {
+                    return None;
+                }
+                let function = value.child_by_field_name("function")?;
+                let arguments = value.child_by_field_name("arguments")?;
+                if function.kind() != "field_expression"
+                    || arguments.named_child_count() != 0
+                    || node_text(source, function.child_by_field_name("field")?) != "as_ref"
+                {
+                    return None;
+                }
+                let access = function.child_by_field_name("value")?;
+                if access.kind() != "field_expression" {
+                    return None;
+                }
+                let base = access.child_by_field_name("value")?;
+                if base.kind() != "identifier" {
+                    return None;
+                }
+                let mut ty = rust_visible_binding_type(source, base, node_text(source, base))?;
+                while ty.kind() == "reference_type" {
+                    ty = ty.child_by_field_name("type")?;
+                }
+                if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+                    return None;
+                }
+                let base_type = node_text(source, ty);
+                // A same-file by-value as_ref trait can change the payload.
+                // Named imports, wildcards, macros and attributes are limits,
+                // not a guessed caller, and are classified by the indexer.
+                let limits = rust_option_scope_limits(source, callee)?;
+                // Expensive whole-source checks belong only to an applicable
+                // typed Option pattern, never every unresolved receiver call.
+                let mut root = callee;
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                #[cfg(test)]
+                OPTION_FIELD_ROOT_CHECKS.with(|count| count.set(count.get() + 1));
+                if shadows(source, root) {
+                    return None;
+                }
+                // A generic type parameter is not a concrete owner.
+                fn is_parameter(source: &[u8], node: Node<'_>, name: &str) -> bool {
+                    (node.kind() == "type_parameter"
+                        && node
+                            .child_by_field_name("name")
+                            .is_some_and(|ident| node_text(source, ident) == name))
+                        || (0..node.named_child_count())
+                            .filter_map(|i| node.named_child(i))
+                            .any(|child| is_parameter(source, child, name))
+                }
+                if is_parameter(source, root, base_type) {
+                    return None;
+                }
+                let member = access.child_by_field_name("field")?;
+                if member.kind() != "field_identifier" {
+                    return None;
+                }
+                return Some(serde_json::json!({
+                    "base_type": base_type,
+                    "field": node_text(source, member),
+                    "adapter": "as_ref",
+                    "pattern": "Some",
+                    "limits": {
+                        "globs": limits.globs,
+                        "imports": limits.imports,
+                        "macros": limits.macros,
+                        "attributes": limits.attributes,
+                        "standard_namespace_bindings": limits.standard_namespace_bindings,
+                    },
+                }));
+            }
+        }
+        if node.kind() == "function_item" {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
 /// Resolve the owner type of an unambiguous Rust receiver call when the AST
 /// carries enough local type evidence. `self.method()` inherits the enclosing
 /// impl owner; named receivers are accepted for explicitly typed parameters or
@@ -346,9 +1682,12 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
         return enclosing_impl_type(source, callee);
     }
     if receiver.kind() != "identifier" || receiver_text.is_empty() {
-        return None;
+        return rust_slice_iterator_owner(source, receiver, callee);
     }
 
+    if let Some(owner) = rust_option_pattern_owner(source, callee, receiver_text) {
+        return owner;
+    }
     let mut ancestor = field.parent();
     while let Some(node) = ancestor {
         if node.kind() == "function_item" {
@@ -724,7 +2063,21 @@ fn node_contains(parent: Node<'_>, child: Node<'_>) -> bool {
 
 fn rust_node_is_call_target(node: Node<'_>, call: Node<'_>) -> bool {
     call.child_by_field_name("function")
-        .map(|function| node_contains(function, node))
+        .map(|function| {
+            // Turbofish arguments belong to the call's type/value inputs,
+            // not its callee. Suppressing the entire generic_function loses
+            // parse::<Response>() and parse::<module::Response>().
+            if function.kind() == "generic_function" {
+                for index in 0..function.named_child_count() {
+                    if function.named_child(index).is_some_and(|child| {
+                        child.kind() == "type_arguments" && node_contains(child, node)
+                    }) {
+                        return false;
+                    }
+                }
+            }
+            node_contains(function, node)
+        })
         .unwrap_or(false)
 }
 
@@ -768,6 +2121,10 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
     const MAX_PARENT_DEPTH: usize = 10;
     let mut cur = node.parent();
     let mut depth = 0;
+    // A callback argument belongs to its nearest call. An outer chained
+    // method's receiver also contains the inner arguments, but does not turn
+    // those arguments into callees.
+    let mut nearest_call_seen = false;
     while let Some(n) = cur {
         if depth >= MAX_PARENT_DEPTH {
             break;
@@ -775,14 +2132,195 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
         if RUST_USAGE_IMPORT_SUPPRESSORS.contains(&n.kind()) {
             return true;
         }
-        if n.kind() == "call_expression" && rust_node_is_call_target(node, n) {
-            return true;
+        if n.kind() == "call_expression" && !nearest_call_seen {
+            nearest_call_seen = true;
+            if rust_node_is_call_target(node, n) {
+                return true;
+            }
         }
         if n.kind() == "macro_invocation" {
             return true;
         }
         cur = n.parent();
         depth += 1;
+    }
+    false
+}
+
+/// Bare value names bound in an active local scope do not name a module
+/// function. Only patterns bind; initializer calls and parameter types do not.
+fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: &str) -> bool {
+    fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+        if matches!(pattern.kind(), "identifier" | "shorthand_field_identifier") {
+            return node_text(source, pattern) == name;
+        }
+        let constructor = pattern.child_by_field_name("type");
+        let field_label = (pattern.kind() == "field_pattern")
+            .then(|| pattern.child_by_field_name("name"))
+            .flatten();
+        (0..pattern.named_child_count())
+            .filter_map(|index| pattern.named_child(index))
+            .filter(|child| Some(*child) != constructor && Some(*child) != field_label)
+            .any(|child| binds(source, child, name))
+    }
+    // A pattern's declaration is not a read of a same-named module value.
+    // Unlike body references, it occurs before the binding becomes visible.
+    // Keep constructor/type paths as references while marking only bare binding
+    // identifiers in let/if-let/while-let patterns.
+    let mut pattern_ancestor = reference.parent();
+    while let Some(parent) = pattern_ancestor {
+        if matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier" | "range_pattern" | "const_block"
+        ) {
+            break;
+        }
+        if matches!(parent.kind(), "tuple_struct_pattern" | "struct_pattern")
+            && parent
+                .child_by_field_name("type")
+                .or_else(|| parent.child_by_field_name("name"))
+                .is_some_and(|constructor| node_contains(constructor, reference))
+        {
+            break;
+        }
+        if matches!(parent.kind(), "let_declaration" | "let_condition") {
+            if parent
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| node_contains(pattern, reference))
+            {
+                return true;
+            }
+            break;
+        }
+        if matches!(
+            parent.kind(),
+            "block" | "function_item" | "closure_expression"
+        ) {
+            break;
+        }
+        pattern_ancestor = parent.parent();
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if scope.kind() == "block" {
+            for index in 0..scope.named_child_count() {
+                let Some(declaration) = scope.named_child(index) else {
+                    continue;
+                };
+                if declaration.kind() == "let_declaration"
+                    && declaration.end_byte() <= reference.start_byte()
+                    && declaration
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| binds(source, pattern, name))
+                {
+                    return true;
+                }
+            }
+        }
+        if matches!(scope.kind(), "function_item" | "closure_expression") {
+            if let Some(parameters) = scope.child_by_field_name("parameters") {
+                for index in 0..parameters.named_child_count() {
+                    let Some(parameter) = parameters.named_child(index) else {
+                        continue;
+                    };
+                    let pattern = parameter
+                        .child_by_field_name("pattern")
+                        .or_else(|| (parameter.kind() == "identifier").then_some(parameter));
+                    if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                        return true;
+                    }
+                }
+            }
+            if scope.kind() == "function_item" {
+                break;
+            }
+        }
+        if scope.kind() == "for_expression"
+            && scope
+                .child_by_field_name("body")
+                .is_some_and(|body| node_contains(body, reference))
+            && scope
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return true;
+        }
+        if scope.kind() == "match_arm"
+            && scope.child_by_field_name("pattern").is_some_and(|pattern| {
+                !node_contains(pattern, reference) && binds(source, pattern, name)
+            })
+        {
+            return true;
+        }
+        if matches!(scope.kind(), "if_expression" | "while_expression")
+            && scope
+                .child_by_field_name("consequence")
+                .or_else(|| scope.child_by_field_name("body"))
+                .is_some_and(|body| node_contains(body, reference))
+            && scope
+                .child_by_field_name("condition")
+                .filter(|condition| condition.kind() == "let_condition")
+                .and_then(|condition| condition.child_by_field_name("pattern"))
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return true;
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
+// Tree-sitter also uses type_identifier for the owner/name of struct-style
+// enum construction and patterns. Those paths must keep variant resolution.
+fn rust_reference_is_type_usage(reference: Node<'_>) -> bool {
+    if reference.kind() != "type_identifier" {
+        return false;
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "struct_expression" | "struct_pattern" | "tuple_struct_pattern"
+        ) && scope
+            .child_by_field_name("type")
+            .or_else(|| scope.child_by_field_name("name"))
+            .is_some_and(|constructor| node_contains(constructor, reference))
+        {
+            return false;
+        }
+        if scope.kind() == "function_item" {
+            break;
+        }
+        ancestor = scope.parent();
+    }
+    true
+}
+
+/// A generic type parameter is not a reference to a same-named project type.
+fn rust_usage_has_local_type_binding(source: &[u8], reference: Node<'_>, name: &str) -> bool {
+    let mut ancestor = reference.parent();
+    let mut function_seen = false;
+    while let Some(scope) = ancestor {
+        if scope.kind() == "function_item" {
+            if function_seen {
+                break;
+            }
+            function_seen = true;
+        }
+        if let Some(parameters) = scope.child_by_field_name("type_parameters") {
+            for index in 0..parameters.named_child_count() {
+                let Some(parameter) = parameters.named_child(index) else {
+                    continue;
+                };
+                if matches!(parameter.kind(), "type_parameter" | "const_parameter")
+                    && named_child_of_kinds(parameter, &["type_identifier", "identifier"])
+                        .is_some_and(|binding| node_text(source, binding) == name)
+                {
+                    return true;
+                }
+            }
+        }
+        ancestor = scope.parent();
     }
     false
 }
@@ -796,16 +2334,35 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
 /// symbols and keeps only unique matches. Non-resolving references (locals,
 /// params with no matching def, etc.) are emitted here but dropped at
 /// resolution.
-fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str)>(source: &[u8], node: Node<'t>, emit: &mut F) {
+fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
+    source: &[u8],
+    node: Node<'t>,
+    emit: &mut F,
+) {
+    // A named struct-literal field is a label selected by its owner, not a
+    // value lookup in the surrounding scope. Bare-name resolution would bind
+    // it to an unrelated same-named parameter or function elsewhere.
+    let field_label = node.kind() == "field_identifier"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "field_initializer");
     // Try to emit a usage for THIS node.
-    if is_rust_reference_kind(node.kind())
+    if !field_label
+        && is_rust_reference_kind(node.kind())
         && !rust_usage_is_suppressed(node)
-        && !is_definition_name(node)
+        && (!is_definition_name(node)
+            || node.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "struct_expression" | "struct_pattern")
+            }))
     {
+        // Rust names in struct expressions/patterns reference a value; the
+        // grammar's `name` field does not make them definition names.
         let name_node = rust_reference_leaf(node);
         let text = node_text(source, name_node);
         if !text.is_empty() && !is_rust_keyword_or_self(text) {
-            emit(name_node, text);
+            let ref_path = matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+                .then(|| node_text(source, node));
+            emit(name_node, text, ref_path);
         }
         if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
             return;
@@ -816,6 +2373,160 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str)>(source: &[u8], node: Node<'t>,
         if let Some(child) = node.child(i) {
             walk_rust_usages(source, child, emit);
         }
+    }
+}
+
+#[cfg(test)]
+mod rust_constructor_reference_tests {
+    use super::*;
+
+    #[test]
+    fn chained_rust_calls_keep_callback_argument_usages() {
+        let code = r#"
+fn predicate(value: i32) -> bool { value > 0 }
+fn callbacks(value: Option<i32>) -> bool {
+    value.map(predicate).unwrap_or(false);
+    value.map(crate::predicate).unwrap_or(false);
+    value.map(|item| predicate(item)).unwrap_or(false);
+    predicate(1)
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut references = Vec::new();
+        walk_rust_usages(
+            code.as_bytes(),
+            tree.root_node(),
+            &mut |node, name, path| {
+                if name == "predicate" {
+                    references.push((node.start_position().row, path.map(str::to_owned)));
+                }
+            },
+        );
+        assert_eq!(
+            references,
+            vec![(3, None), (4, Some("crate::predicate".into()))],
+            "callback arguments remain usages; declarations and direct callees do not"
+        );
+    }
+
+    #[test]
+    fn structured_rust_value_paths_are_usages_not_definitions() {
+        let code = r#"
+pub enum Instruction { AddImmediateByte { amount: u8 } }
+pub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }
+pub fn state(value: Instruction) -> u8 {
+    match value { Instruction::AddImmediateByte { amount } => amount }
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut paths = Vec::new();
+        let mut constructor_field_labels = Vec::new();
+        walk_rust_usages(
+            code.as_bytes(),
+            tree.root_node(),
+            &mut |node, name, path| {
+                if name == "amount" && node.start_position().row == 2 {
+                    constructor_field_labels.push(name.to_owned());
+                }
+                if name == "AddImmediateByte" {
+                    paths.push(path.map(str::to_owned));
+                }
+            },
+        );
+        assert_eq!(
+            paths,
+            vec![
+                Some("Instruction::AddImmediateByte".into()),
+                Some("Instruction::AddImmediateByte".into()),
+            ],
+            "constructor and pattern are usages; the variant declaration is not"
+        );
+        assert!(
+            constructor_field_labels.is_empty(),
+            "named field labels are not unqualified value reads"
+        );
+    }
+
+    #[test]
+    fn callback_binding_declarations_are_local_but_initializers_and_constructors_are_reads() {
+        let source = br#"
+fn predicate(value: i32) -> bool { value > 0 }
+struct Callback(fn(i32) -> bool);
+fn local_callback(value: Option<i32>) {
+    let predicate = predicate;
+    value.map(predicate).unwrap_or(false);
+}
+fn conditional_callback(value: Option<i32>, candidate: Option<fn(i32) -> bool>) {
+    if let Some(predicate) = candidate { value.map(predicate); }
+}
+fn constructor_callback(value: Option<i32>, candidate: Callback) {
+    let Callback(predicate) = candidate;
+    value.map(predicate);
+}
+const LIMIT: i32 = 9;
+fn range_callback(value: i32) { if let 1..=LIMIT = value {} }
+"#;
+        let extracted = extract_rust(source, "callbacks.rs").unwrap();
+        let references = |caller: &str| {
+            extracted
+                .edges
+                .iter()
+                .filter(move |edge| {
+                    edge.edge_type == "USAGE"
+                        && edge.source_qualified_name.ends_with(caller)
+                        && edge.properties["ref_name"] == "predicate"
+                })
+                .collect::<Vec<_>>()
+        };
+        let local = references("::local_callback");
+        assert_eq!(local.len(), 3);
+        assert_eq!(
+            local
+                .iter()
+                .filter(|edge| edge.properties["ref_local_binding"] == true)
+                .count(),
+            2,
+            "the declaration and callback are local; the initializer still reads the global"
+        );
+        for caller in ["::conditional_callback", "::constructor_callback"] {
+            let references = references(caller);
+            assert_eq!(references.len(), 2, "{caller}: {references:?}");
+            assert!(references
+                .iter()
+                .all(|edge| edge.properties["ref_local_binding"] == true));
+        }
+        let constructor = extracted
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "USAGE"
+                    && edge
+                        .source_qualified_name
+                        .ends_with("::constructor_callback")
+                    && edge.properties["ref_name"] == "Callback"
+            })
+            .expect("a destructuring constructor is a type reference");
+        assert_ne!(constructor.properties["ref_local_binding"], true);
+        let range_limit = extracted
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "USAGE"
+                    && edge.source_qualified_name.ends_with("::range_callback")
+                    && edge.properties["ref_name"] == "LIMIT"
+            })
+            .expect("a range endpoint is a constant reference, not a binding");
+        assert_ne!(range_limit.properties["ref_local_binding"], true);
     }
 }
 
@@ -1248,7 +2959,8 @@ fn extract_js_ts(
     let mut result = crate::spec::spec_extract(language, spec, queries, source, file_path)?;
     let tree = crate::parse(language, source)?;
     let root = tree.root_node();
-    extract_js_ts_variables(root, source, file_path, &mut result);
+    let effect_import = js_ts_has_effect_import(root, source);
+    extract_js_ts_variables(root, source, file_path, effect_import, &mut result);
 
     // CALLS — the shared spec engine hangs a call's source endpoint off the
     // nearest ancestor whose *kind* matches a callable `DefRule`. For JS/TS
@@ -1262,7 +2974,7 @@ fn extract_js_ts(
     // `method_definition` / `arrow_function` / `function_expression`, named the
     // way the def pass named it, with a `__file__` fallback at module scope.
     result.edges.retain(|e| e.edge_type != "CALLS");
-    extract_js_ts_calls(root, source, file_path, &mut result);
+    extract_js_ts_calls(root, source, file_path, effect_import, &mut result);
 
     // USAGE — a per-language reference pass: every bare
     // `identifier` / `type_identifier` that is NOT the callee/argument of a
@@ -1272,7 +2984,7 @@ fn extract_js_ts(
     // shared indexer resolves `ref_name` to any registered symbol and drops it
     // unless unique, so unresolved references never become edges (no
     // over-emission).
-    extract_js_ts_usages(root, source, file_path, &mut result);
+    extract_js_ts_usages(root, source, file_path, effect_import, &mut result);
     Ok(result)
 }
 
@@ -1403,13 +3115,33 @@ const JS_TS_KEYWORDS: &[&str] = &[
 ///   * an anonymous inline callback is skipped and the walk continues to the
 ///     nearest NAMED scope, so a callback nested in a named function is still
 ///     attributed to that function;
-///   * if no named enclosing function at all, fall back to
-///     `{file}::__file__`.
-fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> String {
+///   * if no named enclosing function exists but the call is nested in a
+///     module-level variable initializer, use that Variable's qname;
+///   * otherwise fall back to `{file}::__file__` for a true module-scope call.
+fn js_ts_enclosing_qname(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    effect_import: bool,
+) -> String {
     let file_qname = format!("{file_path}::__file__");
+    let mut module_variable = None;
     let mut p = node.parent();
     while let Some(cur) = p {
         if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            // A computed key is evaluated when the method is created, outside
+            // its body. Keep walking to the containing scope for key usages
+            // and calls, while body references retain the method's identity.
+            if cur.kind() == "method_definition"
+                && cur.child_by_field_name("name").is_some_and(|name| {
+                    name.kind() == "computed_property_name"
+                        && node.start_byte() >= name.start_byte()
+                        && node.end_byte() <= name.end_byte()
+                })
+            {
+                p = cur.parent();
+                continue;
+            }
             if let Some((name, node_for_owner)) = js_ts_func_name(cur, source) {
                 // `function_declaration` is never class-owned by the def pass.
                 let owner = if cur.kind() == "function_declaration" {
@@ -1427,45 +3159,94 @@ fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> Stri
             // erase the real caller whenever the callback sits inside a named
             // function (`function outer() { arr.map(x => helper(x)) }` would
             // lose `outer -> helper`) — keep walking to the nearest NAMED scope;
-            // module-level callbacks still fall through to `__file__` below.
+            // module-level callbacks keep walking so a surrounding module
+            // Variable can own the call; a truly bare callback falls through
+            // to `__file__` below.
+        }
+        if module_variable.is_none() && cur.kind() == "variable_declarator" {
+            module_variable = js_ts_module_variable_name(cur, source).map(|name| {
+                let label = if js_ts_effect_fn_binding(cur, source, effect_import) {
+                    "Function"
+                } else {
+                    "Variable"
+                };
+                format!("{file_path}::{label}::{name}")
+            });
         }
         p = cur.parent();
     }
-    file_qname
+    module_variable.unwrap_or(file_qname)
 }
 
-/// The name of a JS/TS enclosing-function node plus the node whose ancestry
-/// decides class ownership. Returns `None` when the function is anonymous (so
-/// the caller falls back to the `__file__` node).
+/// Return the binding name when `declarator` is one of the module Variables
+/// emitted by [`extract_js_ts_variables`]. Calls inside an anonymous callback
+/// nested in a factory expression such as
+/// `const task = Effect.gen(function* () { helper() })` otherwise fall back to
+/// `__file__`; navigation deliberately hides that synthetic anchor and would
+/// falsely report `helper` as uncalled. The real module Variable is a stable,
+/// user-addressable source node for that call.
+fn js_ts_module_variable_name<'a>(declarator: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let declaration = declarator.parent()?;
+    if !matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return None;
+    }
+    let container = declaration.parent()?;
+    let module_level = container.kind() == "program"
+        || matches!(
+            container.kind(),
+            "export_statement" | "statement" | "expression_statement"
+        ) && container
+            .parent()
+            .is_some_and(|parent| parent.kind() == "program");
+    if !module_level {
+        return None;
+    }
+    // The variable pass deliberately omits direct generator bindings, while
+    // the definition query does not emit them either. Never invent their owner.
+    if declarator
+        .child_by_field_name("value")
+        .is_some_and(|value| {
+            matches!(
+                value.kind(),
+                "arrow_function" | "function_expression" | "generator_function"
+            )
+        })
+    {
+        return None;
+    }
+    let name = declarator.child_by_field_name("name")?;
+    (name.kind() == "identifier")
+        .then(|| node_text(source, name))
+        .filter(|name| !name.is_empty())
+}
+
+/// Return only a name emitted by the definition pass. Internal names of
+/// callback expressions are lexical bindings, not standalone graph definitions.
 fn js_ts_func_name<'a, 't>(func: Node<'t>, source: &'a [u8]) -> Option<(&'a str, Node<'t>)> {
-    // A `name:` field covers `function_declaration`, `method_definition`, and a
-    // named `function_expression`.
-    if let Some(name_node) = func.child_by_field_name("name") {
-        let name = node_text(source, name_node);
-        if !name.is_empty() {
-            return Some((name, func));
-        }
-    }
-    // Arrow / anonymous function-expression bound to a declarator:
-    // `const f = () => {}` / `const f = function () {}`. The def pass emits
-    // this via the `variable_declarator` rule, named from the declarator.
     if matches!(func.kind(), "arrow_function" | "function_expression") {
-        if let Some(parent) = func.parent() {
-            if parent.kind() == "variable_declarator" {
-                if let Some(vname) = parent.child_by_field_name("name") {
-                    if vname.kind() == "identifier" {
-                        let name = node_text(source, vname);
-                        if !name.is_empty() {
-                            // Class ownership is decided from the declarator's
-                            // ancestry (same as the def pass).
-                            return Some((name, parent));
-                        }
-                    }
-                }
-            }
+        let parent = func.parent()?;
+        if parent.kind() != "variable_declarator"
+            || parent.child_by_field_name("value").map(|value| value.id()) != Some(func.id())
+        {
+            return None;
         }
+        let name = parent.child_by_field_name("name")?;
+        return (name.kind() == "identifier")
+            .then(|| node_text(source, name))
+            .filter(|name| !name.is_empty())
+            .map(|name| (name, parent));
     }
-    None
+    // Generator expressions/declarations are not emitted by the current
+    // definition query. Keep walking to their persisted enclosing owner.
+    if !matches!(func.kind(), "function_declaration" | "method_definition") {
+        return None;
+    }
+    let name = func.child_by_field_name("name")?;
+    let name = node_text(source, name);
+    (!name.is_empty()).then_some((name, func))
 }
 
 /// The name of the nearest enclosing `class` of `node`, if any (drives
@@ -1492,6 +3273,7 @@ fn extract_js_ts_calls(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut stack = vec![root];
@@ -1499,7 +3281,7 @@ fn extract_js_ts_calls(
         if JS_TS_CALL_KINDS.contains(&node.kind()) {
             if let Some(callee) = js_ts_callee_name(node, source) {
                 if !callee.is_empty() && callee != "require" {
-                    let src = js_ts_enclosing_qname(node, source, file_path);
+                    let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
                         source_qualified_name: src,
@@ -1554,11 +3336,12 @@ fn extract_js_ts_usages(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        try_emit_js_ts_usage(node, source, file_path, result);
+        try_emit_js_ts_usage(node, source, file_path, effect_import, result);
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
@@ -1570,9 +3353,48 @@ fn try_emit_js_ts_usage(
     node: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
+    if !matches!(node.kind(), "identifier" | "type_identifier") {
+        return;
+    }
+    // JSX tag names are references, despite the grammar naming their field
+
+    // `name`. Handle them before call-ancestor suppression (render callbacks
+    // often sit inside map calls), and suppress closing/member/intrinsic tags.
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(
+            parent.kind(),
+            "jsx_opening_element" | "jsx_self_closing_element" | "jsx_closing_element"
+        ) {
+            if let Some(tag) = parent.child_by_field_name("name") {
+                if node.start_byte() >= tag.start_byte() && node.end_byte() <= tag.end_byte() {
+                    let name = node_text(source, node);
+                    if parent.kind() != "jsx_closing_element"
+                        && tag.kind() == "identifier"
+                        && node.id() == tag.id()
+                        && name.chars().next().is_some_and(char::is_uppercase)
+                        && !js_ts_jsx_locally_bound(node, source, name)
+                    {
+                        result.edges.push(ExtractedEdge {
+                            edge_type: "USAGE".into(),
+                            source_qualified_name: js_ts_enclosing_qname(node, source, file_path, effect_import),
+                            target_qualified_name: format!("{file_path}::__ref__::{name}"),
+                            file_path: file_path.to_owned(),
+                            line: node.start_position().row as u32 + 1,
+                            properties: serde_json::json!({ "ref_name": name, "jsx_component": true }),
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+        ancestor = parent.parent();
+    }
     // JS/TS references are `identifier` / `type_identifier`.
+
     if !matches!(node.kind(), "identifier" | "type_identifier") {
         return;
     }
@@ -1590,7 +3412,12 @@ fn try_emit_js_ts_usage(
     if name.is_empty() || JS_TS_KEYWORDS.contains(&name) {
         return;
     }
-    let src = js_ts_enclosing_qname(node, source, file_path);
+    // Parameters and active local value bindings are not references to a
+    // same-named imported/project symbol. Type annotations remain usages.
+    if node.kind() == "identifier" && js_ts_jsx_locally_bound(node, source, name) {
+        return;
+    }
+    let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
     result.edges.push(ExtractedEdge {
         edge_type: "USAGE".into(),
         source_qualified_name: src,
@@ -1603,6 +3430,130 @@ fn try_emit_js_ts_usage(
     });
 }
 
+/// Check active lexical scopes only. Lexical declarations bind throughout
+/// their scope (including the temporal dead zone); var binds throughout the
+/// enclosing function. Sibling blocks and nested functions cannot shadow it.
+fn js_ts_jsx_locally_bound(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut parent = node.parent();
+    while let Some(scope) = parent {
+        let function = JS_TS_FUNC_KINDS.contains(&scope.kind());
+        let lexical = matches!(
+            scope.kind(),
+            "statement_block"
+                | "switch_body"
+                | "catch_clause"
+                | "for_statement"
+                | "for_in_statement"
+        );
+        if function {
+            for field in ["parameters", "parameter"] {
+                if scope
+                    .child_by_field_name(field)
+                    .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                {
+                    return true;
+                }
+            }
+        }
+        if lexical || function {
+            let mut stack = vec![scope];
+            while let Some(binding) = stack.pop() {
+                let nested_function =
+                    binding.id() != scope.id() && JS_TS_FUNC_KINDS.contains(&binding.kind());
+                let nested_scope = binding.id() != scope.id()
+                    && matches!(
+                        binding.kind(),
+                        "statement_block"
+                            | "switch_body"
+                            | "catch_clause"
+                            | "for_statement"
+                            | "for_in_statement"
+                    );
+                let declaration = binding.kind() == "variable_declarator"
+                    && binding.parent().is_some_and(|p| {
+                        if function {
+                            p.kind() == "variable_declaration"
+                        } else {
+                            p.kind() == "lexical_declaration"
+                        }
+                    });
+                if (declaration
+                    || (!function
+                        && matches!(binding.kind(), "function_declaration" | "class_declaration")))
+                    && binding
+                        .child_by_field_name("name")
+                        .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                {
+                    return true;
+                }
+                if binding.kind() == "catch_clause"
+                    && binding.id() == scope.id()
+                    && binding
+                        .child_by_field_name("parameter")
+                        .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                {
+                    return true;
+                }
+                // Function-level var discovery crosses blocks, but never
+                // crosses a nested function or class. Lexical discovery stops
+                // at every child scope; that scope is checked only if active.
+                if nested_function
+                    || matches!(binding.kind(), "class_declaration" | "class")
+                    || (!function && nested_scope)
+                {
+                    continue;
+                }
+                let mut cursor = binding.walk();
+                stack.extend(binding.named_children(&mut cursor));
+            }
+        }
+        parent = scope.parent();
+    }
+    false
+}
+
+fn js_ts_pattern_binds(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut patterns = vec![pattern];
+    while let Some(pattern) = patterns.pop() {
+        if matches!(
+            pattern.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && node_text(source, pattern) == name
+        {
+            return true;
+        }
+        if matches!(pattern.kind(), "required_parameter" | "optional_parameter") {
+            if let Some(binding) = pattern
+                .child_by_field_name("pattern")
+                .or_else(|| pattern.child_by_field_name("name"))
+            {
+                patterns.push(binding);
+                continue;
+            }
+        }
+        // Defaults and types reference values/types, rather than binding them.
+
+        if matches!(
+            pattern.kind(),
+            "type_annotation" | "call_expression" | "member_expression"
+        ) {
+            continue;
+        }
+        if matches!(
+            pattern.kind(),
+            "assignment_pattern" | "object_assignment_pattern"
+        ) {
+            if let Some(left) = pattern.child_by_field_name("left") {
+                patterns.push(left);
+            }
+            continue;
+        }
+        let mut cursor = pattern.walk();
+        patterns.extend(pattern.named_children(&mut cursor));
+    }
+    false
+}
+
 /// Whether any ancestor of `node` within 10 levels has a kind in `kinds`.
 fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
     let mut p = node.parent();
@@ -1610,6 +3561,10 @@ fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
     while let Some(cur) = p {
         if depth >= 10 {
             break;
+        }
+        // Callback references belong to their own body, not the outer factory.
+        if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            return false;
         }
         if kinds.contains(&cur.kind()) {
             return true;
@@ -1632,6 +3587,11 @@ fn js_ts_inside_import(node: Node<'_>) -> bool {
     while let Some(cur) = p {
         if depth >= 10 {
             break;
+        }
+        // Function bodies/signatures do not become import bindings just
+        // because the function is stored in an outer const declaration.
+        if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            return false;
         }
         if JS_TS_IMPORT_KINDS.contains(&cur.kind())
             && !(cur.kind() == "export_statement" && js_ts_export_of_declaration(cur))
@@ -1702,6 +3662,7 @@ fn extract_js_ts_variables(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     // Module-level `const`/`let`/`var`. Only top-level children of the program
@@ -1711,7 +3672,7 @@ fn extract_js_ts_variables(
     for child in root.children(&mut cursor) {
         match child.kind() {
             "lexical_declaration" | "variable_declaration" => {
-                emit_js_ts_declarators(child, source, file_path, result);
+                emit_js_ts_declarators(child, source, file_path, effect_import, result);
             }
             // Unwrap an `export`/`statement`/`expression_statement` wrapper and
             // look one level in for a variable declaration or enum
@@ -1721,7 +3682,7 @@ fn extract_js_ts_variables(
                 for grand in child.named_children(&mut inner) {
                     match grand.kind() {
                         "lexical_declaration" | "variable_declaration" => {
-                            emit_js_ts_declarators(grand, source, file_path, result);
+                            emit_js_ts_declarators(grand, source, file_path, effect_import, result);
                         }
                         "enum_declaration" => {
                             emit_js_ts_enum_members(grand, source, file_path, result);
@@ -1744,6 +3705,7 @@ fn emit_js_ts_declarators(
     decl: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut cursor = decl.walk();
@@ -1765,10 +3727,17 @@ fn emit_js_ts_declarators(
         };
         match name_node.kind() {
             "object_pattern" | "array_pattern" => {
-                emit_js_ts_destructured(name_node, vd, source, file_path, result);
+                emit_js_ts_destructured(name_node, vd, source, file_path, effect_import, result);
             }
             _ => {
-                push_js_ts_variable(node_text(source, name_node), vd, file_path, result);
+                push_js_ts_variable(
+                    node_text(source, name_node),
+                    vd,
+                    source,
+                    file_path,
+                    effect_import,
+                    result,
+                );
             }
         }
     }
@@ -1780,6 +3749,7 @@ fn emit_js_ts_destructured(
     decl: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut cursor = pattern.walk();
@@ -1796,12 +3766,12 @@ fn emit_js_ts_destructured(
         // A nested pattern (`{ a: { b } }`) recurses; a bare identifier emits.
         match ident.kind() {
             "object_pattern" | "array_pattern" => {
-                emit_js_ts_destructured(ident, decl, source, file_path, result);
+                emit_js_ts_destructured(ident, decl, source, file_path, effect_import, result);
             }
             _ => {
                 let text = node_text(source, ident);
                 if !text.is_empty() {
-                    push_js_ts_variable(text, decl, file_path, result);
+                    push_js_ts_variable(text, decl, source, file_path, effect_import, result);
                 }
             }
         }
@@ -1857,19 +3827,159 @@ fn emit_js_ts_enum_members(
 
 /// Push a single `Variable` node (`decl` supplies the line span, recording the
 /// declarator's position).
-fn push_js_ts_variable(name: &str, decl: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
+fn push_js_ts_variable(
+    name: &str,
+    decl: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    effect_import: bool,
+    result: &mut ExtractionResult,
+) {
     if name.is_empty() {
         return;
     }
+    let label = if js_ts_effect_fn_binding(decl, source, effect_import) {
+        "Function"
+    } else {
+        "Variable"
+    };
     result.nodes.push(ExtractedNode {
-        label: "Variable".into(),
+        label: label.into(),
         name: name.to_string(),
-        qualified_name: format!("{file_path}::Variable::{name}"),
+        qualified_name: format!("{file_path}::{label}::{name}"),
         file_path: file_path.to_string(),
         start_line: decl.start_position().row as u32 + 1,
         end_line: decl.end_position().row as u32 + 1,
         properties: serde_json::json!({}),
     });
+}
+
+/// Effect.fn(name)(callback) creates a callable binding; Effect.gen and
+/// arbitrary callback-consuming factories may produce ordinary values instead.
+fn js_ts_effect_fn_binding(decl: Node<'_>, source: &[u8], effect_import: bool) -> bool {
+    let Some(value) = decl.child_by_field_name("value") else {
+        return false;
+    };
+    if value.kind() != "call_expression" {
+        return false;
+    }
+    let Some(factory) = value.child_by_field_name("function") else {
+        return false;
+    };
+    if factory.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = factory.child_by_field_name("function") else {
+        return false;
+    };
+    if node_text(source, callee) != "Effect.fn" || !effect_import {
+        return false;
+    }
+    let Some(arguments) = value.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let callable = arguments.named_children(&mut cursor).any(|argument| {
+        matches!(
+            argument.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    });
+    callable
+}
+
+/// Require the named package import, and conservatively reject any local binding
+/// of Effect in this file. Unknown factories must remain ordinary Variables.
+fn js_ts_has_effect_import(node: Node<'_>, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut imported = false;
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if current.kind() == "import_statement" {
+            let from_effect = !node_text(source, current)
+                .trim_start()
+                .starts_with("import type ")
+                && current.child_by_field_name("source").is_some_and(|path| {
+                    matches!(node_text(source, path), "\"effect\"" | "'effect'")
+                });
+            if from_effect {
+                let mut imports = vec![current];
+                while let Some(part) = imports.pop() {
+                    if part.kind() == "import_specifier" {
+                        let name = part
+                            .child_by_field_name("name")
+                            .map(|n| node_text(source, n));
+                        let alias = part
+                            .child_by_field_name("alias")
+                            .map(|n| node_text(source, n));
+                        let mut token_cursor = part.walk();
+                        let type_only = part
+                            .children(&mut token_cursor)
+                            .any(|token| token.kind() == "type");
+                        imported |= !type_only
+                            && name == Some("Effect")
+                            && alias.is_none_or(|name| name == "Effect");
+                    }
+                    let mut cursor = part.walk();
+                    imports.extend(part.named_children(&mut cursor));
+                }
+            }
+            continue;
+        }
+        if matches!(
+            current.kind(),
+            "variable_declarator" | "function_declaration" | "class_declaration"
+        ) && current
+            .child_by_field_name("name")
+            .is_some_and(|n| js_ts_binds_effect(n, source))
+        {
+            return false;
+        }
+        if matches!(
+            current.kind(),
+            "formal_parameters" | "required_parameter" | "optional_parameter"
+        ) {
+            let mut parameters = vec![current];
+            while let Some(parameter) = parameters.pop() {
+                if matches!(
+                    parameter.kind(),
+                    "identifier" | "shorthand_property_identifier_pattern"
+                ) && node_text(source, parameter) == "Effect"
+                {
+                    return false;
+                }
+                let mut cursor = parameter.walk();
+                parameters.extend(parameter.named_children(&mut cursor));
+            }
+        }
+        let mut cursor = current.walk();
+        pending.extend(current.named_children(&mut cursor));
+    }
+    imported
+}
+
+/// Binding patterns only: a property key named Effect is not a shadow when
+/// destructuring binds another name (`{ Effect: different }`).
+fn js_ts_binds_effect(pattern: Node<'_>, source: &[u8]) -> bool {
+    if matches!(
+        pattern.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        return node_text(source, pattern) == "Effect";
+    }
+    if pattern.kind() == "pair_pattern" {
+        return pattern
+            .child_by_field_name("value")
+            .is_some_and(|value| js_ts_binds_effect(value, source));
+    }
+    let mut cursor = pattern.walk();
+    let binds = pattern
+        .named_children(&mut cursor)
+        .any(|child| js_ts_binds_effect(child, source));
+    binds
 }
 
 /// First direct child of `node` whose kind is `kind`, if any.
@@ -2356,6 +4466,312 @@ fn collect_python_import_modules(
     }
 }
 
+/// Rust macro arguments are token trees, not call expressions. Reparse the
+/// expression-list macros whose arguments preserve Rust expression syntax;
+/// never infer calls from arbitrary DSL tokens or string contents.
+fn rust_expression_macro_shadowed_bindings(
+    source: &[u8],
+    root: Node<'_>,
+    macros: &[&str],
+    conservative_globs: bool,
+) -> std::collections::HashSet<String> {
+    let mut shadowed = std::collections::HashSet::new();
+    let mut scan = vec![root];
+    while let Some(node) = scan.pop() {
+        if matches!(node.kind(), "macro_definition" | "mod_item") {
+            if let Some(name) = node.child_by_field_name("name") {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "extern_crate_declaration" {
+            // An extern-prelude dependency does not prove the identity of an
+            // explicitly rebound crate namespace (including macro_use crates).
+            if let Some(name) = node
+                .child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "use_declaration" {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                for import in expand_use_tree(source, argument, "") {
+                    let known = import.path == "anyhow::ensure"
+                        || import
+                            .path
+                            .strip_prefix("std::")
+                            .is_some_and(|n| macros.contains(&n))
+                        || import
+                            .path
+                            .strip_prefix("core::")
+                            .is_some_and(|n| macros.contains(&n));
+                    if import.is_glob && conservative_globs {
+                        shadowed.extend(macros.iter().map(|name| (*name).to_string()));
+                    }
+                    if !import.is_glob && !known {
+                        shadowed.insert(import.imported_name);
+                    }
+                }
+            }
+        }
+        scan.extend(node.named_children(&mut node.walk()));
+    }
+    shadowed
+}
+
+/// Preserve block-local type items when a nested token tree loses its AST.
+/// Rust items are block-scoped and hoisted, unlike value let bindings.
+fn rust_expression_macro_has_local_type_binding(
+    source: &[u8],
+    reference: Node<'_>,
+    name: &str,
+) -> bool {
+    if rust_usage_has_local_type_binding(source, reference, name) {
+        return true;
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if scope.kind() == "block" {
+            let mut cursor = scope.walk();
+            if scope.named_children(&mut cursor).any(|item| {
+                matches!(
+                    item.kind(),
+                    "type_item" | "struct_item" | "enum_item" | "union_item"
+                ) && item
+                    .child_by_field_name("name")
+                    .is_some_and(|binding| node_text(source, binding) == name)
+            }) {
+                return true;
+            }
+        }
+        if scope.kind() == "function_item" {
+            break;
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
+fn rust_expression_macro_calls(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+) -> greppy_core::Result<Vec<ExtractedEdge>> {
+    const PREFIX: &str = "async fn __greppy_macro_arguments__() { let _ = (";
+    const MACROS: &[&str] = &[
+        "ensure",
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "format",
+        "format_args",
+        "print",
+        "println",
+        "eprint",
+        "eprintln",
+        "write",
+        "writeln",
+    ];
+    let queries = crate::query::cached_query_set(&Language::Rust)
+        .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
+    let shadowed = rust_expression_macro_shadowed_bindings(source, root, MACROS, false);
+    let admitted = |path: &str, shadowed: &std::collections::HashSet<String>| {
+        if let Some((owner, name)) = path.rsplit_once("::") {
+            !shadowed.contains(owner)
+                && ((owner == "anyhow" && name == "ensure")
+                    || (matches!(owner, "std" | "core") && MACROS.contains(&name)))
+        } else {
+            MACROS.contains(&path) && !shadowed.contains(path)
+        }
+    };
+    let mut pending = Vec::new();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "macro_invocation" {
+            if let (Some(name), Some(tokens), Some(caller)) = (
+                node.child_by_field_name("macro"),
+                node.named_children(&mut node.walk())
+                    .find(|n| n.kind() == "token_tree"),
+                enclosing_function_qname(source, node, file_path),
+            ) {
+                let name = node_text(source, name);
+                if admitted(name, &shadowed) && tokens.end_byte() > tokens.start_byte() + 1 {
+                    pending.push((
+                        source[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
+                        tokens.start_position().row,
+                        caller,
+                        name.to_string(),
+                        0usize,
+                        node,
+                        std::collections::HashSet::<String>::new(),
+                        std::collections::HashSet::<String>::new(),
+                        shadowed.clone(),
+                    ));
+                }
+            }
+        }
+        nodes.extend(node.named_children(&mut node.walk()));
+    }
+    let mut edges = Vec::new();
+    let mut budget = source.len().saturating_mul(16);
+    while let Some((
+        body,
+        row,
+        caller,
+        macro_name,
+        depth,
+        context,
+        visible_values,
+        visible_types,
+        mut macro_bindings,
+    )) = pending.pop()
+    {
+        if depth >= 16 || body.len() > budget {
+            return Err(greppy_core::Error::Parse(
+                "Rust expression-macro call extraction exceeded its bounded nesting budget".into(),
+            ));
+        }
+        budget -= body.len();
+        let mut wrapped = PREFIX.as_bytes().to_vec();
+        wrapped.extend_from_slice(&body);
+        wrapped.extend_from_slice(b"); }");
+        let tree = crate::parse(Language::Rust, &wrapped)?;
+        // Unknown/invalid macro-specific syntax is not evidence of a call.
+        if tree.root_node().has_error() {
+            continue;
+        }
+        for cq in queries.iter().filter(|cq| cq.kind == QueryKind::Calls) {
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&cq.query, tree.root_node(), wrapped.as_slice());
+            while let Some(m) = matches.next() {
+                for cap in m.captures {
+                    let node = cap.node;
+                    if cq.capture_names.get(cap.index as usize).map(String::as_str)
+                        != Some("callee")
+                        || node.start_byte() < PREFIX.len()
+                        || node.end_byte() > PREFIX.len() + body.len()
+                        || enclosing_function_qname(&wrapped, node, file_path)
+                            != Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+                    {
+                        continue;
+                    }
+                    let name = node_text(&wrapped, node);
+                    let receiver = node
+                        .parent()
+                        .is_some_and(|n| n.kind() == "field_expression");
+                    // The synthetic context has no surrounding receiver/type
+                    // provenance. Do not manufacture unresolved or wrong method calls.
+                    if receiver {
+                        continue;
+                    }
+                    let mut properties = serde_json::json!({
+                        "callee_text": name, "callee_name": name,
+                        "callee_form": "direct",
+                        "rust_expression_macro": macro_name,
+                    });
+                    if !receiver {
+                        if let Some(path) = rust_scoped_call_path(&wrapped, node) {
+                            let owner = path.split("::").next().unwrap_or("");
+                            if visible_types.contains(owner)
+                                || rust_expression_macro_has_local_type_binding(
+                                    source, context, owner,
+                                )
+                                || rust_expression_macro_has_local_type_binding(
+                                    &wrapped, node, owner,
+                                )
+                            {
+                                properties["rust_local_type_owner"] = serde_json::json!(true);
+                            }
+                            properties["callee_path"] = serde_json::json!(path);
+                        } else if visible_values.contains(name)
+                            || rust_usage_has_local_value_binding(source, context, name)
+                            || rust_usage_has_local_value_binding(&wrapped, node, name)
+                        {
+                            continue;
+                        }
+                    }
+                    edges.push(ExtractedEdge {
+                        edge_type: "CALLS".into(),
+                        source_qualified_name: caller.clone(),
+                        target_qualified_name: format!("{file_path}::Function::{name}"),
+                        file_path: file_path.to_string(),
+                        line: (row + node.start_position().row) as u32 + 1,
+                        properties,
+                    });
+                }
+            }
+        }
+        // Local macro bindings introduced in this token tree must survive its
+        // destruction before a queued child is reparsed. Unknown glob imports
+        // cannot establish a standard macro identity.
+        macro_bindings.extend(rust_expression_macro_shadowed_bindings(
+            &wrapped,
+            tree.root_node(),
+            MACROS,
+            true,
+        ));
+        // A nested expression macro remains a token tree after the first parse.
+        let mut nested = vec![tree.root_node()];
+        while let Some(node) = nested.pop() {
+            if node.kind() == "macro_invocation"
+                && enclosing_function_qname(&wrapped, node, file_path)
+                    == Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+            {
+                if let (Some(name), Some(tokens)) = (
+                    node.child_by_field_name("macro"),
+                    node.named_children(&mut node.walk())
+                        .find(|n| n.kind() == "token_tree"),
+                ) {
+                    let name = node_text(&wrapped, name);
+                    if admitted(name, &macro_bindings)
+                        && tokens.end_byte() > tokens.start_byte() + 1
+                    {
+                        // A queued child loses this parse tree. Preserve only
+                        // bindings that are visible at the nested macro site,
+                        // using candidate names from its token tree.
+                        let mut values = visible_values.clone();
+                        let mut types = visible_types.clone();
+                        let mut candidates = vec![tokens];
+                        let mut names = std::collections::HashSet::new();
+                        while let Some(candidate) = candidates.pop() {
+                            if matches!(candidate.kind(), "identifier" | "type_identifier") {
+                                names.insert(node_text(&wrapped, candidate));
+                            }
+                            candidates.extend(candidate.named_children(&mut candidate.walk()));
+                        }
+                        for candidate in names {
+                            if rust_usage_has_local_value_binding(&wrapped, node, candidate) {
+                                values.insert(candidate.to_string());
+                            }
+                            if rust_expression_macro_has_local_type_binding(
+                                &wrapped, node, candidate,
+                            ) {
+                                types.insert(candidate.to_string());
+                            }
+                        }
+                        pending.push((
+                            wrapped[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
+                            row + tokens.start_position().row,
+                            caller.clone(),
+                            name.to_string(),
+                            depth + 1,
+                            context,
+                            values,
+                            types,
+                            macro_bindings.clone(),
+                        ));
+                    }
+                }
+            }
+            nested.extend(node.named_children(&mut node.walk()));
+        }
+    }
+    Ok(edges)
+}
+
 fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
     let tree = crate::parse(Language::Rust, source)?;
     let queries = crate::query::cached_query_set(&Language::Rust)
@@ -2414,6 +4830,10 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     let decl = node.parent().unwrap_or(node);
                     let mut properties = serde_json::Map::new();
                     if let Some(ty) = field_declared_type(source, decl) {
+                        if field_option_payload_is_generic(source, node, &ty) {
+                            // A generic payload is not a concrete method owner.
+                            properties.insert("generic_payload".into(), serde_json::json!(1));
+                        }
                         properties.insert("return_type".into(), serde_json::Value::String(ty));
                     }
                     result.nodes.push(ExtractedNode {
@@ -2611,6 +5031,24 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     }
                 }
 
+                if label == "Interface" {
+                    let head = node_text(source, def_node);
+                    let signature = head.split('{').next().unwrap_or(head);
+                    if signature.contains(':') {
+                        // Supertraits can contribute as_ref without naming it here.
+                        properties.insert("has_bounds".into(), serde_json::json!(1));
+                    }
+                    // Signature-only trait methods are not Method nodes. Record
+                    // as_ref's receiver on the trait so an import can still reject
+                    // a by-value adapter.
+                    if let Some(receiver) = rust_trait_as_ref_receiver(source, def_node) {
+                        properties.insert(
+                            "as_ref_receiver".into(),
+                            serde_json::Value::String(receiver),
+                        );
+                    }
+                }
+
                 let properties = serde_json::Value::Object(properties);
                 result.nodes.push(ExtractedNode {
                     label,
@@ -2680,6 +5118,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         "imported_name": imported_name,
                         "original_name": original_name,
                         "glob": is_glob,
+                        "imported_items": items.iter().map(|item| serde_json::json!({
+                            "path": item.path,
+                            "imported_name": item.imported_name,
+                            "original_name": item.original_name,
+                            "glob": item.is_glob,
+                        })).collect::<Vec<_>>(),
                     }),
                 });
             }
@@ -2718,7 +5162,55 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 } else {
                     "direct"
                 };
+                let receiver_option_pattern = node
+                    .parent()
+                    .and_then(|field| field.child_by_field_name("value"))
+                    .filter(|receiver| receiver.kind() == "identifier")
+                    .is_some_and(|receiver| {
+                        rust_option_pattern_owner(source, node, node_text(source, receiver))
+                            .is_some()
+                    });
                 let receiver_owner = rust_receiver_owner(source, node);
+                let receiver_factory_pattern = (callee_form == "receiver"
+                    && receiver_owner.is_none())
+                .then(|| node.parent()?.child_by_field_name("value"))
+                .flatten()
+                .filter(|receiver| receiver.kind() == "identifier")
+                .and_then(|receiver| {
+                    rust_option_factory_pattern_path(source, node, node_text(source, receiver))
+                });
+                let anyhow_factory_owner = receiver_factory_pattern.and_then(|factory_path| {
+                    let mut parent = node.parent();
+                    while let Some(scope) = parent {
+                        if scope.kind() == "if_expression" {
+                            let value = scope
+                                .child_by_field_name("condition")?
+                                .child_by_field_name("value")?;
+                            let call = if value.kind() == "try_expression" {
+                                value.named_child(0)?
+                            } else {
+                                value
+                            };
+                            if call
+                                .child_by_field_name("function")
+                                .is_some_and(|target| node_text(source, target) == factory_path)
+                            {
+                                return rust_option_factory_owner_with_anyhow(source, value, true);
+                            }
+                        }
+                        parent = scope.parent();
+                    }
+                    None
+                });
+                let anyhow_globs = anyhow_factory_owner
+                    .and_then(|_| rust_anyhow_factory_scope_globs(source, node));
+                let anyhow_factory_owner = anyhow_factory_owner.filter(|_| anyhow_globs.is_some());
+                let receiver_provenance = (callee_form == "receiver" && receiver_owner.is_none())
+                    .then(|| {
+                        rust_direct_self_field_receiver(source, node)
+                            .or_else(|| rust_option_field_receiver(source, node))
+                    })
+                    .flatten();
                 // The scoped path a direct call names (`store::f` for
                 // `store::f()`), so the indexer can honour an explicit module
                 // over a same-named function in the caller's own file.
@@ -2754,6 +5246,21 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             "callee_name": text,
                             "callee_form": callee_form,
                             });
+                            if let Some(owner) = anyhow_factory_owner {
+                                properties["receiver_anyhow_factory_owner"] =
+                                    serde_json::json!(owner);
+                                properties["receiver_anyhow_glob_files"] =
+                                    serde_json::json!(anyhow_globs);
+                            }
+                            if let Some(factory) = receiver_factory_pattern {
+                                properties["receiver_factory_pattern"] = serde_json::json!(factory);
+                            }
+                            if receiver_option_pattern || anyhow_factory_owner.is_some() {
+                                properties.as_object_mut().unwrap().insert(
+                                    "receiver_option_pattern".into(),
+                                    serde_json::json!(true),
+                                );
+                            }
                             if let (Some(owner), Some(object)) =
                                 (receiver_owner, properties.as_object_mut())
                             {
@@ -2762,9 +5269,24 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                                     serde_json::Value::String(owner.to_string()),
                                 );
                             }
+                            if let (Some(fact), Some(object)) =
+                                (receiver_provenance, properties.as_object_mut())
+                            {
+                                object.insert("receiver_provenance".into(), fact);
+                            }
                             if let (Some(path), Some(object)) =
                                 (callee_path, properties.as_object_mut())
                             {
+                                if rust_usage_has_local_type_binding(
+                                    source,
+                                    node,
+                                    path.split("::").next().unwrap_or(""),
+                                ) {
+                                    object.insert(
+                                        "rust_local_type_owner".into(),
+                                        serde_json::json!(true),
+                                    );
+                                }
                                 object.insert(
                                     "callee_path".into(),
                                     serde_json::Value::String(path.to_string()),
@@ -2777,6 +5299,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
             }
         }
     }
+
+    result.edges.extend(rust_expression_macro_calls(
+        source,
+        tree.root_node(),
+        file_path,
+    )?);
 
     // PASS 4+5 — usages (the unified reference model). There are NO separate
     // `TYPE_REF`/`USES` passes: every non-call, non-import identifier
@@ -2797,7 +5325,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     // in a type position is just another reference node) so structs, enums,
     // and traits still get their usage edges.
     {
-        let mut emit = |node: Node<'_>, text: &str| {
+        let mut emit = |node: Node<'_>, text: &str, ref_path: Option<&str>| {
             // The nearest enclosing function's qname, with the same file-node
             // fallback the resolver applies when the reference is not inside
             // any function.
@@ -2813,9 +5341,39 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 target_qualified_name: format!("{file_path}::__ref__::{text}"),
                 file_path: file_path.to_string(),
                 line: node.start_position().row as u32 + 1,
-                properties: serde_json::json!({
-                    "ref_name": text,
-                }),
+                properties: {
+                    let mut properties = serde_json::json!({ "ref_name": text });
+                    if rust_reference_is_type_usage(node) {
+                        properties["rust_type_reference"] = serde_json::json!(true);
+                        if ref_path.is_none()
+                            && rust_usage_has_local_type_binding(source, node, text)
+                        {
+                            properties["ref_local_binding"] = serde_json::json!(true);
+                        }
+                    }
+                    if ref_path.is_none()
+                        && node.kind() == "identifier"
+                        && rust_usage_has_local_value_binding(source, node, text)
+                    {
+                        // Keep the raw reference, but never bind a proven local
+                        // value to a same-named module function or type.
+                        properties["ref_local_binding"] = serde_json::json!(true);
+                    }
+                    if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
+                        if rust_usage_has_local_type_binding(
+                            source,
+                            node,
+                            path.split("::").next().unwrap_or(""),
+                        ) {
+                            object.insert("ref_local_binding".into(), serde_json::json!(true));
+                        }
+                        object.insert(
+                            "ref_path".into(),
+                            serde_json::Value::String(path.to_string()),
+                        );
+                    }
+                    properties
+                },
             });
         };
         walk_rust_usages(source, tree.root_node(), &mut emit);
@@ -2912,6 +5470,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
         let impl_type_idx = cq.capture_index("impl_type");
         let enum_name_idx = cq.capture_index("enum_name");
         let enum_variant_idx = cq.capture_index("enum_variant");
+        let enum_variant_item_idx = cq.capture_index("enum_variant_item");
         let assoc_const_idx = cq.capture_index("assoc_const");
         let assoc_type_idx = cq.capture_index("assoc_type");
 
@@ -2951,15 +5510,20 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
             }
 
             // ---- enum variants ----
-            if let (Some(eni), Some(evi)) = (enum_name_idx, enum_variant_idx) {
+            if let (Some(eni), Some(evi), Some(item_idx)) =
+                (enum_name_idx, enum_variant_idx, enum_variant_item_idx)
+            {
                 let enum_cap = m.captures.iter().find(|c| c.index == eni);
                 let variant_cap = m.captures.iter().find(|c| c.index == evi);
-                if let (Some(enum_cap), Some(variant_cap)) = (enum_cap, variant_cap) {
+                let item_cap = m.captures.iter().find(|c| c.index == item_idx);
+                if let (Some(enum_cap), Some(variant_cap), Some(item_cap)) =
+                    (enum_cap, variant_cap, item_cap)
+                {
                     let enum_name = node_text(source, enum_cap.node);
                     let variant_name = node_text(source, variant_cap.node);
                     if !enum_name.is_empty() && !variant_name.is_empty() {
-                        let start_line = variant_cap.node.start_position().row as u32 + 1;
-                        let end_line = variant_cap.node.end_position().row as u32 + 1;
+                        let start_line = item_cap.node.start_position().row as u32 + 1;
+                        let end_line = item_cap.node.end_position().row as u32 + 1;
                         let variant_qname = format!("{file_path}::{enum_name}::{variant_name}");
                         let enum_qname = format!("{file_path}::Enum::{enum_name}");
                         result.nodes.push(ExtractedNode {
@@ -15323,6 +17887,7 @@ pub(crate) fn node_text<'a>(source: &'a [u8], node: Node<'_>) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    use super::OPTION_FIELD_ROOT_CHECKS;
     use crate::extract;
     use crate::language::Language;
 
@@ -15443,6 +18008,160 @@ mod tests {
     }
 
     #[test]
+    fn rust_expression_macros_capture_calls_without_inventing_dsl_or_string_calls() {
+        let source = r#"fn callee<T>(value: &T) -> bool { true }
+fn nested() -> bool { true }
+fn decoy() {}
+#[cfg(target_os = "linux")]
+async fn caller() {
+    ensure!(
+        callee(&driver).await == Err(Unavailable),
+        "decoy() is text"
+    );
+    assert!(format!("{}", nested()).is_empty());
+    custom_dsl!(decoy());
+    assert!({ fn hidden() { decoy(); } true });
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/tests.rs").unwrap();
+        let calls: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "CALLS")
+            .collect();
+        assert!(calls.iter().any(|e| e.properties["callee_name"] == "callee"
+            && e.line == 7
+            && e.source_qualified_name == "src/tests.rs::Function::caller"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|e| e.properties["callee_name"] == "nested")
+                .count(),
+            1
+        );
+        assert!(!calls.iter().any(|e| e.properties["callee_name"] == "decoy"));
+        assert!(
+            !calls
+                .iter()
+                .any(|e| e.properties["callee_name"] == "is_empty"),
+            "receiver provenance is unavailable in a synthetic macro context"
+        );
+    }
+
+    #[test]
+    fn rust_expression_macros_do_not_call_global_namesakes_of_inner_bindings() {
+        let source = r#"
+fn callback() -> bool { true }
+fn caller() {
+    assert!({ let callback = || true; callback() });
+    assert!({ let callback = || true; ensure!(callback()); true });
+    assert!({ type T = Local; ensure!(T::run()); true });
+    assert!({ ensure!(U::run()); type U = Local; true });
+    { type Outside = Local; }
+    assert!(Outside::run());
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "U::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "Outside::run"
+                && e.properties.get("rust_local_type_owner").is_none()));
+    }
+
+    #[test]
+    fn rust_expression_macros_preserve_nested_macro_binding_identity() {
+        for body in [
+            "macro_rules! ensure { ($($tokens:tt)*) => {} } ensure!(decoy());",
+            "use custom::ensure; ensure!(decoy());",
+            "use custom::dsl as ensure; assert!({ ensure!(decoy()); true });",
+            "use custom::*; ensure!(decoy());",
+            "extern crate custom as anyhow; anyhow::ensure!(decoy());",
+        ] {
+            let source = format!(
+                "use anyhow::ensure; fn decoy() -> bool {{ true }} fn caller() {{ assert!({{ {body} true }}); }}"
+            );
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert!(
+                !result
+                    .edges
+                    .iter()
+                    .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "decoy"),
+                "nested custom macro invented a call: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_expression_macros_keep_original_generic_and_local_callee_scope() {
+        let source = "fn caller<T>(callback: fn()) { assert!(T::run()); assert!(callback()); }";
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+    }
+
+    #[test]
+    fn rust_expression_macros_do_not_admit_shadowed_or_qualified_custom_macros() {
+        for source in [
+            "macro_rules! assert { ($($tokens:tt)*) => {} } fn caller() { assert!(decoy()); }",
+            "use custom::dsl as ensure; fn caller() { ensure!(decoy()); }",
+            "use custom::assert; fn caller() { assert!(decoy()); }",
+            "fn caller() { custom::assert!(decoy()); }",
+            "mod anyhow {} fn caller() { anyhow::ensure!(decoy()); }",
+            "use custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+            "extern crate anyhow as real_anyhow; extern crate custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+            "extern crate custom as std; fn caller() { std::assert!(decoy()); }",
+        ] {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert!(
+                !result
+                    .edges
+                    .iter()
+                    .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "decoy"),
+                "custom macro invented a call: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_expression_macros_preserve_scoped_turbofish_and_original_lines() {
+        let source = "fn caller() {\n anyhow::ensure!(crate::worker::run::<u8>() &&\n crate::worker::check(), \"message\");\n}\n";
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        let calls: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "CALLS")
+            .collect();
+        assert!(calls
+            .iter()
+            .any(|e| e.properties["callee_path"] == "crate::worker::run" && e.line == 2));
+        assert!(calls
+            .iter()
+            .any(|e| e.properties["callee_path"] == "crate::worker::check" && e.line == 3));
+    }
+
+    #[test]
     fn extract_emits_calls_edges_for_caller_callee_pairs() {
         // A CALLS edge from `hello` (the enclosing
         // function) to the callee text.
@@ -15515,6 +18234,345 @@ mod tests {
             !callee_names.contains("Foo"),
             "must NOT capture type path `Foo`, got {callee_names:?}"
         );
+    }
+
+    #[test]
+    fn rust_slice_iterator_receiver_requires_transparent_typed_binding() {
+        let cases = [
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }", false),
+            ("fn f(items: &[i32]) { items.iter().next(); }", true),
+            ("fn f(items: &[i32; 2]) { items.iter().next(); }", false),
+
+            ("fn f(items: &mut [i32]) { items.iter().next(); }", true),
+            ("fn f() { let items: &[i32] = &[]; items.iter().next(); }", true),
+            ("fn f(items: &[i32]) { let items = custom(); items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { let (items, _) = custom(); items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { for items in custom() { items.iter().next(); } }", false),
+            ("fn f(items: &[i32]) { let f = |items| items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { match custom() { Some(items) => { items.iter().next(); }, _ => {} } }", false),
+            ("fn f(items: &[i32]) { if let Some(items) = custom() { items.iter().next(); } }", false),
+            ("fn f(items: Custom) { items.iter().next(); }", false),
+            ("type Alias = &'static [i32]; fn f(items: Alias) { items.iter().next(); }", false),
+            ("fn f() { let items = &[1,2]; items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { items.iter().map(custom).next(); }", false),
+            ("fn f(items: &mut [i32]) { items.iter_mut().next(); }", false),
+            ("use custom::Iter; fn f(items: &[i32]) { items.iter().next(); }", false),
+            ("trait Iter { fn iter(self) -> Scheduler; } impl Iter for &[i32] { fn iter(self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { inject!(); items.iter().next(); }", false),
+            ("#[custom::inject] struct X; fn f(items: &[i32]) { items.iter().next(); }", false),
+        ];
+        for (source, proven) in cases {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let edge = result
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str())
+                            == Some("next")
+                })
+                .unwrap();
+            let owner = edge
+                .properties
+                .get("receiver_owner")
+                .and_then(|v| v.as_str());
+            assert_eq!(owner, proven.then_some("core::slice::Iter"), "{source}");
+        }
+    }
+
+    #[test]
+    fn unrelated_receiver_calls_do_not_scan_option_field_root() {
+        OPTION_FIELD_ROOT_CHECKS.with(|count| count.set(0));
+        let source = format!(
+            "fn f(value: Unknown) {{ {} }}",
+            "value.uniform();".repeat(256)
+        );
+        extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 0);
+        let source = "fn f(manifest: crate::scene::Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }";
+        extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 1);
+        OPTION_FIELD_ROOT_CHECKS.with(|count| count.set(0));
+        let source = "use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }";
+        extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn consuming_trait_and_wildcard_some_do_not_establish_option_payload() {
+        let source = r#"
+struct Field;
+struct Other;
+enum Alternate<T> { Some(T), None }
+use Alternate::*;
+trait Consume { fn as_ref(self) -> Alternate<Other>; }
+impl Consume for Option<Field> {
+    fn as_ref(self) -> Alternate<Other> { Alternate::Some(Other) }
+}
+struct Manifest { remaster_irradiance: Option<Field> }
+fn f(manifest: Manifest) {
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        let edge = result
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.properties.get("callee_name").and_then(|v| v.as_str())
+                        == Some("uniform")
+            })
+            .unwrap();
+        assert!(edge.properties.get("receiver_owner").is_none());
+        assert!(edge.properties.get("receiver_provenance").is_none());
+    }
+
+    #[test]
+    fn rust_option_receiver_patterns_respect_block_value_items_and_opaque_lookup() {
+        for declaration in [
+            "const field: Other = Other;",
+            "static field: Other = Other;",
+            "struct field;",
+        ] {
+            for before in [true, false] {
+                let body = if before {
+                    format!("{declaration} field.uniform();")
+                } else {
+                    format!("field.uniform(); {declaration}")
+                };
+                for source in [
+                    format!("fn f(value: Option<Field>) {{ match value {{ Some(field) => {{ {body} }}, _ => () }} }}"),
+                    format!("fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => {{ {body} }}, _ => () }} }}"),
+                ] {
+                    let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+                    let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+                    assert!(call.properties.get("receiver_owner").is_none(), "{source}");
+                    assert!(call.properties.get("receiver_provenance").is_none(), "{source}");
+                }
+            }
+        }
+        for (opaque, provenance) in [
+            ("use custom::*;", Some("custom")),
+            ("trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }", None),
+            ("inject_some_and_adapter!();", Some("inject_some_and_adapter")),
+            ("helper::assert!();", Some("helper::assert")),
+            ("#[custom::allow]", Some("custom::allow")),
+            ("macro_rules! println { () => {}; }", Some("println")),
+            ("#[unknown_attribute]", Some("unknown_attribute")),
+            ("use custom::Some;", None),
+        ] {
+            let source = format!("{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}");
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+            let fact = call.properties.get("receiver_provenance");
+            assert_eq!(fact.is_some(), provenance.is_some(), "{source}");
+            if let Some(marker) = provenance {
+                let rendered = fact.unwrap().to_string();
+                assert!(rendered.contains(marker), "{source}: {rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn rust_option_field_patterns_preserve_only_explicit_provenance() {
+        let cases = [
+            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("wasm_bindgen::prelude")),
+            ("use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("crate::scene::Manifest")),
+            ("#[allow(unused)] fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { println!(\"load\"); field.uniform(); } }", Some("")),
+            ("fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("")),
+            ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+        ];
+        for (source, marker) in cases {
+            let result = extract(Language::Rust, source.as_bytes(), "src/gpu.rs").unwrap();
+            let edge = result
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == "CALLS"
+                        && edge
+                            .properties
+                            .get("callee_name")
+                            .and_then(|value| value.as_str())
+                            == Some("uniform")
+                })
+                .unwrap();
+            assert_eq!(
+                edge.properties.get("receiver_provenance").is_some(),
+                marker.is_some(),
+                "{source}"
+            );
+            assert!(edge.properties.get("receiver_owner").is_none(), "{source}");
+            if let Some(marker) = marker {
+                let fact = &edge.properties["receiver_provenance"];
+                assert_eq!(fact["field"], "remaster_irradiance");
+                assert_eq!(fact["adapter"], "as_ref");
+                assert_eq!(fact["pattern"], "Some");
+                let limits = fact["limits"].to_string();
+                if marker.is_empty() {
+                    assert_eq!(
+                        fact["limits"]["globs"].as_array().map(Vec::len),
+                        Some(0),
+                        "{source}"
+                    );
+                    assert_eq!(
+                        fact["limits"]["imports"].as_array().map(Vec::len),
+                        Some(0),
+                        "{source}"
+                    );
+                    assert_eq!(
+                        fact["limits"]["macros"].as_array().map(Vec::len),
+                        Some(0),
+                        "{source}"
+                    );
+                    assert_eq!(
+                        fact["limits"]["attributes"].as_array().map(Vec::len),
+                        Some(0),
+                        "{source}"
+                    );
+                } else {
+                    assert!(limits.contains(marker), "{source}: {limits}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_factory_option_patterns_use_explicit_signatures_without_guessing_wrappers() {
+        for (signature, extra, body, expected, diagnostic) in [
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", Some("Writer"), false),
+            ("Result<Option<Self>, ()>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
+            ("FactoryResult<Option<Self>>", "type FactoryResult<T> = Result<T, ()>;", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
+            ("anyhow::Result<Option<Self>>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
+            ("Option<Other>", "struct Other;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Option<Self>", "use custom::Some;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { let writer = opaque(); writer.upsert(); }", None, false),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { } else { writer.upsert(); }", None, false),
+            ("Option<Self>", "enum Option<T> { Some(T), None }", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Result<Option<Self>, ()>", "enum Result<T,E> { Ok(T), Err(E) }", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
+        ] {
+            let source = format!("{extra} struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }} fn caller() {{ {body} }}");
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
+            assert_eq!(call.properties["receiver_owner"].as_str(), expected, "{source}");
+            assert_eq!(call.properties.get("receiver_factory_pattern").is_some(), diagnostic, "{source}");
+        }
+    }
+
+    #[test]
+    fn rust_anyhow_factory_evidence_is_provisional_and_rejects_namespace_shadows() {
+        let source = "struct Writer; impl Writer { fn open() -> anyhow::Result<Option<Self>> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }";
+        let extract_calls = |source: &str| {
+            extract(Language::Rust, source.as_bytes(), "src/lib.rs")
+                .unwrap()
+                .edges
+                .into_iter()
+                .filter(|edge| edge.properties["callee_name"] == "upsert")
+                .collect::<Vec<_>>()
+        };
+        let calls = extract_calls(source);
+        assert_eq!(
+            calls[0].properties["receiver_anyhow_factory_owner"],
+            "Writer"
+        );
+        assert!(
+            calls[0].properties.get("receiver_owner").is_none(),
+            "parser cannot certify external dependency identity"
+        );
+        for prefix in [
+            "mod anyhow {} ",
+            "use other as anyhow; ",
+            "use other::anyhow; ",
+            "use other::*; ",
+        ] {
+            assert!(
+                extract_calls(&format!("{prefix}{source}"))[0]
+                    .properties
+                    .get("receiver_anyhow_factory_owner")
+                    .is_none(),
+                "{prefix}"
+            );
+        }
+        let shadow = source.replace("writer.upsert();", "let writer = unknown; writer.upsert();");
+        assert!(extract_calls(&shadow)[0]
+            .properties
+            .get("receiver_anyhow_factory_owner")
+            .is_none());
+        let wrapper = source.replace("anyhow::Result", "external::Result");
+        assert!(extract_calls(&wrapper)[0]
+            .properties
+            .get("receiver_anyhow_factory_owner")
+            .is_none());
+    }
+
+    #[test]
+    fn rust_factory_option_patterns_reject_async_generic_and_nearest_shadow() {
+        for source in [
+            "struct Writer; impl Writer { async fn open() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { writer.upsert(); } }",
+            "struct Writer; impl Writer { fn open<T>() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { writer.upsert(); } }",
+            "struct Writer; impl Writer { fn open() -> Option<Self> { loop {} } } fn caller<Writer>() { if let Some(mut writer) = Writer::open() { writer.upsert(); } }",
+            "struct Writer; impl Writer { fn open() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { let f = |writer| writer.upsert(); } }",
+        ] {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
+            assert!(call.properties.get("receiver_owner").is_none(), "{source}");
+            if source.contains("|writer|") {
+                assert!(call.properties.get("receiver_factory_pattern").is_none(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn rust_option_patterns_require_explicit_unshadowed_type_evidence() {
+        let cases = [
+            ("fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }", Some("crate::lighting::Field")),
+            ("fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }", Some("Field")),
+            ("fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let (field, _) = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let closure = |field| field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(manifest: Manifest) { match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", None),
+            ("enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("struct Field; fn f<Field>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }", Some("Wrong")),
+        ];
+        for (source, expected) in cases {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str())
+                            == Some("uniform")
+                })
+                .unwrap();
+            assert_eq!(
+                call.properties
+                    .get("receiver_owner")
+                    .and_then(|v| v.as_str()),
+                expected,
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -15684,6 +18742,58 @@ mod tests {
         assert!(
             us.contains(&("src/lib.rs::Function::build".into(), "Config".into())),
             "let-binding type Config missing: {us:?}"
+        );
+    }
+
+    #[test]
+    fn rust_turbofish_types_are_usages_but_callee_and_type_parameter_are_not_globals() {
+        let result = extract(
+            Language::Rust,
+            br#"
+enum Response { Ready }
+fn parse<T>() {}
+fn plain() { parse::<Response>(); }
+fn scoped() { parse::<crate::Response>(); }
+fn shadowed<Response>() { parse::<Response>(); }
+"#,
+            "src/lib.rs",
+        )
+        .unwrap();
+        let usages = result
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_type == "USAGE")
+            .collect::<Vec<_>>();
+        for caller in ["plain", "scoped", "shadowed"] {
+            let edge = usages
+                .iter()
+                .find(|edge| {
+                    edge.source_qualified_name == format!("src/lib.rs::Function::{caller}")
+                        && edge.properties["ref_name"] == "Response"
+                })
+                .unwrap();
+            assert_eq!(edge.properties["rust_type_reference"], true);
+            assert_eq!(
+                edge.properties
+                    .get("ref_local_binding")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                caller == "shadowed"
+            );
+            if caller == "scoped" {
+                assert_eq!(edge.properties["ref_path"], "crate::Response");
+            }
+        }
+        assert!(!usages
+            .iter()
+            .any(|edge| edge.properties["ref_name"] == "parse"));
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .filter(|edge| edge.edge_type == "CALLS")
+                .count(),
+            3
         );
     }
 
@@ -16258,6 +19368,39 @@ fn plain() {}
                 defines.contains(&("src/lib.rs::Enum::Color".to_string(), qname.to_string())),
                 "missing DEFINES edge Enum::Color -> {qname}: {defines:?}"
             );
+        }
+    }
+
+    #[test]
+    fn enum_variant_spans_cover_complete_items_without_adjacent_variants() {
+        let source = "enum Kind {\n    Unit,\n    Tuple(\n        u32,\n        u64,\n    ),\n    Inline { value: u32 },\n    Branch {\n        condition: bool,\n    },\n    Discriminant =\n        7,\n    Tail,\n}\n";
+        let extraction = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        for (name, start, end) in [
+            ("Unit", 2, 2),
+            ("Tuple", 3, 6),
+            ("Inline", 7, 7),
+            ("Branch", 8, 10),
+            ("Discriminant", 11, 12),
+            ("Tail", 13, 13),
+        ] {
+            let node = extraction
+                .nodes
+                .iter()
+                .find(|n| n.label == "EnumVariant" && n.name == name)
+                .unwrap();
+            assert_eq!(node.qualified_name, format!("src/lib.rs::Kind::{name}"));
+            assert_eq!((node.start_line, node.end_line), (start, end), "{name}");
+            let returned = source
+                .lines()
+                .skip(start as usize - 1)
+                .take((end - start + 1) as usize)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if name == "Branch" {
+                assert!(returned.contains("condition: bool"));
+                assert!(returned.ends_with("    },"));
+                assert!(!returned.contains("Discriminant"));
+            }
         }
     }
 
@@ -17395,6 +20538,198 @@ const mul = (a, b) => compute(a) * b;
     }
 
     #[test]
+    fn ts_call_in_factory_callback_sources_from_module_variable() {
+        let r = ts(
+            r#"
+import { helper } from "./helper";
+export const make = Effect.gen(function* () {
+    helper(platform);
+}).pipe(Effect.withSpan("make"));
+"#,
+            "src/app.ts",
+        );
+        assert!(
+            r.nodes.iter().any(|node| {
+                node.label == "Variable" && node.qualified_name == "src/app.ts::Variable::make"
+            }),
+            "module variable `make` must exist: {:?}",
+            r.nodes
+        );
+        assert!(
+            r.edges.iter().any(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.source_qualified_name == "src/app.ts::Variable::make"
+                    && edge
+                        .properties
+                        .get("callee_name")
+                        .and_then(|value| value.as_str())
+                        == Some("helper")
+            }),
+            "helper call must be attributed to `make`, not the hidden file anchor: {:?}",
+            r.edges
+        );
+    }
+
+    #[test]
+    fn ts_effect_fn_generator_call_keeps_exported_binding_owner() {
+        let r = ts(
+            r#"
+import { Effect } from "effect";
+const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
+    function* (input: { model: string }) { return input.model; },
+);
+export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEnvironment")(
+    function* (input: { model: string }) {
+        const gatewayProvider = input.model.length > 0
+            ? yield* resolveGatewayProviderForModel({ model: input.model })
+            : undefined;
+        return gatewayProvider;
+    },
+);
+"#,
+            "src/routing.ts",
+        );
+        let owner = "src/routing.ts::Function::resolveGatewayRoutedEnvironment";
+        assert!(r.nodes.iter().any(|node| node.qualified_name == owner));
+        let calls: Vec<_> = r
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge
+                        .properties
+                        .get("callee_name")
+                        .and_then(|value| value.as_str())
+                        == Some("resolveGatewayProviderForModel")
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one direct helper call: {calls:?}"
+        );
+        assert_eq!(calls[0].source_qualified_name, owner);
+    }
+
+    #[test]
+    fn js_ts_usage_owner_matches_persisted_named_callback_bindings() {
+        let source = r#"
+import { Effect } from "effect";
+export const make = Effect.gen(function* PreviewManagerMake() { return Boundary; });
+export const exposed = function Internal() { return Boundary; };
+export const task = Effect.fn("task")(function* InternalTask() { return Boundary; });
+function outer() { return wrap(function InternalCallback() { return Boundary; }); }
+function* UnsupportedDeclaration() { yield Boundary; }
+const unsupportedBinding = function* InternalGenerator() { yield Boundary; };
+module.exports = function ExportedInternal() { return Boundary; };
+"#;
+        for language in [Language::JavaScript, Language::TypeScript { tsx: false }] {
+            let r = extract(language, source.as_bytes(), "src/app.ts").unwrap();
+            let usages: Vec<_> = r
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.edge_type == "USAGE"
+                        && edge.properties.get("ref_name").and_then(|v| v.as_str())
+                            == Some("Boundary")
+                })
+                .collect();
+            assert_eq!(usages.len(), 7, "{language:?}: {usages:?}");
+            let expected = [
+                "Variable::make",
+                "Function::exposed",
+                "Function::task",
+                "Function::outer",
+            ];
+            for suffix in expected {
+                let qname = format!("src/app.ts::{suffix}");
+                assert!(
+                    usages
+                        .iter()
+                        .any(|edge| edge.source_qualified_name == qname),
+                    "{qname}: {usages:?}"
+                );
+                assert!(
+                    r.nodes.iter().any(|node| node.qualified_name == qname),
+                    "{qname}: {:?}",
+                    r.nodes
+                );
+            }
+            assert_eq!(
+                usages
+                    .iter()
+                    .filter(|edge| edge.source_qualified_name == "src/app.ts::__file__")
+                    .count(),
+                3
+            );
+            assert!(usages
+                .iter()
+                .all(|edge| edge.source_qualified_name == "src/app.ts::__file__"
+                    || r.nodes
+                        .iter()
+                        .any(|node| node.qualified_name == edge.source_qualified_name)));
+        }
+    }
+
+    #[test]
+    fn js_ts_usage_owner_call_attribution_keeps_binding_instead_of_internal_name() {
+        let r = ts(
+            r#"
+import { Effect } from "effect";
+export const make = Effect.gen(function* PreviewManagerMake() { return helper(); });
+const exposed = function Internal() { return helper(); };
+function outer() { return wrap(function InternalCallback() { return helper(); }); }
+"#,
+            "src/app.ts",
+        );
+        let calls: Vec<_> = r
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("helper")
+            })
+            .collect();
+        assert_eq!(calls.len(), 3);
+        for suffix in ["Variable::make", "Function::exposed", "Function::outer"] {
+            assert!(
+                calls
+                    .iter()
+                    .any(|edge| edge.source_qualified_name == format!("src/app.ts::{suffix}")),
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_effect_fn_requires_package_import_without_shadowing() {
+        for prefix in [
+            "",
+            "const Effect = { fn: () => () => 42 };",
+            "import { type Effect } from 'effect';",
+            "import { Effect } from 'effect'; function shadow() { const { Effect } = local; }",
+            "import { Effect } from 'effect'; function shadow() { const { local: Effect } = local; }",
+
+            "import { Effect } from 'effect'; function unrelated(Effect: unknown) {}",
+            "import { Effect } from 'elsewhere';",
+        ] {
+            let source = format!("{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}");
+            let result = ts(&source, "shadow.ts");
+            assert!(
+                result
+                    .nodes
+                    .iter()
+                    .any(|node| node.name == "value" && node.label == "Variable"),
+                "unproven or shadowed factory must remain a Variable: {prefix}"
+            );
+            assert!(!result
+                .nodes
+                .iter()
+                .any(|node| node.name == "value" && node.label == "Function"));
+        }
+    }
+
+    #[test]
     fn js_imports_named_default_namespace_alias_and_require() {
         let r = js(JS_SRC, "src/a.js");
         // imported_name -> (path, original_name) for IMPORTS edges.
@@ -17505,6 +20840,74 @@ class FileRepo implements Repo {
     fn ts(src: &str, path: &str) -> crate::extract::ExtractionResult {
         let lang = crate::language::language_for_path(std::path::Path::new(path));
         extract(lang, src.as_bytes(), path).unwrap()
+    }
+
+    #[test]
+    fn jsx_components_are_usages_without_intrinsic_member_or_shadow_guesses() {
+        let result = ts(
+            r#"
+import { Boundary } from './boundary';
+export function Render() { return items.map(() => <Boundary><Boundary /></Boundary>); }
+export function Shadow(Boundary: unknown) { return <Boundary />; }
+export function Local() { const Boundary = custom; return <Boundary />; }
+export function Native() { return <div><svg:path /><UI.Boundary /></div>; }
+"#,
+            "view.tsx",
+        );
+        let usages: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.properties["jsx_component"] == true)
+            .collect();
+        assert_eq!(
+            usages.len(),
+            2,
+            "opening and self-closing tags count once: {usages:?}"
+        );
+        assert!(usages
+            .iter()
+            .all(|edge| edge.properties["ref_name"] == "Boundary"
+                && edge.source_qualified_name == "view.tsx::Function::Render"));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI"));
+    }
+
+    #[test]
+    fn jsx_shadowing_follows_active_lexical_scopes_and_hoisting() {
+        let result = ts(
+            r#"
+import { Boundary } from './boundary';
+function NestedFunction() { function inner(Boundary: unknown) { return <Boundary />; } return <Boundary />; }
+function NestedBlock() { { const Boundary = local; } return <Boundary />; }
+function SiblingBlock() { { const Boundary = local; } { return <Boundary />; } }
+function LaterSibling() { const result = <Boundary />; { const Boundary = local; } return result; }
+function LaterLexical() { const result = <Boundary />; const Boundary = local; return result; }
+function TrueLocal() { const Boundary = local; return <Boundary />; }
+function ActiveBlock() { { const Boundary = local; return <Boundary />; } }
+function HoistedVar() { const result = <Boundary />; { var Boundary = local; } return result; }
+function Parameter(Boundary: unknown) { return <Boundary />; }
+"#,
+            "view.tsx",
+        );
+        let owners: std::collections::BTreeSet<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.properties["jsx_component"] == true)
+            .map(|edge| edge.source_qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            owners,
+            [
+                "view.tsx::Function::NestedFunction",
+                "view.tsx::Function::NestedBlock",
+                "view.tsx::Function::SiblingBlock",
+                "view.tsx::Function::LaterSibling"
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]

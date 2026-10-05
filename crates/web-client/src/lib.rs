@@ -5,6 +5,7 @@
 mod frame;
 mod observation_scope;
 mod protocol;
+pub mod record_query;
 pub mod workflow;
 
 pub use observation_scope::{guard_scoped_observation, observation_scope_roots};
@@ -25,7 +26,8 @@ pub const DESCRIBE_NODE_JS: &str = concat!(
 
 pub use frame::{read_frame, write_frame, FrameError, MAX_FRAME_BYTES};
 pub use protocol::{
-    new_request_id, new_session_id, ErrorObject, Handshake, Metrics, Request, Response, SCHEMA,
+    new_request_id, new_session_id, runtime_image_id, ErrorObject, Handshake, Metrics, Request,
+    Response, SCHEMA,
 };
 
 #[cfg(unix)]

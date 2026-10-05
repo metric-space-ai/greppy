@@ -5,6 +5,94 @@ use clap::Subcommand;
 use greppy_core::error::Result;
 use serde_json::json;
 
+// Compile the native URL policy directly: bootstrap must not invent a second,
+// weaker definition of which explicit origins grant local-project access.
+#[allow(dead_code)]
+#[path = "../../../web-runtime/runtime/src/policy.rs"]
+mod bootstrap_policy;
+use bootstrap_policy::{decide_url, NetworkProfile, UrlDecision};
+
+pub(super) fn standalone_profile(spawn: &SupervisorSpawn, read_url: Option<&str>) -> &'static str {
+    let needs_project = read_url
+        .into_iter()
+        .chain(spawn.fixture_url.as_deref())
+        .chain(spawn.search_endpoint.as_deref())
+        .any(|url| {
+            matches!(
+                decide_url(NetworkProfile::Research, url),
+                UrlDecision::Deny { .. }
+            ) && matches!(decide_url(NetworkProfile::Project, url), UrlDecision::Allow)
+        });
+    if needs_project {
+        "project"
+    } else {
+        "research"
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_public_origins_keep_research() {
+        for url in [
+            "https://example.com/",
+            "data:text/html,hello",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/",
+            "http://metadata.google.internal/",
+            "file:///tmp/file",
+        ] {
+            let spawn = SupervisorSpawn {
+                fixture_url: Some(url.into()),
+                search_endpoint: Some(url.into()),
+            };
+            assert_eq!(standalone_profile(&spawn, Some(url)), "research", "{url}");
+        }
+        assert_eq!(
+            standalone_profile(&SupervisorSpawn::default(), None),
+            "research"
+        );
+    }
+
+    #[test]
+    fn only_explicit_loopback_origins_grant_project() {
+        for url in [
+            "http://localhost/x",
+            "http://127.0.0.1/x",
+            "http://127.0.0.2/x",
+            "http://[::1]/x",
+            "http://[::ffff:127.0.0.1]/x",
+        ] {
+            assert_eq!(
+                standalone_profile(&SupervisorSpawn::default(), Some(url)),
+                "project"
+            );
+            assert_eq!(
+                standalone_profile(
+                    &SupervisorSpawn {
+                        fixture_url: Some(url.into()),
+                        search_endpoint: None
+                    },
+                    None
+                ),
+                "project"
+            );
+            assert_eq!(
+                standalone_profile(
+                    &SupervisorSpawn {
+                        fixture_url: None,
+                        search_endpoint: Some(url.into())
+                    },
+                    None
+                ),
+                "project"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum NavCommand {
     /// Navigate the current tab to a URL.
@@ -54,6 +142,16 @@ pub enum NavCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+pub(super) fn requests_json(command: &NavCommand) -> bool {
+    match command {
+        NavCommand::Goto { json, .. }
+        | NavCommand::Open { json, .. }
+        | NavCommand::Back { json, .. }
+        | NavCommand::Forward { json, .. }
+        | NavCommand::Reload { json, .. } => *json,
+    }
 }
 
 pub(super) fn dispatch(command: NavCommand, root: Option<&str>) -> Result<i32> {
@@ -159,9 +257,27 @@ pub(super) fn resolve_or_create_session(
     json: bool,
     create: bool,
 ) -> std::result::Result<String, i32> {
+    resolve_or_create_session_with_spawn(
+        root,
+        session,
+        json,
+        create,
+        &SupervisorSpawn::default(),
+        "project",
+    )
+}
+
+pub(super) fn resolve_or_create_session_with_spawn(
+    root: Option<&str>,
+    session: Option<String>,
+    json: bool,
+    create: bool,
+    spawn: &SupervisorSpawn,
+    profile: &str,
+) -> std::result::Result<String, i32> {
     match resolve_session(root, session) {
         Ok(session) => Ok(session),
-        Err(_) if create => create_session(root, json),
+        Err(_) if create => create_session(root, json, spawn, profile),
         Err(error) => {
             let code = emit_error(json, error).unwrap_or(EXIT_WEB_INVALID);
             Err(code)
@@ -169,13 +285,21 @@ pub(super) fn resolve_or_create_session(
     }
 }
 
-fn create_session(root: Option<&str>, json: bool) -> std::result::Result<String, i32> {
-    match rpc_response(
-        root,
-        "web.session.create",
-        json!({ "profile": "project" }),
-        None,
-    ) {
+fn create_session(
+    root: Option<&str>,
+    json: bool,
+    spawn: &SupervisorSpawn,
+    profile: &str,
+) -> std::result::Result<String, i32> {
+    let response = supervisor_for_session(root, spawn, None).and_then(|ctx| {
+        rpc_on_response(
+            &ctx,
+            "web.session.create",
+            json!({ "profile": profile }),
+            None,
+        )
+    });
+    match response {
         Err(error) => {
             let code = emit_error(json, error).unwrap_or(EXIT_WEB_UNAVAILABLE);
             Err(code)
