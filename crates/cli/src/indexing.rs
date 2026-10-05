@@ -2501,6 +2501,7 @@ struct EmbeddingResumeCursor {
     model_contract: String,
     prompt_version: String,
     task_profile: String,
+    max_input_tokens: Option<usize>,
     prefixes: Vec<String>,
     next_node_offset: usize,
 }
@@ -2528,6 +2529,7 @@ fn embedding_resume_contract(
         model_contract: embedding_query_cache_key(cfg),
         prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
         task_profile: greppy_embed_native::CODE_RETRIEVAL_PROFILE.into(),
+        max_input_tokens: cfg.max_length,
         prefixes,
         next_node_offset: 0,
     }
@@ -2590,6 +2592,7 @@ mod embedding_resume_cursor_tests {
             model_contract: "model|prompt|task|weights-a".into(),
             prompt_version: "prompt-v3".into(),
             task_profile: "task".into(),
+            max_input_tokens: Some(2048),
             prefixes: vec!["src".into()],
             next_node_offset: 0,
         }
@@ -2620,6 +2623,10 @@ mod embedding_resume_cursor_tests {
             },
             EmbeddingResumeCursor {
                 task_profile: "other-task".into(),
+                ..saved.clone()
+            },
+            EmbeddingResumeCursor {
+                max_input_tokens: Some(1024),
                 ..saved.clone()
             },
             EmbeddingResumeCursor {
