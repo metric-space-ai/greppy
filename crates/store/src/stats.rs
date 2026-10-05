@@ -78,10 +78,7 @@ impl GraphStats {
 impl Store {
     /// Complete incoming hub degrees without decoding edge properties or
     /// sorting/materializing every edge once for each relationship type.
-    pub fn incoming_degrees(
-        &self,
-        project: &str,
-    ) -> Result<std::collections::HashMap<i64, usize>> {
+    pub fn incoming_degrees(&self, project: &str) -> Result<std::collections::HashMap<i64, usize>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT target_id, COUNT(*) FROM edges
              WHERE project = ?1
@@ -360,7 +357,10 @@ mod tests {
         fn check(store: &Store) {
             let mut expected = std::collections::HashMap::<i64, usize>::new();
             for kind in ["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"] {
-                for edge in store.list_edges_by_type("p", kind, usize::MAX >> 1).unwrap() {
+                for edge in store
+                    .list_edges_by_type("p", kind, usize::MAX >> 1)
+                    .unwrap()
+                {
                     *expected.entry(edge.target_id).or_default() += 1;
                 }
             }
@@ -370,51 +370,113 @@ mod tests {
         let (mut base, a, b, st) = seed("p");
         for kind in ["USAGE", "TYPE_REF", "IMPORTS", "IGNORED"] {
             base.insert_edge(&NewEdge {
-                project: "p".into(), source_id: a, target_id: b,
-                edge_type: kind.into(), properties: serde_json::json!({"detail": "retained"}),
-            }).unwrap();
+                project: "p".into(),
+                source_id: a,
+                target_id: b,
+                edge_type: kind.into(),
+                properties: serde_json::json!({"detail": "retained"}),
+            })
+            .unwrap();
         }
         check(&base);
         assert_eq!(base.incoming_degrees("p").unwrap()[&b], 4);
         let scratch = tempfile::tempdir().unwrap();
         let base_path = scratch.path().join("base.db");
-        base.conn().execute("VACUUM main INTO ?1", [base_path.to_str().unwrap()]).unwrap();
+        base.conn()
+            .execute("VACUUM main INTO ?1", [base_path.to_str().unwrap()])
+            .unwrap();
         let bytes = std::fs::read(&base_path).unwrap();
-        let mut overlay = Store::open_overlay(&base_path, &scratch.path().join("delta.db"), &crate::VisibilityIndex::default()).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &crate::VisibilityIndex::default(),
+        )
+        .unwrap();
         check(&overlay);
-        let replacement = overlay.insert_node(&NewNode {
-            project: "p".into(), label: "Function".into(), name: "A".into(),
-            qualified_name: "p.A".into(), file_path: "a.rs".into(),
-            start_line: 1, end_line: 5, properties: serde_json::json!({}),
-        }).unwrap();
-        overlay.insert_edge(&NewEdge {
-            project: "p".into(), source_id: replacement, target_id: -b,
-            edge_type: "CALLS".into(), properties: serde_json::json!({"replacement": true}),
-        }).unwrap();
+        let replacement = overlay
+            .insert_node(&NewNode {
+                project: "p".into(),
+                label: "Function".into(),
+                name: "A".into(),
+                qualified_name: "p.A".into(),
+                file_path: "a.rs".into(),
+                start_line: 1,
+                end_line: 5,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        overlay
+            .insert_edge(&NewEdge {
+                project: "p".into(),
+                source_id: replacement,
+                target_id: -b,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"replacement": true}),
+            })
+            .unwrap();
         check(&overlay);
-        assert_eq!(overlay.incoming_degrees("p").unwrap()[&-b], 4, "a Delta duplicate shadows its Base edge instead of counting twice");
-        overlay.conn().execute("INSERT INTO js_ts_reference_override_files(project,file_path) VALUES ('p','a.rs')", []).unwrap();
+        assert_eq!(
+            overlay.incoming_degrees("p").unwrap()[&-b],
+            4,
+            "a Delta duplicate shadows its Base edge instead of counting twice"
+        );
+        overlay
+            .conn()
+            .execute(
+                "INSERT INTO js_ts_reference_override_files(project,file_path) VALUES ('p','a.rs')",
+                [],
+            )
+            .unwrap();
         check(&overlay);
-        assert_eq!(overlay.incoming_degrees("p").unwrap()[&-b], 1, "masked Base relations are absent; Delta relation remains");
-        overlay.insert_edge(&NewEdge {
-            project: "p".into(), source_id: -b, target_id: -st,
-            edge_type: "CALLS".into(), properties: serde_json::json!({}),
-        }).unwrap();
-        for key in ["greppy.js_ts_caller_override_files.p", "greppy.rust_usage_override_files.p"] {
-            overlay.conn().execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?1,?2)", [key, "[\"b.rs\"]"]).unwrap();
+        assert_eq!(
+            overlay.incoming_degrees("p").unwrap()[&-b],
+            1,
+            "masked Base relations are absent; Delta relation remains"
+        );
+        overlay
+            .insert_edge(&NewEdge {
+                project: "p".into(),
+                source_id: -b,
+                target_id: -st,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        for key in [
+            "greppy.js_ts_caller_override_files.p",
+            "greppy.rust_usage_override_files.p",
+        ] {
+            overlay
+                .conn()
+                .execute(
+                    "INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?1,?2)",
+                    [key, "[\"b.rs\"]"],
+                )
+                .unwrap();
         }
         check(&overlay);
         drop(overlay);
-        let visibility: crate::VisibilityIndex = serde_json::from_value(serde_json::json!({"base_commit":"fixture","dirty":[],"deleted":["b.rs"]})).unwrap();
-        let hidden = Store::open_overlay_read_only(&base_path, &scratch.path().join("delta.db"), &visibility).unwrap();
+        let visibility: crate::VisibilityIndex = serde_json::from_value(
+            serde_json::json!({"base_commit":"fixture","dirty":[],"deleted":["b.rs"]}),
+        )
+        .unwrap();
+        let hidden = Store::open_overlay_read_only(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &visibility,
+        )
+        .unwrap();
         check(&hidden);
         assert!(hidden.incoming_degrees("p").unwrap().is_empty());
-        assert_eq!(std::fs::read(&base_path).unwrap(), bytes, "degree query never writes the immutable Base");
+        assert_eq!(
+            std::fs::read(&base_path).unwrap(),
+            bytes,
+            "degree query never writes the immutable Base"
+        );
     }
 
     #[test]
     fn node_counts_by_label_grouped_and_sorted() {
-
         let (s, ..) = seed("p");
         let got = s.node_counts_by_label("p").unwrap();
         assert_eq!(

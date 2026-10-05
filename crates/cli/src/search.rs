@@ -1721,13 +1721,9 @@ fn wait_for_embedding_publication(
             prefixes,
         )
         .ok_or_else(|| {
-            let progress = embedding_progress_value(
-                effective_root,
-                cfg,
-                requested_generation,
-            );
+            let progress = embedding_progress_value(effective_root, cfg, requested_generation);
             let detail = background_embedding_failure(progress.clone())
-            .unwrap_or_else(|| "the embedding process could not be started".into());
+                .unwrap_or_else(|| "the embedding process could not be started".into());
             semantic_embedding_error(effective_root, Some(&progress), detail)
         })?;
         let initial_job = read_background_job(launch.path());
@@ -1869,13 +1865,21 @@ fn semantic_embedding_error(
 ) -> Error {
     let deferred = job.is_some_and(|job| {
         job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
-            && job.get("preparation_failure_kind").and_then(serde_json::Value::as_str)
+            && job
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
                 == Some("admission_deferred")
     });
     if deferred {
-        Error::AdmissionDeferred { root: root.to_path_buf(), detail }
+        Error::AdmissionDeferred {
+            root: root.to_path_buf(),
+            detail,
+        }
     } else {
-        Error::Index(format!("semantic embedding failed for {}: {detail}", root.display()))
+        Error::Index(format!(
+            "semantic embedding failed for {}: {detail}",
+            root.display()
+        ))
     }
 }
 
@@ -1883,10 +1887,27 @@ fn semantic_embedding_error(
 #[test]
 fn semantic_preparation_preserves_typed_admission_and_real_failure() {
     let root = std::path::Path::new("/repo");
-    let admission = serde_json::json!({"state":"failed","preparation_failure_kind":"admission_deferred"});
-    assert!(matches!(semantic_embedding_error(root, Some(&admission), "No work started; another owner".into()), Error::AdmissionDeferred { .. }));
-    for job in [None, Some(serde_json::json!({"state":"failed","preparation_failure_kind":"preparation_failed"})), Some(serde_json::json!({"state":"running","preparation_failure_kind":"admission_deferred"}))] {
-        assert!(matches!(semantic_embedding_error(root, job.as_ref(), "GPU load failed".into()), Error::Index(_)));
+    let admission =
+        serde_json::json!({"state":"failed","preparation_failure_kind":"admission_deferred"});
+    assert!(matches!(
+        semantic_embedding_error(
+            root,
+            Some(&admission),
+            "No work started; another owner".into()
+        ),
+        Error::AdmissionDeferred { .. }
+    ));
+    for job in [
+        None,
+        Some(serde_json::json!({"state":"failed","preparation_failure_kind":"preparation_failed"})),
+        Some(
+            serde_json::json!({"state":"running","preparation_failure_kind":"admission_deferred"}),
+        ),
+    ] {
+        assert!(matches!(
+            semantic_embedding_error(root, job.as_ref(), "GPU load failed".into()),
+            Error::Index(_)
+        ));
     }
 }
 
