@@ -100,15 +100,38 @@ fn concurrent_journal(fixture: &Fixture) -> PathBuf {
         .join("edit-journal")
 }
 
-fn bounded_output(mut child: std::process::Child) -> Output {
+struct OwnedEditChild(Option<std::process::Child>);
+impl std::ops::Deref for OwnedEditChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for OwnedEditChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for OwnedEditChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn bounded_output(mut child: OwnedEditChild) -> Output {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+            return child.0.take().unwrap().wait_with_output().unwrap();
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
             panic!(
                 "owned concurrent edit exceeded test deadline: {}",
                 combined(&output)
@@ -118,15 +141,17 @@ fn bounded_output(mut child: std::process::Child) -> Output {
     }
 }
 
-fn spawn_edit(fixture: &Fixture, args: &[&str]) -> std::process::Child {
-    fixture
-        .command()
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+fn spawn_edit(fixture: &Fixture, args: &[&str]) -> OwnedEditChild {
+    OwnedEditChild(Some(
+        fixture
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ))
 }
 
 fn wait_for_file_owner(fixture: &Fixture, file: &str) {
@@ -159,7 +184,7 @@ fn wait_for_file_owner(fixture: &Fixture, file: &str) {
     }
 }
 
-fn release_stdin(mut child: std::process::Child, replacement: &[u8]) -> Output {
+fn release_stdin(mut child: OwnedEditChild, replacement: &[u8]) -> Output {
     use std::io::Write as _;
     child.stdin.take().unwrap().write_all(replacement).unwrap();
     bounded_output(child)
@@ -169,30 +194,35 @@ fn release_stdin(mut child: std::process::Child, replacement: &[u8]) -> Output {
 fn concurrent_six_call_report_and_dozen_agents_preserve_every_edit_and_undo() {
     for count in [6, 32] {
         let fixture = Fixture::new("parallel-edit-round");
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
+        use std::io::Write as _;
         for i in 0..count {
             std::fs::write(fixture.repo.join(format!("f{i}.txt")), "A B\n").unwrap();
         }
-        let mut threads = Vec::new();
+        let mut children = Vec::new();
         for i in 0..count {
-            // Six-call original report includes two edits to one file.
             let (file, old, new) = if count == 6 && i == 5 {
                 ("f0.txt".to_string(), "B", "Y")
             } else {
                 (format!("f{i}.txt"), "A", "X")
             };
-            let mut command = fixture.command();
-            command
-                .args(["replace-text", &file, old, new])
-                .stdin(Stdio::null());
-            let barrier = barrier.clone();
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                command.output().unwrap()
-            }));
+            let child = spawn_edit(&fixture, &["replace-text", &file, old]);
+            if !(count == 6 && i == 5) {
+                wait_for_file_owner(&fixture, &file);
+            }
+            children.push((child, new));
         }
-        for thread in threads {
-            let output = thread.join().unwrap();
+        // All disjoint targets demonstrably own their locks simultaneously.
+        // Release payloads together, then wait with bounded kill/reap guards.
+        for (child, new) in &mut children {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(new.as_bytes())
+                .unwrap();
+        }
+        for (child, _) in children {
+            let output = bounded_output(child);
             assert!(output.status.success(), "{}", combined(&output));
         }
         for i in 0..count {

@@ -105,25 +105,20 @@ fn edit_lock_until(
 // the file lock. The grammar still performs its full path/syntax/CAS checks
 // after this lock is acquired, so no pre-wait snapshot is ever published.
 fn edit_lock_identity(path: &std::path::Path) -> std::path::PathBuf {
-    let mut normalized = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
+    // Existing paths must resolve symlinks before interpreting `..`, exactly
+    // like file reads; lexical folding first can give one target two locks.
+    if let Ok(identity) = path.canonicalize() {
+        return identity;
     }
-    let mut ancestor = normalized.as_path();
+    let mut ancestor = path;
     let mut tail = Vec::new();
     while ancestor.canonicalize().is_err() {
         let Some(name) = ancestor.file_name() else {
-            return normalized;
+            return path.to_path_buf();
         };
         tail.push(name.to_os_string());
         let Some(parent) = ancestor.parent() else {
-            return normalized;
+            return path.to_path_buf();
         };
         ancestor = parent;
     }
@@ -160,7 +155,25 @@ fn acquire_edit_command_locks(
     let barrier = edit_lock_until(journal, "transaction", mode, deadline)?;
     let mut files = Vec::new();
     if let Some(file) = file {
-        let identity = edit_lock_identity(&file_operand_path(file_base, file));
+        let operand = file_operand_path(file_base, file);
+        // Write's resolver deliberately normalizes its create path lexically.
+        // Follow that resolver's path semantics rather than the read semantics.
+        let operand = if matches!(command, EditCommand::Write { .. }) {
+            let mut normalized = std::path::PathBuf::new();
+            for component in operand.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other.as_os_str()),
+                }
+            }
+            normalized
+        } else {
+            operand
+        };
+        let identity = edit_lock_identity(&operand);
         let name = format!(
             "file-{}",
             edit_sha256_hex(identity.as_os_str().as_encoded_bytes())
@@ -5003,6 +5016,19 @@ mod patch_rollback_tests {
         assert!(begin.elapsed() >= std::time::Duration::from_millis(30));
         drop(first);
         assert!(acquire_edit_command_locks(&journal, &command("a.txt"), dir.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_identity_resolves_symlinks_before_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("real/child")).unwrap();
+        std::fs::write(dir.path().join("real/a.txt"), "A").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real/child"), dir.path().join("link")).unwrap();
+        assert_eq!(
+            edit_lock_identity(&dir.path().join("link/../a.txt")),
+            edit_lock_identity(&dir.path().join("real/a.txt"))
+        );
     }
 
     #[test]
