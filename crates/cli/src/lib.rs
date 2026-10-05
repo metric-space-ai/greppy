@@ -7090,6 +7090,7 @@ fn combined_inference_gpu_memory() -> u64 {
 #[derive(Default)]
 struct DirtyOverlay {
     git_available: bool,
+    diagnostic: Option<&'static str>,
     clean: bool,
     total: usize,
     staged_count: usize,
@@ -7137,7 +7138,9 @@ impl DirtyOverlay {
             .collect::<Vec<_>>();
         serde_json::json!({
             "git_available": self.git_available,
-            "clean": self.clean,
+            "clean": self.git_available.then_some(self.clean),
+            "assessment": if self.git_available { "assessed" } else { "unknown" },
+            "diagnostic": self.diagnostic,
             "total": self.total,
             "staged_count": self.staged_count,
             "unstaged_count": self.unstaged_count,
@@ -7162,12 +7165,22 @@ fn dirty_overlay(root_path: &std::path::Path) -> Result<DirtyOverlay> {
             "--untracked-files=all",
         ])
         .current_dir(root_path)
-        .output()
-        .map_err(|e| Error::io("spawn git status for dirty overlay", e))?;
+        .output();
+    let out = match out {
+        Ok(out) => out,
+        // NotFound can also mean the working directory disappeared. Only a
+        // valid repository directory makes a missing executable advisory.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && root_path.is_dir() => {
+            return Ok(DirtyOverlay {
+                diagnostic: Some("git executable unavailable; repository dirtiness is unknown"),
+                ..DirtyOverlay::default()
+            });
+        }
+        Err(e) => return Err(Error::io("spawn git status for dirty overlay", e)),
+    };
     if !out.status.success() {
         return Ok(DirtyOverlay {
-            git_available: false,
-            clean: true,
+            diagnostic: Some("git status unsuccessful; repository dirtiness is unknown"),
             ..DirtyOverlay::default()
         });
     }

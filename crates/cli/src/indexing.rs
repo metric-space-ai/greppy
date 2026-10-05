@@ -1175,6 +1175,9 @@ fn dispatch_index_health_with_detail(
             if let Some(daemons) = &inference_daemons {
                 print_inference_daemons(daemons);
             }
+            if let Some(diagnostic) = dirty_overlay.diagnostic {
+                println!("dirty_overlay: {diagnostic}");
+            }
             if dirty_overlay.git_available && !dirty_overlay.clean {
                 println!(
                     "dirty_overlay: total={} staged={} unstaged={} untracked={} deleted={} renamed={} ignored={}",
@@ -1501,6 +1504,9 @@ fn dispatch_index_health_with_detail(
             }
         } else {
             println!("project_present: false");
+        }
+        if let Some(diagnostic) = dirty_overlay.diagnostic {
+            println!("dirty_overlay: {diagnostic}");
         }
         if dirty_overlay.git_available && !dirty_overlay.clean {
             println!(

@@ -1718,6 +1718,58 @@ fn diagnostics_json_exposes_provider_incompleteness() {
 }
 
 #[test]
+fn doctor_json_without_git_preserves_inference_diagnostics() {
+    let (root, _scratch) = fresh_dir("doctor-without-git");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let empty_path = root.join("empty-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run_with_env(
+        &["doctor", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &[("PATH", empty_path.to_str().unwrap())],
+    );
+    assert_eq!(code, 1, "stderr={err}\nstdout={out}");
+    assert!(err.is_empty(), "stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "no_index");
+    assert_eq!(v["dirty_overlay"]["git_available"], false);
+    assert!(v["dirty_overlay"]["clean"].is_null());
+    assert_eq!(v["dirty_overlay"]["assessment"], "unknown");
+    assert!(v["dirty_overlay"]["diagnostic"]
+        .as_str()
+        .unwrap()
+        .contains("git executable unavailable"));
+    assert!(v["inference"]["registry"].is_object());
+    assert!(v["inference"]["daemons"].is_object());
+    assert!(v["inference"]["models"].is_object());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_git_spawn_permission_error_remains_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, _scratch) = fresh_dir("doctor-git-permission");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let path = root.join("path");
+    std::fs::create_dir_all(&path).unwrap();
+    let git = path.join("git");
+    std::fs::write(&git, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (code, out, err) = run_with_env(
+        &["doctor", "--json", "--diagnostics"],
+        &repo,
+        &root.join("store"),
+        &[("PATH", path.to_str().unwrap())],
+    );
+    assert_eq!(code, 73, "stderr={err}\nstdout={out}");
+    assert!(err.contains("spawn git status for dirty overlay"), "{err}");
+}
+
+#[test]
 fn doctor_json_reports_missing_index_as_structured_status() {
     let (root, _scratch) = fresh_dir("doctor-no-index");
     let repo = root.join("repo");
@@ -1740,6 +1792,14 @@ fn doctor_json_reports_missing_index_as_structured_status() {
     assert_eq!(v["healthy"], false);
     assert_eq!(v["store_exists"], false);
     assert_eq!(v["project"], "repo");
+    // This fixture has a .git directory but no Git repository metadata.
+    assert_eq!(v["dirty_overlay"]["git_available"], false);
+    assert!(v["dirty_overlay"]["clean"].is_null());
+    assert_eq!(v["dirty_overlay"]["assessment"], "unknown");
+    assert!(v["dirty_overlay"]["diagnostic"]
+        .as_str()
+        .unwrap()
+        .contains("git status unsuccessful"));
     assert_eq!(v["project_present"], false);
     assert_eq!(v["fresh"], false);
     assert_eq!(v["store_cow"]["mode"], "single");
