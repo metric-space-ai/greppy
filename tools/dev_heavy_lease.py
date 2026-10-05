@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import threading
+import time
 
 
 class LeaseWitness:
@@ -39,7 +40,12 @@ class LeaseWitness:
                 try:
                     client.settimeout(0.2)
                     data = b""
-                    while b"\n" not in data and len(data) < 2048:
+                    deadline = time.monotonic() + 0.5
+                    while b"\n" not in data and len(data) < 2048 and not self.stop.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        client.settimeout(min(0.2, remaining))
                         part = client.recv(2048 - len(data))
                         if not part:
                             break
