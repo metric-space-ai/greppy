@@ -1127,7 +1127,11 @@ fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() 
     #[cfg(unix)]
     let sparse = {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(&path).unwrap().blocks().saturating_mul(512) < small_tail / 2
+        std::fs::metadata(&path)
+            .unwrap()
+            .blocks()
+            .saturating_mul(512)
+            < small_tail / 2
     };
     #[cfg(not(unix))]
     let sparse = false;
@@ -1137,10 +1141,7 @@ fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() 
         small_tail
     };
     if sparse {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(tail_offset)).unwrap();
         file.write_all(b"\xff").unwrap();
         drop(file);
