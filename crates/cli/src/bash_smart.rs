@@ -30,6 +30,28 @@ pub(crate) struct ExpandWindow {
     pub limit: Option<usize>,
     pub max_bytes: Option<usize>,
 }
+fn expand_retry_command(
+    id: &str,
+    window: ExpandWindow,
+    json: bool,
+    offset: Option<usize>,
+) -> String {
+    let mut command = format!("greppy expand {id}");
+    if json {
+        command.push_str(" --json");
+    }
+    if let Some(offset) = offset {
+        command.push_str(&format!(" --offset {offset}"));
+    }
+    if let Some(limit) = window.limit {
+        command.push_str(&format!(" --limit {limit}"));
+    }
+    if let Some(max_bytes) = window.max_bytes {
+        command.push_str(&format!(" --max-bytes {max_bytes}"));
+    }
+    command
+}
+
 const EMBED_BATCH_LINES: usize = 16;
 const NOVELTY_TOP_K: usize = 3;
 const NOVELTY_DISTANCE_FLOOR: f32 = 0.12;
@@ -1096,12 +1118,12 @@ pub(crate) fn expand(
                 "next": next.as_ref().zip(next_line).map(|(id, line)| serde_json::json!({
                         "id": id,
                         "line": line,
-                        "command": format!("greppy expand {id}"),
+                        "command": expand_retry_command(id, window, true, None),
                     })).or_else(|| fallback_offset.zip(next_line).map(|(offset, line)| serde_json::json!({
                         "id": pack.id,
                         "line": line,
                         "offset": offset,
-                        "command": format!("greppy expand {} --offset {offset}", pack.id),
+                        "command": expand_retry_command(&pack.id, window, true, Some(offset)),
                         "warning": "continuation allocation failed; retry the immutable source pack at the exact saved-line offset",
                     }))),
             }))
@@ -1133,15 +1155,16 @@ pub(crate) fn expand(
     if !remaining_ranges.is_empty() {
         if let (Some(next_id), Some(next_line)) = (next, next_line) {
             let remaining = range_line_count(&remaining_ranges);
+            let command = expand_retry_command(&next_id, window, false, None);
             let _ = writeln!(
                 stdout,
-                "… {remaining} lines — greppy expand {next_id} continues at {next_line}"
+                "… {remaining} lines — {command} continues at {next_line}"
             );
         } else if let Some(offset) = fallback_offset {
+            let command = expand_retry_command(&pack.id, window, false, Some(offset));
             let _ = writeln!(
                 stdout,
-                "continuation allocation failed; retry without loss: greppy expand {} --offset {offset}",
-                pack.id
+                "continuation allocation failed; retry without loss: {command}"
             );
         }
     }

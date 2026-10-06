@@ -259,6 +259,13 @@ fn expand_global_window_is_deterministic_and_owns_truthful_continuation_metadata
     assert!(page.get("truncated").is_none(), "{page}");
     assert!(page.get("total").is_none(), "{page}");
     assert!(page["next"]["id"].as_str().is_some(), "{page}");
+    let retry = page["next"]["command"].as_str().unwrap();
+    assert!(
+        retry.contains("--json")
+            && retry.contains("--limit 200")
+            && retry.contains("--max-bytes 30000"),
+        "continuation must retain its output contract: {retry}"
+    );
     assert_eq!(page["next"]["line"], page["end_line"].as_u64().unwrap() + 1);
     assert!(first.stdout.len() <= 30_000, "{}", first.stdout.len());
 
