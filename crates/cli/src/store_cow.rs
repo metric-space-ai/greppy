@@ -1856,6 +1856,12 @@ pub(crate) fn try_reuse_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
 ) -> Result<Option<PreparedBase>> {
+    if !workspace
+        .baseline_is_clean()
+        .map_err(|error| Error::Invalid(error.to_string()))?
+    {
+        return Ok(None);
+    }
     let identity = base_identity(workspace)?;
     let layout = BaseStoreLayout::new(shared_data_root, &identity)
         .map_err(|error| Error::io("construct Base Store layout", error))?;
@@ -2056,6 +2062,14 @@ pub(crate) fn prepare_base_store(
     deadline: Option<std::time::Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
+    if !workspace
+        .baseline_is_clean()
+        .map_err(|error| Error::Invalid(error.to_string()))?
+    {
+        return Err(Error::Invalid(
+            "dirty baseline requires a private agent store".into(),
+        ));
+    }
     prepare_base_store_paths(
         BaseSourcePaths {
             repo_root: workspace.repo_root(),

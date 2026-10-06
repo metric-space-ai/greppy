@@ -40,7 +40,7 @@ use crate::agent_tui::{
 const PROTOCOL_VERSION: u64 = 1;
 const AUTH_METHOD_ID: &str = "greppy.env";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
-const DEFAULT_MAX_TURNS: usize = 40;
+const DEFAULT_MAX_TURNS: usize = 0;
 
 thread_local! {
     static ACTIVE_TOOL_CALL: RefCell<Option<String>> = const { RefCell::new(None) };

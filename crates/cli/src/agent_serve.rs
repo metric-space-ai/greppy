@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use greppy_agent::{AgentConfig, Client, GreppyEnv, Usage};
+use greppy_agent::{AgentConfig, AgentWorkspace, Client, GreppyEnv, RunOutcome, Usage};
 use serde_json::{json, Value};
 
 use crate::agent::{spawn_session_worker, SessionSummary, SessionWorkerParts};
@@ -24,9 +24,7 @@ static SIGNALS: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn record_signal(_: libc::c_int) {
     let prior = SIGNALS.fetch_add(1, Ordering::SeqCst);
-    if prior > 0 {
-        unsafe { libc::_exit(130) };
-    }
+    let _ = prior; // Repeated signals remain graceful so proposal cleanup can run.
 }
 
 struct SignalGuard {
@@ -103,6 +101,7 @@ pub(crate) struct ServeLaunch<'a> {
     pub(crate) sandbox: &'a str,
     pub(crate) idle_timeout_secs: Option<u64>,
     pub(crate) json_session: &'a JsonSession,
+    pub(crate) workspace: &'a AgentWorkspace,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -154,6 +153,9 @@ pub(crate) fn run(
     let mut next_prompt = 1u64;
     let mut quit = false;
     let mut blocked_error = None::<String>;
+    let mut final_answer = String::new();
+    let mut proposal_ref = None::<String>;
+    let mut checkpoint_sequence = 0u64;
     let mut usage = record.usage;
     let mut turns = record.turns;
     let mut current_model = launch.model.to_string();
@@ -169,238 +171,306 @@ pub(crate) fn run(
         next_prompt = next_prompt.saturating_add(1);
     }
 
-    loop {
-        let intake = handle.intake.poll(POLL_INTERVAL);
-        let mut worker_error_event = false;
-        if !intake.text.is_empty() {
-            emit(&mut server, emitter, text_event(&intake.text));
-            last_activity = Instant::now();
-        }
-        for event in intake.discrete {
-            match event {
-                SessionEvent::SetupReady => {
-                    set_phase(&mut server, emitter, &mut phase, Phase::Idle);
-                    last_activity = Instant::now();
-                }
-                SessionEvent::SetupBlocked(message) | SessionEvent::GatewayRequired(message) => {
-                    set_phase(&mut server, emitter, &mut phase, Phase::Blocked);
-                    emit(&mut server, emitter, error_event(&message));
-                    blocked_error = Some(message);
-                    quit = true;
-                }
-                SessionEvent::Configuration {
-                    endpoint, model, ..
-                } => {
-                    current_endpoint = endpoint;
-                    current_model = model;
-                }
-                SessionEvent::ToolStart { id, summary } => {
-                    emit(&mut server, emitter, tool_start_event(&id, "", &summary));
-                    last_activity = Instant::now();
-                }
-                SessionEvent::ToolFinish {
-                    id,
-                    failed,
-                    elapsed_ms,
-                    preview,
-                } => {
-                    emit(
-                        &mut server,
-                        emitter,
-                        tool_finish_event(&id, failed, elapsed_ms, &preview),
-                    );
-                    last_activity = Instant::now();
-                }
-                SessionEvent::Done {
-                    input_tokens,
-                    output_tokens,
-                    cache_read,
-                    cache_write,
-                    turns: prompt_turns,
-                    stop,
-                    ..
-                } => {
-                    let turn_usage = Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_input_tokens: cache_read,
-                        cache_creation_input_tokens: cache_write,
-                    };
-                    add_usage(&mut usage, &turn_usage);
-                    turns = turns.saturating_add(prompt_turns);
-                    emit(
-                        &mut server,
-                        emitter,
-                        turn_complete_event(&stop, &turn_usage),
-                    );
-                    set_phase(&mut server, emitter, &mut phase, Phase::Idle);
-                    last_activity = Instant::now();
-                }
-                SessionEvent::Error(message) => {
-                    emit(&mut server, emitter, error_event(&message));
-                    set_phase(&mut server, emitter, &mut phase, Phase::Idle);
-                    blocked_error = Some(message);
-                    quit = true;
-                    worker_error_event = true;
-                }
-                SessionEvent::Warning(message) | SessionEvent::EndpointRejected { message, .. } => {
-                    eprintln!("greppy agent serve: {message}");
-                }
-                SessionEvent::SetupProgress { .. }
-                | SessionEvent::BackgroundProgress { .. }
-                | SessionEvent::BackgroundReady
-                | SessionEvent::Text(_)
-                | SessionEvent::Thinking(_)
-                | SessionEvent::Compacted { .. } => {}
-            }
-        }
-        if worker_error_event || handle.join.is_finished() {
-            break;
-        }
-
-        for incoming in server.poll() {
-            let Incoming::Request {
-                conn,
-                id,
-                method,
-                params,
-            } = incoming
-            else {
-                continue;
-            };
-            last_activity = Instant::now();
-            match method.as_str() {
-                "session/describe" => server.reply(
-                    conn,
-                    id,
-                    Ok(describe(
-                        &record,
-                        launch,
-                        &current_model,
-                        &current_endpoint,
-                        phase,
-                        turns,
-                        &usage,
-                        queue.len(),
-                        &socket_path,
-                        store,
-                    )),
-                ),
-                "session/subscribe" => server.reply(conn, id, Ok(json!({"subscribed":true}))),
-                "turn/start" => {
-                    let text = params
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim();
-                    if text.is_empty() {
-                        server.reply(conn, id, Err(RpcError::new(-32602, "empty prompt")));
-                        continue;
-                    }
-                    if quit {
-                        server.reply(conn, id, Err(RpcError::new(-32000, "session is quitting")));
-                        continue;
-                    }
-                    let source = params
-                        .get("source")
-                        .and_then(Value::as_str)
-                        .filter(|source| !source.trim().is_empty())
-                        .unwrap_or("remote")
-                        .to_string();
-                    let prompt_id = format!("p-{next_prompt}");
-                    let position = match enqueue_prompt(
-                        &mut queue,
-                        PendingPrompt {
-                            id: prompt_id.clone(),
-                            text: text.to_string(),
-                            source,
-                        },
-                    ) {
-                        Ok(position) => position,
-                        Err(error) => {
-                            server.reply(conn, id, Err(error));
-                            continue;
-                        }
-                    };
-                    next_prompt = next_prompt.saturating_add(1);
-                    server.reply(
-                        conn,
-                        id,
-                        Ok(json!({"accepted":true,"prompt_id":prompt_id,"position":position})),
-                    );
-                }
-                "turn/interrupt" => {
-                    if matches!(phase, Phase::Busy | Phase::Cancelling) {
-                        cancel.store(true, Ordering::Relaxed);
-                        set_phase(&mut server, emitter, &mut phase, Phase::Cancelling);
-                    }
-                    server.reply(conn, id, Ok(json!({"accepted":true})));
-                }
-                "session/quit" => {
-                    quit = true;
-                    queue.clear();
-                    server.reply(conn, id, Ok(json!({"accepted":true})));
-                }
-                _ => server.reply(conn, id, Err(RpcError::new(-32601, "method not found"))),
-            }
-        }
-
-        if SIGNALS.load(Ordering::SeqCst) > 0 {
-            quit = true;
-            queue.clear();
-            if matches!(phase, Phase::Busy | Phase::Cancelling) {
-                cancel.store(true, Ordering::Relaxed);
-                set_phase(&mut server, emitter, &mut phase, Phase::Cancelling);
-            }
-        }
-        if phase == Phase::Idle && !quit {
-            if let Some(prompt) = queue.pop_front() {
-                // Establish Busy and clear only cancellation from a completed
-                // earlier turn before publishing turn_start. Once a client
-                // can observe this turn, a confirmed interrupt must remain
-                // set until the worker observes it.
-                cancel.store(false, Ordering::Relaxed);
-                set_phase(&mut server, emitter, &mut phase, Phase::Busy);
-                store
-                    .append_turn_start(&record.id, &prompt.source, &prompt.text)
-                    .map_err(|error| format!("session save failed: {error}"))?;
-                emit(
-                    &mut server,
-                    emitter,
-                    turn_start_event(&prompt.id, &prompt.source, &prompt.text),
-                );
-                handle
-                    .commands
-                    .send(SessionCommand::Prompt(prompt.text))
-                    .map_err(|_| "session worker disconnected".to_string())?;
+    let loop_result = (|| -> Result<(), String> {
+        loop {
+            let intake = handle.intake.poll(POLL_INTERVAL);
+            let mut worker_error_event = false;
+            if !intake.text.is_empty() {
+                emit(&mut server, emitter, text_event(&intake.text));
                 last_activity = Instant::now();
             }
-        }
-        if phase == Phase::Idle
-            && launch
-                .idle_timeout_secs
-                .is_some_and(|secs| last_activity.elapsed() >= Duration::from_secs(secs))
-        {
-            quit = true;
-            queue.clear();
-        }
-        if quit && !matches!(phase, Phase::Busy | Phase::Cancelling) {
-            break;
-        }
-        if intake.disconnected && !handle.join.is_finished() {
-            return Err("session worker disconnected".to_string());
-        }
-    }
+            for event in intake.discrete {
+                match event {
+                    SessionEvent::SetupReady => {
+                        set_phase(&mut server, emitter, &mut phase, Phase::Idle);
+                        last_activity = Instant::now();
+                    }
+                    SessionEvent::SetupBlocked(message)
+                    | SessionEvent::GatewayRequired(message) => {
+                        set_phase(&mut server, emitter, &mut phase, Phase::Blocked);
+                        emit(&mut server, emitter, error_event(&message));
+                        blocked_error = Some(message);
+                        quit = true;
+                    }
+                    SessionEvent::Configuration {
+                        endpoint, model, ..
+                    } => {
+                        current_endpoint = endpoint;
+                        current_model = model;
+                    }
+                    SessionEvent::ToolStart { id, summary } => {
+                        emit(&mut server, emitter, tool_start_event(&id, "", &summary));
+                        last_activity = Instant::now();
+                    }
+                    SessionEvent::ToolFinish {
+                        id,
+                        failed,
+                        elapsed_ms,
+                        preview,
+                    } => {
+                        emit(
+                            &mut server,
+                            emitter,
+                            tool_finish_event(&id, failed, elapsed_ms, &preview),
+                        );
+                        last_activity = Instant::now();
+                    }
+                    SessionEvent::Done {
+                        input_tokens,
+                        output_tokens,
+                        cache_read,
+                        cache_write,
+                        turns: prompt_turns,
+                        stop,
+                        messages,
+                    } => {
+                        final_answer = messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == "assistant")
+                            .map(|message| {
+                                message
+                                    .parts
+                                    .iter()
+                                    .filter(|part| part.kind == "text")
+                                    .map(|part| part.text.as_str())
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        let turn_usage = Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens: cache_read,
+                            cache_creation_input_tokens: cache_write,
+                        };
+                        add_usage(&mut usage, &turn_usage);
+                        turns = turns.saturating_add(prompt_turns);
+                        checkpoint_sequence = checkpoint_sequence.saturating_add(1);
+                        let message = if final_answer.trim().is_empty() {
+                            "Agent proposal (response incomplete)"
+                        } else {
+                            final_answer.trim()
+                        };
+                        proposal_ref = match launch
+                            .workspace
+                            .finish_checkpoint(message, checkpoint_sequence)
+                            .map_err(|error| format!("proposal checkpoint failed: {error}"))?
+                        {
+                            RunOutcome::Clean => None,
+                            RunOutcome::Proposal { ref_name, .. } => Some(ref_name),
+                        };
+                        store
+                            .append_worktree(
+                                &record.id,
+                                &record.worktree,
+                                proposal_ref.as_deref().unwrap_or(""),
+                            )
+                            .map_err(|error| format!("session save failed: {error}"))?;
+                        emit(&mut server, emitter, {
+                            let mut event = turn_complete_event(&stop, &turn_usage);
+                            event["final_answer"] = json!(final_answer);
+                            event["proposal_ref"] = json!(proposal_ref);
+                            event
+                        });
+                        set_phase(&mut server, emitter, &mut phase, Phase::Idle);
+                        last_activity = Instant::now();
+                    }
+                    SessionEvent::Error(message) => {
+                        emit(&mut server, emitter, error_event(&message));
+                        set_phase(&mut server, emitter, &mut phase, Phase::Idle);
+                        blocked_error = Some(message);
+                        quit = true;
+                        worker_error_event = true;
+                    }
+                    SessionEvent::Warning(message)
+                    | SessionEvent::EndpointRejected { message, .. } => {
+                        eprintln!("greppy agent serve: {message}");
+                    }
+                    SessionEvent::SetupProgress { .. }
+                    | SessionEvent::BackgroundProgress { .. }
+                    | SessionEvent::BackgroundReady
+                    | SessionEvent::Text(_)
+                    | SessionEvent::Thinking(_)
+                    | SessionEvent::Compacted { .. } => {}
+                }
+            }
+            if worker_error_event || handle.join.is_finished() {
+                break;
+            }
 
+            for incoming in server.poll() {
+                let Incoming::Request {
+                    conn,
+                    id,
+                    method,
+                    params,
+                } = incoming
+                else {
+                    continue;
+                };
+                last_activity = Instant::now();
+                match method.as_str() {
+                    "session/describe" => server.reply(
+                        conn,
+                        id,
+                        Ok(describe(
+                            &record,
+                            launch,
+                            &current_model,
+                            &current_endpoint,
+                            phase,
+                            turns,
+                            &usage,
+                            queue.len(),
+                            &socket_path,
+                            store,
+                            &final_answer,
+                            proposal_ref.as_deref(),
+                        )),
+                    ),
+                    "session/subscribe" => server.reply(conn, id, Ok(json!({"subscribed":true}))),
+                    "turn/start" => {
+                        let text = params
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        if text.is_empty() {
+                            server.reply(conn, id, Err(RpcError::new(-32602, "empty prompt")));
+                            continue;
+                        }
+                        if quit {
+                            server.reply(
+                                conn,
+                                id,
+                                Err(RpcError::new(-32000, "session is quitting")),
+                            );
+                            continue;
+                        }
+                        let source = params
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .filter(|source| !source.trim().is_empty())
+                            .unwrap_or("remote")
+                            .to_string();
+                        let prompt_id = format!("p-{next_prompt}");
+                        let position = match enqueue_prompt(
+                            &mut queue,
+                            PendingPrompt {
+                                id: prompt_id.clone(),
+                                text: text.to_string(),
+                                source,
+                            },
+                        ) {
+                            Ok(position) => position,
+                            Err(error) => {
+                                server.reply(conn, id, Err(error));
+                                continue;
+                            }
+                        };
+                        next_prompt = next_prompt.saturating_add(1);
+                        server.reply(
+                            conn,
+                            id,
+                            Ok(json!({"accepted":true,"prompt_id":prompt_id,"position":position})),
+                        );
+                    }
+                    "turn/interrupt" => {
+                        if matches!(phase, Phase::Busy | Phase::Cancelling) {
+                            cancel.store(true, Ordering::Relaxed);
+                            set_phase(&mut server, emitter, &mut phase, Phase::Cancelling);
+                        }
+                        server.reply(conn, id, Ok(json!({"accepted":true})));
+                    }
+                    "session/quit" => {
+                        quit = true;
+                        queue.clear();
+                        if matches!(phase, Phase::Busy | Phase::Cancelling) {
+                            cancel.store(true, Ordering::Relaxed);
+                            set_phase(&mut server, emitter, &mut phase, Phase::Cancelling);
+                        }
+                        server.reply(conn, id, Ok(json!({"accepted":true})));
+                    }
+                    _ => server.reply(conn, id, Err(RpcError::new(-32601, "method not found"))),
+                }
+            }
+
+            if SIGNALS.load(Ordering::SeqCst) > 0 {
+                quit = true;
+                queue.clear();
+                if matches!(phase, Phase::Busy | Phase::Cancelling) {
+                    cancel.store(true, Ordering::Relaxed);
+                    set_phase(&mut server, emitter, &mut phase, Phase::Cancelling);
+                }
+            }
+            if phase == Phase::Idle && !quit {
+                if let Some(prompt) = queue.pop_front() {
+                    // Establish Busy and clear only cancellation from a completed
+                    // earlier turn before publishing turn_start. Once a client
+                    // can observe this turn, a confirmed interrupt must remain
+                    // set until the worker observes it.
+                    cancel.store(false, Ordering::Relaxed);
+                    set_phase(&mut server, emitter, &mut phase, Phase::Busy);
+                    store
+                        .append_turn_start(&record.id, &prompt.source, &prompt.text)
+                        .map_err(|error| format!("session save failed: {error}"))?;
+                    emit(
+                        &mut server,
+                        emitter,
+                        turn_start_event(&prompt.id, &prompt.source, &prompt.text),
+                    );
+                    handle
+                        .commands
+                        .send(SessionCommand::Prompt(prompt.text))
+                        .map_err(|_| "session worker disconnected".to_string())?;
+                    last_activity = Instant::now();
+                }
+            }
+            if phase == Phase::Idle
+                && launch
+                    .idle_timeout_secs
+                    .is_some_and(|secs| last_activity.elapsed() >= Duration::from_secs(secs))
+            {
+                quit = true;
+                queue.clear();
+            }
+            if quit && !matches!(phase, Phase::Busy | Phase::Cancelling) {
+                break;
+            }
+            if intake.disconnected && !handle.join.is_finished() {
+                return Err("session worker disconnected".to_string());
+            }
+        }
+
+        Ok(())
+    })();
+    if loop_result.is_err() {
+        cancel.store(true, Ordering::Relaxed);
+    }
     let _ = handle.commands.send(SessionCommand::Quit);
-    drop(server);
-    let summary = handle
+    let joined = handle
         .join
         .join()
-        .map_err(|_| "session worker panicked".to_string())??;
-    if let Some(message) = blocked_error {
-        return Err(message);
+        .map_err(|_| "session worker panicked".to_string())
+        .and_then(|result| result);
+    let mut summary = match joined {
+        Ok(summary) => summary,
+        Err(error) => SessionSummary {
+            usage,
+            turns,
+            session_id: record.id.clone(),
+            final_answer: final_answer.clone(),
+            error: Some(error),
+            ..SessionSummary::default()
+        },
+    };
+    if let Err(error) = loop_result {
+        summary.error = Some(error);
     }
+    if let Some(message) = blocked_error {
+        summary.error = Some(message);
+    }
+    summary.control_server = Some(server);
     Ok(summary)
 }
 
@@ -433,6 +503,8 @@ fn describe(
     pending: usize,
     socket: &PathBuf,
     store: &SessionStore,
+    final_answer: &str,
+    proposal_ref: Option<&str>,
 ) -> Value {
     json!({
         "session_id": record.id,
@@ -445,6 +517,8 @@ fn describe(
         "endpoint": endpoint,
         "sandbox": launch.sandbox,
         "phase": phase.label(),
+        "final_answer": final_answer,
+        "proposal_ref": proposal_ref,
         "turns": turns,
         "usage": usage_object(usage),
         "pending": pending,

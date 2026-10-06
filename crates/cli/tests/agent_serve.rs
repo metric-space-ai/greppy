@@ -387,6 +387,15 @@ fn control_socket_hosts_queued_turns_and_quits_cleanly() {
         client.call("session/quit", json!({})).unwrap(),
         json!({"accepted":true})
     );
+    let final_result = next_type(&mut client, "result");
+    assert!(final_result.get("proposal_ref").is_some(), "{final_result}");
+    assert!(
+        !final_result["final_answer"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "{final_result}"
+    );
     let status = hosted.child.wait().unwrap();
     let mut rest = String::new();
     hosted.stdout.read_to_string(&mut rest).unwrap();

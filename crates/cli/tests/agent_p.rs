@@ -340,6 +340,28 @@ fn assert_provider_optional_proposal(installed_inactive: bool) {
     assert_eq!(result["applied"], false, "{result}");
     let proposal = result["proposal_ref"].as_str().expect("proposal ref");
     assert!(proposal.starts_with("refs/greppy/agent/"), "{proposal}");
+    assert_eq!(result["final_answer"], "hi from stub");
+    let message = Command::new("git")
+        .current_dir(&repo)
+        .args(["show", "-s", "--format=%s", proposal])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&message.stdout).trim(),
+        "hi from stub"
+    );
+    let paths = Command::new("git")
+        .current_dir(&repo)
+        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", proposal])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&paths.stdout).trim(), "hello.txt");
+    let session = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "session")
+        .unwrap();
+    assert!(!PathBuf::from(session["worktree"].as_str().unwrap()).exists());
     let shown = Command::new("git")
         .current_dir(&repo)
         .args(["show", &format!("{proposal}:hello.txt")])
@@ -559,14 +581,18 @@ fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
             vec!["--max-turns", "4", "--deadline-secs", "0"],
             "deadline reached",
         ),
-        (vec!["--max-turns", "0"], "turn limit reached"),
+        (vec!["--max-turns", "1"], "turn limit reached"),
     ] {
         let repo = unique_temp("limited-repo");
         init_repo(&repo);
         let store = unique_temp("limited-store");
         let provider_root = unique_temp("limited-provider");
         let provider = spawn_fake_provider(&provider_root, &repo);
-        let (endpoint, stop, handle) = spawn_stub_gateway();
+        let (endpoint, stop, handle) = if expected_stop == "turn limit reached" {
+            spawn_edit_gateway()
+        } else {
+            spawn_stub_gateway()
+        };
         let output = Command::new(binary_path())
             .current_dir(&repo)
             .env("GREPPY_STORE_DIR", &store)
@@ -608,7 +634,14 @@ fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
         assert_eq!(result["status"], "incomplete");
         assert_eq!(result["exit_code"], 5);
         assert_eq!(result["stop"], expected_stop);
-        assert_eq!(result["turns"], 0);
+        assert_eq!(
+            result["turns"],
+            if expected_stop == "turn limit reached" {
+                1
+            } else {
+                0
+            }
+        );
         assert!(!result["session_id"].as_str().unwrap().is_empty());
         assert_eq!(result["applied"], false);
         let _ = std::fs::remove_dir_all(&repo);
@@ -619,7 +652,7 @@ fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
 }
 
 #[test]
-fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
+fn greppy_p_incomplete_proposal_is_not_applied_and_cleans_worktree() {
     let repo = unique_temp("partial-proposal-repo");
     init_repo(&repo);
     let store = unique_temp("partial-proposal-store");
@@ -699,22 +732,18 @@ fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
         "proposal={proposal} stdout={}",
         String::from_utf8_lossy(&shown.stdout)
     );
-    let kept = stderr
+    let worktree = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("worktree kept for debugging: "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "session")
+        .unwrap()["worktree"]
+        .as_str()
         .map(PathBuf::from)
-        .expect("incomplete run must report its retained worktree");
+        .unwrap();
     assert!(
-        kept.exists(),
-        "retained worktree missing: {}",
-        kept.display()
+        !worktree.exists(),
+        "saved incomplete proposal must clean temporary worktree"
     );
-
-    let _ = Command::new("git")
-        .args(["worktree", "remove", "--force"])
-        .arg(&kept)
-        .current_dir(&repo)
-        .status();
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
     drop(provider);
