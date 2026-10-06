@@ -95,6 +95,7 @@ pub struct Client {
     stream_byte_cap: usize,
     /// Injectable stream event cap (tests use a small value).
     stream_event_cap: usize,
+    output_limits: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Option<u64>>>>,
 }
 
 // Manual impl: the api key must never reach logs or error output.
@@ -122,6 +123,7 @@ impl Client {
             api_key: None,
             stream_byte_cap: DEFAULT_STREAM_BYTE_CAP,
             stream_event_cap: DEFAULT_STREAM_EVENT_CAP,
+            output_limits: Default::default(),
         }
     }
 
@@ -168,6 +170,42 @@ impl Client {
     /// URL used by [`Client::stream_turn`] (`POST {base}/v1/messages`).
     pub fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
+    }
+    /// Use only an advertised model output limit for the unlimited-loop sentinel.
+    /// Unknown metadata remains absent; it must never become a fabricated 8192 cap.
+    fn request_body(&self, req: &ModelRequest) -> Value {
+        let mut body = to_messages_request_body(req);
+        if req.max_tokens != u64::MAX {
+            return body;
+        }
+        let cached = self
+            .output_limits
+            .lock()
+            .ok()
+            .and_then(|limits| limits.get(&req.model).copied());
+        let limit = match cached {
+            Some(limit) => limit,
+            None => {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(2))
+                    .build();
+                let limit = self
+                    .authed(agent.get(&self.models_url()))
+                    .call()
+                    .ok()
+                    .and_then(|response| response.into_string().ok())
+                    .and_then(|data| advertised_output_limit(&data, &req.model));
+                if let Ok(mut limits) = self.output_limits.lock() {
+                    limits.insert(req.model.clone(), limit);
+                }
+                limit
+            }
+        };
+        if let Some(limit) = limit {
+            body["max_tokens"] = serde_json::json!(limit);
+        }
+        body
     }
 
     /// List model ids advertised by `GET {base}/v1/models`.
@@ -236,7 +274,7 @@ impl Client {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> Result<TurnResult, ClientError> {
         let url = self.messages_url();
-        let body = to_messages_request_body(req);
+        let body = self.request_body(req);
         let body_str = serde_json::to_string(&body)
             .map_err(|e| ClientError::Transport(format!("serialize model request: {e}")))?;
 
@@ -292,7 +330,7 @@ impl Client {
             .map_err(|error| {
                 ClientError::Transport(format!("create model HTTP client: {error}"))
             })?;
-        let body = serde_json::to_string(&to_messages_request_body(req))
+        let body = serde_json::to_string(&self.request_body(req))
             .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
         let mut request = client
             .post(self.messages_url())
@@ -533,12 +571,89 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Read output limits from the exact advertised model, without guessing from context size.
+fn advertised_output_limit(data: &str, model: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(data).ok()?;
+    let models = value
+        .get("data")
+        .or_else(|| value.get("models"))?
+        .as_array()?;
+    let metadata = models
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+    [
+        "/max_output_tokens",
+        "/output_token_limit",
+        "/max_tokens",
+        "/limits/max_output_tokens",
+    ]
+    .iter()
+    .filter_map(|path| metadata.pointer(path).and_then(Value::as_u64))
+    .find(|n| *n > 0 && *n != u64::MAX)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn only_exact_advertised_output_limit_is_used() {
+        let metadata = r#"{"data":[{"id":"m","context_length":100000,"max_output_tokens":16000},{"id":"other","max_output_tokens":64000}]}"#;
+        assert_eq!(advertised_output_limit(metadata, "m"), Some(16000));
+        assert_eq!(advertised_output_limit(metadata, "missing"), None);
+        assert_eq!(
+            advertised_output_limit(r#"{"data":[{"id":"m","context_length":100000}]}"#, "m"),
+            None
+        );
+    }
+    #[test]
+    fn assembler_preserves_real_signature() {
+        let mut assembler = TurnAssembler::new();
+        assembler
+            .observe(&StreamEvent::Started { model: "m".into() })
+            .unwrap();
+        assembler
+            .observe(&StreamEvent::ThinkingDelta {
+                text: "reason".into(),
+            })
+            .unwrap();
+        assembler
+            .observe(&StreamEvent::ThinkingSignatureDelta {
+                signature: "sig".into(),
+            })
+            .unwrap();
+        assembler
+            .observe(&StreamEvent::BlockFinished { index: 0 })
+            .unwrap();
+        assembler
+            .observe(&StreamEvent::Finished {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+            .unwrap();
+        let result = assembler.finish().unwrap();
+        assert_eq!(
+            result.message.content[0],
+            ContentPart::SignedThinking {
+                text: "reason".into(),
+                signature: "sig".into()
+            }
+        );
+    }
+}
+
 /// Currently-open content block while streaming.
 #[derive(Debug)]
 enum OpenBlock {
     None,
-    Text { index: usize, text: String },
-    Thinking { index: usize, text: String },
+    Text {
+        index: usize,
+        text: String,
+    },
+    Thinking {
+        index: usize,
+        text: String,
+        signature: String,
+    },
 }
 
 #[derive(Debug)]
@@ -607,6 +722,20 @@ impl TurnAssembler {
                     return Ok(());
                 }
                 self.append_thinking(text)
+            }
+            StreamEvent::ThinkingSignatureDelta { signature } => {
+                if matches!(self.open, OpenBlock::None) {
+                    self.append_thinking("")?;
+                }
+                match &mut self.open {
+                    OpenBlock::Thinking { signature: acc, .. } => {
+                        acc.push_str(signature);
+                        Ok(())
+                    }
+                    _ => Err(ClientError::Stream(
+                        "signature outside thinking block".into(),
+                    )),
+                }
             }
             StreamEvent::ToolCallStarted { index, id, name } => {
                 if !matches!(self.open, OpenBlock::None) {
@@ -712,6 +841,7 @@ impl TurnAssembler {
                 self.open = OpenBlock::Thinking {
                     index,
                     text: text.to_string(),
+                    signature: String::new(),
                 };
                 Ok(())
             }
@@ -766,9 +896,15 @@ impl TurnAssembler {
             OpenBlock::Thinking {
                 index: open_idx,
                 text,
+                signature,
             } => {
                 let _ = open_idx;
-                self.parts.push((index, ContentPart::Thinking { text }));
+                let part = if signature.is_empty() {
+                    ContentPart::Thinking { text }
+                } else {
+                    ContentPart::SignedThinking { text, signature }
+                };
+                self.parts.push((index, part));
                 self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
                 Ok(())
             }
