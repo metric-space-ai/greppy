@@ -1093,15 +1093,19 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     let mut job = BackgroundJobGuard::from_env();
     job.attach_foreground(path.clone());
     job.device = Some("metal:0".into());
-    job.embedding_started("metal", 19_786);
+    job.embedding_started("metal", 19_786, 2_249);
     let initial = read_background_job(&path).unwrap();
-    assert_eq!(initial["eta_seconds"], 2_474);
+    assert_eq!(initial["eta_seconds"], 2_193);
+    assert_eq!(initial["total_spans"], 17_537);
+    assert_eq!(initial["validated_spans"], 19_786);
+    assert_eq!(initial["reusable_spans"], 2_249);
     assert_eq!(initial["eta_basis"], "backend_prior");
 
     job.last_progress_write = None;
     job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
         completed_documents: 2_249,
         total_documents: 19_786,
+        reusable_documents: 2_249,
         local_store_reuse: 2_249,
         global_cache_hits: 0,
         global_cache_misses: 0,
@@ -1118,6 +1122,7 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
         completed_documents: 19_786,
         total_documents: 19_786,
+        reusable_documents: 19_786,
         local_store_reuse: 19_786,
         global_cache_hits: 0,
         global_cache_misses: 0,
@@ -1128,7 +1133,7 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     assert_eq!(finished["eta_basis"], "completed_embedding_work");
     assert!(finished["rate_milli_spans_per_second"].is_null());
 
-    job.embedding_started("metal", 20);
+    job.embedding_started("metal", 20, 0);
     let started = std::time::Instant::now();
     job.embedding_started = Some(started);
     job.last_progress_write = None;
@@ -1136,6 +1141,7 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
         greppy_indexer::EmbeddingIndexProgress {
             completed_documents: 1,
             total_documents: 20,
+            reusable_documents: 0,
             local_store_reuse: 0,
             global_cache_hits: 0,
             global_cache_misses: 1,
@@ -1148,6 +1154,72 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     assert_eq!(slow["eta_basis"], "observed_inference");
     assert!(slow["eta_seconds"].as_u64().unwrap() >= 38_019);
     job.complete();
+}
+
+#[test]
+fn embedding_progress_before_validation_does_not_estimate_whole_graph_work() {
+    let progress = serde_json::json!({
+        "backend": "cuda",
+        "work_assessment": "pending_validation",
+        "completed_spans": 0,
+        "total_spans": serde_json::Value::Null,
+        "eta_seconds": serde_json::Value::Null,
+    });
+    assert_eq!(
+        embedding_progress_text(&progress),
+        "semantic index building — validating spans, pending work and ETA measuring (backend cuda)"
+    );
+}
+
+#[test]
+fn warm_refresh_job_counts_only_uncached_work_after_validation() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
+    let root = test_tempdir("warm-refresh-pending");
+    let path = root.join("index.job");
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::remove_var("GREPPY_BACKGROUND_JOB");
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+    let mut job = BackgroundJobGuard::from_env();
+    job.attach_foreground(path.clone());
+    job.embedding_started("cuda", 197, 196);
+    let initial = read_background_job(&path).unwrap();
+    assert_eq!(initial["completed_spans"], 0);
+    assert_eq!(initial["total_spans"], 1);
+    assert_eq!(initial["validated_spans"], 197);
+    assert_eq!(initial["reusable_spans"], 196);
+    assert_eq!(initial["eta_seconds"], 1);
+    assert!(initial["rate_milli_spans_per_second"].is_null());
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 196,
+        total_documents: 197,
+        reusable_documents: 196,
+        local_store_reuse: 196,
+        ..Default::default()
+    });
+    let reused = read_background_job(&path).unwrap();
+    assert_eq!(reused["completed_spans"], 0);
+    assert_eq!(reused["total_spans"], 1);
+    assert_eq!(reused["eta_seconds"], 1);
+    assert!(reused["rate_milli_spans_per_second"].is_null());
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 197,
+        total_documents: 197,
+        reusable_documents: 196,
+        local_store_reuse: 196,
+        global_cache_hits: 1,
+        ..Default::default()
+    });
+    let finished = read_background_job(&path).unwrap();
+    assert_eq!(finished["completed_spans"], 1);
+    assert_eq!(finished["total_spans"], 1);
+    assert_eq!(finished["eta_seconds"], 0);
+    assert!(finished["rate_milli_spans_per_second"].is_null());
+    job.complete();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2637,11 +2709,12 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     }
 
     let mut guard = BackgroundJobGuard::from_env();
-    guard.embedding_started("cpu", 10);
+    guard.embedding_started("cpu", 10, 1);
     guard.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
         current_symbol: None,
         completed_documents: 4,
         total_documents: 10,
+        reusable_documents: 1,
         local_store_reuse: 1,
         global_cache_hits: 2,
         global_cache_misses: 1,
@@ -2655,8 +2728,10 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     assert_eq!(job["cause"], "foreground-index");
     assert_eq!(job["kind"], "index");
     assert_eq!(job["state"], "base_graph_ready");
-    assert_eq!(job["completed_spans"], 4);
-    assert_eq!(job["total_spans"], 10);
+    assert_eq!(job["completed_spans"], 3);
+    assert_eq!(job["total_spans"], 9);
+    assert_eq!(job["validated_spans"], 10);
+    assert_eq!(job["reusable_spans"], 1);
     assert_eq!(job["local_store_reuse"], 1);
     assert_eq!(job["global_cache_hits"], 2);
     assert_eq!(job["global_cache_misses"], 1);
