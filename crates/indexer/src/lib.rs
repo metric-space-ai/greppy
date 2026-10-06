@@ -14411,6 +14411,7 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
                 (dropped > 0 && error.is_none()).then_some(source)
             })
             .unwrap_or_else(|| panic!("pin a real grammar-recovery record: {diagnostics:?}"));
+        eprintln!("malformed_fixture_source={source:?}");
         fs::write(repo.path().join(file), &source).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, repo.path(), "test").unwrap();
