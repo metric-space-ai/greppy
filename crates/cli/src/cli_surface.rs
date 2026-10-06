@@ -252,6 +252,9 @@ pub enum Command {
         argv: Vec<String>,
     },
     /// Print a prepared evidence pack created by a previous query command.
+    /// Global --offset/--limit select saved raw lines. --max-bytes reserves
+    /// metadata (1024 bytes text, 2048 JSON) and never splits a raw line; one
+    /// oversized line is emitted whole with explicit evidence.
     Expand {
         id: Option<String>,
         /// Emit machine-readable JSON wrapper with metadata and payload.

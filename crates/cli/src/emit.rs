@@ -846,6 +846,11 @@ pub(crate) fn finish_output_capture(
 ) {
     use std::io::Write as _;
 
+    if OUTPUT_OWNED_BY_COMMAND.with(std::cell::Cell::get) {
+        OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().take());
+        return;
+    }
+
     let captured = OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default());
     let captured = if compact_json {
         compact_default_json_output(&captured).unwrap_or(captured)

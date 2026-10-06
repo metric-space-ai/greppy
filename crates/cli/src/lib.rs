@@ -281,11 +281,13 @@ thread_local! {
         std::cell::RefCell::new(CliInferenceOverride::default());
     static CLI_RESULT_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static CLI_RESULT_OFFSET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLI_MAX_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static CLI_INVOCATION: std::cell::RefCell<Vec<std::ffi::OsString>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static CLI_JSON_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OUTPUT_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
+    static OUTPUT_OWNED_BY_COMMAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static NAV_TEXT_WINDOW: std::cell::RefCell<Option<NavTextWindow>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -303,6 +305,10 @@ fn cli_inference_override() -> CliInferenceOverride {
 fn set_cli_result_window(limit: Option<usize>, offset: usize) {
     CLI_RESULT_LIMIT.with(|value| value.set(limit));
     CLI_RESULT_OFFSET.with(|value| value.set(offset));
+}
+
+fn set_cli_max_bytes(max_bytes: Option<usize>) {
+    CLI_MAX_BYTES.with(|value| value.set(max_bytes));
 }
 
 fn set_cli_json_output(enabled: bool) {
@@ -1939,6 +1945,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         return Err(Error::Invalid("--max-bytes must be at least 1".into()));
     }
     set_cli_result_window(cli.limit, cli.offset);
+    set_cli_max_bytes(cli.max_bytes);
     set_cli_json_output(command_requests_json(cli.command.as_ref()));
     let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
     if !no_gpu {
@@ -6909,7 +6916,12 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     };
     #[cfg(feature = "bash-smart")]
     if pack.command == "bash-smart" {
-        return bash_smart::expand(&pack_store, pack, json);
+        let window = bash_smart::ExpandWindow {
+            offset: cli_result_offset(),
+            limit: cli_result_limit_raw(),
+            max_bytes: CLI_MAX_BYTES.with(std::cell::Cell::get),
+        };
+        return bash_smart::expand(&pack_store, pack, json, window);
     }
     if pack.command == "read-file" {
         return dispatch_read_expand(&pack_store, &pack, json, root);
@@ -11281,8 +11293,13 @@ fn print_multi_unresolved_receivers(page: &UnresolvedReceiverPage, start: usize)
 }
 
 fn begin_output_capture() {
+    OUTPUT_OWNED_BY_COMMAND.with(|owned| owned.set(false));
     NAV_TEXT_WINDOW.with(|window| *window.borrow_mut() = None);
     OUTPUT_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+}
+
+pub(crate) fn command_owns_output() {
+    OUTPUT_OWNED_BY_COMMAND.with(|owned| owned.set(true));
 }
 
 fn retry_with_offset(command: &str, offset: usize) -> String {

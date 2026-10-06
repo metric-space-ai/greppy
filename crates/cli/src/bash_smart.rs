@@ -21,6 +21,15 @@ const HEAD_LINES: usize = 20;
 const SUCCESS_TAIL_LINES: usize = 30;
 const FAILURE_TAIL_LINES: usize = 60;
 const EXPAND_PAGE_LINES: usize = 400;
+const EXPAND_TEXT_METADATA_RESERVE: usize = 1024;
+const EXPAND_JSON_METADATA_RESERVE: usize = 2048;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExpandWindow {
+    pub offset: usize,
+    pub limit: Option<usize>,
+    pub max_bytes: Option<usize>,
+}
 const EMBED_BATCH_LINES: usize = 16;
 const NOVELTY_TOP_K: usize = 3;
 const NOVELTY_DISTANCE_FLOOR: f32 = 0.12;
@@ -985,6 +994,7 @@ pub(crate) fn expand(
     store: &greppy_store::Store,
     pack: greppy_store::ExpandPack,
     json: bool,
+    window: ExpandWindow,
 ) -> Result<i32> {
     let reason = pack_decode_failure(&pack);
     let Some((pack, raw)) = relocate_or_refuse(store, pack)? else {
@@ -1002,8 +1012,44 @@ pub(crate) fn expand(
         &raw.stdout
     };
     let lines = split_lines(bytes);
+    crate::command_owns_output();
+    let metadata_reserve = if json {
+        EXPAND_JSON_METADATA_RESERVE
+    } else {
+        EXPAND_TEXT_METADATA_RESERVE
+    };
+    if let Some(max_bytes) = window
+        .max_bytes
+        .filter(|max_bytes| *max_bytes < metadata_reserve)
+    {
+        return Err(Error::Invalid(format!(
+            "bash-smart expand --max-bytes {max_bytes} is below the {metadata_reserve}-byte {} metadata minimum; raise --max-bytes or omit it",
+            if json { "JSON" } else { "text" }
+        )));
+    }
     let ranges = pack_line_ranges(&pack, lines.len());
-    let (page_ranges, remaining_ranges) = take_range_page(&ranges, EXPAND_PAGE_LINES);
+    let (skipped_ranges, ranges) = skip_range_lines(&ranges, window.offset);
+    let page_limit = window
+        .limit
+        .unwrap_or(EXPAND_PAGE_LINES)
+        .min(EXPAND_PAGE_LINES);
+    let (candidate_ranges, mut remaining_ranges) = take_range_page(&ranges, page_limit);
+    let raw_byte_budget = window.max_bytes.map(|max_bytes| {
+        let available = max_bytes - metadata_reserve;
+        if json {
+            available / 2
+        } else {
+            available
+        }
+    });
+    let (page_ranges, byte_remaining, oversized_line_bytes) =
+        take_range_byte_page(&candidate_ranges, &lines, raw_byte_budget);
+    if !byte_remaining.is_empty() {
+        byte_remaining
+            .into_iter()
+            .rev()
+            .for_each(|range| remaining_ranges.insert(0, range));
+    }
     let start = page_ranges.first().map(|(start, _)| *start).unwrap_or(1);
     let end_line = page_ranges.last().map(|(_, end)| *end).unwrap_or(0);
     let next_line = remaining_ranges.first().map(|(start, _)| *start);
@@ -1013,6 +1059,8 @@ pub(crate) fn expand(
     } else {
         insert_continuation_pack(store, &pack, &raw, stream, &remaining_ranges).ok()
     };
+    let fallback_offset = (!remaining_ranges.is_empty() && next.is_none())
+        .then_some(window.offset + range_line_count(&page_ranges));
 
     if json {
         let page = page_ranges
@@ -1030,12 +1078,25 @@ pub(crate) fn expand(
                 "start_line": start,
                 "end_line": end_line,
                 "line_count": lines.len(),
+                "requested_offset": window.offset,
+                "skipped_lines": range_line_count(&skipped_ranges),
+                "exhausted": page_ranges.is_empty() && remaining_ranges.is_empty(),
+                "raw_bytes": range_byte_count(&page_ranges, &lines),
+                "max_bytes": window.max_bytes,
+                "raw_byte_budget": raw_byte_budget,
+                "oversized_complete_line_bytes": oversized_line_bytes,
                 "raw_line_hex": page,
                 "next": next.as_ref().zip(next_line).map(|(id, line)| serde_json::json!({
-                    "id": id,
-                    "line": line,
-                    "command": format!("greppy expand {id}"),
-                })),
+                        "id": id,
+                        "line": line,
+                        "command": format!("greppy expand {id}"),
+                    })).or_else(|| fallback_offset.zip(next_line).map(|(offset, line)| serde_json::json!({
+                        "id": pack.id,
+                        "line": line,
+                        "offset": offset,
+                        "command": format!("greppy expand {} --offset {offset}", pack.id),
+                        "warning": "continuation allocation failed; retry the immutable source pack at the exact saved-line offset",
+                    }))),
             }))
             .map_err(|error| Error::Invalid(format!("serialize bash-smart expand: {error}")))?
         );
@@ -1043,6 +1104,14 @@ pub(crate) fn expand(
     }
 
     let mut stdout = std::io::stdout().lock();
+    if window.offset > 0 {
+        let _ = writeln!(
+            stdout,
+            "offset: {} ({} saved lines skipped by request)",
+            window.offset,
+            range_line_count(&skipped_ranges)
+        );
+    }
     write_line_ranges(&mut stdout, &lines, &page_ranges);
     if let Some((_, end)) = page_ranges.last() {
         if !lines[*end - 1].raw.ends_with(b"\n") {
@@ -1056,11 +1125,20 @@ pub(crate) fn expand(
                 stdout,
                 "… {remaining} lines — greppy expand {next_id} continues at {next_line}"
             );
-        } else {
-            // If allocating the next page fails, deliver it now rather than
-            // leave a continuation that cannot be opened.
-            write_line_ranges(&mut stdout, &lines, &remaining_ranges);
+        } else if let Some(offset) = fallback_offset {
+            let _ = writeln!(
+                stdout,
+                "continuation allocation failed; retry without loss: greppy expand {} --offset {offset}",
+                pack.id
+            );
         }
+    }
+    if let Some(bytes) = oversized_line_bytes {
+        let _ = writeln!(
+            stdout,
+            "note: one complete raw line is {bytes} bytes and exceeds --max-bytes {}; emitted whole to preserve exact bytes",
+            raw_byte_budget.unwrap_or(bytes)
+        );
     }
     Ok(0)
 }
@@ -1901,6 +1979,63 @@ fn take_range_page(ranges: &[(usize, usize)], page_lines: usize) -> (LineRanges,
     (page, remaining)
 }
 
+fn skip_range_lines(ranges: &[(usize, usize)], mut offset: usize) -> (LineRanges, LineRanges) {
+    let mut skipped = Vec::new();
+    let mut remaining = Vec::new();
+    for &(start, end) in ranges {
+        let count = end - start + 1;
+        if offset == 0 {
+            remaining.push((start, end));
+        } else if offset >= count {
+            skipped.push((start, end));
+            offset -= count;
+        } else {
+            skipped.push((start, start + offset - 1));
+            remaining.push((start + offset, end));
+            offset = 0;
+        }
+    }
+    (skipped, remaining)
+}
+
+fn take_range_byte_page(
+    ranges: &[(usize, usize)],
+    lines: &[RawLine<'_>],
+    max_bytes: Option<usize>,
+) -> (LineRanges, LineRanges, Option<usize>) {
+    let Some(max_bytes) = max_bytes else {
+        return (ranges.to_vec(), Vec::new(), None);
+    };
+    let mut keep = 0usize;
+    let mut used = 0usize;
+    let mut oversized = None;
+    'outer: for &(start, end) in ranges {
+        for line in &lines[start - 1..end] {
+            let bytes = line.raw.len();
+            if keep == 0 && bytes > max_bytes {
+                keep = 1;
+                oversized = Some(bytes);
+                break 'outer;
+            }
+            if used.saturating_add(bytes) > max_bytes {
+                break 'outer;
+            }
+            used += bytes;
+            keep += 1;
+        }
+    }
+    let (page, remaining) = take_range_page(ranges, keep);
+    (page, remaining, oversized)
+}
+
+fn range_byte_count(ranges: &[(usize, usize)], lines: &[RawLine<'_>]) -> usize {
+    ranges
+        .iter()
+        .flat_map(|(start, end)| &lines[start - 1..*end])
+        .map(|line| line.raw.len())
+        .sum()
+}
+
 fn range_line_count(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|(start, end)| end - start + 1).sum()
 }
@@ -2411,6 +2546,46 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_window_preserves_disjoint_ranges_and_advances_without_gaps() {
+        let ranges = vec![(2, 4), (7, 10)];
+        let (skipped, remaining) = skip_range_lines(&ranges, 2);
+        assert_eq!(skipped, vec![(2, 3)]);
+        assert_eq!(remaining, vec![(4, 4), (7, 10)]);
+
+        let (page, remaining) = take_range_page(&remaining, 3);
+        assert_eq!(page, vec![(4, 4), (7, 8)]);
+        assert_eq!(remaining, vec![(9, 10)]);
+        assert_eq!(range_line_count(&skipped), 2);
+        assert_eq!(range_line_count(&page), 3);
+        assert_eq!(range_line_count(&remaining), 2);
+    }
+
+    #[test]
+    fn expand_byte_window_keeps_complete_lines_and_reports_oversized_first_line() {
+        let raw = b"one\ntwo-two\nthree\n";
+        let lines = split_lines(raw);
+        let ranges = vec![(1, 3)];
+
+        let (page, remaining, oversized) = take_range_byte_page(&ranges, &lines, Some(12));
+        assert_eq!(page, vec![(1, 2)]);
+        assert_eq!(remaining, vec![(3, 3)]);
+        assert_eq!(range_byte_count(&page, &lines), 12);
+        assert_eq!(oversized, None);
+
+        let (page, remaining, oversized) = take_range_byte_page(&ranges, &lines, Some(3));
+        assert_eq!(page, vec![(1, 1)]);
+        assert_eq!(remaining, vec![(2, 3)]);
+        assert_eq!(oversized, Some(4));
+        assert_eq!(write_ranges_to_vec(&lines, &page), b"one\n");
+    }
+
+    fn write_ranges_to_vec(lines: &[RawLine<'_>], ranges: &[(usize, usize)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_line_ranges(&mut bytes, lines, ranges);
+        bytes
+    }
 
     #[cfg(any(unix, windows))]
     fn deterministic_daemon_probe_config() -> EmbeddingModelConfig {

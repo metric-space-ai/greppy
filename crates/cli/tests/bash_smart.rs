@@ -205,6 +205,66 @@ fn expand_id(stdout: &str) -> &str {
 }
 
 #[test]
+fn expand_global_window_is_deterministic_and_owns_truthful_continuation_metadata() {
+    let workspace = fresh_workspace("expand-window");
+    let raw = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1300); do echo line $i; done",
+        ],
+    );
+    assert_eq!(raw.status.code(), Some(0));
+    let id = expand_id(&text(&raw.stdout)).to_string();
+    let expand = || {
+        command(&workspace)
+            .args([
+                "--offset",
+                "20",
+                "--limit",
+                "200",
+                "--max-bytes",
+                "30000",
+                "expand",
+                &id,
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let first = expand();
+    let replay = expand();
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    assert_eq!(
+        first.stdout, replay.stdout,
+        "same immutable id/window must replay"
+    );
+    let page: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(page["requested_offset"], 20);
+    assert_eq!(page["skipped_lines"], 20);
+    assert!(page["raw_line_hex"].as_array().unwrap().len() <= 200);
+    assert!(page.get("truncated").is_none(), "{page}");
+    assert!(page.get("total").is_none(), "{page}");
+    assert!(page["next"]["id"].as_str().is_some(), "{page}");
+    assert_eq!(page["next"]["line"], page["end_line"].as_u64().unwrap() + 1);
+    assert!(first.stdout.len() <= 30_000, "{}", first.stdout.len());
+
+    let too_small = command(&workspace)
+        .args(["expand", &id, "--json", "--max-bytes", "100"])
+        .output()
+        .unwrap();
+    assert_eq!(too_small.status.code(), Some(64));
+    assert!(too_small.stdout.is_empty(), "{}", text(&too_small.stdout));
+    assert!(text(&too_small.stderr).contains("2048-byte JSON metadata minimum"));
+    assert!(!text(&too_small.stderr).contains("total: 0"));
+    std::fs::remove_dir_all(workspace.base).unwrap();
+}
+
+#[test]
 fn raw_output_continuations_and_missing_handles_never_prepare_a_code_index() {
     let workspace = fresh_workspace("expand-no-index");
     let marker = workspace.base.join("gate-was-called");
