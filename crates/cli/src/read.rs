@@ -1544,7 +1544,6 @@ fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path:
     file_operand_path(root_path, subject)
 }
 
-
 fn read_resolve_file(
     root_path: &std::path::Path,
     canonical_root: &std::path::Path,
