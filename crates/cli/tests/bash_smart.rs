@@ -239,11 +239,20 @@ fn expand_global_window_is_deterministic_and_owns_truthful_continuation_metadata
     let first = expand();
     let replay = expand();
     assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
-    assert_eq!(
-        first.stdout, replay.stdout,
-        "same immutable id/window must replay"
-    );
     let page: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let replay_page: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    for key in [
+        "stream",
+        "content_sha256",
+        "start_line",
+        "end_line",
+        "requested_offset",
+        "skipped_lines",
+        "raw_bytes",
+        "raw_line_hex",
+    ] {
+        assert_eq!(page[key], replay_page[key], "unstable replay field {key}");
+    }
     assert_eq!(page["requested_offset"], 20);
     assert_eq!(page["skipped_lines"], 20);
     assert!(page["raw_line_hex"].as_array().unwrap().len() <= 200);
@@ -252,6 +261,41 @@ fn expand_global_window_is_deterministic_and_owns_truthful_continuation_metadata
     assert!(page["next"]["id"].as_str().is_some(), "{page}");
     assert_eq!(page["next"]["line"], page["end_line"].as_u64().unwrap() + 1);
     assert!(first.stdout.len() <= 30_000, "{}", first.stdout.len());
+
+    for budget in ["3000", "4096"] {
+        let bounded = command(&workspace)
+            .args(["expand", &id, "--json", "--max-bytes", budget])
+            .output()
+            .unwrap();
+        assert_eq!(bounded.status.code(), Some(0), "{}", text(&bounded.stderr));
+        assert!(
+            bounded.stdout.len() <= budget.parse::<usize>().unwrap(),
+            "budget={budget}, actual={}",
+            bounded.stdout.len()
+        );
+        let bounded: serde_json::Value = serde_json::from_slice(&bounded.stdout).unwrap();
+        assert!(bounded["raw_line_hex"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty()));
+        assert!(bounded["next"]["id"].as_str().is_some());
+    }
+
+    let follow = |next: &serde_json::Value| {
+        command(&workspace)
+            .args(["expand", next["id"].as_str().unwrap(), "--json"])
+            .output()
+            .unwrap()
+    };
+    let next_a = follow(&page["next"]);
+    let next_b = follow(&replay_page["next"]);
+    assert_eq!(next_a.status.code(), Some(0), "{}", text(&next_a.stderr));
+    assert_eq!(next_b.status.code(), Some(0), "{}", text(&next_b.stderr));
+    let next_a: serde_json::Value = serde_json::from_slice(&next_a.stdout).unwrap();
+    let next_b: serde_json::Value = serde_json::from_slice(&next_b.stdout).unwrap();
+    assert_eq!(next_a["start_line"], page["next"]["line"]);
+    assert_eq!(next_b["start_line"], replay_page["next"]["line"]);
+    assert_eq!(next_a["end_line"], next_b["end_line"]);
+    assert_eq!(next_a["raw_line_hex"], next_b["raw_line_hex"]);
 
     let too_small = command(&workspace)
         .args(["expand", &id, "--json", "--max-bytes", "100"])

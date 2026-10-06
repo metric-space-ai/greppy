@@ -1042,8 +1042,17 @@ pub(crate) fn expand(
             available
         }
     });
-    let (page_ranges, byte_remaining, oversized_line_bytes) =
-        take_range_byte_page(&candidate_ranges, &lines, raw_byte_budget);
+    let (page_ranges, byte_remaining, oversized_line_bytes) = if json {
+        take_range_json_page(
+            &candidate_ranges,
+            &lines,
+            window
+                .max_bytes
+                .map(|max_bytes| max_bytes - metadata_reserve),
+        )
+    } else {
+        take_range_byte_page(&candidate_ranges, &lines, raw_byte_budget)
+    };
     if !byte_remaining.is_empty() {
         byte_remaining
             .into_iter()
@@ -1068,9 +1077,7 @@ pub(crate) fn expand(
             .flat_map(|(start, end)| lines[start - 1..*end].iter())
             .map(|line| hex_encode(line.raw))
             .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let rendered = serde_json::to_vec_pretty(&serde_json::json!({
                 "id": pack.id,
                 "kind": "bash-smart",
                 "stream": stream,
@@ -1098,8 +1105,13 @@ pub(crate) fn expand(
                         "warning": "continuation allocation failed; retry the immutable source pack at the exact saved-line offset",
                     }))),
             }))
-            .map_err(|error| Error::Invalid(format!("serialize bash-smart expand: {error}")))?
-        );
+            .map_err(|error| Error::Invalid(format!("serialize bash-smart expand: {error}")))?;
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&rendered)
+            .and_then(|_| stdout.write_all(b"\n"))
+            .and_then(|_| stdout.flush())
+            .map_err(|error| Error::io("write bash-smart expand JSON", error))?;
         return Ok(0);
     }
 
@@ -1136,8 +1148,9 @@ pub(crate) fn expand(
     if let Some(bytes) = oversized_line_bytes {
         let _ = writeln!(
             stdout,
-            "note: one complete raw line is {bytes} bytes and exceeds --max-bytes {}; emitted whole to preserve exact bytes",
-            raw_byte_budget.unwrap_or(bytes)
+            "note: one complete raw line is {bytes} bytes and exceeds the {}-byte raw payload allowance within --max-bytes {}; emitted whole to preserve exact bytes",
+            raw_byte_budget.unwrap_or(bytes),
+            window.max_bytes.unwrap_or(bytes)
         );
     }
     Ok(0)
@@ -2028,6 +2041,39 @@ fn take_range_byte_page(
     (page, remaining, oversized)
 }
 
+fn take_range_json_page(
+    ranges: &[(usize, usize)],
+    lines: &[RawLine<'_>],
+    encoded_budget: Option<usize>,
+) -> (LineRanges, LineRanges, Option<usize>) {
+    let Some(encoded_budget) = encoded_budget else {
+        return (ranges.to_vec(), Vec::new(), None);
+    };
+    let mut keep = 0usize;
+    let mut encoded = 0usize;
+    let mut oversized = None;
+    'outer: for &(start, end) in ranges {
+        for line in &lines[start - 1..end] {
+            // Pretty JSON renders each hex string with quotes, indentation,
+            // an optional comma, and a newline. Twelve bytes is a strict
+            // upper bound for that framing at this fixed nesting depth.
+            let line_encoded = line.raw.len().saturating_mul(2).saturating_add(12);
+            if keep == 0 && line_encoded > encoded_budget {
+                keep = 1;
+                oversized = Some(line.raw.len());
+                break 'outer;
+            }
+            if encoded.saturating_add(line_encoded) > encoded_budget {
+                break 'outer;
+            }
+            encoded += line_encoded;
+            keep += 1;
+        }
+    }
+    let (page, remaining) = take_range_page(ranges, keep);
+    (page, remaining, oversized)
+}
+
 fn range_byte_count(ranges: &[(usize, usize)], lines: &[RawLine<'_>]) -> usize {
     ranges
         .iter()
@@ -2579,6 +2625,26 @@ mod tests {
         assert_eq!(remaining, vec![(2, 3)]);
         assert_eq!(oversized, Some(4));
         assert_eq!(write_ranges_to_vec(&lines, &page), b"one\n");
+    }
+
+    #[test]
+    fn expand_json_window_accounts_for_each_short_lines_encoding_overhead() {
+        let raw = b"x\n".repeat(400);
+        let lines = split_lines(&raw);
+        let ranges = vec![(1, 400)];
+        let encoded_budget = 3_000 - EXPAND_JSON_METADATA_RESERVE;
+        let (page, remaining, oversized) =
+            take_range_json_page(&ranges, &lines, Some(encoded_budget));
+        let kept = range_line_count(&page);
+        assert!(kept > 0 && kept < 400);
+        assert_eq!(range_line_count(&remaining), 400 - kept);
+        assert_eq!(oversized, None);
+        let hex = page
+            .iter()
+            .flat_map(|(start, end)| lines[start - 1..*end].iter())
+            .map(|line| hex_encode(line.raw))
+            .collect::<Vec<_>>();
+        assert!(serde_json::to_vec_pretty(&hex).unwrap().len() <= encoded_budget);
     }
 
     fn write_ranges_to_vec(lines: &[RawLine<'_>], ranges: &[(usize, usize)]) -> Vec<u8> {
