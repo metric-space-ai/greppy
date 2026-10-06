@@ -303,7 +303,8 @@ pub fn run_agent_loop_with_history(
 
     let mut total_usage = Usage::default();
     let mut turns: usize = 0;
-    let mut last_stop = LoopStop::EndTurn;
+    // Every exit from the loop below sets this before `break`.
+    let mut last_stop: LoopStop;
     let mut final_text = String::new();
     let mut turn_budget_advised = false;
     let mut deadline_advised = false;
@@ -557,7 +558,6 @@ verifiable and report the rest."
 
                 // Continue the outer loop for the next assistant turn.
                 // After the last action turn, the next request permits only a final report.
-                last_stop = LoopStop::MaxTurns; // provisional; overwritten on next end
                 continue;
             }
             StopReason::EndTurn | StopReason::ToolUse => {
@@ -571,7 +571,6 @@ verifiable and report the rest."
                         text: "The response reached its token limit. Continue from the interruption and complete the task.".into(),
                     }],
                 });
-                last_stop = LoopStop::MaxTurns;
                 continue;
             }
             StopReason::Other(_) => {
@@ -900,7 +899,7 @@ mod tests {
 
     fn run(
         model: &mut dyn ModelStream,
-        env: &mut FakeEnv,
+        env: &mut dyn ExecutionEnv,
         config: &AgentConfig,
         prompt: &str,
     ) -> Result<(LoopResult, Vec<LoopEvent>), LoopError> {
