@@ -21,7 +21,7 @@ use greppy_agent::{
 
 use crate::agent_control::{socket_path_for, ControlServer};
 use crate::agent_tui::{
-    bounded_pair, compact_messages, messages_from_protocol, new_session_id,
+    bounded_pair, messages_from_protocol, new_session_id,
     protocol_from_persisted, redact_json, SessionCommand, SessionEvent, SessionRecord,
     SessionStore, TuiConfig,
 };
@@ -1031,6 +1031,7 @@ fn run_agent(
 
     let mut config = AgentConfig {
         max_turns: args.max_turns,
+        context_summary: headless_session.as_ref().and_then(|(record, _)| record.context_summary.clone()),
         system: Some(system_prompt_for_mode(if serve {
             BuiltinPromptMode::Serve
         } else if interactive {
@@ -1687,6 +1688,11 @@ fn run_headless_session(
             prompt_turns = prompt_turns.saturating_add(1);
         }
         match &event {
+            LoopEvent::ContextCompacted { archive, messages, summary } => {
+                persist_session(&mut stderr, store.append_context_checkpoint(
+                    &record.id, &messages_from_protocol(archive),
+                    &messages_from_protocol(messages), Some(summary)));
+            }
             LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
                 if let Some(emitter) = json.as_mut() {
                     emitter.text(text);
@@ -1756,13 +1762,15 @@ fn run_headless_session(
             }
             let _ = stdout.flush();
 
-            let new_messages = messages_from_protocol(
-                &result.messages[previous_message_count.min(result.messages.len())..],
-            );
-            persist_session(
-                &mut stderr,
-                store.append_messages(&record.id, &new_messages),
-            );
+            if result.context_summary.is_some() {
+                persist_session(&mut stderr, store.append_context_checkpoint(
+                    &record.id, &[], &messages_from_protocol(&result.messages),
+                    result.context_summary.as_deref()));
+            } else {
+                let new_messages = messages_from_protocol(
+                    &result.messages[previous_message_count.min(result.messages.len())..]);
+                persist_session(&mut stderr, store.append_messages(&record.id, &new_messages));
+            }
             add_usage(&mut summary.usage, &result.usage);
             summary.turns = summary.turns.saturating_add(prompt_turns);
             persist_session(
@@ -1822,6 +1830,7 @@ pub(crate) fn spawn_session_worker(
         .clone()
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     config.cancel = Some(Arc::clone(&cancel));
+    config.context_summary = record.context_summary.clone();
     let history = protocol_from_persisted(&record.messages);
     let restored_usage = record.usage;
     let restored_turns = record.turns;
@@ -1973,6 +1982,7 @@ pub(crate) fn spawn_session_worker(
                         match store_for_worker.load(&next_session_id) {
                             Ok(next) => {
                                 history = protocol_from_persisted(&next.messages);
+                                config.context_summary = next.context_summary;
                                 summary.usage = next.usage;
                                 summary.turns = next.turns;
                                 summary.last_stop = None;
@@ -1989,18 +1999,32 @@ pub(crate) fn spawn_session_worker(
                         }
                     }
                     SessionCommand::Compact => {
-                        let compacted = compact_messages(&messages_from_protocol(&history), 8);
-                        history = protocol_from_persisted(&compacted);
-                        if let Err(error) =
-                            store_for_worker.append_message_checkpoint(&session_id, &compacted)
-                        {
-                            worker_bridge.send_discrete(SessionEvent::Warning(format!(
-                                "session save failed: {error}"
-                            )));
+                        let archive = history.clone();
+                        let mut system = config.system.clone();
+                        greppy_agent::context::restore_summary(&mut system, config.context_summary.as_deref());
+                        let template = greppy_agent::ModelRequest {
+                            model: config.model.clone(), system: system.clone(), messages: Vec::new(),
+                            tools: Vec::new(), tool_choice: greppy_agent::ToolChoice::None,
+                            max_tokens: config.max_tokens,
+                        };
+                        match greppy_agent::context::compact_with_model(
+                            &mut client, &mut history, &mut system, &template, 0) {
+                            Ok(Some(usage)) => {
+                                let context_summary = greppy_agent::context::saved_summary(system.as_deref());
+                                let compacted = messages_from_protocol(&history);
+                                if let Err(error) = store_for_worker.append_context_checkpoint(
+                                    &session_id, &messages_from_protocol(&archive), &compacted, context_summary) {
+                                    history = archive;
+                                    worker_bridge.send_discrete(SessionEvent::Warning(format!("context checkpoint save failed: {error}")));
+                                } else {
+                                    config.context_summary = context_summary.map(str::to_owned);
+                                    add_usage(&mut summary.usage, &usage);
+                                    worker_bridge.send_discrete(SessionEvent::Compacted { messages: compacted });
+                                }
+                            }
+                            Ok(None) => worker_bridge.send_discrete(SessionEvent::Warning("No complete earlier exchange to compact.".into())),
+                            Err(error) => worker_bridge.send_discrete(SessionEvent::Warning(format!("context compaction failed; original history retained: {error}"))),
                         }
-                        worker_bridge.send_discrete(SessionEvent::Compacted {
-                            messages: compacted,
-                        });
                     }
                     SessionCommand::Prompt(prompt) => {
                         let mut prompt_turns = 0u64;
@@ -2027,6 +2051,14 @@ pub(crate) fn spawn_session_worker(
                                     prompt_turns = prompt_turns.saturating_add(1);
                                 }
                                 match event {
+                                    LoopEvent::ContextCompacted { archive, messages, summary } => {
+                                        if let Err(error) = store_for_worker.append_context_checkpoint(
+                                            &session_id, &messages_from_protocol(&archive),
+                                            &messages_from_protocol(&messages), Some(&summary)) {
+                                            worker_bridge.send_discrete(SessionEvent::Warning(format!("context checkpoint save failed: {error}")));
+                                            cancel.store(true, Ordering::Relaxed);
+                                        }
+                                    }
                                     LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
                                         worker_bridge.send_text(&text);
                                     }
@@ -2088,6 +2120,7 @@ pub(crate) fn spawn_session_worker(
 
                         match result {
                             Ok(result) => {
+                                config.context_summary = result.context_summary;
                                 summary.final_answer = result.final_text;
                                 history = result.messages;
                                 add_usage(&mut summary.usage, &result.usage);
@@ -2097,8 +2130,13 @@ pub(crate) fn spawn_session_worker(
                                 let new_messages = messages_from_protocol(
                                     &history[previous_message_count.min(history.len())..],
                                 );
-                                if let Err(error) =
+                                let save = if config.context_summary.is_some() {
+                                    store_for_worker.append_context_checkpoint(&session_id, &[], &persisted,
+                                        config.context_summary.as_deref())
+                                } else {
                                     store_for_worker.append_messages(&session_id, &new_messages)
+                                };
+                                if let Err(error) = save
                                 {
                                     worker_bridge.send_discrete(SessionEvent::Warning(format!(
                                         "session save failed: {error}"
@@ -2497,7 +2535,7 @@ fn handle_loop_event(
                 *tool_line_open = false;
             }
         }
-        LoopEvent::TurnComplete { .. } => {}
+        LoopEvent::TurnComplete { .. } | LoopEvent::ContextCompacted { .. } => {}
     }
 }
 
