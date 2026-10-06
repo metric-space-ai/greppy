@@ -229,6 +229,35 @@ impl Store {
             .map_err(Error::Sqlite)
     }
 
+    /// Test reuse identity without reading or decoding the vector payload.
+    /// Planning still validates content/model/prompt/task identity; the actual
+    /// embedding pass owns vector integrity checks and publication.
+    pub fn has_reusable_vector_embedding(
+        &self,
+        key: &ReusableVectorEmbeddingKey<'_>,
+    ) -> Result<bool> {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM vector_embeddings
+                    WHERE project = ?1 AND model_id = ?2 AND prompt_version = ?3
+                      AND task = ?4 AND qualified_name = ?5 AND chunk_idx = ?6
+                      AND content_sha256 = ?7
+                 )",
+                params![
+                    key.project,
+                    key.model_id,
+                    key.prompt_version,
+                    key.task,
+                    key.qualified_name,
+                    key.chunk_idx,
+                    key.content_sha256
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Error::Sqlite)
+    }
+
     /// Count embedding rows for a vector-search scope.
     pub fn count_vector_embeddings(
         &self,
@@ -917,6 +946,100 @@ mod tests {
         }
     }
 
+    fn reusable_key<'a>(
+        project: &'a str,
+        name: &'a str,
+        hash: &'a str,
+    ) -> ReusableVectorEmbeddingKey<'a> {
+        ReusableVectorEmbeddingKey {
+            project,
+            model_id: "google/embeddinggemma-300m-q4",
+            prompt_version: "embeddinggemma-code-retrieval-st-v2",
+            task: "retrieval_document",
+            qualified_name: name,
+            chunk_idx: 0,
+            content_sha256: hash,
+        }
+    }
+
+    #[test]
+    fn reusable_metadata_matches_full_identity_without_decoding_payload() {
+        let mut store = store_with_project("p");
+        let hash = "a".repeat(64);
+        let key = reusable_key("p", "p.f", &hash);
+        assert!(!store.has_reusable_vector_embedding(&key).unwrap());
+        store
+            .upsert_vector_embedding(&embedding(
+                "p",
+                None,
+                "p.f",
+                "src/f.rs",
+                1,
+                &hash,
+                vec![1.0, 0.0],
+            ))
+            .unwrap();
+        store
+            .upsert_vector_embedding(&embedding(
+                "p",
+                None,
+                "p.f",
+                "src/f.rs",
+                2,
+                &hash,
+                vec![0.0, 1.0],
+            ))
+            .unwrap();
+        for probe in [
+            key,
+            ReusableVectorEmbeddingKey {
+                project: "other",
+                ..key
+            },
+            ReusableVectorEmbeddingKey {
+                model_id: "other",
+                ..key
+            },
+            ReusableVectorEmbeddingKey {
+                prompt_version: "other",
+                ..key
+            },
+            ReusableVectorEmbeddingKey {
+                task: "other",
+                ..key
+            },
+            ReusableVectorEmbeddingKey {
+                qualified_name: "p.other",
+                ..key
+            },
+            ReusableVectorEmbeddingKey {
+                chunk_idx: 1,
+                ..key
+            },
+            ReusableVectorEmbeddingKey {
+                content_sha256: "changed",
+                ..key
+            },
+        ] {
+            assert_eq!(
+                store.has_reusable_vector_embedding(&probe).unwrap(),
+                store
+                    .find_reusable_vector_embedding(&probe)
+                    .unwrap()
+                    .is_some(),
+                "{probe:?}"
+            );
+        }
+        // Planning must not decode all payloads. A corrupt matching payload
+        // remains a real error when the actual reuse pass fetches it.
+        store
+            .conn()
+            .execute("UPDATE vector_embeddings SET vector = X'00'", [])
+            .unwrap();
+        assert!(store.has_reusable_vector_embedding(&key).unwrap());
+        assert!(store.find_reusable_vector_embedding(&key).is_err());
+    }
+
     #[test]
     fn upsert_get_and_count_round_trip() {
         let mut s = store_with_project("p");
@@ -1434,6 +1557,24 @@ mod tests {
 
         let visibility = crate::VisibilityIndex::new(["src/dirty.rs".into()], []).unwrap();
         let overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        for (name, hash, expected) in [
+            ("p.clean", "a".repeat(64), true),
+            ("p.old_dirty", "b".repeat(64), false),
+            ("p.new_dirty", "c".repeat(64), true),
+        ] {
+            let key = reusable_key("p", name, &hash);
+            assert_eq!(
+                overlay.has_reusable_vector_embedding(&key).unwrap(),
+                expected
+            );
+            assert_eq!(
+                overlay.has_reusable_vector_embedding(&key).unwrap(),
+                overlay
+                    .find_reusable_vector_embedding(&key)
+                    .unwrap()
+                    .is_some()
+            );
+        }
         let hits = overlay
             .vector_search_exact(&[1.0, 0.0], &query("p", Some(2), 10))
             .unwrap();
