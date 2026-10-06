@@ -88,5 +88,8 @@ fn write_omitted_new_preserves_shell_metacharacters_in_new_python_test() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(std::fs::read(temp.path().join("test_new.py")).unwrap(), content);
+    assert_eq!(
+        std::fs::read(temp.path().join("test_new.py")).unwrap(),
+        content
+    );
 }

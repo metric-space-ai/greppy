@@ -762,9 +762,7 @@ pub(crate) fn dispatch_read(
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
     let file_base = resolve_file_operand_base(root, &root_path);
-    if let Some((path, range)) =
-        read_positional_file_range(subjects, &file_base, &canonical_root)
-    {
+    if let Some((path, range)) = read_positional_file_range(subjects, &file_base, &canonical_root) {
         let mut retry = format!(
             "greppy read-file {} --lines {}",
             shell_example_arg(path),
@@ -874,7 +872,8 @@ fn read_positional_file_range<'a>(
 ) -> Option<(&'a str, String)> {
     let file_intent = |path: &str| {
         !path.contains("::")
-            && (looks_like_path(path) || read_resolve_file(file_base, canonical_root, path).is_some())
+            && (looks_like_path(path)
+                || read_resolve_file(file_base, canonical_root, path).is_some())
     };
     if let [path, range] = subjects {
         if file_intent(path) && read_parse_file_range(range, usize::MAX).is_ok() {
