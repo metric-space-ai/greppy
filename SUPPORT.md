@@ -2,18 +2,20 @@
 
 ## Release targets
 
-The `v0.4.0` release gate covers:
+The `v0.4.1` release gate covers:
 
 | Platform | Inference backend | Daemon transport | Web tool | Portable CoW |
 |---|---|---|---|---|
-| macOS Apple Silicon | CPU and Metal | Unix-domain socket | yes (beta) | FSKit |
-| Linux x86_64 | CPU and NVIDIA CUDA | Unix-domain socket | yes (beta) | FUSE3 |
-| Windows x86_64 | CPU | named pipe with user ACL | not in 0.4.0 | private WinFsp fork |
+| macOS Apple Silicon | Metal | Unix-domain socket | yes (beta) | optional FSKit |
+| Linux x86_64 | NVIDIA CUDA | Unix-domain socket | yes (beta) | optional FUSE3 |
+| Windows x86_64 (debug source build) | CPU (debug only) | named pipe with user ACL | not shipped | private WinFsp fork |
 
-Windows CUDA, macOS Intel, and Linux ARM64 are not release-gated for `v0.4.0`.
-An unsupported accelerator must not prevent CPU operation in automatic mode.
-An explicitly selected unavailable backend fails with a diagnostic instead of
-silently switching devices.
+Windows CUDA, macOS Intel, and Linux ARM64 are not release-gated for `v0.4.1`.
+Production inference requires Metal on macOS Apple Silicon or CUDA on Linux
+x86_64. Automatic selection refuses inference when a suitable GPU is unavailable;
+it never silently switches to CPU. CPU execution is reserved for debug and test
+usage. An explicitly selected unavailable backend fails with its diagnostic.
+FSKit is optional acceleration, not a prerequisite for ordinary Greppy use.
 
 The Windows package is released only after Microsoft Hardware Dev Center has
 returned the exact HLK/dashboard-signed WinFsp driver and catalog bound by the

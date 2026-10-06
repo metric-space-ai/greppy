@@ -64,12 +64,12 @@ greppy -p "keep going" --continue              # resume this project's most rece
 greppy agent --model MODEL                     # full-screen session, same isolated workspace
 greppy agent --continue --model MODEL          # restore this project's most recent session
 
-# In 0.4.0, agents and ordinary linked Git worktrees share immutable Base data:
+# In 0.4.1, agents and ordinary linked Git worktrees share immutable Base data:
 greppy index --agent-worktree                  # build or validate the shared Base ahead of time
 greppy index .                                 # first worktree creates the Base; later worktrees index only their Delta
 greppy index status --json                     # lock-free phase/progress/readiness, including ETA when known
 
-# 0.4.0 also exposes the local browser and persistent remote-controlled sessions:
+# 0.4.1 also exposes the local browser and persistent remote-controlled sessions:
 greppy web open https://example.com            # open, observe, interact and verify locally
 greppy -p --json "TASK"                        # newline-delimited session/tool/result events
 greppy agent sessions list --json              # persisted sessions and greppy:// handles
@@ -106,7 +106,7 @@ platform CoW provider, and the Web Runtime on macOS and Linux.
 [SUPPORT.md](SUPPORT.md) for the exact target list):
 
 ```bash
-version=v0.4.0
+version=v0.4.1
 asset=greppy-macos-arm64.pkg           # or greppy-linux-x86_64.deb/.rpm
 gh release download "$version" --repo metric-space-ai/greppy \
   --pattern "$asset" --pattern SHA256SUMS
@@ -116,10 +116,10 @@ sudo installer -pkg "$asset" -target /            # macOS
 #        sudo rpm -U ./greppy-linux-x86_64.rpm
 ```
 
-Windows has no 0.4.0 package: the private WinFsp transport requires a returned
+Windows has no 0.4.1 package: the private WinFsp transport requires a returned
 Microsoft Hardware Dev Center HLK/dashboard signature before Greppy will ship
 its driver. Windows developers may build the CLI from source; the Web Runtime
-and portable CoW workspace remain unavailable there in 0.4.0. Signature and
+and portable CoW workspace remain unavailable there in 0.4.1. Signature and
 provenance requirements are documented in [SECURITY.md](SECURITY.md).
 
 *Checking the release before installing* — one command each; note that the
@@ -128,9 +128,9 @@ only the two "Source code" links. The API and the bundled inventory are the
 source of truth:
 
 ```bash
-gh release view v0.4.0 --repo metric-space-ai/greppy \
+gh release view v0.4.1 --repo metric-space-ai/greppy \
   --json assets -q '.assets[].name'
-gh release download v0.4.0 --repo metric-space-ai/greppy \
+gh release download v0.4.1 --repo metric-space-ai/greppy \
   --pattern RELEASE-ASSETS.json                # machine-readable asset inventory
 gh attestation verify "$asset" --repo metric-space-ai/greppy   # build provenance
 ```
@@ -140,7 +140,7 @@ downloads ~780 MB of model files):
 
 ```bash
 git clone https://github.com/metric-space-ai/greppy && cd greppy
-git checkout v0.4.0
+git checkout v0.4.1
 ./tools/fetch_model_assets.sh
 cargo build --locked --release --bin greppy
 install -m 0755 target/release/greppy "$HOME/.local/bin/greppy"
@@ -220,7 +220,7 @@ serde commit — evidence in
 server, no per-agent config, no API keys. Works in any agent that can run
 shell commands (Claude Code, Cursor, Codex CLI, Gemini CLI, your own).
 
-The prompt ships as [`AGENTS.md`](AGENTS.md) in this repo. In 0.4.0 it includes
+The prompt ships as [`AGENTS.md`](AGENTS.md) in this repo. In 0.4.1 it includes
 the approved `BROWSER` block, so copying this one file activates both code and
 web tools for the agent; no second prompt fragment or feature flag is needed.
 Copy it into your
@@ -554,7 +554,7 @@ repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
   create another inference daemon or model-owner lock. `GREPPY_RUNTIME_DIR`
   remains an explicit whole-runtime override for isolated test harnesses and
   must not be set separately for each production agent.
-- **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
+- **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. Production artifacts use Metal on Apple Silicon or CUDA on Linux x86_64. Automatic inference refuses an unavailable GPU; CPU execution is reserved for debug and test usage.
 
 ## What the graph cannot see
 
@@ -583,7 +583,7 @@ are private to the current user (`0700` on Unix), and cache objects are managed
 only after ownership, type, and path validation. Set `GREPPY_STORE_DIR` to place
 the data on an encrypted or ephemeral volume.
 
-For agents and linked worktrees in 0.4.0, unchanged repository data is held once in a
+For agents and linked worktrees in 0.4.1, unchanged repository data is held once in a
 content-identified, immutable Base Store. Each run gets a writable private Delta
 containing only dirty, deleted, renamed, or newly created paths. The Base identity
 includes the Git tree, schema/indexer versions, and summary/embedding model
@@ -642,7 +642,7 @@ to carry a non-attestation Hardware Dev Center HLK/dashboard signature. Their
 hashes, signer EKUs and the canonical unsigned PE payload are bound into the
 release contract. Until the returned signed driver passes the identical
 mounted, install, upgrade, uninstall, isolation, and performance contracts,
-0.4.0 deliberately publishes no Windows package. None of
+0.4.1 deliberately publishes no Windows package. None of
 these providers requires APFS
 clones, Btrfs subvolumes, reflinks, NTFS block cloning, or another host-
 filesystem CoW feature. The small macOS extension host is Swift because FSKit
@@ -671,7 +671,7 @@ are all present.
 Version 0.3.3 remains reproducible as the earlier limited native-CoW release:
 its APFS/Btrfs/reflink behavior, Rift-derived implementation, flags, and native
 fallback are historical 0.3.3 behavior documented in the changelog. None of
-those backends or Rift sources participate in the 0.4.0 build or runtime.
+those backends or Rift sources participate in the 0.4.1 build or runtime.
 
 Full source bodies are not duplicated into SQLite. Exact code search reads the
 current worktree through real `grep` where available, with an in-binary literal
@@ -701,9 +701,9 @@ rm "$HOME/.local/bin/greppy"     # or wherever you installed it
 
 ## Status
 
-**Release candidate: v0.4.0. Published stable remains
+**Release candidate: v0.4.1. Published stable remains
 [v0.3.3](https://github.com/metric-space-ai/greppy/releases/tag/v0.3.3) until
-the SHA-bound 0.4.0 gates and signing approvals complete.**
+the SHA-bound 0.4.1 gates and signing approvals complete.**
 Releases ship after CI, CodeQL, the security audit, the task-bank audit, and the
 summary-quality gate pass on the release commit, then get signed, notarized,
 and attested (SBOM + provenance). Agent benchmarks remain non-blocking
@@ -718,9 +718,9 @@ diagnostics for subsequent releases. Pin the tag for production.
   Go, C++, C#, Kotlin, Swift, and Ruby — fixture grids and real-repository tests
   guarantee complete caller/callee/usage/impact relations; other languages
   extract the same relations without that formal guarantee.
-- **0.4.0 package targets:** macOS Apple Silicon with Metal and Linux x86_64
-  with CPU and NVIDIA CUDA. Windows x86_64 remains a source-build CLI target;
-  no Windows package, Web Runtime, or portable CoW workspace ships in 0.4.0.
+- **0.4.1 package targets:** macOS Apple Silicon with Metal and Linux x86_64
+  with NVIDIA CUDA. Windows x86_64 remains a debug source-build CLI target;
+  no Windows package, Web Runtime, or portable CoW workspace ships in 0.4.1.
 - **Known boundaries:** reflection, runtime dependency injection, generated
   code, macros, and dynamic dispatch can hide relationships from any static
   graph. Freshness checks fail closed rather than knowingly returning stale
