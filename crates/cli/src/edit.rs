@@ -1430,14 +1430,31 @@ fn edit_kill_verifier_tree(child: &mut std::process::Child, graceful: bool) {
 }
 
 fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> EditVerification {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let prefix = std::env::temp_dir().join(format!("greppy-verify-{}-{nonce}", std::process::id()));
-    let stdout_path = prefix.with_extension("stdout");
-    let stderr_path = prefix.with_extension("stderr");
-    let runner_status_path = prefix.with_extension("runner.json");
+    // Completion publishing uses the private-cache writer. Never give that
+    // writer the shared OS temp root: it secures its parent directory, which
+    // may belong to another user (Linux /tmp) or serve unrelated processes.
+    // Keep all capture files in an owned private namespace with RAII cleanup.
+    let capture = tempfile::Builder::new()
+        .prefix("greppy-verify-")
+        .tempdir()
+        .and_then(|directory| {
+            greppy_core::cache::secure_private_directory(directory.path())?;
+            Ok(directory)
+        });
+    let capture = match capture {
+        Ok(directory) => directory,
+        Err(error) => {
+            return EditVerification::new(
+                EditVerificationStatus::Unavailable,
+                vec![format!(
+                    "verify: unavailable — cannot create private capture directory: {error}"
+                )],
+            )
+        }
+    };
+    let stdout_path = capture.path().join("stdout");
+    let stderr_path = capture.path().join("stderr");
+    let runner_status_path = capture.path().join("runner.json");
     let stdout = match std::fs::File::create(&stdout_path) {
         Ok(file) => file,
         Err(error) => {

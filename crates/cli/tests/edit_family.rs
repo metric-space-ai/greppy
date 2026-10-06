@@ -2314,3 +2314,51 @@ fn verify_reaps_pipe_holding_descendant_after_test_leader_exits() {
         "pipe-holding test descendant survived timeout"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn verify_completion_keeps_shared_temp_permissions_and_cleans_private_capture() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for code in [0, 3] {
+        let fixture = Fixture::new("verify-shared-temp");
+        let shared = fixture.base.join("shared-temp");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
+        let command = format!(
+            "python3 -c 'import os, pathlib, stat, sys; roots=list(pathlib.Path(os.environ[\"TMPDIR\"]).glob(\"greppy-verify-*\")); assert len(roots)==1; assert stat.S_IMODE(roots[0].stat().st_mode)==0o700; sys.exit({code})'"
+        );
+        let output = fixture
+            .command()
+            .env("TMPDIR", &shared)
+            .env("GREPPY_VERIFY_TEST_COMMAND", command)
+            .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if code == 0 { 0 } else { 17 }),
+            "{}",
+            combined(&output)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value["verify"]["tests_status"],
+            if code == 0 { "passed" } else { "failed" }
+        );
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+        assert!(
+            !std::fs::read_dir(&shared).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("greppy-verify-")
+            }),
+            "private capture was not removed"
+        );
+    }
+}
