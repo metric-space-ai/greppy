@@ -70,7 +70,28 @@ def main():
             cache[key] = (result.returncode, result.stdout + result.stderr)
         return cache[key]
 
+    def command_names(text):
+        block = text.split("\nCommands:\n", 1)
+        if len(block) != 2:
+            return set()
+        block = re.split(r"\n(?:Arguments|Options|Agent modes):", block[1], maxsplit=1)[0]
+        return set(re.findall(r"^  ([a-z][a-z-]*)\s{2,}", block, re.MULTILINE))
+
     for row in rows:
+        # Unknown top-level words deliberately fall through to real grep;
+        # '--help' alone can therefore return zero for an invented command.
+        # Check each path component against its parent's actual command list.
+        path_valid = True
+        for index, word in enumerate(row["command"]):
+            if index == 0 and word in ("-p", "rg"):
+                continue  # Dedicated agent and real-ripgrep compatibility routes.
+            _, parent_help = help_for(row["command"][:index])
+            if word not in command_names(parent_help):
+                failures.append({**row, "error": f"{word} absent from parent help command list"})
+                path_valid = False
+                break
+        if not path_valid:
+            continue
         code, text = help_for(row["command"])
         if code:
             failures.append({**row, "error": f"help returned {code}", "output": text})
