@@ -14,9 +14,15 @@ use std::path::Path;
 // guard hashes in prompt-source-truth-owner-review.md (this parent thread).
 // This new approval covers the full shared contract, restored reading rules,
 // callees wording, export documentation, uniform layout and argv adapter.
+// 2026-10-06: Owner SIGNATURE, AskUserQuestion answer "Sign v3", relayed
+// through the website session and explicitly supplied in this parent thread.
+// Approved exact prompt-content-v3.proposed.md: 12,782 bytes, SHA256 below.
+// This supersedes a1def1ae, fixes external/built-in execution and browser
+// contract contradictions, and preserves the approved argv adapter unchanged.
+// Bench arms use Greppy as their only system prompt, with shell tools only.
 // Later prose changes require a new complete diff and explicit owner approval.
 pub const APPROVED_SHA256: &str =
-    "a1def1aec84c130aa407eba3b53548c0b8f61dd504696e29718e86b5c889195d";
+    "5455a7ba675d47f5adb5d5868b767054227e6fa152cefff021386d5af2de9440";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // The new argv adapter is approved by the same 2026-10-05 "ja" above.
