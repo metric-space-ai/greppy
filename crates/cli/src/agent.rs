@@ -575,6 +575,9 @@ fn run_agent(
         }
     };
     let shared_data_root = greppy_core::cache::data_root();
+    // Capture operator TMPDIR before replacing it with per-workspace scratch.
+    // Expand IDs must survive the mandatory deletion of that workspace.
+    let output_storage = std::env::temp_dir().join("greppy-agent-output");
     let deadline_total = args.deadline_secs.map(Duration::from_secs);
     let deadline = deadline_total.map(|total| Instant::now() + total);
 
@@ -976,6 +979,7 @@ fn run_agent(
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
         Ok(env) => env.with_deadline(deadline).with_output_owner(cwd.clone())
+            .with_output_storage(output_storage)
             .with_sandbox(sandbox_mode.clone()).with_context_status(
             workspace.run_id().to_owned(),
             crate::context_status::agent_notice,

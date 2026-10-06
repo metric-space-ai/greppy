@@ -38,6 +38,8 @@ pub struct AgentConfig {
     pub max_turns: usize,
     /// Optional system prompt forwarded every turn.
     pub system: Option<String>,
+    /// Saved context checkpoint, distinct from the signed mode contract.
+    pub context_summary: Option<String>,
     /// Model tag placed on each [`ModelRequest`].
     pub model: String,
     /// Optional response limit; u64::MAX delegates the limit to the model provider.
@@ -67,6 +69,7 @@ impl PartialEq for AgentConfig {
     fn eq(&self, other: &Self) -> bool {
         self.max_turns == other.max_turns
             && self.system == other.system
+            && self.context_summary == other.context_summary
             && self.model == other.model
             && self.max_tokens == other.max_tokens
             && self.tool_choice == other.tool_choice
@@ -84,6 +87,7 @@ impl Default for AgentConfig {
         Self {
             max_turns: 0,
             system: None,
+            context_summary: None,
             model: String::new(),
             max_tokens: u64::MAX,
             tool_choice: ToolChoice::Auto,
@@ -157,6 +161,8 @@ pub struct LoopResult {
     /// Full conversation history (user prompt + every assistant/tool-result
     /// message produced during the run).
     pub messages: Vec<Message>,
+    /// Continuation checkpoint kept separately from the signed mode contract.
+    pub context_summary: Option<String>,
     /// Concatenated text from the final assistant message (empty if the last
     /// assistant turn had only tool calls / thinking).
     pub final_text: String,
@@ -210,6 +216,12 @@ impl From<ClientError> for LoopError {
 /// Events emitted by the agent loop while it runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopEvent {
+    /// One complete compaction: archive before replacing active session state.
+    ContextCompacted {
+        archive: Vec<Message>,
+        messages: Vec<Message>,
+        summary: String,
+    },
     /// A model-stream event for the current assistant turn.
     Stream(StreamEvent),
     /// About to execute a tool call.
@@ -281,6 +293,7 @@ pub fn run_agent_loop_with_history(
 ) -> Result<LoopResult, LoopError> {
     let mut messages: Vec<Message> = history.to_vec();
     let mut system = config.system.clone();
+    crate::context::restore_summary(&mut system, config.context_summary.as_deref());
     messages.push(Message {
         role: Role::User,
         content: vec![ContentPart::Text {
@@ -544,6 +557,7 @@ verifiable and report the rest."
 
     Ok(LoopResult {
         messages,
+        context_summary: crate::context::saved_summary(system.as_deref()).map(str::to_owned),
         final_text,
         stop: last_stop,
         usage: total_usage,

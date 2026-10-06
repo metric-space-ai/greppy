@@ -70,6 +70,7 @@ pub struct GreppyEnv {
     greppy_bin: PathBuf,
     root: PathBuf,
     output_owner: PathBuf,
+    output_storage: PathBuf,
     bash_timeout: Duration,
     greppy_timeout: Duration,
     max_output_bytes: usize,
@@ -98,6 +99,7 @@ impl GreppyEnv {
         Ok(Self {
             greppy_bin,
             output_owner: root.clone(),
+            output_storage: std::env::temp_dir().join("greppy-agent-output"),
             root,
             bash_timeout: DEFAULT_BASH_TIMEOUT,
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
@@ -125,6 +127,12 @@ impl GreppyEnv {
     /// Bind retained evidence to the durable original checkout, not a disposable worktree.
     pub fn with_output_owner(mut self, owner: PathBuf) -> Self {
         self.output_owner = owner;
+        self
+    }
+
+    /// Keep recoverable output outside the workspace scratch deleted at finish.
+    pub fn with_output_storage(mut self, storage: PathBuf) -> Self {
+        self.output_storage = storage;
         self
     }
 
@@ -224,9 +232,7 @@ impl GreppyEnv {
             return body; // Retention budget cannot cause evidence loss.
         }
         static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-        let directory = std::env::temp_dir()
-            .join("greppy-agent-output")
-            .join(format!(
+        let directory = self.output_storage.join(format!(
                 "capture-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -2092,6 +2098,27 @@ exit 0
             .content
             .contains("corruption"));
         assert!(expand_agent_output(&root, "agent-output-é", 0, 64).is_error);
+    }
+
+    #[test]
+    fn retained_evidence_survives_workspace_and_run_scratch_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("checkout");
+        let worktree = temp.path().join("worktree");
+        let scratch = temp.path().join("scratch");
+        for path in [&owner, &worktree, &scratch] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let env = GreppyEnv::with_binary(PathBuf::from("/not-executed"), worktree.clone())
+            .unwrap().with_output_owner(owner.clone())
+            .with_output_storage(temp.path().join("greppy-agent-output"))
+            .with_max_output_bytes(8);
+        let folded = env.fold_output("verified evidence remains available".into(), b"raw", b"");
+        let id = folded.split("output retained as ").nth(1).unwrap().split(';').next().unwrap();
+        fs::remove_dir_all(worktree).unwrap();
+        fs::remove_dir_all(scratch).unwrap();
+        assert_eq!(expand_agent_output(&owner, id, 0, 128).content,
+            "verified evidence remains available");
     }
 
     #[test]
