@@ -2231,7 +2231,7 @@ fn verify_selected_tests_timeout_without_undoing_edit() {
     std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
     let output = fixture
         .command()
-        .env("GREPPY_VERIFY_TEST_COMMAND", "sleep 30")
+         .env("GREPPY_VERIFY_TEST_COMMAND", "python3 -c \"import os,time;open('owned-test.pid','w').write(str(os.getpid()));time.sleep(30)\"")
         .env("GREPPY_EDIT_VERIFY_TIMEOUT_SECS", "1")
         .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
         .output()
@@ -2240,4 +2240,17 @@ fn verify_selected_tests_timeout_without_undoing_edit() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["verify"]["tests_status"], "timed_out");
     assert_file(&fixture.repo.join("a.txt"), "new\n");
+    let pid: i32 = std::fs::read_to_string(fixture.repo.join("owned-test.pid"))
+        .expect("selected test actually started")
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "selected test process survived timeout"
+    );
 }
