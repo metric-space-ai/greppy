@@ -5061,8 +5061,12 @@ mod tests {
 
         // Materialize the same clean source used by a cold production Base build.
         let clean = TemporaryBaseWorktree::create(repo.path(), &commit).unwrap();
+        // Git checks the clean source out with the user's line-ending settings
+        // (core.autocrlf is on by default on Windows); compare the content.
         assert_eq!(
-            std::fs::read_to_string(clean.path().join("src/a.rs")).unwrap(),
+            std::fs::read_to_string(clean.path().join("src/a.rs"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "fn a() {}\n"
         );
         assert!(!clean.path().join("src/untracked.rs").exists());
