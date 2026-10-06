@@ -458,6 +458,22 @@ fn only_graph_db_below(root: &Path) -> PathBuf {
     found.pop().unwrap()
 }
 
+fn has_graph_or_index_job_below(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let child = entry.path();
+        if child.is_dir() {
+            has_graph_or_index_job_below(&child)
+        } else {
+            child
+                .file_name()
+                .is_some_and(|name| name == "graph.db" || name == "index.job")
+        }
+    })
+}
+
 #[test]
 fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
     use std::io::Write;
@@ -730,16 +746,12 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with(
-            "Source outline for `lib.rs` — large indexed source; text: --lines A:B or --all:"
-        ),
+        stdout
+            .starts_with("Source outline for `lib.rs` — fingerprint-verified indexed definitions:"),
         "{stdout}"
     );
     assert!(!stdout.contains("731"), "{stdout}");
-    assert!(
-        stdout.contains("full text: greppy read-file lib.rs --all"),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("--all"), "{stdout}");
     assert!(!stdout.contains("private source content"), "{stdout}");
     assert!(
         !stdout.lines().any(|line| line.starts_with("handle: ")),
@@ -791,6 +803,88 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
         std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
         source
     );
+}
+
+#[test]
+fn explicit_outline_is_verified_structured_and_handle_truthful() {
+    let (repo, store) = fresh_workspace("outline-explicit");
+    std::fs::write(repo.join("lib.rs"), "pub fn target() -> i32 { 731 }\n").unwrap();
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "lib.rs", "--outline", "--handle", "--json"],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let file = &value["files"][0];
+    assert_eq!(file["kind"], "outline");
+    assert_eq!(file["fingerprint_verified"], true);
+    assert!(file["content"].as_str().unwrap().contains("target"));
+    assert!(file["handle"].is_null());
+    assert!(file["handle_unavailable"]
+        .as_str()
+        .unwrap()
+        .contains("--lines A:B"));
+    assert_eq!(file["lines_command"], "greppy read-file lib.rs --lines A:B");
+    assert!(!stdout.contains("--all"), "{stdout}");
+}
+
+#[test]
+fn explicit_outline_reports_cold_stale_and_definition_free_sources_without_indexing() {
+    let (cold_repo, cold_store) = fresh_workspace("outline-explicit-cold");
+    std::fs::write(cold_repo.join("cold.rs"), "pub fn cold() {}\n").unwrap();
+    let (code, stdout, stderr) = run(
+        &cold_repo,
+        &cold_store,
+        &["read-file", "cold.rs", "--outline", "--json"],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    let cold: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(cold["files"][0]["kind"], "outline_unavailable");
+    assert!(cold["files"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("no index"));
+    assert!(!has_graph_or_index_job_below(&cold_store));
+
+    let (repo, store) = fresh_workspace("outline-explicit-unavailable");
+    std::fs::write(repo.join("lib.rs"), "pub fn before() {}\n").unwrap();
+    std::fs::write(repo.join("notes.txt"), "plain text only\n").unwrap();
+    index(&repo, &store);
+    std::fs::write(repo.join("lib.rs"), "pub fn after_() {}\n").unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--outline"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(stdout.contains("fingerprint is stale"), "{stdout}");
+    assert!(stdout.contains("--lines A:B"), "{stdout}");
+    assert!(!stdout.contains("pub fn before"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "notes.txt", "--outline"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("no eligible definitions") || stdout.contains("not indexed"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn explicit_outline_conflicts_with_exact_range_and_all_modes() {
+    let (repo, store) = fresh_workspace("outline-explicit-conflicts");
+    std::fs::write(repo.join("lib.rs"), "pub fn target() {}\n").unwrap();
+    for tail in [
+        &["--outline", "--all"][..],
+        &["--outline", "--lines", "1:1"][..],
+    ] {
+        let mut args = vec!["read-file", "lib.rs"];
+        args.extend_from_slice(tail);
+        let (code, stdout, stderr) = run(&repo, &store, &args);
+        assert_ne!(code, 0, "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("cannot be used with") || stdout.contains("invalid"),
+            "{stdout}\n{stderr}"
+        );
+    }
 }
 
 #[test]

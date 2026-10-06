@@ -316,6 +316,9 @@ pub enum Command {
         /// Print every line without pagination.
         #[arg(long, conflicts_with = "lines")]
         all: bool,
+        /// Print a fingerprint-verified indexed definition outline without indexing.
+        #[arg(long, conflicts_with_all = ["lines", "all"])]
+        outline: bool,
         /// Also print a compact edit handle for every printed span.
         #[arg(long)]
         handle: bool,

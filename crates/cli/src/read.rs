@@ -818,6 +818,7 @@ pub(crate) fn dispatch_read(
                 std::slice::from_ref(subject),
                 None,
                 false,
+                false,
                 with_handle,
                 false,
                 path_filters,
@@ -1623,29 +1624,48 @@ fn read_file_outline(
     content: &str,
     symbol_read: bool,
 ) -> Option<String> {
+    read_file_outline_result(root, shown, content, symbol_read).ok()
+}
+
+fn read_file_outline_result(
+    root: &std::path::Path,
+    shown: &str,
+    content: &str,
+    symbol_read: bool,
+) -> std::result::Result<String, &'static str> {
     let path = greppy_core::cache::workspace_store_path(root);
     if !path.is_file() {
-        return None;
+        return Err("no index exists for this workspace");
     }
-    let store =
-        greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).ok()?;
-    let store = if let Some((base, commit)) = crate::store_cow::overlay_environment(root).ok()? {
+    let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())
+        .map_err(|_| "the index cannot be opened read-only")?;
+    let store = if let Some((base, commit)) = crate::store_cow::overlay_environment(root)
+        .map_err(|_| "the linked-worktree index identity is unavailable")?
+    {
         let visibility =
-            crate::store_cow::visibility_for_open_connection(root, &commit, store.conn()).ok()?;
-        store.attach_overlay(&base, &visibility).ok()?
+            crate::store_cow::visibility_for_open_connection(root, &commit, store.conn())
+                .map_err(|_| "the linked-worktree visibility is unavailable")?;
+        store
+            .attach_overlay(&base, &visibility)
+            .map_err(|_| "the linked-worktree Base cannot be opened read-only")?
     } else {
         store
     };
     let project = workspace_locator::project_identity(root);
     // Same-length edits can leave obsolete indexed spans in bounds. Unknown
     // or changed fingerprints fall back without index or repair work.
-    let indexed = store.get_file_state(&project, shown).ok()??;
+    let indexed = store
+        .get_file_state(&project, shown)
+        .map_err(|_| "the indexed file state is unavailable")?
+        .ok_or("the file is not indexed")?;
     use sha2::Digest;
     let content_hash = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
     if indexed.sha256 != content_hash {
-        return None;
+        return Err("the indexed fingerprint is stale for the current file");
     }
-    let mut nodes = store.list_nodes_for_file(&project, shown).ok()?;
+    let mut nodes = store
+        .list_nodes_for_file(&project, shown)
+        .map_err(|_| "indexed definitions cannot be read")?;
     let line_count = read_line_count(content) as i64;
     nodes.retain(|node| {
         matches!(
@@ -1666,14 +1686,12 @@ fn read_file_outline(
         }
     }
     if top_level.is_empty() {
-        return None;
+        return Err("the current index has no eligible definitions for this file");
     }
     let mut outline = if symbol_read {
         format!("`{shown}` is a file — read a symbol:\n")
     } else {
-        format!(
-            "Source outline for `{shown}` — large indexed source; text: --lines A:B or --all:\n"
-        )
+        format!("Source outline for `{shown}` — fingerprint-verified indexed definitions:\n")
     };
     for node in &top_level {
         outline.push_str(&format!(
@@ -1685,16 +1703,17 @@ fn read_file_outline(
         ));
     }
     outline.push_str(&format!(
-        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B · full text: greppy read-file {shown} --all\n",
+        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B\n",
         top_level[0].qualified_name
     ));
-    Some(outline)
+    Ok(outline)
 }
 
 pub(crate) fn dispatch_read_files(
     paths: &[String],
     lines: Option<&str>,
     all: bool,
+    outline: bool,
     with_handle: bool,
     json_output: bool,
     path_filter_args: &[String],
@@ -1795,7 +1814,7 @@ pub(crate) fn dispatch_read_files(
             previous_ended_with_newline = group.ends_with('\n');
             continue;
         }
-        let preview = if lines.is_none() && !all {
+        let preview = if lines.is_none() && !all && !outline {
             read_file_preview(&canonical)
         } else {
             std::fs::read_to_string(&canonical).map(|text| (text, None))
@@ -1823,6 +1842,56 @@ pub(crate) fn dispatch_read_files(
             }
         };
         let line_count = read_line_count(&content);
+        if outline {
+            match read_file_outline_result(&root_path, &shown, &content, false) {
+                Ok(result) => {
+                    if json_output {
+                        json_files.push(serde_json::json!({
+                            "path": shown,
+                            "kind": "outline",
+                            "content": result,
+                            "fingerprint_verified": true,
+                            "handle": serde_json::Value::Null,
+                            "handle_unavailable": with_handle.then_some(
+                                "outlines cannot produce an edit handle; request an explicit --lines A:B span"
+                            ),
+                            "lines_command": format!("greppy read-file {shown} --lines A:B"),
+                        }));
+                    } else {
+                        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                        print!("{result}");
+                        if with_handle {
+                            println!(
+                                "note: no handle for an outline; request an explicit --lines A:B span"
+                            );
+                        }
+                        previous_ended_with_newline = true;
+                    }
+                }
+                Err(reason) => {
+                    failed = true;
+                    if json_output {
+                        json_files.push(serde_json::json!({
+                            "path": shown,
+                            "kind": "outline_unavailable",
+                            "error": reason,
+                            "fingerprint_verified": false,
+                            "handle": serde_json::Value::Null,
+                            "handle_unavailable": with_handle.then_some(
+                                "no verified outline exists; request an explicit --lines A:B span"
+                            ),
+                            "lines_command": format!("greppy read-file {shown} --lines A:B"),
+                        }));
+                    } else {
+                        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                        println!("outline unavailable for `{shown}`: {reason}");
+                        println!("read lines: greppy read-file {shown} --lines A:B");
+                        previous_ended_with_newline = true;
+                    }
+                }
+            }
+            continue;
+        }
         // A line page is not a byte budget: generated JSON/NDJSON can put
         // megabytes on one line. Bound only implicit reads; explicit ranges
         // and --all remain exact. Do this before outlines and pack creation

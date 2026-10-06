@@ -1042,7 +1042,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                         );
                     }
                     println!(
-                        "usage: greppy read-file PATH [PATH …] [--lines A:B] [--all] [--json]"
+                        "usage: greppy read-file PATH [PATH …] [--lines A:B|--outline|--all] [--json]"
                     );
                     return 64;
                 }
@@ -2547,6 +2547,7 @@ fn dispatch_subcommand(
             paths,
             lines,
             all,
+            outline,
             handle,
             json,
             path_opts,
@@ -2556,6 +2557,7 @@ fn dispatch_subcommand(
                 &paths,
                 lines.as_deref(),
                 all,
+                outline,
                 handle,
                 json,
                 &path_opts,
