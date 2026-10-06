@@ -7,6 +7,8 @@ use super::*;
 use crate::web::WebCommand;
 use clap::{Parser, Subcommand};
 
+const EDIT_VERIFY_HELP: &str = "Verification: --verify runs local syntax/build checks, not project tests by default.\nSet GREPPY_VERIFY_TEST_COMMAND to the affected test command to run it through bash-smart\nin the same bounded verification. Example (Unix):\n  GREPPY_VERIFY_TEST_COMMAND='python3 -m unittest discover -s tests' greppy patch --verify\nJSON reports each check scope and tests_status separately; a failed test returns exit 17.";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "greppy",
@@ -330,6 +332,7 @@ pub enum Command {
         path_opts: Vec<String>,
     },
     /// Replace a definition with NEW; without NEW, read it from stdin.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     Replace {
         #[arg(value_name = "S", allow_hyphen_values = true)]
         symbol: String,
@@ -346,6 +349,7 @@ pub enum Command {
         json: bool,
     },
     /// Replace OLD in F; OLD must occur exactly once unless --expect says otherwise.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     ReplaceText {
         #[arg(value_name = "F", allow_hyphen_values = true)]
         file: String,
@@ -369,6 +373,7 @@ pub enum Command {
         json: bool,
     },
     /// Replace inclusive 1-based lines A:B in F.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     ReplaceLines {
         #[arg(value_name = "F", allow_hyphen_values = true)]
         file: String,
@@ -384,6 +389,7 @@ pub enum Command {
         json: bool,
     },
     /// Replace the byte-exact span named by H.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     ReplaceSpan {
         #[arg(value_name = "H", allow_hyphen_values = true)]
         handle: String,
@@ -397,6 +403,7 @@ pub enum Command {
         json: bool,
     },
     /// Create or overwrite PATH with NEW.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     Write {
         #[arg(value_name = "PATH", allow_hyphen_values = true)]
         path: String,
@@ -410,6 +417,7 @@ pub enum Command {
         json: bool,
     },
     /// Remove a definition.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     Delete {
         #[arg(value_name = "S", allow_hyphen_values = true)]
         symbol: String,
@@ -421,6 +429,7 @@ pub enum Command {
         json: bool,
     },
     /// Remove inclusive 1-based lines A:B from F.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     DeleteLines {
         #[arg(value_name = "F", allow_hyphen_values = true)]
         file: String,
@@ -434,6 +443,7 @@ pub enum Command {
         json: bool,
     },
     /// Insert NEW after line N in F; line 0 means the top.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     InsertLines {
         #[arg(value_name = "F", allow_hyphen_values = true)]
         file: String,
@@ -449,6 +459,7 @@ pub enum Command {
         json: bool,
     },
     /// Rename a definition and every graph-resolved reference.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     Rename {
         #[arg(value_name = "S", allow_hyphen_values = true)]
         symbol: String,
@@ -462,6 +473,7 @@ pub enum Command {
         json: bool,
     },
     /// Reverse an edit; without ID, reverse the latest one.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     Undo {
         #[arg(value_name = "ID", allow_hyphen_values = true)]
         id: Option<String>,
@@ -477,6 +489,7 @@ pub enum Command {
     /// File creation and deletion are not supported. To create a file, use
     /// `greppy write PATH` with content on stdin; it is a separate transaction,
     /// not atomic with edits in a patch.
+    #[command(after_help = EDIT_VERIFY_HELP)]
     Patch {
         #[arg(value_name = "DIFF", allow_hyphen_values = true)]
         diff: Option<String>,

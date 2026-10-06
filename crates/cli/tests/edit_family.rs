@@ -35,7 +35,8 @@ impl Fixture {
         command
             .current_dir(&self.repo)
             .env("GREPPY_STORE_DIR", &self.store)
-            .env("GREPPY_TEST_SKIP_INFERENCE", "1");
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_VERIFY_TEST_COMMAND");
         command
     }
 
@@ -44,7 +45,8 @@ impl Fixture {
         command
             .current_dir(cwd)
             .env("GREPPY_STORE_DIR", &self.store)
-            .env("GREPPY_TEST_SKIP_INFERENCE", "1");
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_VERIFY_TEST_COMMAND");
         command
     }
 
@@ -2130,4 +2132,112 @@ fn python_body_indentation_is_checked_before_publication() {
         &fixture.repo.join("limits.py"),
         "def clamp(value, lower, upper):\n    return max(lower, min(upper, value))\n",
     );
+}
+
+#[test]
+fn verify_reports_syntax_success_without_claiming_tests_passed() {
+    let fixture = Fixture::new("verify-syntax-coverage");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture.run(&["replace-text", "a.py", "1", "2", "--verify", "--json"]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "not_run");
+    assert_eq!(value["verify"]["checks"][0]["scope"], "syntax");
+    assert_eq!(value["verify"]["checks"][0]["status"], "passed");
+    assert!(combined(&output).contains("tests not run"));
+}
+
+#[test]
+fn verify_selected_python_tests_catch_import_cycle_despite_valid_syntax() {
+    let fixture = Fixture::new("verify-import-cycle");
+    std::fs::create_dir(fixture.repo.join("tests")).unwrap();
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    std::fs::write(fixture.repo.join("b.py"), "from a import VALUE\n").unwrap();
+    std::fs::write(fixture.repo.join("tests/test_imports.py"),
+        "import unittest\nimport a\nclass TestImports(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(a.VALUE, 1)\n").unwrap();
+    let run = |old, new| {
+        fixture
+            .command()
+            .env(
+                "GREPPY_VERIFY_TEST_COMMAND",
+                "python3 -m unittest discover -s tests",
+            )
+            .args(["replace-text", "a.py", old, new, "--verify", "--json"])
+            .output()
+            .unwrap()
+    };
+    let broken = run("VALUE = 1", "from b import VALUE\nVALUE = 1");
+    assert_eq!(broken.status.code(), Some(17), "{}", combined(&broken));
+    let value: serde_json::Value = serde_json::from_slice(&broken.stdout).unwrap();
+    assert_eq!(value["verify"]["checks"][0]["scope"], "syntax");
+    assert_eq!(value["verify"]["checks"][0]["status"], "passed");
+    assert_eq!(value["verify"]["tests_status"], "failed");
+    assert_eq!(value["verify"]["checks"][1]["scope"], "tests");
+    assert!(
+        combined(&broken).contains("ImportError"),
+        "{}",
+        combined(&broken)
+    );
+    assert!(combined(&broken).contains("edit remains applied"));
+    assert_file(
+        &fixture.repo.join("a.py"),
+        "from b import VALUE\nVALUE = 1\n",
+    );
+    let repaired = run("from b import VALUE\nVALUE = 1", "VALUE = 1");
+    assert!(repaired.status.success(), "{}", combined(&repaired));
+    let value: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "passed");
+    assert_eq!(value["verify"]["checks"][1]["status"], "passed");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_selected_test_pipeline_preserves_failure() {
+    let fixture = Fixture::new("verify-test-pipeline");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .env(
+            "GREPPY_VERIFY_TEST_COMMAND",
+            "python3 -c 'raise RuntimeError(\"pipeline failure\")' | head -1",
+        )
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "failed");
+}
+
+#[test]
+fn verify_rejects_empty_selected_tests_instead_of_claiming_success() {
+    let fixture = Fixture::new("verify-empty-tests");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "  ")
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "unavailable");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_selected_tests_timeout_without_undoing_edit() {
+    let fixture = Fixture::new("verify-test-timeout");
+    std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
+    let output = fixture
+        .command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "sleep 30")
+        .env("GREPPY_EDIT_VERIFY_TIMEOUT_SECS", "1")
+        .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "timed_out");
+    assert_file(&fixture.repo.join("a.txt"), "new\n");
 }

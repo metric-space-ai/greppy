@@ -1161,6 +1161,7 @@ pub(crate) fn edit_op_delete(located: &Located) -> EditedContent {
 
 #[derive(Debug)]
 struct EditVerifier {
+    scope: &'static str,
     label: String,
     program: std::path::PathBuf,
     args: Vec<std::ffi::OsString>,
@@ -1246,6 +1247,7 @@ fn edit_verifiers(
         };
         return (
             vec![EditVerifier {
+                scope: "compile",
                 label: "local TypeScript check".into(),
                 program: tsc,
                 args: ["--noEmit", "--pretty", "false", "--incremental", "false"]
@@ -1267,6 +1269,7 @@ fn edit_verifiers(
                 .is_some_and(|extension| matches!(extension, "js" | "mjs" | "cjs"))
         })
         .map(|file| EditVerifier {
+            scope: "syntax",
             label: format!("JavaScript syntax check for {file}"),
             program: std::path::PathBuf::from("node"),
             args: vec!["--check".into(), file.into()],
@@ -1285,6 +1288,7 @@ fn edit_verifiers(
     {
         return (
             vec![EditVerifier {
+                scope: "compile",
                 label: "Rust workspace check".into(),
                 program: "cargo".into(),
                 args: ["check", "--message-format", "short", "--quiet"]
@@ -1299,6 +1303,7 @@ fn edit_verifiers(
     if extensions.iter().any(|extension| extension == "go") && root_path.join("go.mod").is_file() {
         return (
             vec![EditVerifier {
+                scope: "compile",
                 label: "Go workspace build".into(),
                 program: "go".into(),
                 args: vec!["build".into(), "./...".into()],
@@ -1317,6 +1322,7 @@ fn edit_verifiers(
         args.extend(python_files);
         return (
             vec![EditVerifier {
+                scope: "syntax",
                 label: "Python syntax check".into(),
                 program: "python3".into(),
                 args,
@@ -1362,6 +1368,8 @@ impl EditVerificationStatus {
 pub(crate) struct EditVerification {
     pub(crate) status: EditVerificationStatus,
     pub(crate) diagnostics: Vec<String>,
+    checks: Vec<serde_json::Value>,
+    tests_status: &'static str,
 }
 
 impl EditVerification {
@@ -1369,6 +1377,8 @@ impl EditVerification {
         Self {
             status,
             diagnostics,
+            checks: Vec::new(),
+            tests_status: "not_run",
         }
     }
 }
@@ -1382,19 +1392,34 @@ fn edit_verify_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
-fn edit_kill_verifier_tree(child: &mut std::process::Child) {
+fn edit_kill_verifier_tree(child: &mut std::process::Child, graceful: bool) {
     #[cfg(unix)]
     {
         // The verifier owns a process group (configured below). Killing only
         // its shell leaves `sleep`, compilers, or package-manager children
         // alive with inherited descriptors, so callers using captured output
         // still hang until those descendants exit.
+        // A nested bash-smart runner owns its test process group. Give its
+        // signal handler a bounded opportunity to reap that group first.
+        if graceful {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         unsafe {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
     }
     #[cfg(windows)]
     {
+        let _ = graceful;
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdout(std::process::Stdio::null())
@@ -1452,6 +1477,15 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         .current_dir(&verifier.cwd)
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
+    if verifier.scope == "tests" {
+        let bound = timeout.as_millis().saturating_sub(250).max(1);
+        let bound = std::env::var("GREPPY_BASH_SMART_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u128>().ok())
+            .filter(|value| *value > 0)
+            .map_or(bound, |existing| existing.min(bound));
+        process.env("GREPPY_BASH_SMART_TIMEOUT_MS", bound.to_string());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1473,7 +1507,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         match child.try_wait() {
             Ok(Some(status)) => break (Some(status), false),
             Ok(None) if started.elapsed() >= timeout => {
-                edit_kill_verifier_tree(&mut child);
+                edit_kill_verifier_tree(&mut child, verifier.scope == "tests");
                 break (child.wait().ok(), true);
             }
             Ok(None) => {
@@ -1488,7 +1522,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
-                edit_kill_verifier_tree(&mut child);
+                edit_kill_verifier_tree(&mut child, verifier.scope == "tests");
                 let _ = child.wait();
                 let message = format!("verify: failed to observe {command}: {error}");
                 eprintln!("{message}");
@@ -1500,7 +1534,9 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(&stdout_path);
     let _ = std::fs::remove_file(&stderr_path);
-    if timed_out {
+    if timed_out
+        || (verifier.scope == "tests" && status.is_some_and(|status| status.code() == Some(124)))
+    {
         let message = format!(
             "verify: timed out after {}s — edit remains applied; run `{command}` directly to continue",
             timeout.as_secs()
@@ -1541,23 +1577,74 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     EditVerification::new(EditVerificationStatus::Failed, diagnostics)
 }
 
-/// The compiler or linter for the touched file type, when the workspace has a
-/// local one. Verification is observable and bounded; it never downloads a
-/// tool and never silently switches to an unrelated language's workspace.
+/// Local syntax/build checks plus an explicitly selected project test command.
+/// No guessed whole-workspace test suite, network install or test-success claim.
 pub(crate) fn edit_verify(root_path: &std::path::Path, files: &[String]) -> EditVerification {
     let (verifiers, skipped) = edit_verifiers(root_path, files);
-    if let Some(message) = skipped {
-        eprintln!("{message}");
-        return EditVerification::new(EditVerificationStatus::Skipped, vec![message]);
-    }
     let timeout = edit_verify_timeout();
     let mut result = EditVerification::new(EditVerificationStatus::Passed, Vec::new());
+    if let Some(message) = skipped {
+        eprintln!("{message}");
+        result.status = EditVerificationStatus::Skipped;
+        result.diagnostics.push(message);
+    }
     for verifier in &verifiers {
         let checked = edit_run_verifier(verifier, timeout);
+        result.checks.push(serde_json::json!({
+            "scope": verifier.scope,
+            "label": verifier.label,
+            "status": checked.status.as_str(),
+        }));
         if result.status.exit_code() == 0 && checked.status.exit_code() != 0 {
             result.status = checked.status;
         }
         result.diagnostics.extend(checked.diagnostics);
+    }
+    // The caller selects the affected tests; --verify never infers that a
+    // successful compiler/linter proves project behavior. Reuse bash-smart's
+    // argv/shell contract (including pipefail) and retain this verifier's bound.
+    match std::env::var("GREPPY_VERIFY_TEST_COMMAND") {
+        Err(std::env::VarError::NotPresent) => {}
+        Ok(command) if !command.trim().is_empty() && result.status.exit_code() == 0 => {
+            let checked = match std::env::current_exe() {
+                Ok(program) => edit_run_verifier(
+                    &EditVerifier {
+                        scope: "tests",
+                        label: "selected project tests".into(),
+                        program,
+                        args: vec!["bash-smart".into(), "--".into(), command.into()],
+                        cwd: root_path.to_path_buf(),
+                    },
+                    timeout,
+                ),
+                Err(error) => EditVerification::new(
+                    EditVerificationStatus::Unavailable,
+                    vec![format!("verify: test runner unavailable: {error}")],
+                ),
+            };
+            result.tests_status = checked.status.as_str();
+            result.checks.push(serde_json::json!({
+                "scope": "tests", "label": "selected project tests",
+                "status": result.tests_status,
+            }));
+            if checked.status.exit_code() != 0 || result.status == EditVerificationStatus::Skipped {
+                result.status = checked.status;
+            }
+            result.diagnostics.extend(checked.diagnostics);
+        }
+        Ok(command) if !command.trim().is_empty() => {}
+        _ => {
+            result.tests_status = "unavailable";
+            result.status = EditVerificationStatus::Unavailable;
+            result.diagnostics.push(
+                "verify: GREPPY_VERIFY_TEST_COMMAND must be nonempty UTF-8; no tests ran".into(),
+            );
+        }
+    }
+    if result.tests_status == "not_run" {
+        let message = "verify: tests not run — select affected tests with GREPPY_VERIFY_TEST_COMMAND or run them through `greppy bash-smart` before finishing";
+        eprintln!("{message}");
+        result.diagnostics.push(message.into());
     }
     if result.status.exit_code() != 0 {
         result.diagnostics.push(
@@ -2130,6 +2217,8 @@ pub(crate) fn edit_record_json(
                 "status": record.verification.as_ref().map(|verification| verification.status.as_str()),
                 "exit_code": record.verification.as_ref().map_or(0, |verification| verification.status.exit_code()),
                 "diagnostics": diagnostics,
+                "checks": record.verification.as_ref().map(|verification| &verification.checks),
+                "tests_status": record.verification.as_ref().map(|verification| verification.tests_status),
             }),
         );
     }
