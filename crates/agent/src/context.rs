@@ -279,7 +279,7 @@ fn validate_checkpoint(value: &serde_json::Value) -> Result<(), String> {
         || value
             .get("task")
             .and_then(serde_json::Value::as_str)
-            .map_or(true, |s| s.trim().is_empty())
+            .is_none_or(|s| s.trim().is_empty())
     {
         return Err("checkpoint requires a nonempty task string".into());
     }
@@ -287,7 +287,7 @@ fn validate_checkpoint(value: &serde_json::Value) -> Result<(), String> {
         if value
             .get(*field)
             .and_then(serde_json::Value::as_array)
-            .map_or(true, |items| items.iter().any(|item| !item.is_string()))
+            .is_none_or(|items| items.iter().any(|item| !item.is_string()))
         {
             return Err(format!(
                 "checkpoint requires {field} as an array of strings; retry structured JSON"
