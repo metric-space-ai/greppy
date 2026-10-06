@@ -799,6 +799,54 @@ pub(crate) fn edit_locate(
     }
 }
 
+/// Where an OLD text that matched nowhere most likely sits: the window of file
+/// lines equal to OLD up to whitespace, or else the window sharing the most
+/// whitespace-normalized lines with it (at least half, one of them substantive).
+/// Returns 1-based inclusive lines, the window's exact text, and whether only
+/// whitespace differs. Models that copy OLD from earlier ranged reads often get
+/// indentation wrong; without this they re-read the same file again and again.
+pub(crate) fn nearest_old_candidate(
+    content: &[u8],
+    needle: &str,
+) -> Option<(usize, usize, String, bool)> {
+    fn norm(line: &str) -> String {
+        line.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let text = String::from_utf8_lossy(content);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let wanted: Vec<String> = needle
+        .trim_end_matches('\n')
+        .split('\n')
+        .map(norm)
+        .collect();
+    let n = wanted.len();
+    if n == 0 || n > 200 || n > lines.len() || wanted.iter().all(|line| line.is_empty()) {
+        return None;
+    }
+    let normalized: Vec<String> = lines.iter().map(|line| norm(line)).collect();
+    let window = |start: usize| lines[start..start + n].join("\n");
+    if let Some(start) =
+        (0..=lines.len() - n).find(|&start| normalized[start..start + n] == wanted[..])
+    {
+        return Some((start + 1, start + n, window(start), true));
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for start in 0..=lines.len() - n {
+        let mut equal = 0;
+        let mut substantive = false;
+        for (offset, line) in wanted.iter().enumerate() {
+            if !line.is_empty() && normalized[start + offset] == *line {
+                equal += 1;
+                substantive |= line.len() >= 8;
+            }
+        }
+        if substantive && equal * 2 >= n && best.is_none_or(|(_, score)| equal > score) {
+            best = Some((start, equal));
+        }
+    }
+    best.map(|(start, _)| (start + 1, start + n, window(start), false))
+}
+
 /// The number of matches a selector is allowed to have. `--old` and
 /// `--pattern` search, so they can find none or many; every other selector
 /// addresses exactly one span by construction.
@@ -864,10 +912,42 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
             message.push_str("\n  ");
             message.push_str(site);
         }
-        return Err(EditRefusal::new("match_count", message, 13)
+        let nearest = (located.kind == SelectorKind::Text && located.ranges.is_empty())
+            .then(|| {
+                located
+                    .needle
+                    .as_deref()
+                    .and_then(|needle| nearest_old_candidate(&located.content, needle))
+            })
+            .flatten();
+        if let Some((first, last, text, whitespace_only)) = &nearest {
+            let shown: Vec<&str> = text.split('\n').take(30).collect();
+            message.push_str(&format!(
+                "\n{} at {}:{first}-{last}; copy these lines exactly as OLD, or use: greppy replace-lines {} {first}:{last} [NEW]\n",
+                if *whitespace_only {
+                    "nearest match differs only in whitespace"
+                } else {
+                    "closest similar lines"
+                },
+                located.rel,
+                located.rel,
+            ));
+            message.push_str(&shown.join("\n"));
+            if text.split('\n').count() > shown.len() {
+                message.push_str("\n…");
+            }
+        }
+        let mut refusal = EditRefusal::new("match_count", message, 13)
             .with("expected", serde_json::json!(expect))
             .with("found", serde_json::json!(located.ranges.len()))
-            .with("matches", serde_json::json!(sites)));
+            .with("matches", serde_json::json!(sites));
+        if let Some((first, last, _, whitespace_only)) = nearest {
+            refusal = refusal.with(
+                "nearest",
+                serde_json::json!({"lines": [first, last], "whitespace_only": whitespace_only}),
+            );
+        }
+        return Err(refusal);
     }
     Ok(())
 }
@@ -4646,6 +4726,49 @@ pub(crate) fn edit_operation_line_span(
     let line_count = content.iter().filter(|byte| **byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
     (1, line_count.max(1))
+}
+
+#[cfg(test)]
+mod nearest_old_tests {
+    use super::nearest_old_candidate;
+
+    const FILE: &str =
+        "fn clamp(value: i32) -> i32 {\n    if value > HIGH {\n        return value;\n    }\n    value\n}\n";
+
+    #[test]
+    fn whitespace_only_mismatch_points_at_exact_lines() {
+        let found = nearest_old_candidate(
+            FILE.as_bytes(),
+            "  if value > HIGH {\n    return value;\n  }",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            (
+                2,
+                4,
+                "    if value > HIGH {\n        return value;\n    }".to_string(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn partially_matching_window_is_offered_as_similar() {
+        let found = nearest_old_candidate(
+            FILE.as_bytes(),
+            "if value > HIGH {\n        return HIGH;\n    }",
+        )
+        .unwrap();
+        assert_eq!((found.0, found.1, found.3), (2, 4, false));
+    }
+
+    #[test]
+    fn unrelated_or_trivial_text_offers_nothing() {
+        assert!(nearest_old_candidate(FILE.as_bytes(), "let q = 1;").is_none());
+        assert!(nearest_old_candidate(FILE.as_bytes(), "}\nlet q = 1;").is_none());
+        assert!(nearest_old_candidate(FILE.as_bytes(), "").is_none());
+    }
 }
 
 #[cfg(test)]

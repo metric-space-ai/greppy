@@ -2362,3 +2362,35 @@ fn verify_completion_keeps_shared_temp_permissions_and_cleans_private_capture() 
         );
     }
 }
+
+#[test]
+fn old_that_matches_nowhere_points_at_the_whitespace_variant() {
+    let fixture = Fixture::new("nearest-old");
+    std::fs::write(
+        fixture.repo.join("a.txt"),
+        "header line\n    if value > HIGH:\n        return value\nfooter\n",
+    )
+    .unwrap();
+    let out = fixture.run(&[
+        "replace-text",
+        "a.txt",
+        "if value > HIGH:\n    return value",
+        "if value > HIGH:\n    return HIGH",
+    ]);
+    assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+    let text = combined(&out);
+    assert!(text.contains("OLD occurs 0 times"), "{text}");
+    assert!(
+        text.contains("nearest match differs only in whitespace at a.txt:2-3"),
+        "{text}"
+    );
+    assert!(text.contains("greppy replace-lines a.txt 2:3"), "{text}");
+    assert!(
+        text.contains("\n    if value > HIGH:\n        return value"),
+        "{text}"
+    );
+    assert_file(
+        &fixture.repo.join("a.txt"),
+        "header line\n    if value > HIGH:\n        return value\nfooter\n",
+    );
+}
