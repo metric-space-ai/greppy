@@ -42,7 +42,7 @@ pub const EXIT_INCOMPLETE: u8 = 5;
 pub const EXIT_CANCELLED: u8 = 130;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
-const DEFAULT_MAX_TURNS: usize = 40;
+const DEFAULT_MAX_TURNS: usize = 0;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
@@ -88,7 +88,7 @@ Flags:
                       and persist this through /setup)
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
-  --max-turns N       Cap on assistant turns (default 40)
+  --max-turns N       Optional cap on assistant turns (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
                       the loop stops between turns only — a running command is
                       never cut in half
@@ -290,6 +290,10 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
 
 /// Parse and run `greppy agent …` in the full-screen interactive UI.
 pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
+    if std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() {
+        eprintln!("greppy agent: refusing a nested agent run; carry out the task directly");
+        return EXIT_USAGE;
+    }
     let rest = super::grep_passthrough_args(argv);
     if rest.get(1).is_some_and(|token| token == "stdio") {
         return crate::agent_acp::run(rest);
@@ -686,12 +690,59 @@ fn run_agent(
             );
         }
     };
+    let resume_record = if interactive && (args.continue_session || args.resume.is_some()) {
+        match resolve_headless_session_record(
+            &session_store,
+            &logical_project,
+            &model,
+            &run_id,
+            args.continue_session,
+            args.resume.as_deref(),
+        ) {
+            Ok((record, _)) => Some(record),
+            Err((code, message)) => {
+                let _ = workspace.cleanup();
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    code,
+                    &message,
+                );
+            }
+        }
+    } else {
+        headless_session
+            .as_ref()
+            .filter(|(_, resumed)| *resumed)
+            .map(|(record, _)| record.clone())
+    };
+    let restored_proposal = resume_record
+        .as_ref()
+        .is_some_and(|record| !record.proposal_ref.is_empty());
+    if let Some(record) = resume_record {
+        if !record.proposal_ref.is_empty() {
+            if let Err(error) = workspace.restore_proposal(&record.proposal_ref) {
+                let message = format!("greppy agent: cannot restore prior proposal: {error}");
+                let _ = workspace.cleanup();
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    EXIT_AGENT,
+                    &message,
+                );
+            }
+        }
+    }
     json_session.worktree = workspace.worktree_path().display().to_string();
     json_session.branch = git_branch(&cwd);
     if bootstrap
         .as_ref()
         .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
     {
+        if let Err(error) = workspace.cleanup() {
+            eprintln!("greppy agent: cancelled workspace cleanup failed: {error}");
+            return EXIT_AGENT;
+        }
         return EXIT_CANCELLED;
     }
     if let Some(screen) = bootstrap.as_mut() {
@@ -762,7 +813,10 @@ fn run_agent(
         );
     }
 
-    let prepared_base = if args.private_store {
+    let prepared_base = if args.private_store
+        || restored_proposal
+        || !workspace.baseline_is_clean().unwrap_or(false)
+    {
         crate::store_cow::configure_private_environment("explicit --private-store");
         if !interactive {
             eprintln!("store mode: private (--private-store)");
@@ -845,6 +899,10 @@ fn run_agent(
         .as_ref()
         .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
     {
+        if let Err(error) = workspace.cleanup() {
+            eprintln!("greppy agent: cancelled workspace cleanup failed: {error}");
+            return EXIT_AGENT;
+        }
         return EXIT_CANCELLED;
     }
     if let Some(screen) = bootstrap.as_mut() {
@@ -864,6 +922,10 @@ fn run_agent(
         .as_ref()
         .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
     {
+        if let Err(error) = workspace.cleanup() {
+            eprintln!("greppy agent: cancelled workspace cleanup failed: {error}");
+            return EXIT_AGENT;
+        }
         return EXIT_CANCELLED;
     }
     if let Some(screen) = bootstrap.as_mut() {
@@ -1113,6 +1175,7 @@ fn run_agent(
                         sandbox: &json_session.sandbox,
                         idle_timeout_secs,
                         json_session: &json_session,
+                        workspace: &workspace,
                     },
                 )
                 .map(|session| (session, false))
@@ -1155,12 +1218,7 @@ fn run_agent(
         }
     };
     if interactive_cancelled {
-        return crate::agent_json::emit_error_result_opt(
-            json.as_mut(),
-            &json_session,
-            EXIT_CANCELLED,
-            "stopped: cancelled by user",
-        );
+        session.last_stop = Some(LoopStop::Cancelled);
     }
     if run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref()) {
         session.last_stop = Some(LoopStop::Cancelled);
@@ -1181,12 +1239,7 @@ fn run_agent(
         &mut io::stderr().lock(),
     );
 
-    let commit_subject = if task.is_empty() {
-        "interactive agent session"
-    } else {
-        &task
-    };
-    let commit_message = truncate_chars(commit_subject, 72);
+    let commit_message = proposal_answer_message(&session.final_answer);
     let json_mode = json.is_some();
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
@@ -1238,6 +1291,9 @@ fn run_agent(
     let mut cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
     let (mut exit, _) =
         result_exit_and_status(cancelled, session.last_stop.as_ref(), EXIT_OK, "clean");
+    if session.error.is_some() {
+        exit = EXIT_AGENT;
+    }
     let mut result_status = "clean";
     let mut proposal_ref = None;
     let mut commit_id = None;
@@ -1282,7 +1338,7 @@ fn run_agent(
             if !json_mode {
                 let _ = writeln!(stdout, "proposal saved: {ref_name}");
                 let _ = writeln!(stdout, "inspect: git show {ref_name}");
-                let _ = writeln!(stdout, "apply:   git cherry-pick -n {ref_name}");
+                let _ = writeln!(stdout, "apply:   greppy agent apply {ref_name}");
             }
 
             if args.diff && !json_mode {
@@ -1300,7 +1356,7 @@ fn run_agent(
                     Ok(()) => {
                         applied = true;
                         if !json_mode {
-                            let _ = writeln!(stdout, "applied (staged, not committed).");
+                            let _ = writeln!(stdout, "applied to working tree (index preserved).");
                         }
                     }
                     Err(WorkspaceError::DirtyTarget { ref_name, .. }) => {
@@ -1317,7 +1373,7 @@ fn run_agent(
                             "greppy -p: apply conflict: {detail}\n\
                              resolve from {ref_name}:\n\
                              inspect: git show {ref_name}\n\
-                             apply:   git cherry-pick -n {ref_name}"
+                             apply:   greppy agent apply {ref_name}"
                         );
                         let _ = writeln!(stderr, "{message}");
                         apply_error = Some(message);
@@ -1326,7 +1382,11 @@ fn run_agent(
                     Err(e) => {
                         let message = format!("greppy -p: apply failed: {e}");
                         let _ = writeln!(stderr, "{message}");
-                        keep_worktree_on_error(&workspace);
+                        if args.keep_worktree {
+                            keep_worktree_on_error(&workspace);
+                        } else if let Err(error) = workspace.cleanup() {
+                            eprintln!("greppy agent: proposal cleanup failed: {error}");
+                        }
                         drop(stdout);
                         return crate::agent_json::emit_error_result_opt(
                             json.as_mut(),
@@ -1342,7 +1402,7 @@ fn run_agent(
 
     cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
     (exit, _) = result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
-    if exit == EXIT_OK && !args.keep_worktree {
+    if !args.keep_worktree {
         let wt_path = workspace.worktree_path().to_path_buf();
         if let Err(e) = workspace.cleanup() {
             // Any cleanup failure is a non-zero exit — a successful run
@@ -1357,11 +1417,6 @@ fn run_agent(
                 &e.to_string(),
             );
         }
-    } else if exit != EXIT_OK {
-        // Conflict still cleans unless keep — success-path cleanup only when
-        // exit is 0. Spec: cleanup on every successful run; keep on error.
-        // Conflict is exit 4 (error-ish): keep worktree.
-        keep_worktree_on_error(&workspace);
     } else {
         let path = workspace.worktree_path().display().to_string();
         if let Err(error) = workspace.keep() {
@@ -1376,7 +1431,10 @@ fn run_agent(
                 &message,
             );
         }
-        let _ = writeln!(stderr, "worktree kept: {path}");
+        let _ = writeln!(
+            stderr,
+            "worktree kept (expires in 24 hours; next agent startup reaps it): {path}"
+        );
         drop(workspace);
     }
 
@@ -1385,6 +1443,21 @@ fn run_agent(
     cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
     let (exit, status) =
         result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
+    let (exit, status) = if session.error.is_some() {
+        (EXIT_AGENT, "error")
+    } else {
+        (exit, status)
+    };
+    #[cfg(unix)]
+    if let Some(server) = session.control_server.as_mut() {
+        server.broadcast(&serde_json::json!({
+            "type": "result", "status": status, "exit_code": exit,
+            "session_id": session.session_id, "run_id": run_id,
+            "proposal_ref": proposal_ref, "commit": commit_id,
+            "final_answer": session.final_answer,
+        }));
+        let _ = server.poll();
+    }
     if let Some(emitter) = json.as_mut() {
         emitter.session(&json_session);
         emitter.result(&crate::agent_json::JsonResult {
@@ -1410,18 +1483,32 @@ fn run_agent(
             patch: patch_text,
             applied,
             apply_error,
+            final_answer: session.final_answer,
         });
     }
 
     exit
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct SessionSummary {
     pub(crate) usage: Usage,
     pub(crate) turns: u64,
     pub(crate) last_stop: Option<LoopStop>,
     pub(crate) session_id: String,
+    pub(crate) final_answer: String,
+    pub(crate) error: Option<String>,
+    #[cfg(unix)]
+    pub(crate) control_server: Option<ControlServer>,
+}
+
+fn proposal_answer_message(answer: &str) -> String {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        "Agent proposal (response incomplete)".to_string()
+    } else {
+        answer.to_string()
+    }
 }
 
 pub(crate) struct SessionWorkerParts {
@@ -1572,6 +1659,10 @@ fn run_headless_session(
         turns: record.turns,
         last_stop: None,
         session_id: record.id.clone(),
+        final_answer: String::new(),
+        error: None,
+        #[cfg(unix)]
+        control_server: None,
     };
     if let Err(error) = store.append_turn_start(&record.id, "headless", task) {
         eprintln!("greppy -p: session save failed: {error}");
@@ -1687,6 +1778,7 @@ fn run_headless_session(
                     &result.usage,
                 ),
             );
+            summary.final_answer = result.final_text;
             summary.last_stop = Some(result.stop);
             Ok(summary)
         }
@@ -1755,6 +1847,10 @@ pub(crate) fn spawn_session_worker(
                 turns: restored_turns,
                 last_stop: None,
                 session_id: session_id.clone(),
+                final_answer: String::new(),
+                error: None,
+                #[cfg(unix)]
+                control_server: None,
             };
             if cancel.load(Ordering::Relaxed) {
                 return Ok(summary);
@@ -1987,6 +2083,7 @@ pub(crate) fn spawn_session_worker(
 
                         match result {
                             Ok(result) => {
+                                summary.final_answer = result.final_text;
                                 history = result.messages;
                                 add_usage(&mut summary.usage, &result.usage);
                                 summary.turns = summary.turns.saturating_add(prompt_turns);
@@ -2469,7 +2566,7 @@ fn keep_worktree_on_error(workspace: &AgentWorkspace) {
         eprintln!("greppy -p: could not mark failed workspace as kept: {error}");
     }
     eprintln!(
-        "worktree kept for debugging: {}",
+        "worktree kept for debugging (expires in 24 hours; next agent startup reaps it): {}",
         workspace.worktree_path().display()
     );
 }
@@ -3957,6 +4054,20 @@ mod tests {
         cancel_background_job(launch);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn proposal_message_uses_final_answer_title_and_body() {
+        assert_eq!(
+            proposal_answer_message("Repair lifecycle\n\nPreserve operator dirt."),
+            "Repair lifecycle\n\nPreserve operator dirt."
+        );
+        assert_eq!(
+            proposal_answer_message(""),
+            "Agent proposal (response incomplete)"
+        );
+        assert_eq!(parse(&["task", "--model", "m"]).unwrap().max_turns, 0);
+        assert!(!LONG_HELP.contains("default 40"));
     }
 
     #[test]

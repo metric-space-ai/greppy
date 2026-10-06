@@ -35,6 +35,7 @@ pub struct JsonResult {
     pub patch: Option<String>,
     pub applied: bool,
     pub apply_error: Option<String>,
+    pub final_answer: String,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +118,7 @@ impl JsonEmitter {
             "patch": result.patch,
             "applied": result.applied,
             "apply_error": result.apply_error,
+            "final_answer": result.final_answer,
         }));
     }
 }
@@ -195,6 +197,7 @@ pub fn emit_error_result(
         patch: None,
         applied: false,
         apply_error: None,
+        final_answer: String::new(),
     });
 }
 

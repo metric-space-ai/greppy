@@ -962,6 +962,26 @@ fn persist_part(part: &ContentPart) -> PersistedPart {
             name: String::new(),
             is_error: false,
         },
+        ContentPart::SignedThinking { text, signature } => {
+            let redacted = redact_text(text);
+            let unchanged = redacted.as_bytes() == text.as_bytes();
+            PersistedPart {
+                kind: if unchanged {
+                    "signed_thinking"
+                } else {
+                    "thinking_omitted"
+                }
+                .into(),
+                text: redacted,
+                id: if unchanged {
+                    signature.clone()
+                } else {
+                    String::new()
+                },
+                name: String::new(),
+                is_error: false,
+            }
+        }
         ContentPart::ToolCall {
             id,
             name,
@@ -1002,12 +1022,21 @@ fn to_protocol(message: &PersistedMessage) -> Message {
     };
     Message {
         role,
-        content: message.parts.iter().map(to_part).collect(),
+        content: message
+            .parts
+            .iter()
+            .filter(|part| part.kind != "thinking_omitted")
+            .map(to_part)
+            .collect(),
     }
 }
 
 fn to_part(part: &PersistedPart) -> ContentPart {
     match part.kind.as_str() {
+        "signed_thinking" => ContentPart::SignedThinking {
+            text: part.text.clone(),
+            signature: part.id.clone(),
+        },
         "thinking" => ContentPart::Thinking {
             text: part.text.clone(),
         },
@@ -1213,6 +1242,30 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_thinking_replay_requires_byte_identical_text() {
+        let original = ContentPart::SignedThinking {
+            text: "unchanged reasoning".into(),
+            signature: "opaque-signature".into(),
+        };
+        let part = persist_part(&original);
+        assert_eq!(part.kind, "signed_thinking");
+        assert_eq!(to_part(&part), original);
+        let altered = ContentPart::SignedThinking {
+            text: "Authorization: Bearer sk-secret-token".into(),
+            signature: "stale-signature".into(),
+        };
+        let persisted = persist_part(&altered);
+        assert_eq!(persisted.kind, "thinking_omitted");
+        assert!(persisted.id.is_empty());
+        assert!(to_protocol(&PersistedMessage {
+            role: "assistant".into(),
+            parts: vec![persisted]
+        })
+        .content
+        .is_empty());
+    }
 
     fn temp_store(tag: &str) -> (SessionStore, PathBuf) {
         let root = std::env::temp_dir().join(format!(

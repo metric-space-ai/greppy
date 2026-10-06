@@ -286,6 +286,7 @@ fn greppy_p_json_streams_session_text_and_result() {
         "result status must be clean or proposal, got {status}; stdout={stdout}"
     );
     assert_eq!(last["exit_code"].as_u64(), Some(0));
+    assert_eq!(last["final_answer"], "hi from stub");
     assert!(
         events
             .iter()
