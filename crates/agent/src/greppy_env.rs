@@ -376,6 +376,7 @@ impl GreppyEnv {
                             .lines()
                             .any(|line| {
                                 line == "(no matches)"
+                                    || line == "status: no_matches"
                                     || line.starts_with("no matches")
                                     || line.starts_with("message: no matches")
                             }));
@@ -2135,6 +2136,14 @@ exit 0
         let (mut env, _, _) = env_with_stub("printf '(no matches)\\n'\nexit 1");
         assert!(
             !env.call_tool("greppy", &json!({"args": ["search-pattern", "absent"]}))
+                .is_error
+        );
+        // The real search-symbol no-match report names the definition, not "no matches".
+        let (mut env, _, _) = env_with_stub(
+            "printf 'status: no_matches\\nscope: indexed definitions in the repository\\nmessage: no definition named `absent`\\n'\nexit 1",
+        );
+        assert!(
+            !env.call_tool("greppy", &json!({"args": ["search-symbol", "absent"]}))
                 .is_error
         );
         let (mut env, _, _) = env_with_stub(
