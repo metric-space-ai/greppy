@@ -5051,6 +5051,10 @@ mod tests {
             std::env::remove_var(name);
         }
         let repo = fixture();
+        // The fixture writes its files directly with LF. Keep the clean Base
+        // checkout byte-identical to them on runners whose git defaults to
+        // core.autocrlf=true (Windows); this test is about Base reuse.
+        git(repo.path(), &["config", "core.autocrlf", "false"]);
         let commit = git(repo.path(), &["rev-parse", "HEAD"]);
         std::fs::write(repo.path().join("src/a.rs"), "fn operator_dirty() {}\n").unwrap();
         std::fs::write(
@@ -5061,12 +5065,8 @@ mod tests {
 
         // Materialize the same clean source used by a cold production Base build.
         let clean = TemporaryBaseWorktree::create(repo.path(), &commit).unwrap();
-        // Git checks the clean source out with the user's line-ending settings
-        // (core.autocrlf is on by default on Windows); compare the content.
         assert_eq!(
-            std::fs::read_to_string(clean.path().join("src/a.rs"))
-                .unwrap()
-                .replace("\r\n", "\n"),
+            std::fs::read_to_string(clean.path().join("src/a.rs")).unwrap(),
             "fn a() {}\n"
         );
         assert!(!clean.path().join("src/untracked.rs").exists());
