@@ -13,7 +13,8 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,11 +24,11 @@ use crate::env::{ExecutionEnv, ToolOutcome};
 use crate::protocol::ToolDefinition;
 use crate::sandbox::{self, SandboxMode};
 
-/// Default wall-clock budget for `greppy bash-smart` invocations (300 s).
-pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(300);
+/// No default per-tool timeout: the run deadline is the budget.
+pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::MAX;
 
-/// Default wall-clock budget for non-`bash-smart` greppy invocations (120 s).
-pub const DEFAULT_GREPPY_TIMEOUT: Duration = Duration::from_secs(120);
+/// No default per-tool timeout, including verified edits.
+pub const DEFAULT_GREPPY_TIMEOUT: Duration = Duration::MAX;
 
 /// Default combined stdout+stderr cap (64 KiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
@@ -68,9 +69,13 @@ const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
 pub struct GreppyEnv {
     greppy_bin: PathBuf,
     root: PathBuf,
+    output_owner: PathBuf,
     bash_timeout: Duration,
     greppy_timeout: Duration,
     max_output_bytes: usize,
+    deadline: Option<Instant>,
+    retained_bytes: Arc<AtomicU64>,
+    run_scratch: PathBuf,
     sandbox: SandboxMode,
     context_status: Option<(String, ContextStatusHook)>,
 }
@@ -83,12 +88,23 @@ impl GreppyEnv {
 
     /// Build an env that invokes an injectable binary (tests use a stub script).
     pub fn with_binary(greppy_bin: PathBuf, root: PathBuf) -> io::Result<Self> {
+        static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let run_scratch = std::env::temp_dir().join(format!(
+            "greppy-agent-{}-{}",
+            std::process::id(),
+            RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(run_scratch.join("home"))?;
         Ok(Self {
             greppy_bin,
+            output_owner: root.clone(),
             root,
             bash_timeout: DEFAULT_BASH_TIMEOUT,
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            deadline: None,
+            retained_bytes: Arc::new(AtomicU64::new(0)),
+            run_scratch,
             sandbox: SandboxMode::Off,
             context_status: None,
         })
@@ -103,6 +119,18 @@ impl GreppyEnv {
     /// Override the wall-clock timeout used for non-`bash-smart` greppy invocations.
     pub fn with_greppy_timeout(mut self, timeout: Duration) -> Self {
         self.greppy_timeout = timeout;
+        self
+    }
+
+    /// Bind retained evidence to the durable original checkout, not a disposable worktree.
+    pub fn with_output_owner(mut self, owner: PathBuf) -> Self {
+        self.output_owner = owner;
+        self
+    }
+
+    /// Bind every subprocess to the run's remaining wall-clock budget.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
         self
     }
 
@@ -161,7 +189,7 @@ impl GreppyEnv {
     fn greppy_tool_def() -> ToolDefinition {
         ToolDefinition {
             name: "greppy".to_string(),
-            description: "Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
+            description: "Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -176,22 +204,128 @@ impl GreppyEnv {
         }
     }
 
+    fn fold_output(&self, body: String, stdout: &[u8], stderr: &[u8]) -> String {
+        if self.max_output_bytes == 0 || body.len() <= self.max_output_bytes {
+            return body;
+        }
+        let bytes = body
+            .len()
+            .saturating_add(stdout.len())
+            .saturating_add(stderr.len()) as u64;
+        const RUN_RETENTION_BYTES: u64 = 64 * 1024 * 1024;
+        if self
+            .retained_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= RUN_RETENTION_BYTES)
+            })
+            .is_err()
+        {
+            return body; // Retention budget cannot cause evidence loss.
+        }
+        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let directory = std::env::temp_dir()
+            .join("greppy-agent-output")
+            .join(format!(
+                "capture-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+        static STORE_MUTEX: Mutex<()> = Mutex::new(());
+        let _store_guard = STORE_MUTEX.lock().unwrap();
+        let storage = directory.parent().unwrap();
+        let lease = match acquire_output_storage(storage, bytes) {
+            Ok(lease) => lease,
+            Err(_) => {
+                self.retained_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                return body;
+            }
+        };
+        let path = directory.join("manifest.json");
+        let owner =
+            std::fs::canonicalize(&self.output_owner).unwrap_or_else(|_| self.output_owner.clone());
+        let manifest = json!({"owner": owner, "created_at": unix_seconds(),
+            "expires_at": unix_seconds().saturating_add(4 * 24 * 60 * 60), "bytes": bytes,
+            "raw_stdout": "stdout.bin", "raw_stderr": "stderr.bin", "display": "output.txt",
+            "stdout_hash": blake3::hash(stdout).to_hex().to_string(),
+            "stderr_hash": blake3::hash(stderr).to_hex().to_string(),
+            "display_hash": blake3::hash(body.as_bytes()).to_hex().to_string(),
+            "pid": std::process::id(), "purpose": "agent tool evidence"});
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let retained = (|| -> io::Result<()> {
+            std::fs::create_dir(&directory)?;
+            std::fs::write(directory.join("stdout.bin"), stdout)?;
+            std::fs::write(directory.join("stderr.bin"), stderr)?;
+            std::fs::write(directory.join("output.txt"), &body)?;
+            std::fs::write(&path, &manifest_bytes)
+        })();
+        if retained.is_err() {
+            self.retained_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            let _ = std::fs::remove_dir_all(&directory);
+            return body;
+        }
+        drop(lease);
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let id = format!(
+            "agent-output-{}-{}",
+            path.to_string_lossy()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            blake3::hash(&manifest_bytes).to_hex()
+        );
+        let mut end = self.max_output_bytes;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n[output retained as {id}; raw stdout/stderr preserved for four days, owner {}; expand with args [\"expand\", \"{id}\", \"--offset\", \"{end}\"]]", &body[..end], owner.display())
+    }
+
+    fn expand_output(&self, args: &[String]) -> ToolOutcome {
+        let offset = match args {
+            [_, _] => 0,
+            [_, _, flag, value] if flag == "--offset" => match value.parse::<usize>() {
+                Ok(offset) => offset,
+                Err(_) => {
+                    return ToolOutcome::err("expand offset must be a nonnegative byte offset")
+                }
+            },
+            _ => return ToolOutcome::err("usage: expand agent-output-ID [--offset BYTES]"),
+        };
+        expand_agent_output(&self.output_owner, &args[1], offset, self.max_output_bytes)
+    }
+
     fn call_greppy(&self, arguments: &Value) -> ToolOutcome {
-        let args = match parse_string_array(arguments, "args") {
+        let mut args = match parse_string_array(arguments, "args") {
             Ok(args) => args,
             Err(msg) => return ToolOutcome::err(msg),
         };
 
+        if args.first().map(String::as_str) == Some("greppy") {
+            args.remove(0);
+        }
+        if args.first().map(String::as_str) == Some("expand")
+            && args
+                .get(1)
+                .is_some_and(|id| id.starts_with("agent-output-"))
+        {
+            return self.expand_output(&args);
+        }
         if let Some(msg) = greppy_guard(&args) {
             return ToolOutcome::err(msg);
         }
 
-        let timeout = if args.first().map(String::as_str) == Some("bash-smart") {
+        let configured_timeout = if args.first().map(String::as_str) == Some("bash-smart") {
             self.bash_timeout
         } else {
             self.greppy_timeout
         };
 
+        let timeout = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .or_else(|| (configured_timeout != Duration::MAX).then_some(configured_timeout));
         let mut cmd = Command::new(&self.greppy_bin);
         if let Err(e) = sandbox::apply(&mut cmd, &self.greppy_bin, &args, &self.sandbox) {
             return ToolOutcome::err(format!("sandbox: {e}"));
@@ -201,6 +335,7 @@ impl GreppyEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_tool_env(&mut cmd);
+        prepare_tool_cache_env(&mut cmd, &self.run_scratch);
         if let Some((scope, _)) = self.context_status.as_ref() {
             cmd.env("GREPPY_CONTEXT_SCOPE", scope)
                 .env("GREPPY_CONTEXT_ENVELOPE", "1");
@@ -225,22 +360,52 @@ impl GreppyEnv {
             None
         };
 
-        match run_capture_held(&mut cmd, Some(timeout), attach_hold) {
+        match run_capture_held(&mut cmd, timeout, attach_hold) {
             Ok(captured) => {
                 let actual_success = captured.success && !captured.timed_out;
-                let mut outcome = finalize_outcome(
-                    captured,
-                    self.max_output_bytes,
-                    matches!(args.first().map(String::as_str), Some("search" | "context")),
-                );
-                if args.first().map(String::as_str) == Some("web")
+                let no_match = captured.exit_code == Some(1)
+                    && captured.stderr.is_empty()
+                    && (captured.stdout.is_empty()
+                        || String::from_utf8_lossy(&captured.stdout)
+                            .lines()
+                            .any(|line| {
+                                line == "(no matches)"
+                                    || line.starts_with("no matches")
+                                    || line.starts_with("message: no matches")
+                            }));
+                let normal_result = !captured.timed_out
+                    && ((no_match
+                        && matches!(
+                            args.first().map(String::as_str),
+                            Some("search" | "search-symbol" | "search-pattern" | "rg")
+                        ))
+                        || (args.first().map(String::as_str) == Some("bash-smart")
+                            && String::from_utf8_lossy(&captured.stdout)
+                                .lines()
+                                .next()
+                                .is_some_and(|line| line.starts_with("FAILED — exit "))));
+                let screenshot = if args.first().map(String::as_str) == Some("web")
                     && args.get(1).map(String::as_str) == Some("screenshot")
                 {
-                    if let Some(data) = extract_png_base64(&outcome.content) {
-                        outcome.image_png_base64 = Some(data);
-                        outcome.content = "screenshot attached as image for the model".to_owned();
-                    }
+                    extract_png_base64(&merge_stdio(&captured.stdout, &captured.stderr))
+                } else {
+                    None
+                };
+                let raw_stdout = captured.stdout.clone();
+                let raw_stderr = captured.stderr.clone();
+                let mut outcome = finalize_outcome(
+                    captured,
+                    usize::MAX,
+                    matches!(args.first().map(String::as_str), Some("search" | "context")),
+                );
+                if normal_result {
+                    outcome.is_error = false;
                 }
+                if let Some(data) = screenshot {
+                    outcome.image_png_base64 = Some(data);
+                    outcome.content = "screenshot attached as image for the model".to_owned();
+                }
+                outcome.content = self.fold_output(outcome.content, &raw_stdout, &raw_stderr);
                 if actual_success {
                     if let Some((scope, hook)) = self.context_status.as_ref() {
                         if let Some(notice) =
@@ -260,6 +425,196 @@ impl GreppyEnv {
     }
 }
 
+struct OutputStorageLease(PathBuf);
+impl Drop for OutputStorageLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One shared writer and a 64 MiB store cap. Prune only expired owned artifacts;
+/// if admission fails, callers return their full evidence instead of losing it.
+fn acquire_output_storage(storage: &Path, additional: u64) -> io::Result<OutputStorageLease> {
+    std::fs::create_dir_all(storage)?;
+    let lock = storage.join("writer.lease");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)?;
+    let lease = OutputStorageLease(lock);
+    let mut used = 0u64;
+    for entry in std::fs::read_dir(storage)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("capture-")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let directory = entry.path();
+        let metadata = std::fs::read(directory.join("manifest.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if metadata
+            .as_ref()
+            .and_then(|value| value.get("expires_at"))
+            .and_then(Value::as_u64)
+            .is_some_and(|expires| expires <= unix_seconds())
+        {
+            std::fs::remove_dir_all(&directory)?;
+            continue;
+        }
+        for file in std::fs::read_dir(directory)? {
+            used = used.saturating_add(file?.metadata()?.len());
+        }
+    }
+    if used.saturating_add(additional).saturating_add(4096) > 64 * 1024 * 1024 {
+        return Err(io::Error::other(
+            "agent output storage byte budget exhausted",
+        ));
+    }
+    Ok(lease)
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Expand retained tool evidence across GreppyEnv instances and process restarts.
+/// IDs name immutable manifests; owner and expiry are checked before reading.
+/// Raw stdout/stderr remain beside the manifest without UTF-8 conversion.
+pub fn expand_agent_output(root: &Path, id: &str, offset: usize, max_bytes: usize) -> ToolOutcome {
+    let Some(encoded) = id.strip_prefix("agent-output-") else {
+        return ToolOutcome::err("invalid agent output ID");
+    };
+    let Some((hex, checksum)) = encoded.rsplit_once('-') else {
+        return ToolOutcome::err("invalid agent output ID");
+    };
+    if hex.is_empty()
+        || !hex.len().is_multiple_of(2)
+        || hex.len() > 8192
+        || !hex.is_ascii()
+        || checksum.len() != 64
+    {
+        return ToolOutcome::err("invalid agent output ID");
+    }
+    let decoded = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<Vec<_>, _>>();
+    let path = match decoded.ok().and_then(|bytes| String::from_utf8(bytes).ok()) {
+        Some(path) => PathBuf::from(path),
+        None => return ToolOutcome::err("invalid agent output ID"),
+    };
+    if !path.is_absolute()
+        || path.file_name().and_then(|name| name.to_str()) != Some("manifest.json")
+    {
+        return ToolOutcome::err("invalid agent output manifest path");
+    }
+    let Some(directory) = path.parent() else {
+        return ToolOutcome::err("invalid agent output directory");
+    };
+    if !directory
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("capture-"))
+        || directory
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("greppy-agent-output")
+        || std::fs::canonicalize(&path).ok().as_ref() != Some(&path)
+    {
+        return ToolOutcome::err("invalid agent output artifact layout or symlink");
+    }
+    let manifest_bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ToolOutcome::err(
+                "retained output unavailable; its temporary storage may have expired",
+            )
+        }
+    };
+    if blake3::hash(&manifest_bytes).to_hex().as_str() != checksum {
+        return ToolOutcome::err(
+            "retained output manifest corruption; refusing unverified evidence",
+        );
+    }
+    let manifest: Value = match serde_json::from_slice(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(_) => return ToolOutcome::err("retained output manifest corruption"),
+    };
+    let owner = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    if manifest.get("owner").and_then(Value::as_str) != owner.to_str() {
+        return ToolOutcome::err("retained output belongs to a different repository owner");
+    }
+    if manifest
+        .get("expires_at")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        <= unix_seconds()
+    {
+        return ToolOutcome::err("retained output expired after four days");
+    }
+    if manifest
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX)
+        > 64 * 1024 * 1024
+    {
+        return ToolOutcome::err("retained output exceeds the run byte budget");
+    }
+    for (file, key) in [
+        ("stdout.bin", "stdout_hash"),
+        ("stderr.bin", "stderr_hash"),
+        ("output.txt", "display_hash"),
+    ] {
+        let artifact = directory.join(file);
+        if std::fs::canonicalize(&artifact).ok().as_ref() != Some(&artifact) {
+            return ToolOutcome::err("retained output artifact missing or replaced by a symlink");
+        }
+        if std::fs::metadata(&artifact)
+            .map(|metadata| metadata.len())
+            .unwrap_or(u64::MAX)
+            > 64 * 1024 * 1024
+        {
+            return ToolOutcome::err("retained output artifact exceeds the byte budget");
+        }
+        let bytes = match std::fs::read(&artifact) {
+            Ok(bytes) => bytes,
+            Err(error) => return ToolOutcome::err(format!("retained output unavailable: {error}")),
+        };
+        if manifest.get(key).and_then(Value::as_str) != Some(blake3::hash(&bytes).to_hex().as_str())
+        {
+            return ToolOutcome::err("retained output corruption; refusing unverified evidence");
+        }
+    }
+    let body = match std::fs::read_to_string(directory.join("output.txt")) {
+        Ok(body) => body,
+        Err(error) => return ToolOutcome::err(format!("retained output unavailable: {error}")),
+    };
+    if offset > body.len() || !body.is_char_boundary(offset) {
+        return ToolOutcome::err("expand offset must be a UTF-8 boundary within the output");
+    }
+    let mut end = offset
+        .saturating_add(max_bytes.clamp(1, DEFAULT_MAX_OUTPUT_BYTES))
+        .min(body.len());
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == offset && end < body.len() {
+        end += body[offset..].chars().next().unwrap().len_utf8();
+    }
+    let mut page = body[offset..end].to_owned();
+    if end < body.len() {
+        page.push_str(&format!(
+            "\n[next: args [\"expand\", \"{id}\", \"--offset\", \"{end}\"]]"
+        ));
+    }
+    ToolOutcome::ok(page)
+}
+
 /// Prepare a tool subprocess environment: strip credential env vars and mark
 /// the process tree as an agent run so `greppy -p` refuses to nest (a nested
 /// `greppy -p` could otherwise launch a second agent).
@@ -270,6 +625,54 @@ impl GreppyEnv {
 fn prepare_tool_env(cmd: &mut Command) {
     scrub_credential_env(cmd);
     cmd.env(crate::AGENT_RUN_ENV, "1");
+}
+
+/// Keep tool-created package/build caches within this run's writable scratch.
+/// Provider credentials are loaded in the parent, before child HOME changes.
+fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
+    let home = scratch.join("home");
+    if let Some(original_home) = std::env::var_os("HOME") {
+        // Toolchains are durable read-only inputs; Cargo's writable cache is isolated.
+        cmd.env(
+            "RUSTUP_HOME",
+            std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(original_home).join(".rustup")),
+        );
+    }
+    cmd.env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("TMPDIR", scratch)
+        .env("TMP", scratch)
+        .env("TEMP", scratch);
+    for (variable, directory) in [
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("npm_config_cache", "npm"),
+        ("NPM_CONFIG_CACHE", "npm"),
+        ("PIP_CACHE_DIR", "pip"),
+        ("UV_CACHE_DIR", "uv"),
+        ("GOCACHE", "go-build"),
+        ("GOPATH", "go"),
+        ("GOMODCACHE", "go-mod"),
+        ("GRADLE_USER_HOME", "gradle"),
+        ("CARGO_HOME", "cargo"),
+        ("CARGO_TARGET_DIR", "target"),
+        ("CCACHE_DIR", "ccache"),
+        ("SCCACHE_DIR", "sccache"),
+    ] {
+        cmd.env(variable, scratch.join(directory));
+    }
+    let maven = format!(
+        "{} -Dmaven.repo.local={}",
+        std::env::var("MAVEN_OPTS").unwrap_or_default(),
+        scratch.join("maven").display()
+    );
+    cmd.env("MAVEN_OPTS", maven)
+        .env("CARGO_BUILD_JOBS", "2")
+        .env("RUST_TEST_THREADS", "2")
+        .env("CMAKE_BUILD_PARALLEL_LEVEL", "2");
 }
 
 /// Strip credential / secret env vars from a tool `Command`.
@@ -304,15 +707,6 @@ fn greppy_guard(args: &[String]) -> Option<String> {
             "nested agent runs are not supported (first arg {first:?}) — you are \
              the agent; carry out the task directly with the other greppy commands"
         ));
-    }
-    // Models sometimes nest the binary name: `["greppy", "rg", …]`. The tool
-    // already *is* greppy — the first argv element must be the subcommand.
-    if first == "greppy" {
-        return Some(
-            "drop the leading \"greppy\" — pass the subcommand directly, \
-             e.g. [\"rg\", \"-n\", \"pattern\"]"
-                .to_string(),
-        );
     }
     // `bash-smart` is the sanctioned command-execution path under the single
     // greppy tool surface — deliberately allowed here.
@@ -561,20 +955,6 @@ fn finalize_outcome(
         return ToolOutcome::ok(msg);
     }
 
-    // Sandbox write refusals (macOS Seatbelt / Linux Landlock): surface the
-    // policy in plain language, then keep the original output so the model
-    // still sees the raw errno/path. Narrow — only known refusal signals.
-    if !captured.success && is_sandbox_write_refusal(&body) {
-        let mut msg = String::from(
-            "this run is write-confined to the repository worktree; installing \
-             software or writing outside it is not possible. Work with what the \
-             repository provides, or finish and report the missing tool.\n",
-        );
-        msg.push_str(&body);
-        let msg = truncate_output(msg, max_output_bytes);
-        return ToolOutcome::err(msg);
-    }
-
     let body = truncate_output(body, max_output_bytes);
     if captured.success {
         ToolOutcome::ok(body)
@@ -663,39 +1043,6 @@ fn semantic_preparation_stderr(stderr: &[u8]) -> bool {
             || line == "greppy: search still running; no detailed progress is available"
             || line == "greppy: search still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state"
     })
-}
-
-/// True when tool output looks like a write-sandbox refusal.
-///
-/// Narrow signals only:
-/// - macOS Seatbelt: `Operation not permitted`
-/// - Linux Landlock / generic POSIX: `Permission denied` with `EACCES`/`EPERM`
-///   text, or bare `EACCES`/`EPERM` errno tokens.
-///
-/// Unrelated failures (compile errors, missing files, non-zero greppy exits)
-/// must not match.
-fn is_sandbox_write_refusal(body: &str) -> bool {
-    // macOS Seatbelt (sandbox-exec) denial text.
-    if body.contains("Operation not permitted") {
-        return true;
-    }
-    // Linux Landlock / openat failures often surface as "Permission denied"
-    // with an errno token nearby. Require both to avoid swallowing ordinary
-    // "permission denied" application messages that lack errno context.
-    let lower = body.to_ascii_lowercase();
-    if lower.contains("permission denied")
-        && (body.contains("EACCES")
-            || body.contains("EPERM")
-            || lower.contains("eacces")
-            || lower.contains("eperm"))
-    {
-        return true;
-    }
-    // Some shells print only the errno name (e.g. `touch: ...: EACCES`).
-    if body.contains("EACCES") || body.contains("EPERM") {
-        return true;
-    }
-    false
 }
 
 /// Deterministic merge: stdout first, then stderr appended (with a separating
@@ -855,7 +1202,7 @@ pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCh
             ]
         }),
     );
-    if write_out.is_error {
+    if write_out.is_error || write_out.content.starts_with("FAILED — exit ") {
         return Err(SelfCheckError {
             probe: "bash-smart write probe",
             output: truncate_chars_for_diag(&write_out.content, SELFCHECK_OUTPUT_CHARS),
@@ -1145,30 +1492,13 @@ exit 2
     }
 
     #[test]
-    fn guard_leading_greppy_rejected() {
-        let sentinel = std::env::temp_dir().join(format!(
-            "greppy-env-sentinel-nested-greppy-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&sentinel);
-        let stub = format!("touch '{}'\nexit 0\n", sentinel.display());
-        let (mut env, _, _) = env_with_stub(&stub);
-        let out = env.call_tool("greppy", &json!({"args": ["greppy", "rg", "--", "429"]}));
+    fn leading_greppy_is_stripped_and_guard_still_applies() {
+        let (mut env, _, _) = env_with_stub(r#"printf '%s\n' "$1"; exit 0"#);
+        let out = env.call_tool("greppy", &json!({"args": ["greppy", "rg", "pattern"]}));
+        assert!(!out.is_error);
+        assert_eq!(out.content.trim(), "rg");
+        let out = env.call_tool("greppy", &json!({"args": ["greppy", "agent", "run"]}));
         assert!(out.is_error);
-        assert!(
-            out.content.contains("drop the leading \"greppy\""),
-            "content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("[\"rg\""),
-            "must show the corrected shape; content={}",
-            out.content
-        );
-        assert!(
-            !sentinel.exists(),
-            "stub must not have been invoked for nested greppy argv"
-        );
     }
 
     #[test]
@@ -1444,66 +1774,43 @@ exit 2
     }
 
     #[test]
-    fn sandbox_refusal_macos_seatbelt_is_clarified() {
-        let (mut env, _, _) = env_with_stub(
-            r#"
-printf 'touch: /Users/x/.local/bin/pytest: Operation not permitted\n' >&2
-exit 1
-"#,
-        );
-        let out = env.call_tool(
-            "greppy",
-            &json!({"args": ["bash-smart", "--", "touch", "/outside"]}),
-        );
-        assert!(out.is_error, "content={}", out.content);
-        assert!(
-            out.content
-                .contains("this run is write-confined to the repository worktree"),
-            "must state the write-confinement rule; content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("Operation not permitted"),
-            "must keep the original output; content={}",
-            out.content
-        );
-        // Clarifying sentence comes first.
-        let rule_pos = out
-            .content
-            .find("this run is write-confined")
-            .expect("rule");
-        let raw_pos = out.content.find("Operation not permitted").expect("raw");
-        assert!(
-            rule_pos < raw_pos,
-            "rule before raw; content={}",
-            out.content
-        );
+    fn errno_text_does_not_invent_sandbox_policy() {
+        for errno in ["Operation not permitted", "EACCES", "EPERM"] {
+            let (mut env, _, _) = env_with_stub(&format!("printf '%s\\n' '{errno}' >&2\nexit 1"));
+            let out = env.call_tool("greppy", &json!({"args": ["read-file", "fixture"]}));
+            assert!(out.is_error);
+            assert!(out.content.contains(errno));
+            assert!(!out.content.contains("write-confined"));
+        }
     }
 
     #[test]
-    fn sandbox_refusal_linux_eacces_is_clarified() {
+    fn child_home_and_cache_paths_are_inside_run_scratch() {
         let (mut env, _, _) = env_with_stub(
             r#"
-printf 'pip: install failed: [Errno 13] EACCES: /usr/local/lib\n' >&2
-exit 1
+printf '%s\n' "$HOME" "$TMPDIR" "$npm_config_cache" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$GOCACHE" "$GOMODCACHE" "$GRADLE_USER_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+mkdir -p "$HOME/.npm"
+printf ok > "$HOME/.npm/probe"
 "#,
         );
         let out = env.call_tool(
             "greppy",
-            &json!({"args": ["bash-smart", "--", "pip", "install", "x"]}),
+            &json!({"args": ["bash-smart", "--", "cache-probe"]}),
         );
-        assert!(out.is_error, "content={}", out.content);
-        assert!(
-            out.content
-                .contains("this run is write-confined to the repository worktree"),
-            "content={}",
-            out.content
-        );
-        assert!(
-            out.content.contains("EACCES"),
-            "must keep original; content={}",
-            out.content
-        );
+        assert!(!out.is_error, "{}", out.content);
+        for line in out.content.lines() {
+            assert!(Path::new(line).starts_with(&env.run_scratch), "{line}");
+        }
+        assert!(env.run_scratch.join("home/.npm/probe").is_file());
+    }
+
+    #[test]
+    fn deadline_applies_to_verified_edit() {
+        let (env, _, _) = env_with_stub("sleep 5");
+        let mut env = env.with_deadline(Some(Instant::now() + Duration::from_millis(100)));
+        let out = env.call_tool("greppy", &json!({"args": ["patch", "--verify", "diff"]}));
+        assert!(out.is_error);
+        assert!(out.content.contains("timed out"));
     }
 
     #[test]
@@ -1718,26 +2025,92 @@ exit 0
     }
 
     #[test]
-    fn truncation_appends_marker() {
-        // Emit 200 bytes of 'x'; cap at 64.
-        let (env, _, _) = env_with_stub(
-            r#"
-# 200 x's
-printf '%s' "$(dd if=/dev/zero bs=200 count=1 2>/dev/null | tr '\0' 'x')"
-"#,
-        );
+    fn folded_output_is_recoverable_in_pages() {
+        let (env, _, _) = env_with_stub("printf '%0200d' 0");
         let mut env = env.with_max_output_bytes(64);
         let out = env.call_tool("greppy", &json!({"args": ["x"]}));
-        assert!(!out.is_error, "content len={}", out.content.len());
-        assert!(
-            out.content.contains("[output truncated at 64 bytes]"),
-            "content={}",
-            out.content
+        assert!(!out.is_error);
+        let id = out
+            .content
+            .split("output retained as ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let mut recovered = out.content[..64].to_owned();
+        let mut env = GreppyEnv::with_binary(env.greppy_bin.clone(), env.root.clone())
+            .unwrap()
+            .with_max_output_bytes(64);
+        for offset in [64, 128, 192] {
+            let page = env.call_tool(
+                "greppy",
+                &json!({"args": ["expand", id, "--offset", offset.to_string()]}),
+            );
+            assert!(!page.is_error);
+            recovered.push_str(page.content.split("\n[next:").next().unwrap());
+        }
+        assert_eq!(recovered, format!("{:0200}", 0));
+    }
+
+    #[test]
+    fn persisted_output_checks_owner_and_hash_and_preserves_original_bytes() {
+        let (env, _, root) = env_with_stub("exit 0");
+        let env = env.with_max_output_bytes(8).with_output_owner(root.clone());
+        let rendered = "abcdefghijklmno".to_owned();
+        let folded = env.fold_output(rendered.clone(), b"abcdef\xfftail", b"stderr\xfe");
+        let id = folded
+            .split("output retained as ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert!(!expand_agent_output(&root, id, 0, 64).is_error);
+        let (_, encoded) = id.split_once("agent-output-").unwrap();
+        let (hex, _) = encoded.rsplit_once('-').unwrap();
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        let manifest = PathBuf::from(String::from_utf8(bytes).unwrap());
+        assert_eq!(
+            std::fs::read(manifest.with_file_name("stdout.bin")).unwrap(),
+            b"abcdef\xfftail"
         );
-        // Marker is appended after the cut; total can exceed cap by marker length.
-        let marker = "\n[output truncated at 64 bytes]";
-        assert!(out.content.ends_with(marker));
-        assert_eq!(out.content.len(), 64 + marker.len());
+        assert_eq!(
+            std::fs::read(manifest.with_file_name("stderr.bin")).unwrap(),
+            b"stderr\xfe"
+        );
+        let (other_env, _, other_root) = env_with_stub("exit 0");
+        drop(other_env);
+        assert!(expand_agent_output(&other_root, id, 0, 64)
+            .content
+            .contains("different repository"));
+        std::fs::write(manifest.with_file_name("output.txt"), "changed").unwrap();
+        assert!(expand_agent_output(&root, id, 0, 64)
+            .content
+            .contains("corruption"));
+        assert!(expand_agent_output(&root, "agent-output-é", 0, 64).is_error);
+    }
+
+    #[test]
+    fn no_match_and_failed_target_are_normal_results() {
+        let (mut env, _, _) = env_with_stub("printf '(no matches)\\n'\nexit 1");
+        assert!(
+            !env.call_tool("greppy", &json!({"args": ["search-pattern", "absent"]}))
+                .is_error
+        );
+        let (mut env, _, _) = env_with_stub(
+            "printf 'FAILED — exit 101: 1 error\\nEPERM in failing test log\\n'\nexit 101",
+        );
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["bash-smart", "--", "cargo", "test"]}),
+        );
+        assert!(!out.is_error);
+        assert!(out.content.contains("EPERM"));
+        assert!(!out.content.contains("write-confined"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //!    - On `stop_reason == ToolUse`, execute every requested tool call **in
 //!      order**, then append **one** user message carrying all
 //!      `tool_result` blocks (matching call ids) and continue.
-//!    - Stop on `EndTurn`, `MaxTokens`, configured `max_turns`, a wall-clock
+//!    - Stop on `EndTurn`, an opt-in `max_turns`, a wall-clock
 //!      `deadline` (checked only between turns), or a non-recoverable
 //!      transport error.
 //! 2. Tool execution errors become `is_error: true` tool_results and do
@@ -34,21 +34,19 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Hard cap on assistant turns (each model response counts as one).
-    /// Default: 40.
+    /// Zero means unlimited (the default).
     pub max_turns: usize,
     /// Optional system prompt forwarded every turn.
     pub system: Option<String>,
     /// Model tag placed on each [`ModelRequest`].
     pub model: String,
-    /// `max_tokens` for each model turn. Default: 8192.
+    /// Optional response limit; u64::MAX delegates the limit to the model provider.
     pub max_tokens: u64,
     /// Tool-choice policy. Default: [`ToolChoice::Auto`].
     pub tool_choice: ToolChoice,
-    /// Consecutive failed tool outcomes before an advisory is appended to the
-    /// tool result. Default: 4.
+    /// Legacy compatibility field, ignored: failures do not imply missing capability.
     pub consecutive_failure_advisory: usize,
-    /// Consecutive failed tool outcomes before the loop stops as
-    /// [`LoopStop::Stuck`]. Default: 8.
+    /// Legacy compatibility field, ignored: failures never end a run.
     pub consecutive_failure_stop: usize,
     /// Absolute wall-clock deadline. Checked only at the top of each loop
     /// iteration (before a new model turn). An `Instant` (not a duration) so
@@ -84,13 +82,13 @@ impl Eq for AgentConfig {}
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_turns: 40,
+            max_turns: 0,
             system: None,
             model: String::new(),
-            max_tokens: 8192,
+            max_tokens: u64::MAX,
             tool_choice: ToolChoice::Auto,
-            consecutive_failure_advisory: 4,
-            consecutive_failure_stop: 8,
+            consecutive_failure_advisory: 0,
+            consecutive_failure_stop: 0,
             deadline: None,
             deadline_total: None,
             cancel: None,
@@ -123,13 +121,13 @@ impl AgentConfig {
         self
     }
 
-    /// Builder: consecutive-failure advisory threshold.
+    /// Legacy builder retained for compatibility; failure advisories are disabled.
     pub fn with_consecutive_failure_advisory(mut self, n: usize) -> Self {
         self.consecutive_failure_advisory = n;
         self
     }
 
-    /// Builder: consecutive-failure stop threshold ([`LoopStop::Stuck`]).
+    /// Legacy builder retained for compatibility; failure stops are disabled.
     pub fn with_consecutive_failure_stop(mut self, n: usize) -> Self {
         self.consecutive_failure_stop = n;
         self
@@ -143,10 +141,9 @@ pub enum LoopStop {
     EndTurn,
     /// Hit [`AgentConfig::max_turns`].
     MaxTurns,
-    /// Model hit its generation token budget.
+    /// Legacy result variant. Response token exhaustion now continues the run.
     MaxTokens,
-    /// Hit [`AgentConfig::consecutive_failure_stop`] failed tool outcomes in a
-    /// row — the agent could not make progress.
+    /// Legacy result variant. Repeated failures no longer stop the run.
     Stuck,
     /// Hit [`AgentConfig::deadline`] between turns (never mid-turn / mid-tool).
     Deadline,
@@ -294,12 +291,11 @@ pub fn run_agent_loop_with_history(
     let mut turns: usize = 0;
     let mut last_stop = LoopStop::EndTurn;
     let mut final_text = String::new();
-    let mut consecutive_failures: usize = 0;
     let mut turn_budget_advised = false;
     let mut deadline_advised = false;
 
     // Cap the number of model turns. Each successful stream_turn counts as one.
-    while turns < config.max_turns {
+    while config.max_turns == 0 || turns < config.max_turns {
         // Wall-clock deadline is checked only between turns — never mid-turn
         // and never while a tool call is running, so a partial edit cannot be
         // left half-applied.
@@ -346,13 +342,15 @@ pub fn run_agent_loop_with_history(
         // a safe boundary. Without this check an interrupt received while an
         // EndTurn response was in flight was acknowledged and then silently
         // reported as a successful turn.
-        if cancel_requested(config) && !matches!(&turn.stop_reason, StopReason::ToolUse) {
+        if cancel_requested(config) && collect_tool_calls(&turn.message).is_empty() {
             last_stop = LoopStop::Cancelled;
             break;
         }
 
         match turn.stop_reason {
-            StopReason::ToolUse => {
+            StopReason::ToolUse | StopReason::MaxTokens
+                if !collect_tool_calls(&turn.message).is_empty() =>
+            {
                 let tool_calls = collect_tool_calls(&turn.message);
                 if tool_calls.is_empty() {
                     // Model claimed tool_use but produced no calls — treat as end.
@@ -372,7 +370,6 @@ pub fn run_agent_loop_with_history(
                 }
 
                 let mut result_parts: Vec<ContentPart> = Vec::with_capacity(tool_calls.len());
-                let mut stuck = false;
                 let mut cancel_remaining = false;
                 for (id, name, arguments) in tool_calls {
                     if cancel_remaining {
@@ -385,25 +382,6 @@ pub fn run_agent_loop_with_history(
                         arguments: arguments.clone(),
                     });
                     let mut outcome = dispatch_tool(env, &name, &arguments);
-
-                    if outcome.is_error {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        if config.consecutive_failure_advisory > 0
-                            && consecutive_failures == config.consecutive_failure_advisory
-                        {
-                            append_tool_advisory(
-                                &mut outcome.content,
-                                &format!(
-                                    "{} tool calls in a row failed. Change approach: if something the task \
-needs is missing from this environment, stop and report it instead of \
-retrying.",
-                                    config.consecutive_failure_advisory
-                                ),
-                            );
-                        }
-                    } else {
-                        consecutive_failures = 0;
-                    }
 
                     // Turn-budget awareness: once, when ≤25% of max_turns remain
                     // and at least one turn was already used.
@@ -465,12 +443,6 @@ verifiable and report the rest."
                         is_error: outcome.is_error,
                     });
 
-                    if config.consecutive_failure_stop > 0
-                        && consecutive_failures >= config.consecutive_failure_stop
-                    {
-                        stuck = true;
-                        break;
-                    }
                     // After a tool returns is a safe boundary. Remaining calls
                     // are recorded as cancelled results so history stays valid.
                     if cancel_requested(config) {
@@ -484,10 +456,6 @@ verifiable and report the rest."
                     content: result_parts,
                 });
 
-                if stuck {
-                    last_stop = LoopStop::Stuck;
-                    break;
-                }
                 if cancel_remaining || cancel_requested(config) {
                     last_stop = LoopStop::Cancelled;
                     break;
@@ -500,13 +468,19 @@ verifiable and report the rest."
                 last_stop = LoopStop::MaxTurns; // provisional; overwritten on next end
                 continue;
             }
-            StopReason::EndTurn => {
+            StopReason::EndTurn | StopReason::ToolUse => {
                 last_stop = LoopStop::EndTurn;
                 break;
             }
             StopReason::MaxTokens => {
-                last_stop = LoopStop::MaxTokens;
-                break;
+                messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "The response reached its token limit. Continue from the interruption and complete the task.".into(),
+                    }],
+                });
+                last_stop = LoopStop::MaxTurns;
+                continue;
             }
             StopReason::Other(_) => {
                 // Unknown stop: treat like end_turn so the loop does not hang.
@@ -1173,28 +1147,44 @@ mod tests {
     }
 
     #[test]
-    fn max_tokens_stop() {
-        let mut model = FakeModel::new(vec![ScriptedTurn {
-            events: vec![StreamEvent::Finished {
-                stop_reason: StopReason::MaxTokens,
-                usage: usage(1, 99),
-            }],
-            result: Ok(TurnResult {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![ContentPart::Text {
-                        text: "cut off".into(),
-                    }],
-                },
-                stop_reason: StopReason::MaxTokens,
-                usage: usage(1, 99),
-            }),
-        }]);
+    fn default_turn_budget_does_not_stop_at_forty() {
+        let mut turns = failing_tool_turns(45);
+        turns.push(text_turn("done", usage(1, 1)));
+        let mut model = FakeModel::new(turns);
+        let mut env = FakeEnv::new(vec![bash_tool()]);
+        let (result, _) = run(&mut model, &mut env, &AgentConfig::default(), "complete").unwrap();
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(model.calls, 46);
+        assert_eq!(AgentConfig::default().max_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn max_tokens_continues() {
+        let mut model = FakeModel::new(vec![
+            ScriptedTurn {
+                events: vec![StreamEvent::Finished {
+                    stop_reason: StopReason::MaxTokens,
+                    usage: usage(1, 99),
+                }],
+                result: Ok(TurnResult {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentPart::Text {
+                            text: "cut off".into(),
+                        }],
+                    },
+                    stop_reason: StopReason::MaxTokens,
+                    usage: usage(1, 99),
+                }),
+            },
+            text_turn("completed", usage(1, 1)),
+        ]);
         let mut env = FakeEnv::new(vec![]);
         let config = AgentConfig::default().with_model("mock");
         let (result, _) = run(&mut model, &mut env, &config, "hi").expect("ok");
-        assert_eq!(result.stop, LoopStop::MaxTokens);
-        assert_eq!(result.final_text, "cut off");
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(result.final_text, "completed");
+        assert_eq!(model.calls, 2);
     }
 
     #[test]
@@ -1371,113 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_failure_advisory_appears_exactly_once_at_threshold() {
-        // 4 consecutive fails → advisory on the 4th; then end.
-        // Also: after a success, a new streak of 4 gets the advisory again.
-        struct SeqEnv {
-            tools: Vec<ToolDefinition>,
-            outcomes: VecDeque<ToolOutcome>,
-        }
-        impl ExecutionEnv for SeqEnv {
-            fn tool_definitions(&self) -> Vec<ToolDefinition> {
-                self.tools.clone()
-            }
-            fn call_tool(&mut self, name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
-                self.outcomes
-                    .pop_front()
-                    .unwrap_or_else(|| ToolOutcome::unknown_tool(name))
-            }
-        }
-
-        // Phase 1: 4 fails → advisory once; model ends.
-        {
-            let mut turns = failing_tool_turns(4);
-            turns.push(text_turn("stopped trying", usage(1, 1)));
-            let mut outcomes = VecDeque::new();
-            for _ in 0..4 {
-                outcomes.push_back(ToolOutcome::err("fail"));
-            }
-            let mut model = FakeModel::new(turns);
-            let mut env = SeqEnv {
-                tools: vec![bash_tool()],
-                outcomes,
-            };
-            let config = AgentConfig::default()
-                .with_model("mock")
-                .with_consecutive_failure_advisory(4)
-                .with_consecutive_failure_stop(8);
-            let result =
-                run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
-            let contents = tool_result_contents(&result);
-            let advisory_hits: Vec<_> = contents
-                .iter()
-                .filter(|(_, c)| c.contains("4 tool calls in a row failed"))
-                .collect();
-            assert_eq!(
-                advisory_hits.len(),
-                1,
-                "advisory exactly once: {contents:?}"
-            );
-            assert!(
-                contents[3].1.contains("4 tool calls in a row failed"),
-                "advisory on 4th: {contents:?}"
-            );
-            // First three must not have it.
-            for (i, (_, c)) in contents.iter().take(3).enumerate() {
-                assert!(
-                    !c.contains("4 tool calls in a row failed"),
-                    "advisory early at {i}: {c}"
-                );
-            }
-        }
-
-        // Phase 2: 4 fails (advisory) + success (reset) + 4 fails (advisory again).
-        {
-            let mut turns = failing_tool_turns(4);
-            turns.push(tool_turn(
-                None,
-                vec![("ok1", "bash", json!({}))],
-                usage(1, 1),
-            ));
-            turns.extend(failing_tool_turns(4));
-            turns.push(text_turn("done", usage(1, 1)));
-
-            let mut outcomes = VecDeque::new();
-            for _ in 0..4 {
-                outcomes.push_back(ToolOutcome::err("fail"));
-            }
-            outcomes.push_back(ToolOutcome::ok("ok"));
-            for _ in 0..4 {
-                outcomes.push_back(ToolOutcome::err("fail"));
-            }
-
-            let mut model = FakeModel::new(turns);
-            let mut env = SeqEnv {
-                tools: vec![bash_tool()],
-                outcomes,
-            };
-            let config = AgentConfig::default()
-                .with_model("mock")
-                .with_max_turns(20)
-                .with_consecutive_failure_advisory(4)
-                .with_consecutive_failure_stop(8);
-            let result =
-                run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
-            let contents = tool_result_contents(&result);
-            let advisory_hits: Vec<_> = contents
-                .iter()
-                .filter(|(_, c)| c.contains("4 tool calls in a row failed"))
-                .collect();
-            assert_eq!(
-                advisory_hits.len(),
-                2,
-                "advisory once per streak: {contents:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn consecutive_failure_stuck_at_stop_threshold() {
+    fn repeated_failures_do_not_stop_or_advise() {
         // 8 consecutive fails → Stuck; loop returns what it has (no further model turn).
         struct SeqEnv {
             tools: Vec<ToolDefinition>,
@@ -1518,14 +1402,14 @@ mod tests {
             .with_consecutive_failure_stop(8);
 
         let result = run_agent_loop(&mut model, &mut env, &config, "x", &mut |_| {}).expect("loop");
-        assert_eq!(result.stop, LoopStop::Stuck);
-        assert_eq!(env.calls, 8, "must stop after 8th failure");
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(env.calls, 12, "all tool calls must run");
         // 8 tool results present in history.
         let contents = tool_result_contents(&result);
-        assert_eq!(contents.len(), 8);
+        assert_eq!(contents.len(), 12);
         // Advisory at 4th is still present.
         assert!(
-            contents[3].1.contains("4 tool calls in a row failed"),
+            !contents[3].1.contains("4 tool calls in a row failed"),
             "advisory on 4th: {:?}",
             contents[3]
         );
