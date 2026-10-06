@@ -1544,15 +1544,6 @@ fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path:
     file_operand_path(root_path, subject)
 }
 
-fn read_open_file(
-    root_path: &std::path::Path,
-    canonical_root: &std::path::Path,
-    subject: &str,
-) -> Option<(String, std::path::PathBuf, String)> {
-    let (shown, canonical) = read_resolve_file(root_path, canonical_root, subject)?;
-    let content = std::fs::read_to_string(&canonical).ok()?;
-    Some((shown, canonical, content))
-}
 
 fn read_resolve_file(
     root_path: &std::path::Path,

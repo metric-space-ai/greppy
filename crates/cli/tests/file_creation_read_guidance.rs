@@ -48,7 +48,11 @@ fn positional_file_locations_give_exact_recovery_before_opening_a_graph() {
 fn colon_number_in_existing_literal_filename_keeps_file_read_behavior() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join(".git")).unwrap();
-    let mut content = "literal contents\n".repeat(401).into_bytes();
+    // Invalid bytes are beyond the existing 64 KiB preview budget.
+    // File-intent classification must not decode that unobserved tail.
+    let mut content = format!("{}\n", "literal contents ".repeat(16))
+        .repeat(401)
+        .into_bytes();
     content.push(0xff);
     std::fs::write(temp.path().join("note.txt:7"), content).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_greppy"))
@@ -59,7 +63,9 @@ fn colon_number_in_existing_literal_filename_keeps_file_read_behavior() {
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "exit={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("literal contents"));
