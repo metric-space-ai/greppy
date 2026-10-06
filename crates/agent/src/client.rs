@@ -289,7 +289,9 @@ impl Client {
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(600))
             .build()
-            .map_err(|error| ClientError::Transport(format!("create model HTTP client: {error}")))?;
+            .map_err(|error| {
+                ClientError::Transport(format!("create model HTTP client: {error}"))
+            })?;
         let body = serde_json::to_string(&to_messages_request_body(req))
             .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
         let mut request = client
@@ -342,7 +344,7 @@ impl Client {
         loop {
             let n = reader
                 .read(&mut read_buf)
-                .map_err(|e| ClientError::Transport(e.to_string()))?;
+                .map_err(|e| ClientError::Transport(format!("read model response: {e}")))?;
             if n == 0 {
                 break;
             }
