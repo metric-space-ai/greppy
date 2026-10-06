@@ -14345,7 +14345,8 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             (Language::JavaScript, "fixture.js"),
             (Language::TypeScript { tsx: false }, "fixture.ts"),
         ] {
-            let source = b"function target() { return 1; }\nfunction valid() { return target(); }\n";
+            let source =
+                b"function target() { return 1; }\nfunction valid() { return target(); }\n";
             let original = parser_extract(language, source, file).unwrap();
             let mut poisoned = original.clone();
             poisoned.nodes.push(ExtractedNode {
@@ -14358,8 +14359,14 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
                 properties: serde_json::Value::Null,
             });
             let validated = validated_js_ts_repair_extraction(language, file, poisoned).unwrap();
-            assert_eq!(format!("{:?}", validated.nodes), format!("{:?}", original.nodes));
-            assert_eq!(format!("{:?}", validated.edges), format!("{:?}", original.edges));
+            assert_eq!(
+                format!("{:?}", validated.nodes),
+                format!("{:?}", original.nodes)
+            );
+            assert_eq!(
+                format!("{:?}", validated.edges),
+                format!("{:?}", original.edges)
+            );
             assert!(validated.edges.iter().any(|e| e.edge_type == "CALLS"));
         }
     }
@@ -14372,20 +14379,47 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         let source = "function () {}\nfunction target() { return 1; }\nfunction valid() { return target(); }\n";
         let extraction = parser_extract(language, source.as_bytes(), file).unwrap();
         let (_, dropped, error) = validate_or_degrade(language, file, extraction);
-        assert!(dropped > 0, "pin a real grammar-recovery record, not only a mocked extraction");
+        assert!(
+            dropped > 0,
+            "pin a real grammar-recovery record, not only a mocked extraction"
+        );
         assert!(error.is_none());
         fs::write(repo.path().join(file), source).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, repo.path(), "test").unwrap();
         assert!(js_ts_usages_repaired(&store).unwrap());
-        let target = store.get_node_by_qname("test", "fixture.ts::Function::target").unwrap().unwrap();
-        assert_eq!(store.incoming_edges(target.id, Some("CALLS"), 10).unwrap().len(), 1);
+        let target = store
+            .get_node_by_qname("test", "fixture.ts::Function::target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
         let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
         store.conn().execute_batch("DELETE FROM main.raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM main.edges WHERE edge_type IN ('USAGE','CALLS');").unwrap();
-        store.conn().execute("DELETE FROM main.schema_meta WHERE key=?1", [JS_TS_USAGE_REPAIR_KEY]).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
         assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
-        assert_eq!(store.incoming_edges(target.id, Some("CALLS"), 10).unwrap().len(), 1);
-        assert_eq!(nodes, format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap()));
+        assert_eq!(
+            store
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
         assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
     }
 
