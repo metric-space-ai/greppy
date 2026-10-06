@@ -20,7 +20,8 @@ def mentions(text):
         if re.match(r"^[A-Z][A-Z -]+:", line):
             previous = None
         fragments = []
-        if re.match(r"^\s{2,}greppy\s", line):
+        command_row = bool(re.match(r"^\s{2,}greppy\s", line))
+        if command_row:
             fragments.append(re.split(r"\s{2,}", line.strip(), maxsplit=1)[0])
         fragments.extend(match.group(1) for match in re.finditer(r"`(greppy\s[^`]+)`", line))
         for fragment in fragments:
@@ -40,7 +41,7 @@ def mentions(text):
                     break
             if not command:
                 continue  # Literal grep PATTERN / -n compatibility examples.
-            flags = re.findall(r"(?<![\w-])(?:--[a-z][a-z-]*|-[a-z]\b)", fragment)
+            flags = re.findall(r"(?<![\w-])(?:--[a-z][a-z-]*|-[a-z]\b)", line if command_row else fragment)
             row = {"line": number, "command": command, "flags": flags}
             rows.append(row)
             previous = row
@@ -78,6 +79,15 @@ def main():
         for flag in row["flags"]:
             if flag not in available:
                 failures.append({**row, "error": f"{flag} absent from this command's help"})
+    # Generic prose says 'where offered' or 'supported graph queries'; it does
+    # not promise every flag on every command. Still catch invented flag names.
+    all_help_flags = set()
+    for _, text in cache.values():
+        all_help_flags.update(re.findall(r"(?<![\w-])--[a-z][a-z-]*", text))
+    for number, line in enumerate(data.decode().splitlines(), 1):
+        for flag in re.findall(r"(?<![\w-])--[a-z][a-z-]*", line):
+            if flag not in all_help_flags:
+                failures.append({"line": number, "error": f"{flag} absent from all advertised command help"})
     report = {"binary": str(Path(args.binary).resolve()),
               "prompt_sha256": hashlib.sha256(data).hexdigest(),
               "checked_mentions": len(rows), "commands": rows,
