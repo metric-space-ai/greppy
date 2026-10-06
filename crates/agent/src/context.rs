@@ -96,8 +96,9 @@ const CHECKPOINT_FIELDS: &[&str] = &[
 /// Ask the configured model for a structured continuation checkpoint with tools
 /// disabled. Retain the initial/latest human instructions and recent complete
 /// exchanges. No history is discarded unless a complete, schema-valid checkpoint
-/// fits the finite 64KiB policy. Previous checkpoints are preserved verbatim as
-/// historical records, rather than trusting the model to carry every old fact.
+/// fits the finite 64KiB policy. The previous checkpoint is supplied to the model;
+/// exact deduplicated recovery references carry forward into one rolling state.
+/// The parent must persist raw history and prior checkpoints before calling.
 /// The trigger is a byte threshold, not a measured token count. Protected human
 /// instructions and an indivisible recent exchange can exceed it.
 pub fn checkpoint_history<M: crate::model::ModelStream + ?Sized>(
@@ -215,27 +216,22 @@ fn checkpoint_history_with_limit<M: crate::model::ModelStream + ?Sized>(
         ))
     })?;
     validate_checkpoint(&checkpoint).map_err(reject)?;
-    // Carry prior states outside current fields so old pending work is visibly
-    // historical, and no model omission silently destroys a previous checkpoint.
-    let mut archival = Vec::new();
-    if let Some(mut previous) = previous {
-        if let Some(old) = previous
-            .as_object_mut()
-            .and_then(|obj| obj.remove("previous_checkpoints"))
-        {
-            archival.extend(
-                old.as_array()
-                    .expect("validated checkpoint archive")
-                    .iter()
-                    .cloned(),
-            );
-        }
-        archival.push(previous);
+    // The parent durably records raw history and prior checkpoints. Live context
+    // is one current-state snapshot, with exact deduplicated recovery references.
+    let mut recovery_ids = BTreeSet::new();
+    collect_recovery_ids(&checkpoint, &mut recovery_ids);
+    if let Some(previous) = previous.as_ref() {
+        collect_recovery_ids(previous, &mut recovery_ids);
     }
-    checkpoint["previous_checkpoints"] = Value::Array(archival);
+    checkpoint
+        .as_object_mut()
+        .expect("validated checkpoint object")
+        .retain(|key, _| key == "task" || CHECKPOINT_FIELDS.contains(&key.as_str()));
+    checkpoint["recovery_ids"] =
+        Value::Array(recovery_ids.into_iter().map(Value::String).collect());
     let serialized = checkpoint.to_string();
     if serialized.len() > CHECKPOINT_BYTES {
-        return Err(reject("checkpoint plus preserved previous states exceeds 64KiB; preserve raw recovery history and choose a larger explicit policy before retrying".into()));
+        return Err(reject("current checkpoint plus exact recovery references exceeds 64KiB; retain original history and consolidate references through the persisted recovery log before retrying".into()));
     }
     let new_system = format!("{base}{CHECKPOINT_MARKER}{serialized}");
     let removed_messages = (0..cut).filter(|i| !protected(*i)).count();
@@ -252,6 +248,30 @@ fn checkpoint_history_with_limit<M: crate::model::ModelStream + ?Sized>(
         removed_messages,
         checkpoint,
     }))
+}
+
+fn collect_recovery_ids(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    // Legacy checkpoint archives are accepted as input only; migrate their exact
+    // recovery references without carrying historical summaries into live state.
+    if let Some(references) = value
+        .get("recovery_ids")
+        .and_then(serde_json::Value::as_array)
+    {
+        ids.extend(
+            references
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    if let Some(previous) = value
+        .get("previous_checkpoints")
+        .and_then(serde_json::Value::as_array)
+    {
+        for checkpoint in previous {
+            collect_recovery_ids(checkpoint, ids);
+        }
+    }
 }
 
 fn validate_checkpoint(value: &serde_json::Value) -> Result<(), String> {
@@ -619,62 +639,112 @@ mod tests {
         assert_eq!(history.iter().filter(|m| is_user_instruction(m)).count(), 1);
     }
     #[test]
-    fn repeated_model_checkpoints_keep_follow_up_and_prior_state_verbatim() {
-        let first_state = checkpoint_state("First state", "run-1:/durable/first.bundle");
-        let second_state = checkpoint_state("Latest state", "run-2:/durable/second.bundle");
+    fn repeated_model_checkpoints_keep_follow_up_and_recovery_refs_bounded() {
         let mut model = ScriptedCheckpointModel {
-            replies: [
-                Ok(checkpoint_turn(
-                    first_state,
-                    crate::protocol::StopReason::EndTurn,
-                )),
-                Ok(checkpoint_turn(
-                    second_state,
-                    crate::protocol::StopReason::EndTurn,
-                )),
-            ]
-            .into(),
+            replies: (0..100)
+                .map(|cycle| {
+                    let mut state = checkpoint_state(
+                        &format!("Current goal cycle {cycle}"),
+                        &format!("run-{cycle}:/durable/recovery.bundle"),
+                    );
+                    state["constraints"] = json!([format!(
+                        "Latest correction cycle {cycle}: preserve /durable/latest.bundle"
+                    )]);
+                    state["recovery_ids"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("exact-shared-recovery-id"));
+                    Ok(checkpoint_turn(state, crate::protocol::StopReason::EndTurn))
+                })
+                .collect(),
             requests: vec![],
         };
         let mut history = forty_five_turn_history();
         let initial = history[0].clone();
         let mut system = Some("Base".into());
-        let first_checkpoint =
-            checkpoint_history(&mut model, "m", &mut history, &mut system, 16 * 1024)
+        let mut previous = None;
+        for cycle in 0..100 {
+            let correction = text(
+                Role::User,
+                &format!("Latest correction cycle {cycle}: preserve /durable/latest.bundle"),
+            );
+            history.push(correction.clone());
+            for n in 0..8 {
+                exchange(&mut history, 1000 + cycle * 8 + n);
+            }
+            let result = checkpoint_history(&mut model, "m", &mut history, &mut system, 16 * 1024)
                 .unwrap()
-                .unwrap()
-                .checkpoint;
-        let follow_up = text(
-            Role::User,
-            "Latest correction: preserve exact /durable/latest.bundle",
-        );
-        history.push(follow_up.clone());
-        for n in 45..90 {
-            exchange(&mut history, n);
+                .unwrap();
+            assert_eq!(history[0], initial);
+            assert_eq!(history[1], correction);
+            assert!(retained_pending(&history).is_empty());
+            assert_eq!(
+                result.checkpoint["task"],
+                format!("Current goal cycle {cycle}")
+            );
+            assert_eq!(
+                result.checkpoint["constraints"][0],
+                format!("Latest correction cycle {cycle}: preserve /durable/latest.bundle")
+            );
+            assert!(result.checkpoint.get("previous_checkpoints").is_none());
+            let ids = result.checkpoint["recovery_ids"].as_array().unwrap();
+            assert_eq!(ids.len(), cycle + 2);
+            assert_eq!(
+                ids.iter()
+                    .filter(|id| **id == json!("exact-shared-recovery-id"))
+                    .count(),
+                1
+            );
+            for earlier in 0..=cycle {
+                assert!(ids.contains(&json!(format!("run-{earlier}:/durable/recovery.bundle"))));
+            }
+            assert!(saved_summary(system.as_deref()).unwrap().len() < 8 * 1024);
+            let ContentPart::Text { text: payload } = &model.requests[cycle].messages[0].content[0]
+            else {
+                panic!();
+            };
+            let data: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(
+                data["previous_checkpoint"],
+                previous.clone().unwrap_or(serde_json::Value::Null)
+            );
+            previous = Some(result.checkpoint);
         }
-        let second = checkpoint_history(&mut model, "m", &mut history, &mut system, 16 * 1024)
-            .unwrap()
-            .unwrap();
-        assert_eq!(history[0], initial);
-        assert_eq!(history[1], follow_up);
-        assert!(retained_pending(&history).is_empty());
-        let mut archived_first = first_checkpoint.clone();
-        archived_first
-            .as_object_mut()
-            .unwrap()
-            .remove("previous_checkpoints");
-        assert_eq!(second.checkpoint["previous_checkpoints"][0], archived_first);
-        let ContentPart::Text { text: payload } = &model.requests[1].messages[0].content[0] else {
-            panic!();
-        };
-        let data: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(data["previous_checkpoint"], first_checkpoint);
         let mut restored = Some("Resume mode".into());
         restore_summary(&mut restored, saved_summary(system.as_deref()));
         assert!(restored.as_ref().unwrap().starts_with("Resume mode"));
-        assert_eq!(restored.as_ref().unwrap().matches(MARKER).count(), 1);
         restore_summary(&mut restored, saved_summary(system.as_deref()));
         assert_eq!(restored.as_ref().unwrap().matches(MARKER).count(), 1);
+    }
+    #[test]
+    fn legacy_archive_migrates_exact_recovery_ids_without_summary_chain() {
+        let mut prior = checkpoint_state("Old current state", "old-root-id");
+        let mut nested = checkpoint_state("Old historical state", "old-nested-id");
+        nested["recovery_ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("old-root-id"));
+        prior["previous_checkpoints"] = json!([nested]);
+        let mut system = Some("Base".into());
+        restore_summary(&mut system, Some(&prior.to_string()));
+        let mut model = ScriptedCheckpointModel {
+            replies: [Ok(checkpoint_turn(
+                checkpoint_state("Fresh state", "new-id"),
+                crate::protocol::StopReason::EndTurn,
+            ))]
+            .into(),
+            requests: vec![],
+        };
+        let mut history = forty_five_turn_history();
+        let result = checkpoint_history(&mut model, "m", &mut history, &mut system, 16 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.checkpoint["recovery_ids"],
+            json!(["new-id", "old-nested-id", "old-root-id"])
+        );
+        assert!(result.checkpoint.get("previous_checkpoints").is_none());
+        assert_eq!(result.checkpoint["task"], "Fresh state");
     }
     #[test]
     fn failed_truncated_or_invalid_checkpoint_never_discards_history() {
