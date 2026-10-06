@@ -1122,6 +1122,16 @@ fn read_structural_kind(kind: &str) -> bool {
     )
 }
 
+fn read_class_member_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition"
+            | "method_definition"
+            | "method_declaration"
+            | "constructor_declaration"
+    )
+}
+
 fn read_node_end_line(row: usize, column: usize) -> usize {
     row + usize::from(column > 0)
 }
@@ -1241,24 +1251,52 @@ fn read_render_smart_source(
             .unwrap_or(selected)
     };
 
-    let mut candidates = Vec::<(usize, usize)>::new();
+    let class_root = definition_root
+        && matches!(
+            selected.kind(),
+            "class_definition" | "class_declaration" | "class_specifier"
+        );
+    let mut candidates = Vec::<(usize, usize, bool)>::new();
     let mut children = traversal_root.walk();
     let mut stack = traversal_root
         .named_children(&mut children)
         .map(|node| (node, 0usize))
         .collect::<Vec<_>>();
     while let Some((node, parent_depth)) = stack.pop() {
-        let candidate = read_structural_kind(node.kind());
+        let member_body = class_root
+            && node.parent().is_some_and(|parent| {
+                read_class_member_kind(parent.kind())
+                    && parent
+                        .child_by_field_name("body")
+                        .is_some_and(|body| body.id() == node.id())
+            });
+        let candidate = read_structural_kind(node.kind()) || member_body;
         let node_depth = parent_depth + usize::from(candidate);
-        let start = node.start_position().row + 1;
-        let end = read_node_end_line(node.end_position().row, node.end_position().column);
+        let mut start = node.start_position().row + 1;
+        let mut end = read_node_end_line(node.end_position().row, node.end_position().column);
+        if member_body {
+            let body = &content[node.start_byte()..node.end_byte()];
+            if body.starts_with('{') {
+                // Keep the member signature/opening brace and closing brace.
+                // A one-line member has no separate body lines to hide.
+                start += 1;
+                end = end.saturating_sub(1);
+            } else if node
+                .parent()
+                .is_some_and(|parent| parent.start_position().row == node.start_position().row)
+            {
+                // Python permits `def f(self): return 1`; hiding that line
+                // would also hide the signature. Keep it verbatim.
+                start = end.saturating_add(1);
+            }
+        }
         if candidate
             && node_depth >= depth
             && start >= shown_start
             && end <= shown_end
             && end >= start
         {
-            candidates.push((start, end));
+            candidates.push((start, end, member_body));
             continue;
         }
         let mut cursor = node.walk();
@@ -1270,15 +1308,24 @@ fn read_render_smart_source(
     candidates.dedup();
     let mut non_overlapping = Vec::new();
     for range in candidates {
-        if non_overlapping.last().is_none_or(|(_, end)| range.0 > *end) {
+        if non_overlapping
+            .last()
+            .is_none_or(|(_, end, _)| range.0 > *end)
+        {
             non_overlapping.push(range);
         }
     }
 
     let mut gaps = Vec::with_capacity(non_overlapping.len());
-    for (start_line, end_line) in non_overlapping {
+    for (start_line, end_line, member_body) in non_overlapping {
         let source = read_line_slice(content, start_line, end_line);
-        let sentence = read_summary_sentence(root_path, path, source);
+        // Class overview keeps each member's name/signature. A mechanical gap
+        // avoids one extra model inference per method just to fold its body.
+        let sentence = if member_body {
+            "method body".to_string()
+        } else {
+            read_summary_sentence(root_path, path, source)
+        };
         let expand_id = read_insert_smart_pack(
             store, project, path, start_line, end_line, source, &sentence,
         )?;
@@ -1374,7 +1421,10 @@ pub(crate) fn dispatch_read_smart(
             definition.end_line,
             nav_short_name(&definition.node)
         );
-        let foldable = matches!(definition.node.label.as_str(), "Function" | "Method");
+        let foldable = matches!(
+            definition.node.label.as_str(),
+            "Function" | "Method" | "Class"
+        );
         if foldable {
             group.push_str(&read_render_smart_source(
                 &store,

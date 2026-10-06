@@ -1033,6 +1033,117 @@ fn read_smart_folds_by_structure_and_expand_chains() {
 }
 
 #[test]
+fn read_smart_python_class_keeps_members_and_expands_exact_bodies() {
+    let (repo, store) = fresh_workspace("smart-python-class");
+    let mut source = String::from(
+        "class Inventory:\n    tax_rate = 0.2\n\n    @staticmethod\n    def tiny(): return 1\n",
+    );
+    for number in 0..12 {
+        source.push_str(&format!(
+            "\n    @classmethod\n    def compute_{number}(cls, value: int) -> int:\n"
+        ));
+        source.push_str(
+            "        subtotal = value + 12345\n        tax = subtotal * cls.tax_rate\n        discount = subtotal / 10\n        delivery = subtotal / 20\n        handling = subtotal / 40\n        net = subtotal - discount\n        gross = net + tax\n        shipped = gross + delivery\n        final = shipped + handling\n        return int(final)\n",
+        );
+    }
+    std::fs::write(repo.join("inventory.py"), &source).unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Inventory"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(compact.contains("class Inventory:"), "{compact}");
+    assert!(compact.contains("    tax_rate = 0.2"), "{compact}");
+    assert!(compact.contains("    def tiny(): return 1"), "{compact}");
+    assert_eq!(compact.matches("    @classmethod\n").count(), 12);
+    assert_eq!(compact.matches("method body — greppy expand ").count(), 12);
+    assert!(!compact.contains("subtotal = value"), "{compact}");
+    for number in 0..12 {
+        assert!(
+            compact.contains(&format!("def compute_{number}(cls, value: int) -> int:")),
+            "{compact}"
+        );
+    }
+    let (_, full, error) = run(&repo, &store, &["read", "Inventory"]);
+    assert!(full.ends_with(&source), "{full}\n{error}");
+    assert!(
+        compact.len() < full.len() / 2,
+        "compact={} full={}",
+        compact.len(),
+        full.len()
+    );
+    let gap = compact
+        .lines()
+        .find(|line| line.contains("method body — greppy expand "))
+        .unwrap();
+    let range = gap
+        .split('…')
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let (start, end) = range.split_once('-').unwrap();
+    let (start, end) = (
+        start.parse::<usize>().unwrap(),
+        end.parse::<usize>().unwrap(),
+    );
+    let expected = source
+        .lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let id = gap.split("greppy expand ").nth(1).unwrap();
+    let (code, expanded, error) = run(&repo, &store, &["expand", id]);
+    assert_eq!(code, 0, "{expanded}\n{error}");
+    assert_eq!(expanded, expected);
+}
+
+#[test]
+fn read_smart_typescript_class_preserves_signatures_braces_and_inline_members() {
+    let (repo, store) = fresh_workspace("smart-typescript-class");
+    let source = "class Counter {\n  value = 0;\n  // Public increment API.\n  increment(\n    amount: number,\n  ): number {\n    const before = this.value;\n    this.value += amount;\n    return this.value - before;\n  }\n  tiny(): number { return 1; }\n}\n";
+    std::fs::write(repo.join("counter.ts"), source).unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(compact.contains("  value = 0;\n  // Public increment API.\n  increment(\n    amount: number,\n  ): number {\n"), "{compact}");
+    assert!(
+        compact.contains("    … 7-9 method body — greppy expand "),
+        "{compact}"
+    );
+    assert!(
+        compact.contains("\n  }\n  tiny(): number { return 1; }\n}\n"),
+        "{compact}"
+    );
+    let id = compact
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .unwrap();
+    let (code, expanded, error) = run(&repo, &store, &["expand", id]);
+    assert_eq!(code, 0, "{expanded}\n{error}");
+    assert_eq!(expanded, "    const before = this.value;\n    this.value += amount;\n    return this.value - before;\n");
+}
+
+#[test]
+fn read_smart_class_depth_two_keeps_outer_method_body() {
+    let (repo, store) = fresh_workspace("smart-class-depth");
+    std::fs::write(repo.join("counter.py"), "class Counter:\n    def count(self, xs):\n        total = 0\n        for x in xs:\n            total += x\n        return total\n").unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter", "--depth", "2"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(
+        compact.contains("    def count(self, xs):\n        total = 0\n"),
+        "{compact}"
+    );
+    assert!(
+        compact.contains("        … 4-5 folded source block — greppy expand "),
+        "{compact}"
+    );
+    assert!(compact.ends_with("        return total\n"), "{compact}");
+}
+
+#[test]
 fn read_smart_applies_path_filters_before_ambiguity_resolution() {
     let (repo, store) = fresh_workspace("smart-path");
     std::fs::create_dir_all(repo.join("a")).unwrap();
