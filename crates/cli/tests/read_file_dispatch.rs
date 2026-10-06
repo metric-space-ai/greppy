@@ -1056,6 +1056,16 @@ fn read_smart_python_class_keeps_members_and_expands_exact_bodies() {
     assert_eq!(compact.matches("    @classmethod\n").count(), 12);
     assert_eq!(compact.matches("method body — greppy expand ").count(), 12);
     assert!(!compact.contains("subtotal = value"), "{compact}");
+    let (code, handled, error) = run(&repo, &store, &["read-smart", "Inventory", "--handle"]);
+    assert_eq!(code, 0, "{handled}\n{error}");
+    assert!(
+        handled.contains("no edit handle for folded source"),
+        "{handled}"
+    );
+    assert!(
+        !handled.lines().any(|line| line.starts_with("handle: ")),
+        "{handled}"
+    );
     for number in 0..12 {
         assert!(
             compact.contains(&format!("def compute_{number}(cls, value: int) -> int:")),
@@ -1155,6 +1165,14 @@ fn read_smart_python_multiline_signature_with_inline_suite_stays_exact() {
     assert_eq!(code, 0, "{compact}\n{error}");
     assert!(compact.ends_with(source), "{compact}");
     assert!(!compact.contains("greppy expand "), "{compact}");
+    let (code, handled, error) = run(&repo, &store, &["read-smart", "Counter", "--handle"]);
+    assert_eq!(code, 0, "{handled}\n{error}");
+    assert!(handled.contains(source), "{handled}");
+    assert!(
+        handled.lines().any(|line| line.starts_with("handle: ")),
+        "{handled}"
+    );
+    assert!(!handled.contains("no edit handle"), "{handled}");
 }
 
 #[test]

@@ -1434,8 +1434,13 @@ pub(crate) fn dispatch_read_smart(
             definition.node.label.as_str(),
             "Function" | "Method" | "Class"
         );
-        if foldable {
-            group.push_str(&read_render_smart_source(
+        let exact_source = read_line_slice(
+            &definition.content,
+            definition.start_line,
+            definition.end_line,
+        );
+        let rendered = if foldable {
+            read_render_smart_source(
                 &store,
                 &project,
                 &root_path,
@@ -1447,28 +1452,32 @@ pub(crate) fn dispatch_read_smart(
                 definition.end_line,
                 true,
                 depth,
-            )?);
+            )?
         } else {
-            group.push_str(read_line_slice(
-                &definition.content,
-                definition.start_line,
-                definition.end_line,
-            ));
-        }
+            exact_source.to_string()
+        };
+        let folded = rendered != exact_source;
+        group.push_str(&rendered);
         if with_handle {
             if !group.ends_with('\n') {
                 group.push('\n');
             }
-            let full = read_full_handle(
-                &root_path,
-                &definition.node.file_path,
-                definition.content.as_bytes(),
-                definition.start_line,
-                definition.end_line,
-            )?;
-            group.push_str("handle: ");
-            group.push_str(&read_compact_handle(&store, &project, full)?);
-            group.push('\n');
+            if folded {
+                group.push_str(
+                    "note: no edit handle for folded source; request greppy read SYMBOL --handle or read-file PATH --lines A:B --handle\n",
+                );
+            } else {
+                let full = read_full_handle(
+                    &root_path,
+                    &definition.node.file_path,
+                    definition.content.as_bytes(),
+                    definition.start_line,
+                    definition.end_line,
+                )?;
+                group.push_str("handle: ");
+                group.push_str(&read_compact_handle(&store, &project, full)?);
+                group.push('\n');
+            }
         }
         print!("{group}");
         previous_ended_with_newline = group.ends_with('\n');
