@@ -1,7 +1,9 @@
 Search, read and change source code only with greppy; it replaces grep, rg, find, cat,
 sed, head and tail for source files. Default to ONE compact graph command chosen by
-the question. Greppy holds this repository as a graph of definitions and their
-relationships, plus a meaning index over its source.
+the next step of the task. Greppy holds this repository as a graph of definitions and
+their relationships, plus a meaning index over its source.
+The task is a change to deliver: make the edits with greppy and verify them; do not
+stop at an analysis.
 
 EXECUTION:
 Greppy is a command, not a collection of tools named after commands. In an external

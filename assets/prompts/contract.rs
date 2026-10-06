@@ -23,8 +23,16 @@ pub mod render;
 // contract contradictions, and preserves the approved argv adapter unchanged.
 // Bench arms use Greppy as their only system prompt, with shell tools only.
 // Later prose changes require a new complete diff and explicit owner approval.
+// 2026-10-06: Owner SIGNATURE for v4, AskUserQuestion answer "Sign (a)+(b) for
+// 0.4.1" in the 0.4.1 release session, after a verified G-regression (MiniMax-M3
+// on SWE-rebench astral-sh__ruff-25414: vanilla 3/3 patches, v3 3/3 analyses
+// without a patch). Exactly two changes to v3 (5455a7ba…, 12,782 bytes):
+// (a) "chosen by the question" -> "chosen by the next step of the task";
+// (b) new sentence after the opening paragraph: "The task is a change to
+// deliver: make the edits with greppy and verify them; do not stop at an
+// analysis." v4: 12,900 bytes, SHA256 below. Adapter unchanged.
 pub const APPROVED_SHA256: &str =
-    "5455a7ba675d47f5adb5d5868b767054227e6fa152cefff021386d5af2de9440";
+    "12bb2db4bce1ab2603279913aeb676f7b68115143a42170091f5842a6cf0d84f";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // 2026-10-06 consolidated owner order A: exact coding-agent introduction,
@@ -37,10 +45,10 @@ pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "cb105cd2df84a344ed35d69f52956ba2a7116c52f9ccd2ff57231225b42f6985",
-        Interactive => "e728aa713a61d911652f4662fe8133d324fe480feef7d42a85e95a9cf311c730",
-        Serve => "366b2124c0c6cb59a264fa7e901a65dc81c0113f7bc15d8f25054066486f3e9a",
-        Acp => "51baa5de52bb2e0e1c3fc1c89667f04ce1bda2886f194ea07b07709b20d1ec95",
+        OneShot => "edeaa1c109065b42c0438a52a7ebcdca182ffbc6380b791a91723440910324c5",
+        Interactive => "7cd2ccd0d083eebdc55ce4a526dabe9ffdb6819467477ce01e2b733c8d7c3607",
+        Serve => "dd480def31ddda46c2033ad8282b72779664a270e915b4657688b114e7e955b6",
+        Acp => "3683b8542fc14de0b9c46a3ebbed630f076dde4d56bb0523f587e93454198b44",
     }
 }
 
