@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use greppy_agent::system_prompt;
+use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 use greppy_agent::{
     run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
     GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
@@ -981,7 +981,8 @@ fn run_agent(
     std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env.with_sandbox(sandbox_mode.clone()).with_context_status(
+        Ok(env) => env.with_deadline(deadline).with_output_owner(cwd.clone())
+            .with_sandbox(sandbox_mode.clone()).with_context_status(
             workspace.run_id().to_owned(),
             crate::context_status::agent_notice,
         ),
@@ -1032,7 +1033,13 @@ fn run_agent(
 
     let mut config = AgentConfig {
         max_turns: args.max_turns,
-        system: Some(system_prompt()),
+        system: Some(system_prompt_for_mode(if serve {
+            BuiltinPromptMode::Serve
+        } else if interactive {
+            BuiltinPromptMode::Interactive
+        } else {
+            BuiltinPromptMode::OneShot
+        })),
         model: model.clone(),
         deadline,
         deadline_total,

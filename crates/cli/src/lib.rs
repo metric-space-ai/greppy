@@ -1454,6 +1454,7 @@ fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool 
             | Command::Undo { .. },
         ) => true,
         Some(Command::Index { path, .. }) if path.as_deref() == Some("status") => true,
+        Some(Command::Expand { id: Some(id), .. }) if id.starts_with("agent-output-") => true,
         #[cfg(feature = "bash-smart")]
         Some(Command::BashSmart { .. }) => true,
         _ => false,
@@ -2520,6 +2521,18 @@ fn dispatch_subcommand(
         }
         #[cfg(feature = "bash-smart")]
         Command::BashSmart { regexes, argv } => bash_smart::run(&argv, &regexes, root),
+        Command::Expand { id: Some(id), json } if id.starts_with("agent-output-") => {
+            let owner = resolve_root(root)?;
+            let outcome = greppy_agent::greppy_env::expand_agent_output(
+                &owner, &id, cli_result_offset(), CLI_MAX_BYTES.with(std::cell::Cell::get).unwrap_or(64 * 1024)
+            );
+            if json {
+                println!("{}", serde_json::json!({"id": id, "content": outcome.content, "is_error": outcome.is_error}));
+            } else {
+                println!("{}", outcome.content);
+            }
+            Ok(if outcome.is_error { 1 } else { 0 })
+        }
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             symbols,

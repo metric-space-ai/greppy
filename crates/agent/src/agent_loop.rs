@@ -280,6 +280,7 @@ pub fn run_agent_loop_with_history(
     on_event: &mut dyn FnMut(LoopEvent),
 ) -> Result<LoopResult, LoopError> {
     let mut messages: Vec<Message> = history.to_vec();
+    let mut system = config.system.clone();
     messages.push(Message {
         role: Role::User,
         content: vec![ContentPart::Text {
@@ -311,9 +312,10 @@ pub fn run_agent_loop_with_history(
         }
 
         let tools = env.tool_definitions();
+        crate::context::compact_history(&mut messages, &mut system, 256 * 1024);
         let req = ModelRequest {
             model: config.model.clone(),
-            system: config.system.clone(),
+            system: system.clone(),
             messages: messages.clone(),
             tools,
             tool_choice: config.tool_choice,
