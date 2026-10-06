@@ -1698,6 +1698,59 @@ pub(crate) fn dispatch_semantic(
     }
 }
 
+fn should_announce_semantic_work(
+    elapsed: std::time::Duration,
+    progress: Option<&serde_json::Value>,
+) -> bool {
+    // Fast refreshes finish silently. Count/ETA messages are meaningful only
+    // after content reuse has been assessed; generic startup observation is
+    // already owned by the query progress reporter.
+    elapsed >= std::time::Duration::from_secs(10)
+        && progress.is_some_and(|job| {
+            job.get("work_assessment")
+                .and_then(serde_json::Value::as_str)
+                == Some("validated")
+                && job
+                    .get("total_spans")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|n| n > 0)
+        })
+}
+
+#[cfg(test)]
+mod semantic_work_announcement_tests {
+    use super::should_announce_semantic_work;
+    use std::time::Duration;
+
+    #[test]
+    fn fast_unknown_and_reuse_only_refreshes_do_not_emit_compute_estimates() {
+        let known = serde_json::json!({"work_assessment":"validated", "total_spans":1});
+        assert!(!should_announce_semantic_work(
+            Duration::from_millis(9_999),
+            Some(&known)
+        ));
+        assert!(should_announce_semantic_work(
+            Duration::from_secs(10),
+            Some(&known)
+        ));
+        assert!(!should_announce_semantic_work(
+            Duration::from_secs(90),
+            None
+        ));
+        for job in [
+            serde_json::json!({"work_assessment":"pending_validation", "total_spans":197}),
+            serde_json::json!({"work_assessment":"validated", "total_spans":null}),
+            serde_json::json!({"work_assessment":"validated", "total_spans":0}),
+            serde_json::json!({"total_spans":197}),
+        ] {
+            assert!(
+                !should_announce_semantic_work(Duration::from_secs(90), Some(&job)),
+                "{job}"
+            );
+        }
+    }
+}
+
 fn wait_for_embedding_publication(
     root: Option<&str>,
     effective_root: &std::path::Path,
@@ -1707,6 +1760,7 @@ fn wait_for_embedding_publication(
     prefixes: &[String],
 ) -> Result<greppy_store::Store> {
     let mut announced = false;
+    let progress_started = std::time::Instant::now();
     crate::context_status::restricted(
         effective_root,
         requested_generation,
@@ -1736,18 +1790,6 @@ fn wait_for_embedding_publication(
                         .unwrap_or_default()
                         == prefixes
             });
-        if !announced {
-            crate::context_status::restricted(
-                effective_root,
-                requested_generation,
-                crate::context_status::Capability::Semantic,
-            );
-            let progress = initial_job.unwrap_or_else(|| {
-                embedding_progress_value(effective_root, cfg, requested_generation)
-            });
-            eprintln!("semantic-search: {}", embedding_progress_text(&progress));
-            announced = true;
-        }
         loop {
             let owner_active = launch.owner_is_active().map_err(|error| {
                 Error::io(
@@ -1758,15 +1800,25 @@ fn wait_for_embedding_publication(
                     error,
                 )
             })?;
+            let progress = read_background_job(launch.path());
             if matches!(
                 observe_background_embedding(
-                    read_background_job(launch.path()).as_ref(),
+                    progress.as_ref(),
                     owner_active,
                     false,
                     follow_attached_owner,
                 ),
                 BackgroundEmbeddingObservation::Pending
             ) {
+                if !announced
+                    && should_announce_semantic_work(progress_started.elapsed(), progress.as_ref())
+                {
+                    eprintln!(
+                        "semantic-search: {}",
+                        embedding_progress_text(progress.as_ref().expect("validated progress"))
+                    );
+                    announced = true;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
