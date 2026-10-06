@@ -312,7 +312,7 @@ fn expand_global_window_is_deterministic_and_owns_truthful_continuation_metadata
     assert!(too_small.stdout.is_empty(), "{}", text(&too_small.stdout));
     assert!(text(&too_small.stderr).contains("2048-byte JSON metadata minimum"));
     assert!(!text(&too_small.stderr).contains("total: 0"));
-    std::fs::remove_dir_all(workspace.base).unwrap();
+    std::fs::remove_dir_all(&workspace.base).unwrap();
 }
 
 #[test]
