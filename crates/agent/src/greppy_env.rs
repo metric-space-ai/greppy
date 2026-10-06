@@ -233,10 +233,10 @@ impl GreppyEnv {
         }
         static SEQUENCE: AtomicU64 = AtomicU64::new(1);
         let directory = self.output_storage.join(format!(
-                "capture-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
+            "capture-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         static STORE_MUTEX: Mutex<()> = Mutex::new(());
         let _store_guard = STORE_MUTEX.lock().unwrap();
         let storage = directory.parent().unwrap();
@@ -2110,15 +2110,24 @@ exit 0
             fs::create_dir_all(path).unwrap();
         }
         let env = GreppyEnv::with_binary(PathBuf::from("/not-executed"), worktree.clone())
-            .unwrap().with_output_owner(owner.clone())
+            .unwrap()
+            .with_output_owner(owner.clone())
             .with_output_storage(temp.path().join("greppy-agent-output"))
             .with_max_output_bytes(8);
         let folded = env.fold_output("verified evidence remains available".into(), b"raw", b"");
-        let id = folded.split("output retained as ").nth(1).unwrap().split(';').next().unwrap();
+        let id = folded
+            .split("output retained as ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
         fs::remove_dir_all(worktree).unwrap();
         fs::remove_dir_all(scratch).unwrap();
-        assert_eq!(expand_agent_output(&owner, id, 0, 128).content,
-            "verified evidence remains available");
+        assert_eq!(
+            expand_agent_output(&owner, id, 0, 128).content,
+            "verified evidence remains available"
+        );
     }
 
     #[test]

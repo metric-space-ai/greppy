@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, system_prompt_for_mode, BuiltinPromptMode, AgentConfig, Client, ClientError, ExecutionEnv,
-    GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent,
-    ToolOutcome, TurnResult,
+    run_agent_loop_with_history, system_prompt_for_mode, AgentConfig, BuiltinPromptMode, Client,
+    ClientError, ExecutionEnv, GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest,
+    ModelStream, StreamEvent, ToolOutcome, TurnResult,
 };
 use serde_json::{json, Value};
 

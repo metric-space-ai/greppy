@@ -324,7 +324,42 @@ pub fn run_agent_loop_with_history(
             break;
         }
 
-        crate::context::compact_history(&mut messages, &mut system, 256 * 1024);
+        let template = ModelRequest {
+            model: config.model.clone(),
+            system: system.clone(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_tokens: config.max_tokens,
+        };
+        let archive = messages.clone();
+        if let Some(usage) = crate::context::compact_with_model(
+            model,
+            &mut messages,
+            &mut system,
+            &template,
+            256 * 1024,
+        )? {
+            total_usage = sum_usage(total_usage, usage);
+            on_event(LoopEvent::ContextCompacted {
+                archive,
+                messages: messages.clone(),
+                summary: crate::context::saved_summary(system.as_deref())
+                    .unwrap()
+                    .to_owned(),
+            });
+        }
+        if cancel_requested(config) {
+            last_stop = LoopStop::Cancelled;
+            break;
+        }
+        if config
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            last_stop = LoopStop::Deadline;
+            break;
+        }
         let report_only = config.max_turns > 0 && turns >= config.max_turns;
         if report_only {
             messages.push(Message {
@@ -1013,6 +1048,107 @@ mod tests {
         // Usage summed.
         assert_eq!(result.usage.input_tokens, 220);
         assert_eq!(result.usage.output_tokens, 48);
+    }
+
+    #[test]
+    fn long_task_compacts_in_the_real_loop_and_resumes_with_its_checkpoint() {
+        struct CheckpointModel {
+            actions: usize,
+            checkpoints: usize,
+        }
+        impl ModelStream for CheckpointModel {
+            fn stream_turn(
+                &mut self,
+                req: &ModelRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> Result<TurnResult, ClientError> {
+                if req
+                    .system
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Create an accurate continuation checkpoint"))
+                {
+                    assert!(req.tools.is_empty());
+                    assert_eq!(req.tool_choice, ToolChoice::None);
+                    self.checkpoints += 1;
+                    return Ok(TurnResult {
+                        message: Message { role: Role::Assistant, content: vec![ContentPart::Text {
+                            text: json!({"task":"Fix clamp", "constraints":["Preserve operator changes"],
+                                "decisions":["Clamp above upper bound"], "changed_files":["mathlib/ranges.py"],
+                                "tests_results":["pytest passed"], "open_work":["Report verified change"],
+                                "recovery_ids":["agent-output-fixture"]}).to_string()
+                        }] }, stop_reason: StopReason::EndTurn, usage: usage(20, 5),
+                    });
+                }
+                if self.actions == 60 {
+                    return text_turn("Fix clamp\nStatus: done", usage(1, 1)).result;
+                }
+                self.actions += 1;
+                tool_turn(
+                    None,
+                    vec![(&format!("call-{}", self.actions), "echo", json!({}))],
+                    usage(1, 1),
+                )
+                .result
+            }
+        }
+        let mut model = CheckpointModel {
+            actions: 0,
+            checkpoints: 0,
+        };
+        let mut env = FakeEnv::new(vec![echo_tool()]).with_outcome(
+            "echo",
+            ToolOutcome::ok(format!(
+                "mathlib/ranges.py changed; pytest passed\n{}",
+                "source evidence ".repeat(800)
+            )),
+        );
+        let config = AgentConfig::default()
+            .with_model("fixture")
+            .with_system("Signed one-shot role");
+        let (result, events) = run(
+            &mut model,
+            &mut env,
+            &config,
+            "Fix clamp; preserve operator changes",
+        )
+        .unwrap();
+        assert_eq!(model.actions, 60);
+        assert!(model.checkpoints >= 2);
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(result.final_text, "Fix clamp\nStatus: done");
+        assert!(result.messages.len() < 122);
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LoopEvent::ContextCompacted { .. }))
+                .count()
+                >= 2
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(result.context_summary.as_deref().unwrap()).unwrap();
+        assert_eq!(state["changed_files"][0], "mathlib/ranges.py");
+        assert_eq!(state["tests_results"][0], "pytest passed");
+        let mut followup = FakeModel::new(vec![text_turn("Follow-up done", usage(1, 1))]);
+        let config = AgentConfig {
+            system: Some("Signed interactive role".into()),
+            context_summary: result.context_summary,
+            ..AgentConfig::default()
+        };
+        run_agent_loop_with_history(
+            &mut followup,
+            &mut env,
+            &config,
+            &result.messages,
+            "Continue with the next test",
+            &mut |_| {},
+        )
+        .unwrap();
+        let system = followup.requests[0].system.as_deref().unwrap();
+        assert!(system.starts_with("Signed interactive role"));
+        assert!(system.contains("mathlib/ranges.py"));
+        assert!(system.contains("pytest passed"));
+        assert!(system.contains("agent-output-fixture"));
+        assert_eq!(system.matches(crate::context::CHECKPOINT_MARKER).count(), 1);
     }
 
     #[test]

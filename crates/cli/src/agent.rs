@@ -12,18 +12,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 use greppy_agent::{
     run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
     GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
     StreamEvent, Usage, WorkspaceError,
 };
+use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 
 use crate::agent_control::{socket_path_for, ControlServer};
 use crate::agent_tui::{
-    bounded_pair, messages_from_protocol, new_session_id,
-    protocol_from_persisted, redact_json, SessionCommand, SessionEvent, SessionRecord,
-    SessionStore, TuiConfig,
+    bounded_pair, messages_from_protocol, new_session_id, protocol_from_persisted, redact_json,
+    SessionCommand, SessionEvent, SessionRecord, SessionStore, TuiConfig,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -978,12 +977,15 @@ fn run_agent(
     std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env.with_deadline(deadline).with_output_owner(cwd.clone())
+        Ok(env) => env
+            .with_deadline(deadline)
+            .with_output_owner(cwd.clone())
             .with_output_storage(output_storage)
-            .with_sandbox(sandbox_mode.clone()).with_context_status(
-            workspace.run_id().to_owned(),
-            crate::context_status::agent_notice,
-        ),
+            .with_sandbox(sandbox_mode.clone())
+            .with_context_status(
+                workspace.run_id().to_owned(),
+                crate::context_status::agent_notice,
+            ),
         Err(e) => {
             let message = format!("greppy -p: cannot build greppy env: {e}");
             eprintln!("{message}");
@@ -1031,7 +1033,9 @@ fn run_agent(
 
     let mut config = AgentConfig {
         max_turns: args.max_turns,
-        context_summary: headless_session.as_ref().and_then(|(record, _)| record.context_summary.clone()),
+        context_summary: headless_session
+            .as_ref()
+            .and_then(|(record, _)| record.context_summary.clone()),
         system: Some(system_prompt_for_mode(if serve {
             BuiltinPromptMode::Serve
         } else if interactive {
@@ -1688,10 +1692,20 @@ fn run_headless_session(
             prompt_turns = prompt_turns.saturating_add(1);
         }
         match &event {
-            LoopEvent::ContextCompacted { archive, messages, summary } => {
-                persist_session(&mut stderr, store.append_context_checkpoint(
-                    &record.id, &messages_from_protocol(archive),
-                    &messages_from_protocol(messages), Some(summary)));
+            LoopEvent::ContextCompacted {
+                archive,
+                messages,
+                summary,
+            } => {
+                persist_session(
+                    &mut stderr,
+                    store.append_context_checkpoint(
+                        &record.id,
+                        &messages_from_protocol(archive),
+                        &messages_from_protocol(messages),
+                        Some(summary),
+                    ),
+                );
             }
             LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
                 if let Some(emitter) = json.as_mut() {
@@ -1763,13 +1777,23 @@ fn run_headless_session(
             let _ = stdout.flush();
 
             if result.context_summary.is_some() {
-                persist_session(&mut stderr, store.append_context_checkpoint(
-                    &record.id, &[], &messages_from_protocol(&result.messages),
-                    result.context_summary.as_deref()));
+                persist_session(
+                    &mut stderr,
+                    store.append_context_checkpoint(
+                        &record.id,
+                        &[],
+                        &messages_from_protocol(&result.messages),
+                        result.context_summary.as_deref(),
+                    ),
+                );
             } else {
                 let new_messages = messages_from_protocol(
-                    &result.messages[previous_message_count.min(result.messages.len())..]);
-                persist_session(&mut stderr, store.append_messages(&record.id, &new_messages));
+                    &result.messages[previous_message_count.min(result.messages.len())..],
+                );
+                persist_session(
+                    &mut stderr,
+                    store.append_messages(&record.id, &new_messages),
+                );
             }
             add_usage(&mut summary.usage, &result.usage);
             summary.turns = summary.turns.saturating_add(prompt_turns);

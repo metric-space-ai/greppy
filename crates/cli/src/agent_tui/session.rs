@@ -952,44 +952,6 @@ pub fn new_session_id() -> String {
     format!("sess-{ms}-{}", std::process::id())
 }
 
-pub fn compact_messages(messages: &[PersistedMessage], keep: usize) -> Vec<PersistedMessage> {
-    if messages.len() <= keep {
-        return messages.to_vec();
-    }
-    let (old, recent) = messages.split_at(messages.len() - keep);
-    let mut summary = String::from("Earlier conversation summary:\n");
-    for message in old {
-        let preview: String = message
-            .parts
-            .iter()
-            .map(|part| part.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(240)
-            .collect();
-        if !preview.is_empty() {
-            summary.push_str("- ");
-            summary.push_str(&message.role);
-            summary.push_str(": ");
-            summary.push_str(&preview);
-            summary.push('\n');
-        }
-    }
-    let mut out = vec![PersistedMessage {
-        role: "user".to_string(),
-        parts: vec![PersistedPart {
-            kind: "text".to_string(),
-            text: summary,
-            id: String::new(),
-            name: String::new(),
-            is_error: false,
-        }],
-    }];
-    out.extend(recent.iter().cloned());
-    out
-}
-
 fn persist_message(message: &Message) -> PersistedMessage {
     let role = match message.role {
         Role::User => "user",
@@ -1552,26 +1514,6 @@ mod tests {
         let record = SessionRecord::new("sess".into(), "demo".into(), "m".into(), "r".into());
         assert!(store.create(&record).is_err());
         let _ = fs::remove_file(root);
-    }
-
-    #[test]
-    fn compact_keeps_recent_and_summary() {
-        let messages: Vec<_> = (0..10)
-            .map(|i| PersistedMessage {
-                role: "user".into(),
-                parts: vec![PersistedPart {
-                    kind: "text".into(),
-                    text: format!("m{i}"),
-                    id: String::new(),
-                    name: String::new(),
-                    is_error: false,
-                }],
-            })
-            .collect();
-        let compacted = compact_messages(&messages, 4);
-        assert_eq!(compacted.len(), 5);
-        assert!(compacted[0].parts[0].text.contains("Earlier conversation"));
-        assert_eq!(compacted.last().unwrap().parts[0].text, "m9");
     }
 
     #[test]

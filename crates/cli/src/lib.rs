@@ -2428,8 +2428,14 @@ fn dispatch_subcommand(
                 }
             }
         }
-        Command::Prompt { external, mode, json } => {
-            let mode = mode.as_deref().unwrap_or(if external { "external" } else { "one-shot" });
+        Command::Prompt {
+            external,
+            mode,
+            json,
+        } => {
+            let mode = mode
+                .as_deref()
+                .unwrap_or(if external { "external" } else { "one-shot" });
             let metadata = greppy_agent::prompt_metadata_for_mode(mode);
             if json {
                 println!(
@@ -2524,10 +2530,18 @@ fn dispatch_subcommand(
         Command::Expand { id: Some(id), json } if id.starts_with("agent-output-") => {
             let owner = resolve_root(root)?;
             let outcome = greppy_agent::greppy_env::expand_agent_output(
-                &owner, &id, cli_result_offset(), CLI_MAX_BYTES.with(std::cell::Cell::get).unwrap_or(64 * 1024)
+                &owner,
+                &id,
+                cli_result_offset(),
+                CLI_MAX_BYTES
+                    .with(std::cell::Cell::get)
+                    .unwrap_or(64 * 1024),
             );
             if json {
-                println!("{}", serde_json::json!({"id": id, "content": outcome.content, "is_error": outcome.is_error}));
+                println!(
+                    "{}",
+                    serde_json::json!({"id": id, "content": outcome.content, "is_error": outcome.is_error})
+                );
             } else {
                 println!("{}", outcome.content);
             }
