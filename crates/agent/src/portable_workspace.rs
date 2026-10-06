@@ -579,7 +579,9 @@ impl AgentWorkspace {
                 detail: "session baseline changed; refusing to resume on unrelated source".into(),
             });
         }
-        let patch = git_ok(
+        // Exact bytes: a trimmed or lossily decoded diff loses its final
+        // newline and any binary hunk, and git apply rejects it as corrupt.
+        let patch = git_bytes(
             &self.repo_root,
             &[
                 "diff",
@@ -600,7 +602,7 @@ impl AgentWorkspace {
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("missing patch stdin"))?
-            .write_all(patch.as_bytes())?;
+            .write_all(&patch)?;
         output_text("git apply resumed proposal", child.wait_with_output()?)?;
         for group in &proposal.hardlink_groups {
             if let Some(first) = group.first() {
@@ -6244,7 +6246,14 @@ mod tests {
             } => (commit, ref_name, patch),
             RunOutcome::Clean => panic!("expected proposal"),
         };
-        assert_eq!(git(&repo, &["rev-parse", &format!("{commit}^1")]), base);
+        // Owner order 2026-10-06 (C.11): the proposal's parent is the private
+        // baseline view, i.e. the user's dirty snapshot on top of HEAD, so the
+        // proposal carries only the agent's change.
+        assert_eq!(git(&repo, &["rev-parse", &format!("{commit}^1^1")]), base);
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}^1:tracked.txt")]),
+            "dirty"
+        );
         assert!(patch.contains("-dirty"));
         assert!(patch.contains("+agent"));
         assert!(!patch.lines().any(|line| line == "-base"));

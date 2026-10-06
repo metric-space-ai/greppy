@@ -480,9 +480,11 @@ pub fn run_agent_loop_with_history(
 
                     // Turn-budget awareness: once, when ≤25% of max_turns remain
                     // and at least one turn was already used.
+                    // Not after the last action turn: the next request is the
+                    // tool-free report turn, which carries its own instruction.
                     if !turn_budget_advised
                         && turns > 0
-                        && config.max_turns > 0
+                        && config.max_turns > turns
                         && remaining_turns_at_or_below_quarter(turns, config.max_turns)
                     {
                         let remaining = config.max_turns.saturating_sub(turns);
