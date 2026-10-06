@@ -108,9 +108,11 @@ static RUST_ERROR_FIELD_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     .expect("bash-smart Rust error field regex")
 });
 
+// A `warn!(..)` macro or `warn(..)` call at the start of a line is source
+// code (e.g. a `git diff` context line), not an emitted warning.
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:|[0-9]+:[0-9]+[\t ]+warning[\t ]+)",
+        r"(?i-u)^[\t ]*(?:warn(?:ing)?(?:[^a-z0-9_!(]|$)|deprecat|note:|[0-9]+:[0-9]+[\t ]+warning[\t ]+)",
     )
     .expect("bash-smart warning marker regex")
 });
@@ -3455,6 +3457,19 @@ mod tests {
                 "ok — exit 0, 2 warnings"
             );
         }
+    }
+
+    #[test]
+    fn source_warn_macro_and_call_are_not_warnings() {
+        let diff = split_lines(
+            b"@@ -10,6 +10,7 @@ impl Server {\n             warn!(\"timed out waiting for background tasks\");\n-                                warn!(\"receiver lagged\");\n+    warn(\"call\")\n",
+        );
+        assert!(detect_blocks(&diff, &[]).is_empty());
+        let emitted =
+            split_lines(b"warning: unused import\nWARN  pool exhausted\nwarn: deprecated flag\n");
+        let blocks = detect_blocks(&emitted, &[]);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
     }
 
     #[test]
