@@ -281,15 +281,17 @@ impl Client {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
+            .map_err(|error| {
+                ClientError::Transport(format!("create async model runtime: {error}"))
+            })?;
         let _runtime_guard = runtime.enter();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(600))
             .build()
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
+            .map_err(|error| ClientError::Transport(format!("create model HTTP client: {error}")))?;
         let body = serde_json::to_string(&to_messages_request_body(req))
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
+            .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
         let mut request = client
             .post(self.messages_url())
             .header("Content-Type", "application/json")
@@ -299,7 +301,7 @@ impl Client {
             request = request.header("x-api-key", key).bearer_auth(key);
         }
         let response = interruptible_wait(&runtime, cancel, request.send())?
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
+            .map_err(|error| ClientError::Transport(format!("send model request: {error}")))?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = interruptible_wait(&runtime, cancel, response.text())?.unwrap_or_default();
