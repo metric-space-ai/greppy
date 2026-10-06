@@ -14376,43 +14376,16 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         let repo = tempfile::tempdir().unwrap();
         let file = "fixture.ts";
         let language = Language::TypeScript { tsx: false };
-        let candidates = [
-            "function () {}",
-            "function ;",
-            "function ()",
-            "function* () {}",
-            "interface { member: number; }",
-            "type = number;",
-            "enum { A }",
-            "class { method() {} }",
-            "class extends Parent {}",
-            "class C { () {} }",
-            "const = () => 1;",
-            "const [] = [];",
-            "const {} = {};",
-            "function f( = 1) {}",
-            "interface I { (): string; }",
-            "namespace { const x = 1; }",
-            "declare function ();",
-            "export default function () {}",
-            "export default class {}",
-            "function f() { const = () => 1; }",
-            "class C { get () {} }",
-        ];
-        let suffix = "\nfunction target() { return 1; }\nfunction valid() { return target(); }\n";
-        let mut diagnostics = Vec::new();
-        let source = candidates
-            .iter()
-            .find_map(|prefix| {
-                let source = format!("{prefix}{suffix}");
-                let extraction = parser_extract(language, source.as_bytes(), file).unwrap();
-                let (_, dropped, error) = validate_or_degrade(language, file, extraction);
-                diagnostics.push(format!("{prefix:?}: dropped={dropped}, error={error:?}"));
-                (dropped > 0 && error.is_none()).then_some(source)
-            })
-            .unwrap_or_else(|| panic!("pin a real grammar-recovery record: {diagnostics:?}"));
+        let source = "class C { () {} }\nfunction target() { return 1; }\nfunction valid() { return target(); }\n";
+        let extraction = parser_extract(language, source.as_bytes(), file).unwrap();
+        let (_, dropped, error) = validate_or_degrade(language, file, extraction);
+        assert!(
+            dropped > 0,
+            "the malformed method must exercise grammar recovery"
+        );
+        assert!(error.is_none());
         eprintln!("malformed_fixture_source={source:?}");
-        fs::write(repo.path().join(file), &source).unwrap();
+        fs::write(repo.path().join(file), source).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, repo.path(), "test").unwrap();
         assert!(js_ts_usages_repaired(&store).unwrap());
