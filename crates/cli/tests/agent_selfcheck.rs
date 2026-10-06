@@ -273,6 +273,9 @@ fn selfcheck_passes_on_healthy_hidden_only_repository() {
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        // A healthy empty graph in the explicit fixture mode must not depend
+        // on the test host having an available inference GPU.
+        .env("CUDA_VISIBLE_DEVICES", "-1")
         .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")

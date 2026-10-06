@@ -1362,9 +1362,13 @@ fn dispatch_index_health_with_detail(
             .vector_model_ids(&project)
             .map(|v| v.is_empty())
             .unwrap_or(false);
-    let inference_healthy = inference
-        .as_ref()
-        .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
+    // Debug/CI fixtures that explicitly bypass inference still validate the
+    // graph, freshness and provider state without requiring physical GPUs.
+    // Production builds make test_inference_skipped() unconditionally false.
+    let inference_healthy = test_inference_skipped()
+        || inference
+            .as_ref()
+            .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
     let embedding_healthy = embedding_complete || test_inference_skipped();
     let healthy = diag.schema_current
         && diag.integrity_ok
