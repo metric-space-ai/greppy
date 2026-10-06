@@ -353,7 +353,13 @@ fn raw_output_continuations_and_missing_handles_never_prepare_a_code_index() {
                 assert_ne!(next, id);
                 id = next.to_string();
             }
-            None => break,
+            None => {
+                assert_eq!(
+                    page["exhausted"], true,
+                    "the final nonempty page must declare completion"
+                );
+                break;
+            }
         }
         assert!(pages < 10, "continuation did not advance");
     }

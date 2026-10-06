@@ -1087,7 +1087,7 @@ pub(crate) fn expand(
                 "line_count": lines.len(),
                 "requested_offset": window.offset,
                 "skipped_lines": range_line_count(&skipped_ranges),
-                "exhausted": page_ranges.is_empty() && remaining_ranges.is_empty(),
+                "exhausted": remaining_ranges.is_empty(),
                 "raw_bytes": range_byte_count(&page_ranges, &lines),
                 "max_bytes": window.max_bytes,
                 "raw_byte_budget": raw_byte_budget,
