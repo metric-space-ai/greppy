@@ -1169,21 +1169,17 @@ fn complete_tool_pairs(messages: &[PersistedMessage]) -> bool {
             return false;
         }
         for part in &message.parts {
-            match part.kind.as_str() {
+            let paired = match part.kind.as_str() {
                 "tool_call" => {
-                    if message.role != "assistant"
-                        || part.id.is_empty()
-                        || !pending.insert(part.id.clone())
-                    {
-                        return false;
-                    }
+                    message.role == "assistant"
+                        && !part.id.is_empty()
+                        && pending.insert(part.id.clone())
                 }
-                "tool_result" => {
-                    if message.role != "user" || !pending.remove(&part.id) {
-                        return false;
-                    }
-                }
-                _ => {}
+                "tool_result" => message.role == "user" && pending.remove(&part.id),
+                _ => true,
+            };
+            if !paired {
+                return false;
             }
         }
         if message.role == "user" && !pending.is_empty() {
