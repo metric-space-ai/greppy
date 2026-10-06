@@ -9649,9 +9649,28 @@ mod embeddinggemma_assets {
 }
 
 mod qwen35_assets {
+    const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
+    const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
+
+    /// Resolve shared-daemon identity without creating or verifying local assets.
+    pub fn identity_paths() -> (String, String) {
+        identity_paths_in(&greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km"))
+    }
+
+    fn identity_paths_in(root: &std::path::Path) -> (String, String) {
+        (
+            root.join(GGUF_SHA)
+                .join("Qwen3.5-0.8B-MTP-Q4_K_M.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            root.join(TOK_SHA)
+                .join("tokenizer.json")
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     pub fn paths() -> Option<(String, String)> {
-        const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
-        const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
         let root = greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km");
         #[cfg(not(debug_assertions))]
         {
@@ -9698,6 +9717,36 @@ mod qwen35_assets {
             bytes: &[u8],
         ) -> Option<String> {
             crate::extract_embedded_asset(root, expected_sha, name, bytes)
+        }
+
+        #[test]
+        fn daemon_identity_does_not_require_writable_local_model_storage() {
+            let tmp = tempfile::tempdir().unwrap();
+            let blocked_root = tmp.path().join("not-a-directory");
+            std::fs::write(&blocked_root, b"block local asset preparation").unwrap();
+            let (gguf, tokenizer) = super::identity_paths_in(&blocked_root);
+            assert_eq!(
+                std::path::Path::new(&gguf)
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap(),
+                super::GGUF_SHA
+            );
+            assert_eq!(
+                std::path::Path::new(&tokenizer)
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap(),
+                super::TOK_SHA
+            );
+            assert!(!std::path::Path::new(&gguf).exists());
+            assert!(!std::path::Path::new(&tokenizer).exists());
+            assert_eq!(
+                std::fs::read(blocked_root).unwrap(),
+                b"block local asset preparation"
+            );
         }
 
         #[test]
@@ -9748,6 +9797,7 @@ impl std::ops::Deref for LoadedQwen35Summarizer {
 }
 
 fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summarizer> {
+    let cfg = qwen_summary_config_materialized(cfg)?;
     let lease = acquire_cached_model_lease(&cfg.gguf)?;
     let options = greppy_qwen35_native::LoadOptions {
         device: cfg.device.clone(),

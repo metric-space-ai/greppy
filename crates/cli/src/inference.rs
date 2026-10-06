@@ -366,21 +366,38 @@ pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>
     if test_inference_skipped() {
         return Ok(None);
     }
-    let (gguf, tokenizer) = qwen35_assets::paths().ok_or_else(|| {
-        let detail = format!(
-            "Qwen3.5 model assets could not be prepared under {}; shared summary daemon status was not probed; check model-cache permissions, free space and asset integrity",
-            greppy_core::cache::models_root().display()
-        );
-        #[cfg(any(unix, windows))]
-        summarize_daemon::report_configuration_failure(&detail);
-        Error::Config(detail)
-    })?;
+    let (gguf, tokenizer) = qwen35_assets::identity_paths();
     Ok(Some(QwenSummaryConfig {
         model_id: greppy_qwen35_native::MODEL_ID.to_string(),
         gguf: gguf.into(),
         tokenizer: tokenizer.into(),
         device: qwen_summary_device_preference()?,
     }))
+}
+
+/// Only the actual model owner prepares assets; shared clients need identity alone.
+pub(crate) fn qwen_summary_config_materialized(
+    cfg: &QwenSummaryConfig,
+) -> Result<QwenSummaryConfig> {
+    let (gguf, tokenizer) = qwen35_assets::identity_paths();
+    if cfg.gguf != std::path::Path::new(&gguf) || cfg.tokenizer != std::path::Path::new(&tokenizer)
+    {
+        return Ok(cfg.clone());
+    }
+    let (gguf, tokenizer) = qwen35_assets::paths().ok_or_else(|| {
+        let detail = format!(
+            "Qwen3.5 owner could not prepare model assets under {}; check model-cache permissions, free space and asset integrity",
+            greppy_core::cache::models_root().display()
+        );
+        #[cfg(any(unix, windows))]
+        summarize_daemon::report_configuration_failure(&detail);
+        Error::Config(detail)
+    })?;
+    Ok(QwenSummaryConfig {
+        gguf: gguf.into(),
+        tokenizer: tokenizer.into(),
+        ..cfg.clone()
+    })
 }
 
 pub(crate) fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePreference> {
