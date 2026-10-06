@@ -1289,6 +1289,11 @@ fn read_render_smart_source(
                 // would also hide the signature. Keep it verbatim.
                 start = end.saturating_add(1);
             }
+            if start > end {
+                // A nested branch on an inline member's signature line
+                // must not hide that signature either.
+                continue;
+            }
         }
         if candidate
             && node_depth >= depth

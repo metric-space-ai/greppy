@@ -1102,7 +1102,7 @@ fn read_smart_python_class_keeps_members_and_expands_exact_bodies() {
 #[test]
 fn read_smart_typescript_class_preserves_signatures_braces_and_inline_members() {
     let (repo, store) = fresh_workspace("smart-typescript-class");
-    let source = "class Counter {\n  value = 0;\n  // Public increment API.\n  increment(\n    amount: number,\n  ): number {\n    const before = this.value;\n    this.value += amount;\n    return this.value - before;\n  }\n  tiny(): number { return 1; }\n}\n";
+    let source = "class Counter {\n  value = 0;\n  // Public increment API.\n  increment(\n    amount: number,\n  ): number {\n    const before = this.value;\n    this.value += amount;\n    return this.value - before;\n  }\n  tiny(): number { if (this.value > 0) { return 1; } return 0; }\n}\n";
     std::fs::write(repo.join("counter.ts"), source).unwrap();
     index(&repo, &store);
     let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter"]);
@@ -1113,7 +1113,9 @@ fn read_smart_typescript_class_preserves_signatures_braces_and_inline_members() 
         "{compact}"
     );
     assert!(
-        compact.contains("\n  }\n  tiny(): number { return 1; }\n}\n"),
+        compact.contains(
+            "\n  }\n  tiny(): number { if (this.value > 0) { return 1; } return 0; }\n}\n"
+        ),
         "{compact}"
     );
     let id = compact
