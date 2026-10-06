@@ -1830,12 +1830,12 @@ fn plan_semantic_file(
     scope_matches: usize,
     options: &VerbOptions,
 ) -> Result<SemanticFilePlan> {
+    let applied = apply_in_memory(&snapshot, &ops)?;
     let language = if language == Language::C {
-        crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+        crate::txn::syntax_language_for_edit(&snapshot.path, &snapshot.content, &applied.content)
     } else {
         language
     };
-    let applied = apply_in_memory(&snapshot, &ops)?;
     let syntax_before = syntax_counts(language, &snapshot.content);
     let syntax_after = syntax_counts(language, &applied.content);
     let (syntax, applicable) = match (syntax_before, syntax_after) {
@@ -2441,14 +2441,6 @@ fn run_pipeline(
     {
         return Ok(certificate);
     }
-    let language = language.map(|language| {
-        if language == Language::C {
-            crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
-        } else {
-            language
-        }
-    });
-    let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
     let mut formatter_expanded = false;
     let ext = snapshot
@@ -2490,6 +2482,18 @@ fn run_pipeline(
             }
         }
     }
+    let language = language.map(|language| {
+        if language == Language::C {
+            crate::txn::syntax_language_for_edit(
+                &snapshot.path,
+                &snapshot.content,
+                &applied.content,
+            )
+        } else {
+            language
+        }
+    });
+    let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let syntax_after = language.and_then(|l| syntax_counts(l, &applied.content));
 
     let syntax = match (syntax_before, syntax_after) {

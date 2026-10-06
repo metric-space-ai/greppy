@@ -161,6 +161,33 @@ pub fn syntax_language_for_path(path: &Path, before: &[u8]) -> Language {
     language
 }
 
+/// Resolve a C-compatible `.h` edit without interpreting valid new C++ as
+/// broken C. A fallback requires both snapshots to parse completely as C++;
+/// existing recovery diagnostics cannot become a license to change grammar.
+/// Validate both snapshots with the returned grammar.
+pub fn syntax_language_for_edit(path: &Path, before: &[u8], after: &[u8]) -> Language {
+    let language = syntax_language_for_path(path, before);
+    if language != Language::C || path.extension().and_then(|value| value.to_str()) != Some("h") {
+        return language;
+    }
+    if let (Some(c_before), Some(c_after), Some(cpp_before), Some(cpp_after)) = (
+        syntax_counts(Language::C, before),
+        syntax_counts(Language::C, after),
+        syntax_counts(Language::Cpp, before),
+        syntax_counts(Language::Cpp, after),
+    ) {
+        let c_regressed = c_after.errors > c_before.errors || c_after.missing > c_before.missing;
+        let cpp_clean = cpp_before.errors == 0
+            && cpp_before.missing == 0
+            && cpp_after.errors == 0
+            && cpp_after.missing == 0;
+        if c_regressed && cpp_clean {
+            return Language::Cpp;
+        }
+    }
+    language
+}
+
 /// Validation-only recovery for Bash's read/write redirect omitted by the grammar.
 fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     let Ok(tree) = greppy_parser::parse(Language::Bash, content) else {
