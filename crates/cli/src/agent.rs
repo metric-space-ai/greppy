@@ -1547,16 +1547,38 @@ fn proposal_answer_message(answer: &str) -> String {
     }
 }
 
-/// The first `Title:` line of an answer: its line index and the bare title.
+/// The PR title of an answer and its line index: an explicit `Title:` line, or
+/// else the line right before the first `Status:` line, as the prompt's
+/// final-answer format asks ("a one-line title; Status: ...").
 fn explicit_title(answer: &str) -> Option<(usize, String)> {
-    answer.lines().enumerate().find_map(|(index, line)| {
-        let plain = line.replace("**", "").replace("__", "");
-        let plain = plain.trim().trim_start_matches(['#', '>', '-', ' ']);
+    fn plain(line: &str) -> String {
+        let line = line.replace("**", "").replace("__", "");
+        line.trim()
+            .trim_start_matches(['#', '>', '-', ' '])
+            .trim()
+            .trim_matches(['*', '_', '`'])
+            .trim()
+            .to_string()
+    }
+    let lines: Vec<&str> = answer.lines().collect();
+    let explicit = lines.iter().enumerate().find_map(|(index, line)| {
+        let plain = plain(line);
         let rest = plain
             .strip_prefix("Title:")
             .or_else(|| plain.strip_prefix("title:"))?;
         let title = rest.trim().trim_matches(['*', '_', '`', ' ']).trim();
         (!title.is_empty()).then(|| (index, title.to_string()))
+    });
+    explicit.or_else(|| {
+        let status = lines
+            .iter()
+            .position(|line| plain(line).starts_with("Status:"))?;
+        lines[..status]
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, line)| (index, plain(line)))
+            .find(|(_, line)| !line.is_empty() && line.chars().any(char::is_alphanumeric))
     })
 }
 
@@ -4201,6 +4223,15 @@ mod tests {
         );
         assert_eq!(
             proposal_answer_message("## Title: Fix clamp\n\nStatus: done"),
+            "Fix clamp\n\nStatus: done"
+        );
+        let answer = "All four calls ran. The fix is in.\n\n**Fix the clamp upper-bound bug**\n\nStatus: done\n\n- mathlib/ranges.py:6";
+        assert_eq!(
+            proposal_answer_message(answer),
+            format!("Fix the clamp upper-bound bug\n\n{answer}")
+        );
+        assert_eq!(
+            proposal_answer_message("Fix clamp\n\nStatus: done"),
             "Fix clamp\n\nStatus: done"
         );
         assert_eq!(parse(&["task", "--model", "m"]).unwrap().max_turns, 0);
