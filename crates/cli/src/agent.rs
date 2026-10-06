@@ -90,8 +90,8 @@ Flags:
   --max-turns N       Optional cap on action turns, followed by one tool-free
                       report turn (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
-                      the loop stops between turns only — a running command is
-                      never cut in half
+                      the loop stops between turns; tool calls already issued
+                      run for at most 30 s past the deadline
   --apply             Apply only the Agent delta to the exact captured baseline;
                       the existing Git index remains byte-identical
   --diff              Print the full proposal patch after the stat

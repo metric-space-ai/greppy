@@ -30,6 +30,11 @@ pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::MAX;
 /// No default per-tool timeout, including verified edits.
 pub const DEFAULT_GREPPY_TIMEOUT: Duration = Duration::MAX;
 
+/// Tool calls the model issued before the deadline stopped the loop still run
+/// for at most this long past the deadline (owner decision 2026-10-06): edits
+/// from the last turn land in the proposal instead of failing after 0 s.
+pub const DEFAULT_DEADLINE_GRACE: Duration = Duration::from_secs(30);
+
 /// Default combined stdout+stderr cap (64 KiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
 
@@ -75,6 +80,7 @@ pub struct GreppyEnv {
     greppy_timeout: Duration,
     max_output_bytes: usize,
     deadline: Option<Instant>,
+    deadline_grace: Duration,
     retained_bytes: Arc<AtomicU64>,
     run_scratch: PathBuf,
     sandbox: SandboxMode,
@@ -105,6 +111,7 @@ impl GreppyEnv {
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             deadline: None,
+            deadline_grace: DEFAULT_DEADLINE_GRACE,
             retained_bytes: Arc::new(AtomicU64::new(0)),
             run_scratch,
             sandbox: SandboxMode::Off,
@@ -136,9 +143,16 @@ impl GreppyEnv {
         self
     }
 
-    /// Bind every subprocess to the run's remaining wall-clock budget.
+    /// Bind every subprocess to the run's remaining wall-clock budget plus
+    /// [`DEFAULT_DEADLINE_GRACE`].
     pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// Override how long past the deadline an already issued tool may run.
+    pub fn with_deadline_grace(mut self, grace: Duration) -> Self {
+        self.deadline_grace = grace;
         self
     }
 
@@ -330,7 +344,9 @@ impl GreppyEnv {
 
         let timeout = self
             .deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map(|deadline| {
+                (deadline + self.deadline_grace).saturating_duration_since(Instant::now())
+            })
             .or_else(|| (configured_timeout != Duration::MAX).then_some(configured_timeout));
         let mut cmd = Command::new(&self.greppy_bin);
         if let Err(e) = sandbox::apply(&mut cmd, &self.greppy_bin, &args, &self.sandbox) {
@@ -1814,10 +1830,25 @@ printf ok > "$HOME/.npm/probe"
     #[test]
     fn deadline_applies_to_verified_edit() {
         let (env, _, _) = env_with_stub("sleep 5");
-        let mut env = env.with_deadline(Some(Instant::now() + Duration::from_millis(100)));
+        let mut env = env
+            .with_deadline(Some(Instant::now() + Duration::from_millis(100)))
+            .with_deadline_grace(Duration::ZERO);
         let out = env.call_tool("greppy", &json!({"args": ["patch", "--verify", "diff"]}));
         assert!(out.is_error);
         assert!(out.content.contains("timed out"));
+    }
+
+    #[test]
+    fn tool_issued_after_the_deadline_runs_within_the_grace() {
+        let (env, _, _) = env_with_stub("printf 'edited\\n'");
+        let mut env = env.with_deadline(Some(Instant::now()));
+        std::thread::sleep(Duration::from_millis(20));
+        let out = env.call_tool(
+            "greppy",
+            &json!({"args": ["replace-text", "a.rs", "x", "y"]}),
+        );
+        assert!(!out.is_error, "content={}", out.content);
+        assert!(out.content.contains("edited"));
     }
 
     #[test]
