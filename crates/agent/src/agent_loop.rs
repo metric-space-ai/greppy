@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 /// Configuration for [`run_agent_loop`].
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Hard cap on assistant turns (each model response counts as one).
+    /// Optional cap on assistant action turns, followed by one tools-disabled report.
     /// Zero means unlimited (the default).
     pub max_turns: usize,
     /// Optional system prompt forwarded every turn.
@@ -294,8 +294,8 @@ pub fn run_agent_loop_with_history(
     let mut turn_budget_advised = false;
     let mut deadline_advised = false;
 
-    // Cap the number of model turns. Each successful stream_turn counts as one.
-    while config.max_turns == 0 || turns < config.max_turns {
+    // An optional action cap reserves a final reporting response without tools.
+    loop {
         // Wall-clock deadline is checked only between turns — never mid-turn
         // and never while a tool call is running, so a partial edit cannot be
         // left half-applied.
@@ -310,13 +310,30 @@ pub fn run_agent_loop_with_history(
             break;
         }
 
-        let tools = env.tool_definitions();
+        let report_only = config.max_turns > 0 && turns >= config.max_turns;
+        if report_only {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: "The requested action-turn budget is complete. Provide the final report of changes, verification and remaining work using the evidence already obtained. Tools are disabled; do not perform further actions.".into(),
+                }],
+            });
+        }
+        let tools = if report_only {
+            Vec::new()
+        } else {
+            env.tool_definitions()
+        };
         let req = ModelRequest {
             model: config.model.clone(),
             system: config.system.clone(),
             messages: messages.clone(),
             tools,
-            tool_choice: config.tool_choice,
+            tool_choice: if report_only {
+                ToolChoice::None
+            } else {
+                config.tool_choice
+            },
             max_tokens: config.max_tokens,
         };
 
@@ -344,6 +361,33 @@ pub fn run_agent_loop_with_history(
         // reported as a successful turn.
         if cancel_requested(config) && collect_tool_calls(&turn.message).is_empty() {
             last_stop = LoopStop::Cancelled;
+            break;
+        }
+
+        if report_only {
+            // Enforce the tools-disabled request even if a provider emits calls.
+            // Record matching results so saved history remains protocol-valid.
+            let rejected_calls = collect_tool_calls(&turn.message);
+            if !rejected_calls.is_empty() {
+                messages.push(Message {
+                    role: Role::User,
+                    content: rejected_calls.into_iter().map(|(id, _, _)| ContentPart::ToolResult {
+                        call_id: id,
+                        content: "The action-turn budget is exhausted; tools are disabled for the final report.".into(),
+                        is_error: true,
+                    }).collect(),
+                });
+            }
+            last_stop = if cancel_requested(config) {
+                LoopStop::Cancelled
+            } else if config
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                LoopStop::Deadline
+            } else {
+                LoopStop::MaxTurns
+            };
             break;
         }
 
@@ -462,9 +506,7 @@ verifiable and report the rest."
                 }
 
                 // Continue the outer loop for the next assistant turn.
-                // If this was the last allowed turn, the while-guard stops us
-                // with MaxTurns *after* tools ran (matching the "model always
-                // requests tools → stop after configured count" acceptance).
+                // After the last action turn, the next request permits only a final report.
                 last_stop = LoopStop::MaxTurns; // provisional; overwritten on next end
                 continue;
             }
@@ -1011,6 +1053,73 @@ mod tests {
     }
 
     #[test]
+    fn last_allowed_edit_is_followed_by_final_report_without_tools() {
+        let mut model = FakeModel::new(vec![
+            tool_turn(
+                None,
+                vec![("edit", "bash", json!({"command": "apply edit"}))],
+                usage(1, 1),
+            ),
+            text_turn(
+                "Edited clamp and verified the upper-bound regression.",
+                usage(1, 1),
+            ),
+        ]);
+        let mut env = FakeEnv::new(vec![bash_tool()])
+            .with_outcome("bash", ToolOutcome::ok("edit and test passed"));
+        let config = AgentConfig::default().with_max_turns(1);
+        let (result, _) = run(&mut model, &mut env, &config, "fix clamp").unwrap();
+        assert_eq!(result.stop, LoopStop::MaxTurns);
+        assert_eq!(
+            result.final_text,
+            "Edited clamp and verified the upper-bound regression."
+        );
+        assert_eq!(env.calls.len(), 1);
+        assert_eq!(model.calls, 2);
+        let final_request = &model.requests[1];
+        assert!(final_request.tools.is_empty());
+        assert_eq!(final_request.tool_choice, ToolChoice::None);
+        assert!(final_request.messages.iter().any(|message| message.content.iter().any(|part|
+            matches!(part, ContentPart::ToolResult { content, .. } if content == "edit and test passed"))));
+    }
+
+    #[test]
+    fn deadline_prevents_reporting_turn_after_last_action() {
+        struct ExpiringEnv {
+            deadline: Instant,
+            calls: usize,
+        }
+        impl ExecutionEnv for ExpiringEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![bash_tool()]
+            }
+            fn call_tool(&mut self, _: &str, _: &serde_json::Value) -> ToolOutcome {
+                self.calls += 1;
+                while Instant::now() < self.deadline {
+                    std::thread::yield_now();
+                }
+                ToolOutcome::ok("last edit completed")
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let mut env = ExpiringEnv { deadline, calls: 0 };
+        let mut model = FakeModel::new(vec![tool_turn(
+            None,
+            vec![("edit", "bash", json!({}))],
+            usage(1, 1),
+        )]);
+        let config = AgentConfig {
+            max_turns: 1,
+            deadline: Some(deadline),
+            ..AgentConfig::default()
+        };
+        let (result, _) = run(&mut model, &mut env, &config, "fix").unwrap();
+        assert_eq!(result.stop, LoopStop::Deadline);
+        assert_eq!(model.calls, 1);
+        assert_eq!(env.calls, 1);
+    }
+
+    #[test]
     fn max_turns_stops_when_model_always_requests_tools() {
         // Script more turns than the cap so the loop must self-stop.
         let mut turns = Vec::new();
@@ -1042,14 +1151,16 @@ mod tests {
 
         let (result, _) = run(&mut model, &mut env, &config, "loop forever").expect("ok");
         assert_eq!(result.stop, LoopStop::MaxTurns);
-        // Exactly 3 model turns.
-        assert_eq!(model.calls, 3);
+        // Three action turns and one tools-disabled reporting response.
+        assert_eq!(model.calls, 4);
+        assert!(model.requests[3].tools.is_empty());
+        assert_eq!(model.requests[3].tool_choice, ToolChoice::None);
         // 3 tool executions.
         assert_eq!(env.calls.len(), 3);
-        // messages: user + (assistant + tool_user)*3
-        assert_eq!(result.messages.len(), 1 + 3 * 2);
-        assert_eq!(result.usage.input_tokens, 3);
-        assert_eq!(result.usage.output_tokens, 3);
+        // Last disobedient tool call is rejected and recorded without execution.
+        assert_eq!(result.messages.len(), 1 + 3 * 2 + 3);
+        assert_eq!(result.usage.input_tokens, 4);
+        assert_eq!(result.usage.output_tokens, 4);
     }
 
     #[test]
