@@ -743,6 +743,13 @@ fn greppy_p_incomplete_proposal_is_not_applied_and_cleans_worktree() {
         .as_str()
         .map(PathBuf::from)
         .unwrap();
+    // The fixture provider mirrors workspaces into its mount on its own
+    // thread and drops the view asynchronously once the core forgets the
+    // workspace; under load that lags the agent's exit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while worktree.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         !worktree.exists(),
         "saved incomplete proposal must clean temporary worktree"
