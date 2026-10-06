@@ -1528,10 +1528,36 @@ pub(crate) struct SessionSummary {
 fn proposal_answer_message(answer: &str) -> String {
     let answer = answer.trim();
     if answer.is_empty() {
-        "Agent proposal (response incomplete)".to_string()
-    } else {
-        answer.to_string()
+        return "Agent proposal (response incomplete)".to_string();
     }
+    // Models often open with a status sentence and give the PR title further
+    // down as "Title: ..." (often in Markdown). The subject must be that title;
+    // the rest of the answer stays the description.
+    match explicit_title(answer) {
+        Some((0, title)) => {
+            let rest = answer.split_once('\n').map_or("", |(_, rest)| rest.trim());
+            if rest.is_empty() {
+                title
+            } else {
+                format!("{title}\n\n{rest}")
+            }
+        }
+        Some((_, title)) => format!("{title}\n\n{answer}"),
+        None => answer.to_string(),
+    }
+}
+
+/// The first `Title:` line of an answer: its line index and the bare title.
+fn explicit_title(answer: &str) -> Option<(usize, String)> {
+    answer.lines().enumerate().find_map(|(index, line)| {
+        let plain = line.replace("**", "").replace("__", "");
+        let plain = plain.trim().trim_start_matches(['#', '>', '-', ' ']);
+        let rest = plain
+            .strip_prefix("Title:")
+            .or_else(|| plain.strip_prefix("title:"))?;
+        let title = rest.trim().trim_matches(['*', '_', '`', ' ']).trim();
+        (!title.is_empty()).then(|| (index, title.to_string()))
+    })
 }
 
 pub(crate) struct SessionWorkerParts {
@@ -4167,6 +4193,15 @@ mod tests {
         assert_eq!(
             proposal_answer_message(""),
             "Agent proposal (response incomplete)"
+        );
+        let answer = "All 4 tests pass. The task is complete.\n\n---\n\n**Title:** Fix clamp to return upper bound for values above the range\n\n**Status:** done";
+        assert_eq!(
+            proposal_answer_message(answer),
+            format!("Fix clamp to return upper bound for values above the range\n\n{answer}")
+        );
+        assert_eq!(
+            proposal_answer_message("## Title: Fix clamp\n\nStatus: done"),
+            "Fix clamp\n\nStatus: done"
         );
         assert_eq!(parse(&["task", "--model", "m"]).unwrap().max_turns, 0);
         assert!(!LONG_HELP.contains("default 40"));
