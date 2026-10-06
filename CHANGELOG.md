@@ -8,21 +8,51 @@ Nothing yet.
 
 ## [0.4.1] — Unreleased
 
-The owner selected 0.4.1 as the next release on 2026-09-28. No 0.4.0 tag or
-GitHub release was published; 0.4.1 will include the unreleased 0.4.0 line below
-and its subsequent repairs. Version metadata is preparation, not release acceptance.
+0.4.1 includes the unreleased 0.4.0 line below and the changes in this section.
+Production inference uses Metal on macOS and CUDA on Linux; FSKit stays optional
+acceleration and the ordinary workspace backend provides the same agent behavior.
 
-- External and built-in agents receive the owner-approved preparation guidance:
-  retain the task, reuse the running index job, use a reported estimate for one
-  bounded wait, and resume full Greppy functionality afterward. This prompt
-  change does not itself implement a runtime ETA.
-- FSKit is optional acceleration. The ordinary workspace backend must provide
-  the same agent/TUI proposal and apply behavior without extension activation;
-  its implementation and acceptance are in progress.
-- Release acceptance remains open for persisted-index/caller repair, native web
-  regressions and real agent/TUI/benchmark workflows. Optional FSKit has separate
-  provider regression and performance checks; activation is not a core prerequisite.
-  Production inference must use Metal on macOS and CUDA on Linux.
+### Built-in coding agent (`greppy agent`, `greppy -p`, `greppy agent serve`)
+
+- Every task runs in its own temporary copy-on-write worktree and ends as a
+  proposal commit on `refs/greppy/agent/<run-id>`, the pull request. Its parent
+  is the user's baseline including uncommitted work, so the proposal contains
+  only the agent's changes. The worktree is removed once the proposal is saved,
+  also when a limit ends the run (exit 5); it is kept only with
+  `--keep-worktree` or after a failure without a proposal (24 h expiry).
+- The commit message is the agent's final answer. An explicit `Title:` line, or
+  else the line before `Status:`, becomes the subject; the answer is the body.
+- One owner-approved prompt source renders the system prompt per mode:
+  one-shot (`-p`), interactive (TUI), serve and ACP.
+  `greppy prompt --mode one-shot|interactive|serve|acp|external [--json]` prints
+  each rendering with its SHA-256; `greppy prompt --external` keeps the signed
+  external contract.
+- No fixed limits. There is no default turn cap; `--max-turns N` is opt-in and
+  followed by one tool-free report turn. Tools have no fixed timeouts: the run
+  deadline bounds them, and calls issued before the deadline get up to 30 s.
+  Large tool output is folded behind `expand agent-output-ID` instead of cut.
+- No-match searches and failing tests are normal results, not tool failures,
+  and never trigger stop advice. A leading `greppy` in tool argv is accepted.
+  Toolchain caches are redirected into the run's scratch directory, so package
+  managers work inside the sandbox.
+- Long sessions are compacted at complete exchanges into a model-written
+  checkpoint; if a checkpoint cannot be saved, `-p` stops with an error.
+  `--continue` and `--resume` restore the saved proposal into the new
+  worktree, and the TUI refuses a live `/resume` that would not match the files
+  on disk.
+- Claude models get explicit prompt-cache breakpoints for system prompt, tools
+  and history; other providers cache implicitly.
+- The `-p` gateway check allows 2 s to connect and 15 s to answer and prints the
+  cause when it fails.
+- ACP mode still edits the client's folder in place; its prompt makes no
+  worktree or pull-request claim.
+
+### Fixes
+
+- `bash-smart` no longer counts source lines such as `warn!(...)` in a
+  `git diff` as warnings.
+- The TUI prints why `--continue` or `--resume` cannot start instead of only
+  "startup stopped".
 
 ## [0.4.0] — Unreleased development history (superseded by 0.4.1)
 
