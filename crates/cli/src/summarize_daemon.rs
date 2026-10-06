@@ -164,6 +164,15 @@ pub(super) fn triage_spans_via_daemon(
     None
 }
 
+pub(super) fn report_configuration_failure(detail: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "greppy: summary configuration: {detail}; no in-process summary inference started"
+        );
+    }
+}
+
 fn report_daemon_failure(cfg: &super::QwenSummaryConfig, detail: &str) {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -599,8 +608,11 @@ mod tests {
     impl Drop for SharedSummaryServer {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Release);
-            self.worker.take().unwrap().join().unwrap();
+            let result = self.worker.take().unwrap().join();
             let _ = std::fs::remove_file(self.endpoint.address());
+            if !std::thread::panicking() {
+                result.expect("shared summary test server failed");
+            }
         }
     }
 

@@ -367,10 +367,13 @@ pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>
         return Ok(None);
     }
     let (gguf, tokenizer) = qwen35_assets::paths().ok_or_else(|| {
-        Error::Config(format!(
+        let detail = format!(
             "Qwen3.5 model assets could not be prepared under {}; shared summary daemon status was not probed; check model-cache permissions, free space and asset integrity",
             greppy_core::cache::models_root().display()
-        ))
+        );
+        #[cfg(any(unix, windows))]
+        summarize_daemon::report_configuration_failure(&detail);
+        Error::Config(detail)
     })?;
     Ok(Some(QwenSummaryConfig {
         model_id: greppy_qwen35_native::MODEL_ID.to_string(),
