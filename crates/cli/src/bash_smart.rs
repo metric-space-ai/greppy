@@ -511,6 +511,26 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     // Kills and timeouts always receive an id, even when the partial wall is
     // short. Normal short output keeps its raw skeleton bytes after the verdict
     // only. Oversized individual lines are previews with raw-log recovery.
+    // Every completed capture publishes the private verifier status, including
+    // the short-output fast path below. The project child never receives it.
+    if let Some(path) = std::env::var_os("GREPPY_INTERNAL_VERIFY_STATUS_PATH") {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(Error::Invalid(
+                "private verifier status path must be absolute".into(),
+            ));
+        }
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": "greppy.bash-smart.verify-status.v1",
+            "runner_pid": std::process::id(),
+            "timed_out": timed_out,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "exit_code": exit_code,
+        }))
+        .map_err(|error| Error::Invalid(format!("encode verifier completion: {error}")))?;
+        greppy_core::cache::atomic_write(&path, &data)
+            .map_err(|error| Error::io("write verifier completion", error))?;
+    }
     if verbatim_short {
         if let Some(store) = store.as_ref() {
             let ranges = full_line_range(&stdout_lines);
@@ -652,24 +672,6 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         );
     }
 
-    if let Some(path) = std::env::var_os("GREPPY_INTERNAL_VERIFY_STATUS_PATH") {
-        let path = std::path::PathBuf::from(path);
-        if !path.is_absolute() {
-            return Err(Error::Invalid(
-                "private verifier status path must be absolute".into(),
-            ));
-        }
-        let data = serde_json::to_vec(&serde_json::json!({
-            "schema": "greppy.bash-smart.verify-status.v1",
-            "runner_pid": std::process::id(),
-            "timed_out": timed_out,
-            "elapsed_ms": started.elapsed().as_millis(),
-            "exit_code": exit_code,
-        }))
-        .map_err(|error| Error::Invalid(format!("encode verifier completion: {error}")))?;
-        greppy_core::cache::atomic_write(&path, &data)
-            .map_err(|error| Error::io("write verifier completion", error))?;
-    }
     Ok(exit_code)
 }
 
