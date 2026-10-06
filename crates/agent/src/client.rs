@@ -237,8 +237,8 @@ impl Client {
     ) -> Result<TurnResult, ClientError> {
         let url = self.messages_url();
         let body = to_messages_request_body(req);
-        let body_str =
-            serde_json::to_string(&body).map_err(|e| ClientError::Transport(e.to_string()))?;
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| ClientError::Transport(format!("serialize model request: {e}")))?;
 
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
@@ -258,7 +258,7 @@ impl Client {
                 return Err(ClientError::Http { status: code, body });
             }
             Err(ureq::Error::Transport(t)) => {
-                return Err(ClientError::Transport(t.to_string()));
+                return Err(ClientError::Transport(format!("send model request: {t}")));
             }
         };
 
