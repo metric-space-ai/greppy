@@ -756,9 +756,10 @@ fn run_agent(
     if !interactive && !serve {
         match client.probe() {
             Ok(()) => {}
-            Err(ProbeError::Unreachable(_)) => {
+            Err(ProbeError::Unreachable(detail)) => {
                 let message = format!(
                     "greppy -p needs a local model gateway and found none at {endpoint}.\n\
+                 Cause: {detail}\n\
                  Start one (standard: CLIProxyAPI on 127.0.0.1:8317) or set\n\
                  GREPPY_ENDPOINT / --endpoint. Details: greppy -p --help"
                 );

@@ -65,6 +65,12 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+/// An absent local gateway refuses the connection at once; a present one may
+/// sit behind a tunnel or VPN and need well over 2 s to list its models, so
+/// only the connect is bounded tightly.
+const GATEWAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Errors from [`Client::probe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeError {
@@ -215,8 +221,8 @@ impl Client {
     pub fn list_models(&self) -> Result<Vec<String>, ProbeError> {
         let url = self.models_url();
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(2))
-            .timeout(Duration::from_secs(2))
+            .timeout_connect(GATEWAY_CONNECT_TIMEOUT)
+            .timeout(GATEWAY_RESPONSE_TIMEOUT)
             .build();
 
         match self.authed(agent.get(&url)).call() {
@@ -235,15 +241,15 @@ impl Client {
         }
     }
 
-    /// Probe the gateway: `GET {base}/v1/models` with a 2 s timeout.
+    /// Probe the gateway: `GET {base}/v1/models` (2 s to connect, 15 s to answer).
     ///
     /// Distinguishes connect failures ([`ProbeError::Unreachable`]) from
     /// non-2xx / garbage ([`ProbeError::BadResponse`]).
     pub fn probe(&self) -> Result<(), ProbeError> {
         let url = self.models_url();
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(2))
-            .timeout(Duration::from_secs(2))
+            .timeout_connect(GATEWAY_CONNECT_TIMEOUT)
+            .timeout(GATEWAY_RESPONSE_TIMEOUT)
             .build();
 
         match self.authed(agent.get(&url)).call() {
