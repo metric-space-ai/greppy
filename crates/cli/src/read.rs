@@ -762,11 +762,35 @@ pub(crate) fn dispatch_read(
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
     let file_base = resolve_file_operand_base(root, &root_path);
+    if let Some((path, range)) =
+        read_positional_file_range(subjects, &file_base, &canonical_root)
+    {
+        let mut retry = format!(
+            "greppy read-file {} --lines {}",
+            shell_example_arg(path),
+            shell_example_arg(&range)
+        );
+        if with_handle {
+            retry.push_str(" --handle");
+        }
+        if json {
+            retry.push_str(" --json");
+        }
+        for filter in path_filters {
+            retry.push_str(&format!(" --path {}", shell_example_arg(filter)));
+        }
+        if let Some(root) = root {
+            retry.push_str(&format!(" --root {}", shell_example_arg(root)));
+        }
+        return Err(Error::Invalid(format!(
+            "read expects symbols; a file location or positional line range uses read-file.\nretry: {retry}"
+        )));
+    }
     let file_intents = subjects
         .iter()
         .map(|subject| {
             looks_like_path(subject)
-                || read_open_file(&file_base, &canonical_root, subject).is_some()
+                || read_resolve_file(&file_base, &canonical_root, subject).is_some()
         })
         .collect::<Vec<_>>();
 
@@ -838,6 +862,38 @@ pub(crate) fn dispatch_read(
         failed |= code != 0;
     }
     Ok(i32::from(failed))
+}
+
+/// Recognize location-shaped misuse before opening a graph or treating the
+/// range as another symbol. Literal filenames and qualified symbols keep their
+/// existing meaning; this only returns a precise, bounded read-file recovery.
+fn read_positional_file_range<'a>(
+    subjects: &'a [String],
+    file_base: &std::path::Path,
+    canonical_root: &std::path::Path,
+) -> Option<(&'a str, String)> {
+    let file_intent = |path: &str| {
+        !path.contains("::")
+            && (looks_like_path(path) || read_resolve_file(file_base, canonical_root, path).is_some())
+    };
+    if let [path, range] = subjects {
+        if file_intent(path) && read_parse_file_range(range, usize::MAX).is_ok() {
+            return Some((path, range.clone()));
+        }
+    }
+    if let [location] = subjects {
+        let (path, line) = location.rsplit_once(':')?;
+        let line = line.parse::<usize>().ok().filter(|line| *line > 0)?;
+        // Existence, not UTF-8 decoding, preserves literal colon filenames.
+        // A readable first page may have binary bytes later in the same file.
+        if read_resolve_file(file_base, canonical_root, location).is_some() {
+            return None;
+        }
+        if file_intent(path) {
+            return Some((path, format!("{line}:{line}")));
+        }
+    }
+    None
 }
 
 pub(crate) fn dispatch_read_symbols(
