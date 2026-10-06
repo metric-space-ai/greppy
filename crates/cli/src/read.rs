@@ -1284,9 +1284,9 @@ fn read_render_smart_source(
             } else if node
                 .parent()
                 .is_some_and(|parent| parent.start_position().row == node.start_position().row)
-                || node.prev_sibling().is_some_and(|header| {
-                    header.end_position().row == node.start_position().row
-                })
+                || node
+                    .prev_sibling()
+                    .is_some_and(|header| header.end_position().row == node.start_position().row)
             {
                 // Python permits an inline suite on the final header line,
                 // including a multiline signature. Preserve that header/suite
