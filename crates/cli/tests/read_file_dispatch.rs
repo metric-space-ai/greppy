@@ -881,7 +881,7 @@ fn explicit_outline_conflicts_with_exact_range_and_all_modes() {
         let (code, stdout, stderr) = run(&repo, &store, &args);
         assert_ne!(code, 0, "{stdout}\n{stderr}");
         assert!(
-            stderr.contains("cannot be used with") || stdout.contains("invalid"),
+            stderr.contains("cannot be used with") || stdout.contains("cannot be used with"),
             "{stdout}\n{stderr}"
         );
     }
