@@ -58,3 +58,37 @@ fn compatible_header_can_add_cpp_default_member_without_weakening_c() {
     let counts = syntax_counts(language, broken).unwrap();
     assert!(counts.errors > 0 || counts.missing > 0);
 }
+
+#[test]
+fn c11_atomic_type_specifiers_preserve_real_errors_and_expression_rules() {
+    let c = greppy_parser::Language::C;
+    for source in [
+        "_Atomic(int) value;",
+        "struct AtomicState { _Atomic(int) value; };",
+        "_Atomic(unsigned long *) value;",
+        "typedef int MyType; _Atomic(MyType) value;",
+        "void f(void) { _Atomic(int) local; }",
+        "_Atomic int value;",
+        "_Atomic /* type comment */ (int) value;",
+        "_Atomic int first; _Atomic(int) second;",
+        "const char *s = \"_Atomic(int)\"; /* _Atomic() */",
+    ] {
+        let counts = syntax_counts(c, source.as_bytes()).unwrap();
+        assert_eq!((counts.errors, counts.missing), (0, 0), "{source}");
+        assert!(first_syntax_diagnostic(c, source.as_bytes()).is_none());
+    }
+    for source in [
+        "_Atomic() value;",
+        "_Atomic(int value;",
+        "_Atomic(int named) value;",
+        "_Atomic(1 + 2) value;",
+        "struct AtomicState { _Atomic(int) value; }; int broken( ;",
+    ] {
+        let counts = syntax_counts(c, source.as_bytes()).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0, "{source}");
+        assert!(
+            first_syntax_diagnostic(c, source.as_bytes()).is_some(),
+            "{source}"
+        );
+    }
+}

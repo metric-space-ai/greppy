@@ -247,7 +247,13 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if matches!(language, Language::C | Language::Cpp) {
-        return guarded_linkage_validation_content(language, content);
+        let linkage = guarded_linkage_validation_content(language, content);
+        if language == Language::C {
+            if let Cow::Owned(normalized) = c_atomic_validation_content(&linkage) {
+                return Cow::Owned(normalized);
+            }
+        }
+        return linkage;
     }
     if language.name() == "json" {
         return json_validation_content(content);
@@ -540,6 +546,77 @@ fn json_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 
 /// Validate only a complete unique conventional linkage pair. The body and
 /// other directives stay parsed; spaces preserve diagnostic coordinates.
+/// The C grammar reserves `_Atomic` as a qualifier, preventing its
+/// macro-type rule from recognizing standard C11 `_Atomic(type-name)`.
+/// Substitute an equal-length identifier only for actual qualifier tokens,
+/// and retain it only when the reparse proves a complete type specifier in
+/// a type position. Expressions and malformed type arguments cannot qualify.
+fn c_atomic_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    if !content.windows(7).any(|bytes| bytes == b"_Atomic") {
+        return Cow::Borrowed(content);
+    }
+    let Ok(tree) = greppy_parser::parse(Language::C, content) else {
+        return Cow::Borrowed(content);
+    };
+    let mut candidates = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_qualifier"
+            && content.get(node.byte_range()) == Some(b"_Atomic".as_slice())
+        {
+            candidates.push(node.byte_range());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    if candidates.is_empty() {
+        return Cow::Borrowed(content);
+    }
+    let mut proposed = content.to_vec();
+    for range in &candidates {
+        proposed[range.clone()].copy_from_slice(b"Greppyx");
+    }
+    let Ok(view) = greppy_parser::parse(Language::C, &proposed) else {
+        return Cow::Borrowed(content);
+    };
+    let mut normalized: Option<Vec<u8>> = None;
+    for range in candidates {
+        let Some(name) = view
+            .root_node()
+            .descendant_for_byte_range(range.start, range.end)
+        else {
+            continue;
+        };
+        let Some(specifier) = name
+            .parent()
+            .filter(|node| node.kind() == "macro_type_specifier")
+        else {
+            continue;
+        };
+        let type_position = specifier.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "declaration"
+                    | "field_declaration"
+                    | "parameter_declaration"
+                    | "type_definition"
+                    | "type_descriptor"
+            ) && parent.child_by_field_name("type") == Some(specifier)
+        });
+        if name.byte_range() == range
+            && specifier.child_by_field_name("name") == Some(name)
+            && !specifier.has_error()
+            && specifier
+                .child_by_field_name("type")
+                .is_some_and(|node| node.kind() == "type_descriptor" && !node.has_error())
+            && type_position
+        {
+            normalized.get_or_insert_with(|| content.to_vec())[range].copy_from_slice(b"Greppyx");
+        }
+    }
+    normalized.map_or(Cow::Borrowed(content), Cow::Owned)
+}
+
 fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     const OPEN: &[u8] = b"#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
     const CLOSE: &[u8] = b"#ifdef __cplusplus\n}\n#endif\n";
@@ -879,6 +956,23 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c_atomic_validation_view_never_rewrites_call_expressions_or_literal_text() {
+        // The upstream C grammar can accept a reserved spelling as a call
+        // identifier. This view must not pretend to repair or validate that
+        // separate grammar limitation by changing expression bytes.
+        for source in [
+            b"typedef int MyType; int f(void) { return _Atomic(MyType); }".as_slice(),
+            b"const char *text = \"_Atomic(int)\"; /* _Atomic() */".as_slice(),
+            b"_Atomic int value;".as_slice(),
+        ] {
+            assert!(matches!(
+                super::c_atomic_validation_content(source),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+    }
+
     #[test]
     fn python_syntax_counts_reject_empty_suites_and_escaped_returns() {
         for invalid in [
