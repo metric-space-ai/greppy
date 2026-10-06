@@ -131,6 +131,8 @@ pub struct SessionRecord {
     pub proposal_ref: String,
     pub source: String,
     pub messages: Vec<PersistedMessage>,
+    /// Model-facing context summary, restored as system metadata, never as a user message.
+    pub context_summary: Option<String>,
     pub import_ack: Vec<ImportAck>,
     pub usage: Usage,
     pub turns: u64,
@@ -152,6 +154,7 @@ impl SessionRecord {
             proposal_ref: String::new(),
             source: String::new(),
             messages: Vec::new(),
+            context_summary: None,
             import_ack: Vec::new(),
             usage: Usage::default(),
             turns: 0,
@@ -548,6 +551,31 @@ impl SessionStore {
         )
     }
 
+    /// Publish raw recovery history, compacted active history and its system
+    /// summary in one JSONL record. A partial record cannot publish half a checkpoint.
+    pub fn append_context_checkpoint(
+        &self,
+        session_id: &str,
+        archive: &[PersistedMessage],
+        messages: &[PersistedMessage],
+        summary: Option<&str>,
+    ) -> io::Result<()> {
+        if !complete_tool_pairs(archive) || !complete_tool_pairs(messages) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "context checkpoint must preserve complete tool-call/result pairs",
+            ));
+        }
+        let checkpoint = json!({
+            "v": SESSION_FORMAT,
+            "type": "context_checkpoint",
+            "archive": archive.iter().map(redacted_message_line).collect::<Vec<_>>(),
+            "messages": messages.iter().map(redacted_message_line).collect::<Vec<_>>(),
+            "system_summary": {"role": "system", "kind": "context_summary", "text": summary.map(redact_text)},
+        });
+        self.append(session_id, &checkpoint)
+    }
+
     pub fn append_usage(
         &self,
         session_id: &str,
@@ -857,6 +885,33 @@ pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
                 };
                 record.messages = replacement;
             }
+            Some("context_checkpoint") => {
+                // Validate the entire record before publishing either active field.
+                let checkpoint = (|| {
+                    let archive = checkpoint_messages_from_value(value.get("archive")?)?;
+                    let messages = checkpoint_messages_from_value(value.get("messages")?)?;
+                    let metadata = value.get("system_summary")?;
+                    if metadata.get("role")?.as_str()? != "system"
+                        || metadata.get("kind")?.as_str()? != "context_summary"
+                        || !complete_tool_pairs(&archive)
+                        || !complete_tool_pairs(&messages)
+                    {
+                        return None;
+                    }
+                    let summary = match metadata.get("text")? {
+                        Value::Null => None,
+                        Value::String(text) => Some(text.clone()),
+                        _ => return None,
+                    };
+                    Some((messages, summary))
+                })();
+                let Some((messages, summary)) = checkpoint else {
+                    recovered = true;
+                    break;
+                };
+                record.messages = messages;
+                record.context_summary = summary;
+            }
             Some("usage") => apply_usage(&mut record, &value),
             Some("title") => {
                 if let Some(title) = value.get("title").and_then(Value::as_str) {
@@ -1041,6 +1096,7 @@ fn meta_line(record: &SessionRecord) -> Value {
         "branch": record.branch,
         "proposal_ref": record.proposal_ref,
         "source": record.source,
+        "context_summary": record.context_summary.as_deref().map(redact_text),
     })
 }
 
@@ -1077,6 +1133,75 @@ fn message_line(message: &PersistedMessage) -> Value {
     })
 }
 
+fn redacted_message_line(message: &PersistedMessage) -> Value {
+    let mut message = message.clone();
+    for part in &mut message.parts {
+        part.text = if part.kind == "tool_call" {
+            match serde_json::from_str::<Value>(&part.text) {
+                Ok(arguments) => redact_json(&arguments).to_string(),
+                Err(_) => redact_text(&part.text),
+            }
+        } else {
+            redact_text(&part.text)
+        };
+    }
+    message_line(&message)
+}
+
+fn checkpoint_messages_from_value(value: &Value) -> Option<Vec<PersistedMessage>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|message| {
+            if !matches!(message.get("role")?.as_str()?, "user" | "assistant") {
+                return None;
+            }
+            for part in message.get("parts")?.as_array()? {
+                part.get("kind")?.as_str()?;
+                part.get("text")?.as_str()?;
+                part.get("id")?.as_str()?;
+                part.get("name")?.as_str()?;
+                part.get("is_error")?.as_bool()?;
+            }
+            message_from_value(message)
+        })
+        .collect()
+}
+
+fn complete_tool_pairs(messages: &[PersistedMessage]) -> bool {
+    let mut pending = std::collections::BTreeSet::new();
+    for message in messages {
+        if !matches!(message.role.as_str(), "user" | "assistant") {
+            return false;
+        }
+        if message.role == "assistant" && !pending.is_empty() {
+            return false;
+        }
+        for part in &message.parts {
+            match part.kind.as_str() {
+                "tool_call" => {
+                    if message.role != "assistant"
+                        || part.id.is_empty()
+                        || !pending.insert(part.id.clone())
+                    {
+                        return false;
+                    }
+                }
+                "tool_result" => {
+                    if message.role != "user" || !pending.remove(&part.id) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if message.role == "user" && !pending.is_empty() {
+            return false;
+        }
+    }
+    pending.is_empty()
+}
+
 fn message_from_value(value: &Value) -> Option<PersistedMessage> {
     let role = value.get("role")?.as_str()?.to_string();
     let parts = value
@@ -1108,6 +1233,9 @@ fn message_from_value(value: &Value) -> Option<PersistedMessage> {
 }
 
 fn apply_meta(record: &mut SessionRecord, value: &Value) {
+    if let Some(summary) = value.get("context_summary") {
+        record.context_summary = summary.as_str().map(str::to_owned);
+    }
     if let Some(id) = value
         .get("id")
         .and_then(Value::as_str)
@@ -1434,6 +1562,178 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn checkpoint_text(text: &str) -> PersistedMessage {
+        PersistedMessage {
+            role: "user".into(),
+            parts: vec![PersistedPart {
+                kind: "text".into(),
+                text: text.into(),
+                id: String::new(),
+                name: String::new(),
+                is_error: false,
+            }],
+        }
+    }
+
+    fn complete_checkpoint_pair() -> Vec<PersistedMessage> {
+        vec![
+            PersistedMessage {
+                role: "assistant".into(),
+                parts: vec![PersistedPart {
+                    kind: "tool_call".into(),
+                    text: r#"{"args":["read","clamp"]}"#.into(),
+                    id: "call-1".into(),
+                    name: "greppy".into(),
+                    is_error: false,
+                }],
+            },
+            PersistedMessage {
+                role: "user".into(),
+                parts: vec![PersistedPart {
+                    kind: "tool_result".into(),
+                    text: "clamp source".into(),
+                    id: "call-1".into(),
+                    name: String::new(),
+                    is_error: false,
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn context_checkpoint_restores_active_pairs_and_system_summary_with_raw_archive() {
+        let (store, root) = temp_store("context-roundtrip");
+        let record = SessionRecord::new(
+            "context-roundtrip".into(),
+            "demo".into(),
+            "m".into(),
+            "run".into(),
+        );
+        store.create(&record).unwrap();
+        let archive = vec![checkpoint_text("earlier conversation")];
+        let active = complete_checkpoint_pair();
+        store.append_messages(&record.id, &archive).unwrap();
+        store
+            .append_context_checkpoint(
+                &record.id,
+                &archive,
+                &active,
+                Some("Completed source inspection."),
+            )
+            .unwrap();
+        store
+            .append_messages(&record.id, &[checkpoint_text("continue")])
+            .unwrap();
+        let loaded = store.load(&record.id).unwrap();
+        assert_eq!(&loaded.messages[..2], active.as_slice());
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(
+            loaded.context_summary.as_deref(),
+            Some("Completed source inspection.")
+        );
+        assert!(!loaded.recovered);
+        let lines = read_session_log_lines(&store.path_for(&record.id).unwrap()).unwrap();
+        let checkpoint = lines
+            .iter()
+            .filter_map(|line| line.value.as_ref())
+            .find(|value| value["type"] == "context_checkpoint")
+            .unwrap();
+        assert_eq!(
+            checkpoint["archive"][0]["parts"][0]["text"],
+            "earlier conversation"
+        );
+        assert_eq!(checkpoint["system_summary"]["role"], "system");
+        assert!(loaded.messages.iter().all(|message| message
+            .parts
+            .iter()
+            .all(|part| part.text != "Completed source inspection.")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_context_line_restores_previous_history_and_summary_atomically() {
+        let (store, root) = temp_store("context-partial");
+        let record = SessionRecord::new(
+            "context-partial".into(),
+            "demo".into(),
+            "m".into(),
+            "run".into(),
+        );
+        store.create(&record).unwrap();
+        let active = complete_checkpoint_pair();
+        store
+            .append_context_checkpoint(&record.id, &[], &active, Some("previous summary"))
+            .unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(store.path_for(&record.id).unwrap())
+            .unwrap();
+        file.write_all(br#"{"v":1,"type":"context_checkpoint","messages":[],"system_summary":{"role":"system","text":"new"}"#).unwrap();
+        file.flush().unwrap();
+        let loaded = store.load(&record.id).unwrap();
+        assert_eq!(loaded.messages, active);
+        assert_eq!(loaded.context_summary.as_deref(), Some("previous summary"));
+        assert!(loaded.recovered);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_checkpoint_rejects_split_tool_pair_without_publishing_summary() {
+        let (store, root) = temp_store("context-pairs");
+        let record = SessionRecord::new(
+            "context-pairs".into(),
+            "demo".into(),
+            "m".into(),
+            "run".into(),
+        );
+        store.create(&record).unwrap();
+        let active = complete_checkpoint_pair();
+        let error = store
+            .append_context_checkpoint(&record.id, &[], &active[..1], Some("invalid"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        store
+            .append_context_checkpoint(&record.id, &[], &active, Some("valid"))
+            .unwrap();
+        let mut malformed = json!({"v": SESSION_FORMAT, "type":"context_checkpoint",
+            "archive": [], "messages": active.iter().map(message_line).collect::<Vec<_>>(),
+            "system_summary": {"role":"user", "kind":"context_summary", "text":"wrong role"}});
+        malformed["messages"][1]["parts"] = json!([]);
+        store.append(&record.id, &malformed).unwrap();
+        let loaded = store.load(&record.id).unwrap();
+        assert_eq!(loaded.messages, active);
+        assert_eq!(loaded.context_summary.as_deref(), Some("valid"));
+        assert!(loaded.recovered);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_checkpoint_redacts_archive_active_arguments_and_summary() {
+        let (store, root) = temp_store("context-redaction");
+        let record = SessionRecord::new(
+            "context-redaction".into(),
+            "demo".into(),
+            "m".into(),
+            "run".into(),
+        );
+        store.create(&record).unwrap();
+        let mut active = complete_checkpoint_pair();
+        active[0].parts[0].text = r#"{"api_key":"private-test-value","args":[]}"#.into();
+        store
+            .append_context_checkpoint(
+                &record.id,
+                &[checkpoint_text("Bearer archive-secret")],
+                &active,
+                Some("Bearer summary-secret"),
+            )
+            .unwrap();
+        let raw = fs::read_to_string(store.path_for(&record.id).unwrap()).unwrap();
+        assert!(!raw.contains("private-test-value"));
+        assert!(!raw.contains("archive-secret"));
+        assert!(!raw.contains("summary-secret"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn usage_entries_are_cumulative_snapshots() {
         let (store, root) = temp_store("usage-snapshot");
@@ -1482,6 +1782,7 @@ mod tests {
         .unwrap();
         let loaded = store.load("sess-legacy").unwrap();
         assert_eq!(loaded.source, "");
+        assert_eq!(loaded.context_summary, None);
         assert_eq!(loaded.messages[0].parts[0].text, "hi");
         assert_eq!(loaded.usage.input_tokens, 4);
         assert!(!loaded.recovered);
