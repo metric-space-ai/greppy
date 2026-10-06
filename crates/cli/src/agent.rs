@@ -705,6 +705,17 @@ fn run_agent(
             Ok((record, _)) => Some(record),
             Err((code, message)) => {
                 let _ = workspace.cleanup();
+                // The TUI has no JSON stream: leave the bootstrap screen first so
+                // the reason is printed on the restored terminal, in TUI words.
+                drop(bootstrap.take());
+                let message = match message.strip_prefix("greppy -p: ") {
+                    Some("no previous session for this project") => {
+                        "greppy agent: no previous interactive session for this project".to_string()
+                    }
+                    Some(rest) => format!("greppy agent: {rest}"),
+                    None => message,
+                };
+                eprintln!("{message}");
                 return crate::agent_json::emit_error_result_opt(
                     json.as_mut(),
                     &json_session,
