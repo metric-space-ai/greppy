@@ -116,12 +116,16 @@ fn spawn_stub_gateway_with_delay(
                         if line == "\r\n" {
                             break;
                         }
-                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
                         {
                             content_length = value.trim().parse().expect("request content length");
                         }
                     }
-                    assert!(content_length <= 2 * 1024 * 1024, "oversize fixture request");
+                    assert!(
+                        content_length <= 2 * 1024 * 1024,
+                        "oversize fixture request"
+                    );
                     let mut body = vec![0; content_length];
                     if reader.read_exact(&mut body).is_err() {
                         continue;
