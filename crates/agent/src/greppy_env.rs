@@ -586,7 +586,8 @@ fn finalize_outcome(
 /// Stable prefix of the retryable semantic-index status line.
 ///
 /// Must match the format string in `crates/cli/src/inference.rs`
-/// (`embedding_progress_text`): `"semantic index building — {completed}/…"`.
+/// (`embedding_progress_text`): numeric span progress or the exact pending
+/// validation status, both with the same backend suffix.
 #[cfg(test)]
 const SEMANTIC_INDEX_BUILDING_PREFIX: &str = "semantic index building —";
 
@@ -605,19 +606,7 @@ fn semantic_preparation_line(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("semantic index building — ") else {
         return false;
     };
-    let Some((counts, rest)) = rest.split_once(" spans, ETA ") else {
-        return false;
-    };
-    let Some((completed, total)) = counts.split_once('/') else {
-        return false;
-    };
-    let (Some(completed), Some(total)) = (number(completed), number(total)) else {
-        return false;
-    };
-    if completed > total {
-        return false;
-    }
-    let Some((eta, backend)) = rest.rsplit_once(" (backend ") else {
+    let Some((status, backend)) = rest.rsplit_once(" (backend ") else {
         return false;
     };
     let Some(backend) = backend.strip_suffix(')') else {
@@ -628,6 +617,21 @@ fn semantic_preparation_line(line: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
     {
+        return false;
+    }
+    if status == "validating spans, pending work and ETA measuring" {
+        return true;
+    }
+    let Some((counts, eta)) = status.split_once(" spans, ETA ") else {
+        return false;
+    };
+    let Some((completed, total)) = counts.split_once('/') else {
+        return false;
+    };
+    let (Some(completed), Some(total)) = (number(completed), number(total)) else {
+        return false;
+    };
+    if completed > total {
         return false;
     }
     if eta == "measuring" {
@@ -1339,6 +1343,8 @@ exit 2
     #[test]
     fn semantic_preparation_status_grammar_and_diagnostics() {
         for line in [
+            "semantic index building — validating spans, pending work and ETA measuring (backend cuda)",
+            "semantic-search: semantic index building — validating spans, pending work and ETA measuring (backend metal)",
             "semantic index building — 0/12 spans, ETA measuring (backend metal)",
             "semantic index building — 3/12 spans, ETA ~9s (backend cuda)",
             "semantic-search: semantic index building — 3/12 spans, ETA ~2m (backend metal)",
@@ -1355,6 +1361,11 @@ exit 2
         }
         for line in [
             "semantic index building —",
+            "source says semantic index building — validating spans, pending work and ETA measuring (backend cuda)",
+            "semantic index building — validating spans, pending work and ETA measuring (backend cuda) failed",
+            "semantic index building — validating spans, pending work and ETA measuring (backend cuda failed)",
+            "semantic index building — validating spans, pending work and ETA measuring (backend )",
+            "semantic index building — validating spans, pending work and ETA ~1s (backend cuda)",
             "semantic index building — failed to open index",
             "semantic index building — 3/no spans, ETA ~9s (backend cuda)",
             "semantic index building — 3/12 spans, ETA ~9s (backend cuda) failed",
@@ -1399,6 +1410,35 @@ exit 2
             let (mut env, _, _) = env_with_stub(stub);
             let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
             assert!(out.is_error, "{}", out.content);
+            assert!(!out.content.contains("Pending semantic result:"));
+        }
+    }
+
+    #[test]
+    fn validation_status_preserves_failures_and_nonsemantic_commands() {
+        let line = "semantic index building — validating spans, pending work and ETA measuring (backend cuda)";
+        for stub in [
+            format!(
+                "printf '%s\\n' '{line}'; printf 'greppy: failed to open index\\n' >&2; exit 1"
+            ),
+            format!("printf '%s\\nfailed to open index\\n' '{line}'; exit 1"),
+            format!("printf '%s\\n' 'source says {line}'; exit 1"),
+        ] {
+            let (mut env, _, _) = env_with_stub(&stub);
+            let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+            assert!(out.is_error, "{}", out.content);
+            assert!(!out.content.contains("Pending semantic result:"));
+        }
+        for (command, exit, expected_error) in [
+            ("read-file", 1, true),
+            ("bash-smart", 1, true),
+            ("search", 0, false),
+            ("search", 13, true),
+        ] {
+            let stub = format!("printf '%s\\n' '{line}'\nexit {exit}\n");
+            let (mut env, _, _) = env_with_stub(&stub);
+            let out = env.call_tool("greppy", &json!({"args": [command, "target"]}));
+            assert_eq!(out.is_error, expected_error, "{command}: {}", out.content);
             assert!(!out.content.contains("Pending semantic result:"));
         }
     }

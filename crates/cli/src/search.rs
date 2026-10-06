@@ -1813,11 +1813,12 @@ fn wait_for_embedding_publication(
                 if !announced
                     && should_announce_semantic_work(progress_started.elapsed(), progress.as_ref())
                 {
-                    eprintln!(
-                        "semantic-search: {}",
-                        embedding_progress_text(progress.as_ref().expect("validated progress"))
-                    );
-                    announced = true;
+                    if let Some(message) = crate::inference::embedding_validation_progress_update(
+                        progress.as_ref(),
+                        &mut announced,
+                    ) {
+                        eprintln!("semantic-search: {message}");
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;

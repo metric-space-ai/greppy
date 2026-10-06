@@ -2609,18 +2609,16 @@ fn index_embeddings_into_temp_store_scoped(
         // model weights and must remain observable instead of leaving status
         // frozen at the misleading `loading_model` phase.
         job.finalization_phase("counting_embeddings");
-        let total_documents = greppy_indexer::count_code_embedding_documents_for_scope(
-            store,
-            target,
-            project,
-            &provider,
-            options,
-            index_prefixes,
-        )?;
         let (backend, device) = provider.backend_plan();
         job.device = device;
-        job.embedding_started(&backend, total_documents);
-        let mut progress = |value| job.embedding_progress(value);
+        let mut started = false;
+        let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
+            if !started {
+                job.embedding_started(&backend, value.total_documents, value.reusable_documents);
+                started = true;
+            }
+            job.embedding_progress(value);
+        };
         greppy_indexer::index_code_embeddings_for_scope_with_progress(
             store,
             target,
@@ -2628,7 +2626,7 @@ fn index_embeddings_into_temp_store_scoped(
             &mut provider,
             options,
             greppy_indexer::EmbeddingIndexProgressContext {
-                total_documents,
+                total_documents: 0,
                 callback: &mut progress,
             },
             index_prefixes,

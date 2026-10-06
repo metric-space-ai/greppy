@@ -5095,6 +5095,7 @@ struct BackgroundJobGuard {
     device: Option<String>,
     completed_documents: usize,
     total_documents: usize,
+    reusable_documents: usize,
     local_store_reuse: usize,
     global_cache_hits: usize,
     global_cache_misses: usize,
@@ -5213,6 +5214,7 @@ impl BackgroundJobGuard {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned),
             completed_documents: 0,
+            reusable_documents: 0,
             local_store_reuse: 0,
             global_cache_hits: 0,
             global_cache_misses: 0,
@@ -5263,10 +5265,16 @@ impl BackgroundJobGuard {
         self.write_state("starting", None);
     }
 
-    fn embedding_started(&mut self, backend: &str, total_documents: usize) {
+    fn embedding_started(
+        &mut self,
+        backend: &str,
+        total_documents: usize,
+        reusable_documents: usize,
+    ) {
         self.backend = Some(backend.to_string());
         self.completed_documents = 0;
         self.total_documents = total_documents;
+        self.reusable_documents = reusable_documents;
         self.local_store_reuse = 0;
         self.global_cache_hits = 0;
         self.global_cache_misses = 0;
@@ -5276,7 +5284,10 @@ impl BackgroundJobGuard {
         self.progress_phase = Some("embedding");
         self.rate_milli_documents_per_second = None;
         self.current_detail = None;
-        self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
+        self.eta_seconds = initial_embedding_eta_seconds(
+            total_documents.saturating_sub(reusable_documents),
+            backend,
+        );
         self.eta_basis = match self.eta_seconds {
             Some(0) => Some("completed_embedding_work"),
             Some(_) => Some("backend_prior"),
@@ -5298,6 +5309,7 @@ impl BackgroundJobGuard {
         self.progress_phase = Some(progress.phase);
         self.completed_documents = progress.completed_files;
         self.total_documents = progress.total_files;
+        self.reusable_documents = 0;
         self.local_store_reuse = 0;
         self.global_cache_hits = 0;
         self.global_cache_misses = 0;
@@ -5343,6 +5355,7 @@ impl BackgroundJobGuard {
         self.progress_phase = Some(phase);
         self.completed_documents = 0;
         self.total_documents = 0;
+        self.reusable_documents = 0;
         self.local_store_reuse = 0;
         self.global_cache_hits = 0;
         self.global_cache_misses = 0;
@@ -5369,6 +5382,7 @@ impl BackgroundJobGuard {
     ) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
+        self.reusable_documents = progress.reusable_documents;
         self.local_store_reuse = progress.local_store_reuse;
         self.global_cache_hits = progress.global_cache_hits;
         self.global_cache_misses = progress.global_cache_misses;
@@ -5377,12 +5391,13 @@ impl BackgroundJobGuard {
             let elapsed_ms = u64::try_from(now.saturating_duration_since(started).as_millis())
                 .unwrap_or(u64::MAX)
                 .max(1);
-            // Cache copies are not measurements of GPU inference throughput.
-            // Treat unvisited documents as uncached until their reuse is proven.
+            // Validation proves local reuse before the pass begins. Neither
+            // those copies nor global-cache hits measure GPU throughput.
             let (inferred, inference_workload) = embedding_inference_workload(
-                self.completed_documents,
-                self.total_documents,
-                self.local_store_reuse,
+                self.completed_documents
+                    .saturating_sub(self.local_store_reuse),
+                self.total_documents.saturating_sub(self.reusable_documents),
+                0,
                 self.global_cache_hits,
             );
             let observed = observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms);
@@ -5416,13 +5431,25 @@ impl BackgroundJobGuard {
         let now = unix_now_secs_cli();
         let eta_unix_secs = self.eta_seconds.map(|eta| now.saturating_add(eta));
         let eta_minutes = self.eta_seconds.map(|eta| eta.saturating_add(59) / 60);
-        let progress_milli_percent = if self.total_documents == 0 {
-            0
+        let embedding = self.progress_phase == Some("embedding");
+        let total_spans = if embedding {
+            self.total_documents.saturating_sub(self.reusable_documents)
+        } else {
+            self.total_documents
+        };
+        let completed_spans = if embedding {
+            self.completed_documents
+                .saturating_sub(self.local_store_reuse)
         } else {
             self.completed_documents
-                .min(self.total_documents)
+        };
+        let progress_milli_percent = if total_spans == 0 {
+            0
+        } else {
+            completed_spans
+                .min(total_spans)
                 .saturating_mul(100_000)
-                .checked_div(self.total_documents)
+                .checked_div(total_spans)
                 .unwrap_or(0)
         };
         let progress_unit = match self.progress_phase {
@@ -5454,8 +5481,15 @@ impl BackgroundJobGuard {
             "state": state,
             "backend": self.backend,
             "device": self.device,
-            "completed_spans": self.completed_documents,
-            "total_spans": self.total_documents,
+            "completed_spans": completed_spans,
+            "total_spans": total_spans,
+            "validated_spans": embedding.then_some(self.total_documents),
+            "reusable_spans": embedding.then_some(self.reusable_documents),
+            "work_assessment": match self.progress_phase {
+                Some("embedding") => Some("validated"),
+                Some("counting_embeddings") | None => Some("pending_validation"),
+                _ => None,
+            },
             "local_store_reuse": self.local_store_reuse,
             "global_cache_hits": self.global_cache_hits,
             "global_cache_misses": self.global_cache_misses,
@@ -5581,6 +5615,7 @@ mod background_progress_tests {
             device: None,
             completed_documents: 0,
             total_documents: 0,
+            reusable_documents: 0,
             local_store_reuse: 0,
             global_cache_hits: 0,
             global_cache_misses: 0,
@@ -5817,17 +5852,6 @@ fn unix_now_secs_cli() -> u64 {
         .unwrap_or(0)
 }
 
-fn current_embedding_candidate_count(root: &std::path::Path) -> usize {
-    let project = workspace_locator::project_identity(root);
-    greppy_store::Store::open_with(
-        &workspace_locator::store_path(root),
-        greppy_store::OpenOptions::read_only(),
-    )
-    .ok()
-    .and_then(|store| greppy_indexer::count_embedding_candidate_nodes(&store, &project).ok())
-    .unwrap_or(0)
-}
-
 /// Start at most one detached refresh for a worktree. A spawn lock closes the
 /// cross-process race and the atomically published job record is the public
 /// progress surface used by semantic-search.
@@ -5930,20 +5954,14 @@ fn spawn_background_job_handle_scoped(
         return None;
     };
     let started_at = unix_now_secs_cli();
-    let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
+    let (backend, device) = if let Some(cfg) = embedding_cfg {
         let (backend, device) = embedding_backend_plan(cfg);
-        let total = if prefixes.is_empty() {
-            current_embedding_candidate_count(&root)
-        } else {
-            0
-        };
-        let eta = initial_embedding_eta_seconds(total, &backend);
-        (Some(backend), device, total, eta)
+        (Some(backend), device)
     } else {
-        (None, None, 0, None)
+        (None, None)
     };
-    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
-    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    // The upcoming refresh may replace graph rows while reusing nearly all
+    // vectors. Counts and ETA are unknown until scoped content validation.
     let inherited_workers = std::env::var_os("GREPPY_WORKERS");
     let worker_count = Some(automatic_index_worker_count(inherited_workers.as_deref()));
     // Publish a launch record before spawning. Otherwise a concurrent status
@@ -5963,12 +5981,13 @@ fn spawn_background_job_handle_scoped(
         "backend": backend,
         "device": device,
         "completed_spans": 0,
-        "total_spans": total_spans,
+        "total_spans": serde_json::Value::Null,
+        "work_assessment": "pending_validation",
         "progress_milli_percent": 0,
         "rate_milli_spans_per_second": serde_json::Value::Null,
-        "eta_seconds": eta_seconds,
-        "eta_minutes": eta_minutes,
-        "eta_unix_secs": eta_unix_secs,
+        "eta_seconds": serde_json::Value::Null,
+        "eta_minutes": serde_json::Value::Null,
+        "eta_unix_secs": serde_json::Value::Null,
         "last_error": serde_json::Value::Null,
     });
     if start_background_job_record(&job_path, &value).is_err() {

@@ -129,11 +129,12 @@ use rayon::prelude::*;
 
 pub use embedding::{
     count_code_embedding_documents_for_project, count_code_embedding_documents_for_scope,
-    count_embedding_candidate_nodes, embedding_path_matches, index_code_embeddings_for_project,
-    index_code_embeddings_for_project_with_progress, index_code_embeddings_for_scope_with_progress,
-    CodeEmbeddingProvider, EmbeddingGemmaCodeProvider, EmbeddingIndexOptions,
-    EmbeddingIndexProgress, EmbeddingIndexProgressContext, EmbeddingIndexReport,
-    EmbeddingProviderCacheStats,
+    count_code_embedding_work_for_scope, count_embedding_candidate_nodes, embedding_path_matches,
+    index_code_embeddings_for_project, index_code_embeddings_for_project_with_progress,
+    index_code_embeddings_for_scope_with_progress, CodeEmbeddingProvider,
+    EmbeddingGemmaCodeProvider, EmbeddingIndexOptions, EmbeddingIndexProgress,
+    EmbeddingIndexProgressContext, EmbeddingIndexReport, EmbeddingProviderCacheStats,
+    EmbeddingWorkload,
 };
 
 /// Fraction of the process RAM budget the indexer initialises

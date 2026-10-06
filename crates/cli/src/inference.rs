@@ -140,9 +140,6 @@ pub(crate) fn embedding_progress_value(
     }
 
     let (backend, device) = embedding_backend_plan(cfg);
-    let total_spans = current_embedding_candidate_count(root);
-    let eta_seconds = initial_embedding_eta_seconds(total_spans, &backend);
-    let now = unix_now_secs_cli();
     serde_json::json!({
         "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
         "kind": "embedding",
@@ -152,14 +149,39 @@ pub(crate) fn embedding_progress_value(
         "device": device,
         "graph_generation": graph_generation,
         "completed_spans": 0,
-        "total_spans": total_spans,
+        "total_spans": serde_json::Value::Null,
+        "work_assessment": "pending_validation",
         "progress_milli_percent": 0,
         "rate_milli_spans_per_second": serde_json::Value::Null,
-        "eta_seconds": eta_seconds,
-        "eta_minutes": eta_seconds.map(|eta| eta.saturating_add(59) / 60),
-        "eta_unix_secs": eta_seconds.map(|eta| now.saturating_add(eta)),
+        "eta_seconds": serde_json::Value::Null,
+        "eta_minutes": serde_json::Value::Null,
+        "eta_unix_secs": serde_json::Value::Null,
         "last_error": serde_json::Value::Null,
     })
+}
+
+/// Announce the first assessed workload after the launch/validation status.
+/// This is a phase transition, not a polling log; terminal failures still flow
+/// through the caller's publication observation and error handling.
+pub(crate) fn embedding_validation_progress_update(
+    progress: Option<&serde_json::Value>,
+    announced: &mut bool,
+) -> Option<String> {
+    let progress = progress?;
+    if *announced
+        || progress.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+        || progress
+            .get("last_error")
+            .is_some_and(|error| !error.is_null())
+        || progress
+            .get("work_assessment")
+            .and_then(serde_json::Value::as_str)
+            != Some("validated")
+    {
+        return None;
+    }
+    *announced = true;
+    Some(embedding_progress_text(progress))
 }
 
 pub(crate) fn embedding_progress_text(progress: &serde_json::Value) -> String {
@@ -167,6 +189,16 @@ pub(crate) fn embedding_progress_text(progress: &serde_json::Value) -> String {
         .get("backend")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    if progress
+        .get("work_assessment")
+        .and_then(serde_json::Value::as_str)
+        == Some("pending_validation")
+        || progress.get("state").and_then(serde_json::Value::as_str) == Some("counting_embeddings")
+    {
+        return format!(
+            "semantic index building — validating spans, pending work and ETA measuring (backend {backend})"
+        );
+    }
     let completed = progress
         .get("completed_spans")
         .and_then(serde_json::Value::as_u64)
