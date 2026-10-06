@@ -38,10 +38,12 @@ fn prompt_export_matches_embedded_bytes_without_preparing_a_workspace() {
         let expected = greppy_agent::prompt_metadata(external);
         assert_eq!(actual, expected);
         assert_eq!(actual["version"], env!("CARGO_PKG_VERSION"));
-        assert!(actual["prompt"]
-            .as_str()
-            .unwrap()
-            .starts_with(&format!("greppy {}\n\n", env!("CARGO_PKG_VERSION"))));
+        let prefix = if external {
+            format!("greppy {}\n\n", env!("CARGO_PKG_VERSION"))
+        } else {
+            "You are greppy, a coding agent.".to_owned()
+        };
+        assert!(actual["prompt"].as_str().unwrap().starts_with(&prefix));
         let plain_args: &[&str] = if external {
             &["prompt", "--external"]
         } else {
@@ -60,6 +62,13 @@ fn prompt_export_matches_embedded_bytes_without_preparing_a_workspace() {
             "unchanged store sentinel"
         );
         assert!(!scratch.path().join(".greppy").exists());
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+    }
+    for mode in ["one-shot", "interactive", "serve", "acp", "external"] {
+        let actual: serde_json::Value =
+            serde_json::from_str(&run(&["prompt", "--mode", mode, "--json"])).unwrap();
+        assert_eq!(actual, greppy_agent::prompt_metadata_for_mode(mode));
+        assert_eq!(actual["mode"], mode);
         assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
     }
 }

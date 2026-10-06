@@ -56,7 +56,8 @@ fn main() {
     let prompt_root =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .join("../..");
-    prompt_contract::verify_repository(&prompt_root).unwrap_or_else(|e| panic!("{e}"));
+    let prompt_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    prompt_contract::write_snapshots(&prompt_root, &prompt_out).unwrap_or_else(|e| panic!("{e}"));
     let profile = std::env::var("PROFILE").expect("PROFILE");
     let debug_info = std::env::var("DEBUG").as_deref() == Ok("true");
     println!("cargo:rustc-check-cfg=cfg(greppy_debug_profile)");

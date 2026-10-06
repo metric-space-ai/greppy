@@ -1,6 +1,8 @@
 //! Owner signatures shared by both prompt guards and both product builds.
 use sha2::{Digest, Sha256};
 use std::path::Path;
+#[path = "render.rs"]
+pub mod render;
 
 // Owner-approved prompt of record: AGENTS.md @
 // e32618057b887254b2cd6aada91e128dbb3a220d. Approval dated 2026-09-30,
@@ -25,9 +27,22 @@ pub const APPROVED_SHA256: &str =
     "5455a7ba675d47f5adb5d5868b767054227e6fa152cefff021386d5af2de9440";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
-// The new argv adapter is approved by the same 2026-10-05 "ja" above.
+// 2026-10-06 consolidated owner order A: exact coding-agent introduction,
+// task workflow and three mode lines, supplied verbatim in this parent thread.
+// External v3 remains unchanged. The renderer performs only the explicitly
+// ordered exclusions; ACP makes no isolation/proposal promise pending a decision.
 pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
-    "4f9ced0d5090909add2734f695a22ad8539e038090046e0b66c46d02016673ba";
+    "d86ef405b0fb74c3373e08a5c43e40bf823140819fdde607cd58ccab9d91d4f5";
+
+pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
+    use render::BuiltinPromptMode::*;
+    match mode {
+        OneShot => "cb105cd2df84a344ed35d69f52956ba2a7116c52f9ccd2ff57231225b42f6985",
+        Interactive => "e728aa713a61d911652f4662fe8133d324fe480feef7d42a85e95a9cf311c730",
+        Serve => "366b2124c0c6cb59a264fa7e901a65dc81c0113f7bc15d8f25054066486f3e9a",
+        Acp => "51baa5de52bb2e0e1c3fc1c89667f04ce1bda2886f194ea07b07709b20d1ec95",
+    }
+}
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -62,7 +77,32 @@ pub fn verify_repository(root: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
         "cargo:rerun-if-changed={}",
         root.join("assets/prompts/contract.rs").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("assets/prompts/render.rs").display()
+    );
+    let public_text = std::str::from_utf8(&public).map_err(|e| format!("prompt UTF-8: {e}"))?;
+    let adapter_text = std::str::from_utf8(&adapter).map_err(|e| format!("adapter UTF-8: {e}"))?;
+    for mode in render::BUILTIN_MODES {
+        let text = render::render_builtin(public_text, adapter_text, mode);
+        verify_bytes(mode.name(), text.as_bytes(), approved_rendered_sha256(mode))?;
+    }
     Ok((public, adapter))
+}
+
+/// Both builds validate the entire effective rendering, not only its inputs.
+/// The agent embeds snapshots from the same verified byte buffers.
+pub fn write_snapshots(root: &Path, out: &Path) -> Result<(), String> {
+    let (public, adapter) = verify_repository(root)?;
+    let public_text = std::str::from_utf8(&public).map_err(|e| e.to_string())?;
+    let adapter_text = std::str::from_utf8(&adapter).map_err(|e| e.to_string())?;
+    for mode in render::BUILTIN_MODES {
+        let text = render::render_builtin(public_text, adapter_text, mode);
+        std::fs::write(out.join(mode.file_name()), text).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(out.join("canonical-prompt.md"), public).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("agent-adapter.md"), adapter).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]

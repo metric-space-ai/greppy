@@ -81,6 +81,9 @@ pub enum Command {
         /// Export the shared contract without the built-in argv-tool adapter.
         #[arg(long)]
         external: bool,
+        /// Select the exact prompt used by this agent interface.
+        #[arg(long, conflicts_with = "external", value_parser = ["one-shot", "interactive", "serve", "acp", "external"])]
+        mode: Option<String>,
         /// Emit metadata and the exact prompt in the JSON `prompt` field.
         /// Plain output adds a diagnostic hash line before the prompt.
         #[arg(long)]

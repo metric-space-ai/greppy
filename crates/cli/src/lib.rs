@@ -2427,8 +2427,9 @@ fn dispatch_subcommand(
                 }
             }
         }
-        Command::Prompt { external, json } => {
-            let metadata = greppy_agent::prompt_metadata(external);
+        Command::Prompt { external, mode, json } => {
+            let mode = mode.as_deref().unwrap_or(if external { "external" } else { "one-shot" });
+            let metadata = greppy_agent::prompt_metadata_for_mode(mode);
             if json {
                 println!(
                     "{}",

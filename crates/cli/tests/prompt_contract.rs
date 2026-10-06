@@ -754,14 +754,18 @@ fn delimited_browser_block(text: &str) -> Option<&str> {
 }
 
 #[test]
-fn public_and_builtin_browser_prompts_are_byte_identical() {
+fn builtin_browser_prompt_removes_only_unavailable_stdin_features() {
     let public = prompt();
     let beta = beta_web_prompt().expect("canonical browser prompt must ship");
-    assert_eq!(
-        delimited_browser_block(&public),
-        delimited_browser_block(&beta),
-        "public and built-in prompts must expose one canonical browser contract"
-    );
+    let expected = delimited_browser_block(&public)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("  greppy web match "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(" or --value-stdin", "");
+    assert_eq!(Some(expected.as_str()), delimited_browser_block(&beta),
+        "built-in browser must derive from the signed contract with only the owner-ordered stdin exclusions");
 }
 
 #[test]
