@@ -323,18 +323,15 @@ pub fn count_code_embedding_work_for_scope(
             work.total_documents = work.total_documents.saturating_add(chunks.len());
             for chunk in chunks {
                 let content_sha256 = sha256_hex(chunk.text.as_bytes());
-                if store
-                    .find_reusable_vector_embedding(&ReusableVectorEmbeddingKey {
-                        project,
-                        model_id: provider.model_id(),
-                        prompt_version: provider.prompt_version(),
-                        task: provider.task_profile(),
-                        qualified_name: &node.qualified_name,
-                        chunk_idx: chunk.chunk_idx,
-                        content_sha256: &content_sha256,
-                    })?
-                    .is_some()
-                {
+                if store.has_reusable_vector_embedding(&ReusableVectorEmbeddingKey {
+                    project,
+                    model_id: provider.model_id(),
+                    prompt_version: provider.prompt_version(),
+                    task: provider.task_profile(),
+                    qualified_name: &node.qualified_name,
+                    chunk_idx: chunk.chunk_idx,
+                    content_sha256: &content_sha256,
+                })? {
                     work.reusable_documents += 1;
                 }
             }

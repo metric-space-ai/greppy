@@ -1172,6 +1172,54 @@ fn embedding_progress_before_validation_does_not_estimate_whole_graph_work() {
 }
 
 #[test]
+fn semantic_wait_announces_assessed_work_once_after_validation() {
+    let mut announced = false;
+    let validating = serde_json::json!({
+        "backend": "cuda",
+        "work_assessment": "pending_validation",
+        "total_spans": serde_json::Value::Null,
+        "eta_seconds": serde_json::Value::Null,
+    });
+    assert!(crate::inference::embedding_validation_progress_update(None, &mut announced).is_none());
+    assert!(crate::inference::embedding_validation_progress_update(
+        Some(&validating),
+        &mut announced,
+    )
+    .is_none());
+    assert!(!announced);
+    let assessed = serde_json::json!({
+        "backend": "cuda",
+        "work_assessment": "validated",
+        "validated_spans": 197,
+        "reusable_spans": 196,
+        "completed_spans": 0,
+        "total_spans": 1,
+        "eta_seconds": 1,
+    });
+    assert_eq!(
+        crate::inference::embedding_validation_progress_update(Some(&assessed), &mut announced,)
+            .as_deref(),
+        Some("semantic index building — 0/1 spans, ETA ~1s (backend cuda)")
+    );
+    assert!(announced);
+    let mut failed = assessed.clone();
+    failed["state"] = serde_json::json!("failed");
+    failed["last_error"] = serde_json::json!("GPU inference stopped");
+    let mut failure_announced = false;
+    assert!(crate::inference::embedding_validation_progress_update(
+        Some(&failed),
+        &mut failure_announced,
+    )
+    .is_none());
+    assert!(!failure_announced);
+    assert!(crate::inference::embedding_validation_progress_update(
+        Some(&assessed),
+        &mut announced,
+    )
+    .is_none());
+}
+
+#[test]
 fn warm_refresh_job_counts_only_uncached_work_after_validation() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);

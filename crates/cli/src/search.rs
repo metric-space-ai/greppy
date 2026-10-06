@@ -1707,6 +1707,7 @@ fn wait_for_embedding_publication(
     prefixes: &[String],
 ) -> Result<greppy_store::Store> {
     let mut announced = false;
+    let mut announced_workload = false;
     crate::context_status::restricted(
         effective_root,
         requested_generation,
@@ -1746,6 +1747,10 @@ fn wait_for_embedding_publication(
                 embedding_progress_value(effective_root, cfg, requested_generation)
             });
             eprintln!("semantic-search: {}", embedding_progress_text(&progress));
+            announced_workload = progress
+                .get("work_assessment")
+                .and_then(serde_json::Value::as_str)
+                == Some("validated");
             announced = true;
         }
         loop {
@@ -1758,9 +1763,16 @@ fn wait_for_embedding_publication(
                     error,
                 )
             })?;
+            let progress = read_background_job(launch.path());
+            if let Some(message) = crate::inference::embedding_validation_progress_update(
+                progress.as_ref(),
+                &mut announced_workload,
+            ) {
+                eprintln!("semantic-search: {message}");
+            }
             if matches!(
                 observe_background_embedding(
-                    read_background_job(launch.path()).as_ref(),
+                    progress.as_ref(),
                     owner_active,
                     false,
                     follow_attached_owner,

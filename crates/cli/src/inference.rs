@@ -160,6 +160,30 @@ pub(crate) fn embedding_progress_value(
     })
 }
 
+/// Announce the first assessed workload after the launch/validation status.
+/// This is a phase transition, not a polling log; terminal failures still flow
+/// through the caller's publication observation and error handling.
+pub(crate) fn embedding_validation_progress_update(
+    progress: Option<&serde_json::Value>,
+    announced: &mut bool,
+) -> Option<String> {
+    let progress = progress?;
+    if *announced
+        || progress.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+        || progress
+            .get("last_error")
+            .is_some_and(|error| !error.is_null())
+        || progress
+            .get("work_assessment")
+            .and_then(serde_json::Value::as_str)
+            != Some("validated")
+    {
+        return None;
+    }
+    *announced = true;
+    Some(embedding_progress_text(progress))
+}
+
 pub(crate) fn embedding_progress_text(progress: &serde_json::Value) -> String {
     let backend = progress
         .get("backend")
