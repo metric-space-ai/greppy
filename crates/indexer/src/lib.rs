@@ -2845,6 +2845,24 @@ pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
         .map_err(sqlite_err)
 }
 
+/// Fresh indexing and recovery must use the same validated extraction. Grammar
+/// recovery can emit an invalid anonymous record among valid definitions; the
+/// provider contract already filters that record at first use. Reject only an
+/// extraction that still violates the contract, not a successfully cured one.
+fn validated_js_ts_repair_extraction(
+    language: Language,
+    relative: &str,
+    extraction: greppy_parser::ExtractionResult,
+) -> Result<greppy_parser::ExtractionResult> {
+    let (validated, dropped, error) = validate_or_degrade(language, relative, extraction);
+    if let Some(error) = error {
+        return Err(greppy_core::Error::Invalid(format!(
+            "JS/TS usage repair extraction incomplete for {relative}: {error} ({dropped} invalid records removed)"
+        )));
+    }
+    Ok(validated)
+}
+
 /// One-shot source-validated usage recovery, separately partitioned from Rust.
 /// Validate all visible source and definition identities before atomic publication.
 pub fn recover_persisted_js_ts_usages(
@@ -2914,13 +2932,7 @@ pub fn recover_persisted_js_ts_usages(
         }
         let language = greppy_parser::language_for_path(relative);
         let extraction = parser_extract(language, &bytes, &state.rel_path)?;
-        let (extraction, dropped, error) =
-            validate_or_degrade(language, &state.rel_path, extraction);
-        if dropped != 0 || error.is_some() {
-            return Err(greppy_core::Error::Invalid(
-                "JS/TS usage repair extraction incomplete".into(),
-            ));
-        }
+        let extraction = validated_js_ts_repair_extraction(language, &state.rel_path, extraction)?;
         // Persistence upserts in extraction order by (project, qualified_name).
         // Object-literal methods can share a qualified name: validate the final
         // stored definition, rather than rejecting the overwritten earlier span.
@@ -14325,6 +14337,56 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             [],
         ).unwrap();
         assert!(!rust_caller_edges_repaired(&store).unwrap());
+    }
+
+    #[test]
+    fn js_ts_usage_recovery_accepts_validated_degraded_records() {
+        for (language, file) in [
+            (Language::JavaScript, "fixture.js"),
+            (Language::TypeScript { tsx: false }, "fixture.ts"),
+        ] {
+            let source = b"function target() { return 1; }\nfunction valid() { return target(); }\n";
+            let original = parser_extract(language, source, file).unwrap();
+            let mut poisoned = original.clone();
+            poisoned.nodes.push(ExtractedNode {
+                label: "Function".into(),
+                name: String::new(),
+                qualified_name: String::new(),
+                file_path: file.into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::Value::Null,
+            });
+            let validated = validated_js_ts_repair_extraction(language, file, poisoned).unwrap();
+            assert_eq!(format!("{:?}", validated.nodes), format!("{:?}", original.nodes));
+            assert_eq!(format!("{:?}", validated.edges), format!("{:?}", original.edges));
+            assert!(validated.edges.iter().any(|e| e.edge_type == "CALLS"));
+        }
+    }
+
+    #[test]
+    fn js_ts_usage_recovery_indexes_malformed_fixture_without_losing_valid_calls() {
+        let repo = tempfile::tempdir().unwrap();
+        let file = "fixture.ts";
+        let language = Language::TypeScript { tsx: false };
+        let source = "function () {}\nfunction target() { return 1; }\nfunction valid() { return target(); }\n";
+        let extraction = parser_extract(language, source.as_bytes(), file).unwrap();
+        let (_, dropped, error) = validate_or_degrade(language, file, extraction);
+        assert!(dropped > 0, "pin a real grammar-recovery record, not only a mocked extraction");
+        assert!(error.is_none());
+        fs::write(repo.path().join(file), source).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        let target = store.get_node_by_qname("test", "fixture.ts::Function::target").unwrap().unwrap();
+        assert_eq!(store.incoming_edges(target.id, Some("CALLS"), 10).unwrap().len(), 1);
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        store.conn().execute_batch("DELETE FROM main.raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM main.edges WHERE edge_type IN ('USAGE','CALLS');").unwrap();
+        store.conn().execute("DELETE FROM main.schema_meta WHERE key=?1", [JS_TS_USAGE_REPAIR_KEY]).unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert_eq!(store.incoming_edges(target.id, Some("CALLS"), 10).unwrap().len(), 1);
+        assert_eq!(nodes, format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap()));
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
     }
 
     /// ClickHouse regression: one anonymous node from grammar error-recovery
