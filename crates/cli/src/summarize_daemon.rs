@@ -521,8 +521,8 @@ mod tests {
     impl SharedSummaryServer {
         fn new(replies: Vec<serde_json::Value>) -> Self {
             use std::io::{BufRead, Write};
-            use std::sync::Arc;
             use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+            use std::sync::Arc;
             static NONCE: AtomicU64 = AtomicU64::new(0);
             let key = format!(
                 "summary-queue-test-{}-{}",
@@ -666,17 +666,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = greppy_store::SummaryCache::open(root.path()).unwrap();
         let cfg = server.config(root.path());
-        assert!(
-            crate::summarize_source_cached(
-                &cfg,
-                &server.key,
-                (Some(&cache), None, None),
-                "limits.py",
-                "def clamp(v): return min(v, 10)",
-                false
-            )
-            .is_none()
-        );
+        assert!(crate::summarize_source_cached(
+            &cfg,
+            &server.key,
+            (Some(&cache), None, None),
+            "limits.py",
+            "def clamp(v): return min(v, 10)",
+            false
+        )
+        .is_none());
         assert_eq!(server.request_count(), 1);
         assert_eq!(cache.count().unwrap(), 0);
         assert!(!cfg.gguf.exists());

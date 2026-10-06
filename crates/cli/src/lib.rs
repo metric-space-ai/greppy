@@ -68,7 +68,7 @@ mod cli_surface;
 mod web;
 mod web_attach;
 pub use cli_surface::*;
-pub use web::{NavCommand, ResultsCommand, SessionsCommand, WebCommand, web_runtime_socket};
+pub use web::{web_runtime_socket, NavCommand, ResultsCommand, SessionsCommand, WebCommand};
 pub use web_attach::{generate_attach_token, give_child_attach_token};
 mod nav;
 use nav::*;
@@ -2261,8 +2261,8 @@ fn agent_workspace_status(
 mod optional_workspace_status_tests {
     use super::*;
     use greppy_workspace_core::{
-        AdapterKind, PROVIDER_PROTOCOL_VERSION, ProviderCapabilities, ProviderManifest,
-        ProviderState,
+        AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
+        PROVIDER_PROTOCOL_VERSION,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4770,86 +4770,82 @@ fn start_background_demand_monitor(
     let monitor_path = job_path.clone();
     let spawned = std::thread::Builder::new()
         .name("greppy-query-demand".into())
-        .spawn(move || {
-            loop {
-                match greppy_core::cache::acquire_named_lock(
-                    &lock_name,
-                    greppy_core::cache::LockMode::Exclusive,
-                    true,
-                ) {
-                    Ok(Some(_exclusive)) => {
-                        let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
-                        if *terminal {
-                            return;
-                        }
-                        let job = read_background_job(&job_path);
-                        if !background_demand_may_cancel(
-                            job.as_ref(),
-                            *terminal,
-                            expected_pid,
-                            expected_generation,
-                        ) {
-                            return;
-                        }
-                        if delegated_base_owner_starting() {
-                            drop(terminal);
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        if cancel_delegated_base_owner(true) {
-                            if let Some(mut job) = job {
-                                job["state"] = serde_json::json!("cancelled");
-                                job["updated_at_unix_secs"] =
-                                    serde_json::json!(unix_now_secs_cli());
-                                job["last_error"] = serde_json::json!(
-                                    "automatic index stopped after its last query waiter exited"
-                                );
-                                let _ = write_background_job(&job_path, &job);
-                            }
-                            return;
-                        }
-                        finish_background_demand_monitor(
-                            &job_path,
-                            "cancelled",
-                            "automatic index stopped after its last query waiter exited",
-                            130,
-                        );
+        .spawn(move || loop {
+            match greppy_core::cache::acquire_named_lock(
+                &lock_name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            ) {
+                Ok(Some(_exclusive)) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
                     }
-                    Ok(None) => {
-                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
                     }
-                    Err(error) => {
-                        let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
-                        if *terminal {
-                            return;
-                        }
-                        let job = read_background_job(&job_path);
-                        if !background_demand_may_cancel(
-                            job.as_ref(),
-                            *terminal,
-                            expected_pid,
-                            expected_generation,
-                        ) {
-                            return;
-                        }
-                        if delegated_base_owner_starting() {
-                            drop(terminal);
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        let message = format!("automatic index demand monitor failed: {error}");
-                        if cancel_delegated_base_owner(false) {
-                            if let Some(mut job) = job {
-                                job["state"] = serde_json::json!("failed");
-                                job["updated_at_unix_secs"] =
-                                    serde_json::json!(unix_now_secs_cli());
-                                job["last_error"] = serde_json::json!(message.clone());
-                                let _ = write_background_job(&job_path, &job);
-                            }
-                            return;
-                        }
-                        finish_background_demand_monitor(&job_path, "failed", &message, 70);
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
                     }
+                    if cancel_delegated_base_owner(true) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("cancelled");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(
+                                "automatic index stopped after its last query waiter exited"
+                            );
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(
+                        &job_path,
+                        "cancelled",
+                        "automatic index stopped after its last query waiter exited",
+                        130,
+                    );
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    let message = format!("automatic index demand monitor failed: {error}");
+                    if cancel_delegated_base_owner(false) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("failed");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(message.clone());
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(&job_path, "failed", &message, 70);
                 }
             }
         });
@@ -5063,7 +5059,7 @@ fn replace_background_job_file(
 ) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     let source = source
@@ -8021,12 +8017,10 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                 value["unresolved_receivers"] = serde_json::json!(unresolved_json);
             }
             value["callers_incomplete"] = serde_json::json!(true);
-            value["unresolved_omitted"] = serde_json::json!(
-                unresolved_by_target
-                    .iter()
-                    .map(|page| page.omitted)
-                    .sum::<usize>()
-            );
+            value["unresolved_omitted"] = serde_json::json!(unresolved_by_target
+                .iter()
+                .map(|page| page.omitted)
+                .sum::<usize>());
             value["unresolved_truncated"] =
                 serde_json::json!(unresolved_by_target.iter().any(|page| page.truncated));
         }
@@ -9048,12 +9042,11 @@ impl QueryPathFilters {
     }
 
     fn json_value(&self) -> serde_json::Value {
-        serde_json::json!(
-            self.filters
-                .iter()
-                .map(|filter| filter.shown.as_str())
-                .collect::<Vec<_>>()
-        )
+        serde_json::json!(self
+            .filters
+            .iter()
+            .map(|filter| filter.shown.as_str())
+            .collect::<Vec<_>>())
     }
 
     fn repo_prefixes(&self) -> Vec<String> {
@@ -9449,15 +9442,13 @@ mod debug_repo_model_asset_guards {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("bogus.bin");
         std::fs::write(&src, b"not a model").unwrap();
-        assert!(
-            super::extract_repo_model_asset(
-                std::path::Path::new("debug-asset-mismatch"),
-                "0000000000000000000000000000000000000000000000000000000000000000",
-                "asset.bin",
-                src.to_str().unwrap(),
-            )
-            .is_none()
-        );
+        assert!(super::extract_repo_model_asset(
+            std::path::Path::new("debug-asset-mismatch"),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "asset.bin",
+            src.to_str().unwrap(),
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -816,8 +816,8 @@ impl OwnedProcThreadAttributeList {
     fn new(handles: &mut [windows_sys::Win32::Foundation::HANDLE]) -> std::io::Result<Self> {
         use std::ptr::{null, null_mut};
         use windows_sys::Win32::System::Threading::{
-            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            UpdateProcThreadAttribute,
+            InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         };
 
         let mut bytes = 0usize;
@@ -1980,7 +1980,7 @@ impl TransportStream {
             CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
         };
         use windows_sys::Win32::System::Pipes::{
-            PIPE_NOWAIT, PIPE_READMODE_BYTE, SetNamedPipeHandleState, WaitNamedPipeW,
+            SetNamedPipeHandleState, WaitNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE,
         };
 
         let deadline = Instant::now() + timeout;
@@ -2110,7 +2110,7 @@ impl TransportListener {
 #[cfg(windows)]
 fn create_named_pipe(endpoint: &str) -> std::io::Result<std::fs::File> {
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{LocalFree, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
@@ -2946,12 +2946,10 @@ mod tests {
         .unwrap();
         std::fs::write(endpoint.address(), b"stale").unwrap();
         let listener = TransportListener::bind(&endpoint).unwrap();
-        assert!(
-            std::fs::symlink_metadata(endpoint.address())
-                .unwrap()
-                .file_type()
-                .is_socket()
-        );
+        assert!(std::fs::symlink_metadata(endpoint.address())
+            .unwrap()
+            .file_type()
+            .is_socket());
         drop(listener);
         std::fs::remove_file(endpoint.address()).unwrap();
     }
@@ -2964,30 +2962,27 @@ mod tests {
         )
         .unwrap();
         let listener = TransportListener::bind(&endpoint).unwrap();
-        let server = std::thread::spawn(move || {
-            loop {
-                match listener.accept() {
-                    Ok(mut stream) => {
-                        let request =
-                            read_frame(&mut stream, 4096, Duration::from_secs(2)).unwrap();
-                        let value: serde_json::Value = serde_json::from_str(&request).unwrap();
-                        assert_eq!(
-                            value.get("protocol").and_then(serde_json::Value::as_u64),
-                            Some(u64::from(PROTOCOL_VERSION))
-                        );
-                        write_frame(
-                            &mut stream,
-                            b"{\"state\":\"ready\"}\n",
-                            Duration::from_secs(2),
-                        )
-                        .unwrap();
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("transport accept failed: {error}"),
+        let server = std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok(mut stream) => {
+                    let request = read_frame(&mut stream, 4096, Duration::from_secs(2)).unwrap();
+                    let value: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    assert_eq!(
+                        value.get("protocol").and_then(serde_json::Value::as_u64),
+                        Some(u64::from(PROTOCOL_VERSION))
+                    );
+                    write_frame(
+                        &mut stream,
+                        b"{\"state\":\"ready\"}\n",
+                        Duration::from_secs(2),
+                    )
+                    .unwrap();
+                    break;
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("transport accept failed: {error}"),
             }
         });
         let response = request(
