@@ -317,6 +317,11 @@ fn checkpoint_message(message: &Message) -> serde_json::Value {
     json!({"role": match message.role { Role::User=>"user", Role::Assistant=>"assistant" }, "content": content})
 }
 
+/// Whether [`compact_with_model`] would attempt a checkpoint for this window.
+pub(crate) fn compaction_due(messages: &[Message], max_bytes: usize) -> bool {
+    checkpoint_plan(messages, max_bytes).is_some()
+}
+
 fn checkpoint_plan(
     messages: &[Message],
     max_bytes: usize,

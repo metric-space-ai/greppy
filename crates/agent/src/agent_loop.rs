@@ -158,8 +158,11 @@ pub enum LoopStop {
 /// Successful loop outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopResult {
-    /// Full conversation history (user prompt + every assistant/tool-result
-    /// message produced during the run).
+    /// Active conversation window to continue from: the user prompt and every
+    /// assistant/tool-result message since the last context compaction. After
+    /// a compaction this is *not* the full history; earlier messages live in
+    /// the archive of [`LoopEvent::ContextCompacted`] and are summarized in
+    /// [`LoopResult::context_summary`].
     pub messages: Vec<Message>,
     /// Continuation checkpoint kept separately from the signed mode contract.
     pub context_summary: Option<String>,
@@ -325,30 +328,35 @@ pub fn run_agent_loop_with_history(
             break;
         }
 
-        let template = ModelRequest {
-            model: config.model.clone(),
-            system: system.clone(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: ToolChoice::None,
-            max_tokens: config.max_tokens,
-        };
-        let archive = messages.clone();
-        if let Some(usage) = crate::context::compact_with_model(
-            model,
-            &mut messages,
-            &mut system,
-            &template,
-            256 * 1024,
-        )? {
-            total_usage = sum_usage(total_usage, usage);
-            on_event(LoopEvent::ContextCompacted {
-                archive,
-                messages: messages.clone(),
-                summary: crate::context::saved_summary(system.as_deref())
-                    .unwrap()
-                    .to_owned(),
-            });
+        // Snapshot the pre-compaction window only when a checkpoint is due,
+        // not on every turn.
+        const COMPACTION_BYTES: usize = 256 * 1024;
+        if crate::context::compaction_due(&messages, COMPACTION_BYTES) {
+            let template = ModelRequest {
+                model: config.model.clone(),
+                system: system.clone(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: ToolChoice::None,
+                max_tokens: config.max_tokens,
+            };
+            let archive = messages.clone();
+            if let Some(usage) = crate::context::compact_with_model(
+                model,
+                &mut messages,
+                &mut system,
+                &template,
+                COMPACTION_BYTES,
+            )? {
+                total_usage = sum_usage(total_usage, usage);
+                on_event(LoopEvent::ContextCompacted {
+                    archive,
+                    messages: messages.clone(),
+                    summary: crate::context::saved_summary(system.as_deref())
+                        .unwrap()
+                        .to_owned(),
+                });
+            }
         }
         if cancel_requested(config) {
             last_stop = LoopStop::Cancelled;

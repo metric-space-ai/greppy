@@ -87,7 +87,8 @@ Flags:
                       and persist this through /setup)
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
-  --max-turns N       Optional cap on assistant turns (unlimited by default)
+  --max-turns N       Optional cap on action turns, followed by one tool-free
+                      report turn (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
                       the loop stops between turns only — a running command is
                       never cut in half
@@ -1687,6 +1688,7 @@ fn run_headless_session(
     let mut tool_line_open = false;
     let mut prompt_turns = 0u64;
     let mut tool_started = std::collections::HashMap::<String, Instant>::new();
+    let mut checkpoint_error: Option<String> = None;
     let result = run_agent_loop_with_history(client, env, config, &history, task, &mut |event| {
         if matches!(event, LoopEvent::TurnComplete { .. }) {
             prompt_turns = prompt_turns.saturating_add(1);
@@ -1697,15 +1699,20 @@ fn run_headless_session(
                 messages,
                 summary,
             } => {
-                persist_session(
-                    &mut stderr,
-                    store.append_context_checkpoint(
-                        &record.id,
-                        &messages_from_protocol(archive),
-                        &messages_from_protocol(messages),
-                        Some(summary),
-                    ),
-                );
+                // The compacted window replaces the in-memory history; without a
+                // durable checkpoint a resume would continue from fiction. Stop at
+                // the next safe boundary and fail the run instead of logging on.
+                if let Err(error) = store.append_context_checkpoint(
+                    &record.id,
+                    &messages_from_protocol(archive),
+                    &messages_from_protocol(messages),
+                    Some(summary),
+                ) {
+                    if let Some(flag) = config.cancel.as_ref() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    checkpoint_error.get_or_insert(error.to_string());
+                }
             }
             LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
                 if let Some(emitter) = json.as_mut() {
@@ -1765,6 +1772,15 @@ fn run_headless_session(
             json_mode,
         );
     });
+
+    if let Some(error) = checkpoint_error {
+        if tool_line_open {
+            let _ = writeln!(stderr);
+        }
+        let message = format!("context checkpoint save failed: {error}");
+        persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+        return Err(message);
+    }
 
     match result {
         Ok(result) => {
@@ -2004,6 +2020,13 @@ pub(crate) fn spawn_session_worker(
                     }
                     SessionCommand::Resume(next_session_id) => {
                         match store_for_worker.load(&next_session_id) {
+                            // The TUI refuses this too; never load a history
+                            // whose saved proposal is absent from this workspace.
+                            Ok(next) if next.id != session_id && !next.proposal_ref.is_empty() => {
+                                worker_bridge.send_discrete(SessionEvent::Error(format!(
+                                    "cannot resume session {next_session_id} live: its proposal is not in this workspace"
+                                )));
+                            }
                             Ok(next) => {
                                 history = protocol_from_persisted(&next.messages);
                                 config.context_summary = next.context_summary;

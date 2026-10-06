@@ -575,7 +575,7 @@ fn greppy_e_dash_p_is_not_intercepted_as_agent() {
 
 #[test]
 fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
-    // Neither run reaches a model turn; both must retain a usable result.
+    // Both limit stops must still deliver a usable result.
     for (limit_args, expected_stop) in [
         (
             vec!["--max-turns", "4", "--deadline-secs", "0"],
@@ -634,10 +634,12 @@ fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
         assert_eq!(result["status"], "incomplete");
         assert_eq!(result["exit_code"], 5);
         assert_eq!(result["stop"], expected_stop);
+        // `turns` counts model turns: the one action turn plus the tool-free
+        // report turn that always follows the action-turn cap.
         assert_eq!(
             result["turns"],
             if expected_stop == "turn limit reached" {
-                1
+                2
             } else {
                 0
             }
@@ -706,7 +708,8 @@ fn greppy_p_incomplete_proposal_is_not_applied_and_cleans_worktree() {
         .expect("incomplete proposal result");
     assert_eq!(result["status"], "incomplete");
     assert_eq!(result["stop"], "turn limit reached");
-    assert_eq!(result["turns"], 1);
+    // One action turn plus the tool-free report turn after the cap.
+    assert_eq!(result["turns"], 2);
     assert_eq!(result["applied"], false);
     let proposal = result["proposal_ref"].as_str().unwrap_or_else(|| {
         panic!("partial proposal must remain inspectable; stdout={stdout}\nstderr={stderr}")
