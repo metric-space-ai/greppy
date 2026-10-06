@@ -1284,9 +1284,13 @@ fn read_render_smart_source(
             } else if node
                 .parent()
                 .is_some_and(|parent| parent.start_position().row == node.start_position().row)
+                || node.prev_sibling().is_some_and(|header| {
+                    header.end_position().row == node.start_position().row
+                })
             {
-                // Python permits `def f(self): return 1`; hiding that line
-                // would also hide the signature. Keep it verbatim.
+                // Python permits an inline suite on the final header line,
+                // including a multiline signature. Preserve that header/suite
+                // instead of hiding any part of the signature.
                 start = end.saturating_add(1);
             }
             if start > end {

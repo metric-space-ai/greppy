@@ -1146,6 +1146,18 @@ fn read_smart_class_depth_two_keeps_outer_method_body() {
 }
 
 #[test]
+fn read_smart_python_multiline_signature_with_inline_suite_stays_exact() {
+    let (repo, store) = fresh_workspace("smart-python-inline-multiline");
+    let source = "class Counter:\n    def count(\n        self, value: int\n    ) -> int: return value\n\n    def branch(\n        self, value: int\n    ) -> int: return value if value > 0 else 0\n";
+    std::fs::write(repo.join("counter.py"), source).unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(compact.ends_with(source), "{compact}");
+    assert!(!compact.contains("greppy expand "), "{compact}");
+}
+
+#[test]
 fn read_smart_applies_path_filters_before_ambiguity_resolution() {
     let (repo, store) = fresh_workspace("smart-path");
     std::fs::create_dir_all(repo.join("a")).unwrap();
