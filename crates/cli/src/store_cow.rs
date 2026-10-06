@@ -1856,24 +1856,25 @@ pub(crate) fn try_reuse_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
 ) -> Result<Option<PreparedBase>> {
-    if !workspace
-        .baseline_is_clean()
-        .map_err(|error| Error::Invalid(error.to_string()))?
-    {
-        return Ok(None);
-    }
     let identity = base_identity(workspace)?;
     let layout = BaseStoreLayout::new(shared_data_root, &identity)
         .map_err(|error| Error::io("construct Base Store layout", error))?;
     let Ok(manifest) = layout.read_verified_manifest() else {
         return Ok(None);
     };
-    if validate_base_contents(workspace.worktree_path(), &layout.graph, &identity).is_err()
-        || validate_base_summary_cache(
-            workspace.worktree_path(),
-            &layout.graph,
-            &layout.summary_cache,
-            &identity,
+    // Validate the authenticated immutable publication, never live dirty source.
+    // The current visible baseline and restored edits belong to private Delta.
+    if validate_base_contents_for_project(
+        &greppy_core::project_identity(workspace.repo_root()),
+        &layout.graph,
+        &identity,
+    )
+    .is_err()
+        || greppy_store::SummaryCache::open_read_only(
+            layout
+                .summary_cache
+                .parent()
+                .ok_or_else(|| Error::Invalid("Base summary cache has no parent".into()))?,
         )
         .is_err()
     {
@@ -2062,19 +2063,19 @@ pub(crate) fn prepare_base_store(
     deadline: Option<std::time::Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
-    if !workspace
-        .baseline_is_clean()
-        .map_err(|error| Error::Invalid(error.to_string()))?
-    {
-        return Err(Error::Invalid(
-            "dirty baseline requires a private agent store".into(),
-        ));
+    if let Some(prepared) = try_reuse_base_store(workspace, shared_data_root)? {
+        return Ok(prepared);
     }
+    // A cold Base is materialized exclusively from the pinned clean commit.
+    // In particular, the agent's visible dirty baseline must never be published
+    // under the clean HEAD identity. The normal overlay index below startup
+    // attaches its dirty files and restored proposal edits as private Delta.
+    let clean = TemporaryBaseWorktree::create(workspace.repo_root(), workspace.base_commit())?;
     prepare_base_store_paths(
         BaseSourcePaths {
             repo_root: workspace.repo_root(),
-            source_path: workspace.repository_path(),
-            worktree_path: workspace.worktree_path(),
+            source_path: clean.path(),
+            worktree_path: clean.path(),
             base_commit: workspace.base_commit(),
         },
         shared_data_root,
@@ -5017,6 +5018,219 @@ mod tests {
         let staging_path = staging.path().to_path_buf();
         drop(staging);
         assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn dirty_agent_baseline_reuses_clean_base_and_indexes_only_private_delta() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let _tmp = TmpdirRestore::set(scratch.path());
+        let _environment = EnvRestore::capture(&[
+            "GREPPY_PROJECT_IDENTITY",
+            "GREPPY_WORKSPACE_DIR",
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_TEST_FORBID_TEMP_BASE_CHECKOUT,
+        ]);
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        std::env::set_var(
+            "GREPPY_WORKSPACE_DIR",
+            scratch.path().join("agent-workspaces"),
+        );
+        for name in [
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_TEST_FORBID_TEMP_BASE_CHECKOUT,
+        ] {
+            std::env::remove_var(name);
+        }
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("src/a.rs"), "fn operator_dirty() {}\n").unwrap();
+        std::fs::write(
+            repo.path().join("src/untracked.rs"),
+            "fn operator_untracked() {}\n",
+        )
+        .unwrap();
+
+        // Materialize the same clean source used by a cold production Base build.
+        let clean = TemporaryBaseWorktree::create(repo.path(), &commit).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clean.path().join("src/a.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+        assert!(!clean.path().join("src/untracked.rs").exists());
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let staged_graph = scratch.path().join("staged-base.db");
+        {
+            let mut base = greppy_store::Store::open(&staged_graph).unwrap();
+            greppy_indexer::index(&mut base, clean.path(), "p").unwrap();
+            let fingerprint = greppy_core::GitFingerprint::capture(clean.path());
+            base.upsert_workspace_state(&greppy_store::WorkspaceState {
+                root_path: clean.path().to_string_lossy().into_owned(),
+                git_dir: fingerprint
+                    .git_dir
+                    .map(|path| path.to_string_lossy().into_owned()),
+                git_common_dir: fingerprint
+                    .git_common_dir
+                    .map(|path| path.to_string_lossy().into_owned()),
+                head_oid: fingerprint.head_oid,
+                index_signature: fingerprint.index_signature,
+                schema_version: base.schema_version().unwrap(),
+                indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
+                graph_generation: 1,
+                updated_at: "2026-10-06T00:00:00Z".into(),
+            })
+            .unwrap();
+        }
+        mark_base_embeddings_deferred(&staged_graph, "p", &identity).unwrap();
+        let summaries =
+            build_base_summary_cache(&staged_graph, &identity.summary_model_and_prompt_version)
+                .unwrap();
+        let shared = scratch.path().join("shared");
+        let layout = BaseStoreLayout::new(&shared, &identity).unwrap();
+        {
+            let _builder = layout.acquire_builder(true).unwrap().unwrap();
+            layout
+                .publish_graph_with_summary(identity, &staged_graph, &summaries)
+                .unwrap();
+        }
+        drop(clean);
+        let baseline =
+            greppy_agent::AgentWorkspace::create(repo.path(), "dirty-base-reuse").unwrap();
+        assert!(!baseline.baseline_is_clean().unwrap());
+        let base_before = std::fs::read(&layout.graph).unwrap();
+        std::env::set_var(ENV_TEST_FORBID_TEMP_BASE_CHECKOUT, "1");
+        let prepared = prepare_base_store(
+            &baseline,
+            &shared,
+            crate::EmbeddingCliArgs {
+                device: None,
+                no_gpu: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            prepared.reused,
+            "dirty baseline must reuse authenticated clean Base without rebuilding"
+        );
+        configure_overlay_environment(&prepared, baseline.base_commit());
+        let spec = overlay_spec(baseline.worktree_path()).unwrap().unwrap();
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut overlay = greppy_store::Store::open_overlay(
+                &prepared.graph_path,
+                &delta_path,
+                &spec.visibility,
+            )
+            .unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(
+                    ["src/a.rs".to_string(), "src/untracked.rs".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+            greppy_indexer::index_with_options(
+                &mut overlay,
+                baseline.worktree_path(),
+                "p",
+                &options,
+            )
+            .unwrap();
+            assert!(overlay
+                .get_node_by_qname("p", "src/a.rs::Function::operator_dirty")
+                .unwrap()
+                .is_some());
+            assert!(overlay
+                .get_node_by_qname("p", "src/untracked.rs::Function::operator_untracked")
+                .unwrap()
+                .is_some());
+            assert!(overlay
+                .get_node_by_qname("p", "src/b.rs::Function::b")
+                .unwrap()
+                .is_some());
+        }
+        {
+            let base = greppy_store::Store::open_with(
+                &layout.graph,
+                greppy_store::OpenOptions::read_only(),
+            )
+            .unwrap();
+            assert!(base
+                .get_node_by_qname("p", "src/a.rs::Function::a")
+                .unwrap()
+                .is_some());
+            assert!(base
+                .get_node_by_qname("p", "src/a.rs::Function::operator_dirty")
+                .unwrap()
+                .is_none());
+            assert!(base
+                .get_node_by_qname("p", "src/untracked.rs::Function::operator_untracked")
+                .unwrap()
+                .is_none());
+            let delta =
+                greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                    .unwrap();
+            assert!(
+                delta
+                    .get_node_by_qname("p", "src/b.rs::Function::b")
+                    .unwrap()
+                    .is_none(),
+                "unchanged code remains exclusively in shared Base"
+            );
+        }
+        // Restored proposal edits still use the same Base on the next startup.
+        std::fs::write(
+            baseline.worktree_path().join("src/a.rs"),
+            "fn restored_agent_edit() {}\n",
+        )
+        .unwrap();
+        let reused = try_reuse_base_store(&baseline, &shared).unwrap().unwrap();
+        assert!(reused.reused);
+        let refreshed = overlay_spec(baseline.worktree_path()).unwrap().unwrap();
+        {
+            let mut overlay = greppy_store::Store::open_overlay(
+                &reused.graph_path,
+                &delta_path,
+                &refreshed.visibility,
+            )
+            .unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(["src/a.rs".to_string()].into_iter().collect()),
+                ..Default::default()
+            };
+            greppy_indexer::index_with_options(
+                &mut overlay,
+                baseline.worktree_path(),
+                "p",
+                &options,
+            )
+            .unwrap();
+            assert!(overlay
+                .get_node_by_qname("p", "src/a.rs::Function::restored_agent_edit")
+                .unwrap()
+                .is_some());
+            assert!(overlay
+                .get_node_by_qname("p", "src/a.rs::Function::operator_dirty")
+                .unwrap()
+                .is_none());
+            assert!(overlay
+                .get_node_by_qname("p", "src/b.rs::Function::b")
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(std::fs::read(&layout.graph).unwrap(), base_before);
+        baseline.cleanup().unwrap();
     }
 
     #[test]

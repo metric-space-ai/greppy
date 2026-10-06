@@ -123,9 +123,9 @@ Session flags:
 Exit codes:
   0  ok (clean, proposal saved, or applied)
   2  no gateway / bad usage / missing model / unsupported repository
-  3  agent or loop error (worktree kept for debugging)
+  3  agent or loop error (unsaved workspace retained for up to 24 hours)
   4  --apply refused (dirty target) or cherry-pick conflict (ref still available)
-  5  incomplete (turn/token/deadline limit or repeated tool failures; proposal saved)
+  5  incomplete (explicit turn limit or deadline reached; proposal saved)
 ";
 
 /// Parsed `greppy -p` arguments (everything after the leading `-p` token).
@@ -716,9 +716,6 @@ fn run_agent(
             .filter(|(_, resumed)| *resumed)
             .map(|(record, _)| record.clone())
     };
-    let restored_proposal = resume_record
-        .as_ref()
-        .is_some_and(|record| !record.proposal_ref.is_empty());
     if let Some(record) = resume_record {
         if !record.proposal_ref.is_empty() {
             if let Err(error) = workspace.restore_proposal(&record.proposal_ref) {
@@ -813,10 +810,7 @@ fn run_agent(
         );
     }
 
-    let prepared_base = if args.private_store
-        || restored_proposal
-        || !workspace.baseline_is_clean().unwrap_or(false)
-    {
+    let prepared_base = if args.private_store {
         crate::store_cow::configure_private_environment("explicit --private-store");
         if !interactive {
             eprintln!("store mode: private (--private-store)");
