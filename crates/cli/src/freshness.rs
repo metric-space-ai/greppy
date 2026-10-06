@@ -987,6 +987,12 @@ pub(crate) fn wait_for_index_publication(
         baseline_generation.unwrap_or(0).saturating_add(1),
         crate::context_status::Capability::Graph,
     );
+    #[cfg(any(
+        debug_assertions,
+        feature = "ci-test-assets",
+        feature = "store-cow-release-perf"
+    ))]
+    let mut test_wait_ready = std::env::var_os("GREPPY_TEST_QUERY_PUBLICATION_WAIT_READY");
     loop {
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(
@@ -1008,6 +1014,20 @@ pub(crate) fn wait_for_index_publication(
             );
         match observe_first_use_index(job.as_ref(), snapshot_ready, owner_active) {
             FirstUseIndexObservation::Pending => {
+                // Tests synchronize on actual contention, independently of
+                // token-saving progress output. No hook exists in production.
+                #[cfg(any(
+                    debug_assertions,
+                    feature = "ci-test-assets",
+                    feature = "store-cow-release-perf"
+                ))]
+                if owner_active {
+                    if let Some(ready) = test_wait_ready.take() {
+                        std::fs::write(ready, "waiting for publication").map_err(|error| {
+                            Error::io("write test publication-wait marker", error)
+                        })?;
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             FirstUseIndexObservation::Published => {

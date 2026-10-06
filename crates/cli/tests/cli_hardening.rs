@@ -560,12 +560,17 @@ fn query_after_releasing_writer(
         }
     }
     let diagnostic = store.join("waiting-query.stderr");
+    let waiting = store.join("waiting-query.ready");
+    if waiting.exists() {
+        std::fs::remove_file(&waiting).unwrap();
+    }
     let mut query = Query(Some(
         Command::new(bin())
             .args(args)
             .current_dir(repo)
             .env("GREPPY_STORE_DIR", store)
             .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_QUERY_PUBLICATION_WAIT_READY", &waiting)
             .env_remove("GREPPY_DISCOVER_INCLUDE")
             .env_remove("GREPPY_DISCOVER_EXCLUDE")
             .stdout(std::process::Stdio::piped())
@@ -583,15 +588,12 @@ fn query_after_releasing_writer(
             writer.child.try_wait().unwrap().is_none(),
             "fixture writer must remain held"
         );
-        if std::fs::read_to_string(&diagnostic)
-            .unwrap()
-            .contains("syncing_snapshot")
-        {
+        if waiting.exists() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "query never reported held publication: {}",
+            "query never joined held publication: {}",
             std::fs::read_to_string(&diagnostic).unwrap()
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
