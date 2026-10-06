@@ -6741,6 +6741,10 @@ mod tests {
             b"untracked\n"
         );
         resumed.cleanup().unwrap();
+        let baseline_mtime = fs::metadata(repo.join("tracked.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
         fs::write(repo.join("tracked.txt"), b"changed operator baseline\n").unwrap();
         let changed = AgentWorkspace::create(&repo, "resume-reject-changed").unwrap();
         assert!(matches!(
@@ -6748,7 +6752,15 @@ mod tests {
             Err(WorkspaceError::DirtyTarget { .. })
         ));
         changed.cleanup().unwrap();
+        // The baseline hash covers each dirty path's mtime, so restoring the
+        // operator state means restoring the bytes and the modification time.
         fs::write(repo.join("tracked.txt"), b"unstaged\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo.join("tracked.txt"))
+            .unwrap()
+            .set_modified(baseline_mtime)
+            .unwrap();
         workspace.apply_to(&repo, &commit).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
         assert_eq!(
