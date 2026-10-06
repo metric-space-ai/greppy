@@ -353,6 +353,9 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
 
     let mut command = command_for_argv(argv)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A private completion channel belongs to the enclosing edit verifier.
+    // Never leak it to the arbitrary project test command or nested greppy calls.
+    command.env_remove("GREPPY_INTERNAL_VERIFY_STATUS_PATH");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -408,37 +411,43 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
                 .map_err(|error| Error::io("wait for interrupted bash-smart command", error))?;
         }
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                let elapsed = started.elapsed();
-                if elapsed >= next_heartbeat {
-                    let latest =
-                        heartbeat_tail(&stderr_path).or_else(|| heartbeat_tail(&stdout_path));
-                    if let Some(latest) = latest {
-                        eprintln!(
+            Ok(Some(status)) => {
+                if stdout_thread.is_finished() && stderr_thread.is_finished() {
+                    break status;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(Error::io("wait for bash-smart command", error)),
+        }
+        // Descendants may retain output pipes after the leader exits. Keep
+        // deadline and signal handling alive until both drainers are done.
+        {
+            let elapsed = started.elapsed();
+            if elapsed >= next_heartbeat {
+                let latest = heartbeat_tail(&stderr_path).or_else(|| heartbeat_tail(&stdout_path));
+                if let Some(latest) = latest {
+                    eprintln!(
                             "bash-smart: command still running — pid={}, elapsed={}s; latest child output: {latest}",
                             child.id(),
                             elapsed.as_secs()
                         );
-                    } else {
-                        eprintln!(
+                } else {
+                    eprintln!(
                             "bash-smart: command still running — pid={}, elapsed={}s; child output is being captured and will be summarized on exit",
                             child.id(),
                             elapsed.as_secs()
                         );
-                    }
-                    next_heartbeat = next_heartbeat.saturating_add(heartbeat_interval);
                 }
-                if timeout_ms.is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) {
-                    timed_out = true;
-                    kill_child_tree(&mut child);
-                    break child.wait().map_err(|error| {
-                        Error::io("wait for timed-out bash-smart command", error)
-                    })?;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                next_heartbeat = next_heartbeat.saturating_add(heartbeat_interval);
             }
-            Err(error) => return Err(Error::io("wait for bash-smart command", error)),
+            if timeout_ms.is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) {
+                timed_out = true;
+                kill_child_tree(&mut child);
+                break child
+                    .wait()
+                    .map_err(|error| Error::io("wait for timed-out bash-smart command", error))?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     };
     let capture_end_micros = started.elapsed().as_micros();
@@ -452,7 +461,13 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         .flatten();
     let exit_code = forwarded_signal
         .map(|signal| 128 + signal)
-        .unwrap_or_else(|| child_exit_code(&status));
+        .unwrap_or_else(|| {
+            if timed_out && status.success() {
+                137
+            } else {
+                child_exit_code(&status)
+            }
+        });
     let raw = StoredRaw::from_capture(stdout_capture, stderr_capture)?;
     let stdout_lines = split_lines(&raw.stdout);
     let stderr_lines = split_lines(&raw.stderr);
@@ -637,6 +652,24 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         );
     }
 
+    if let Some(path) = std::env::var_os("GREPPY_INTERNAL_VERIFY_STATUS_PATH") {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(Error::Invalid(
+                "private verifier status path must be absolute".into(),
+            ));
+        }
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": "greppy.bash-smart.verify-status.v1",
+            "runner_pid": std::process::id(),
+            "timed_out": timed_out,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "exit_code": exit_code,
+        }))
+        .map_err(|error| Error::Invalid(format!("encode verifier completion: {error}")))?;
+        greppy_core::cache::atomic_write(&path, &data)
+            .map_err(|error| Error::io("write verifier completion", error))?;
+    }
     Ok(exit_code)
 }
 

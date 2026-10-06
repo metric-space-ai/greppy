@@ -1308,3 +1308,35 @@ fn active_index_writer_never_blocks_command_execution() {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     }
 }
+
+#[test]
+fn timeout_reaps_pipe_holding_descendant_after_leader_exits_successfully() {
+    let workspace = fresh_workspace("exited-leader-timeout");
+    let _ = run(&workspace, &["bash-smart", "--", "true"]);
+    let started = Instant::now();
+    let output = command(&workspace)
+        .env("GREPPY_BASH_SMART_TIMEOUT_MS", "1000")
+        .args(["bash-smart", "--", "python3", "-c",
+            "import subprocess;p=subprocess.Popen(['sleep','30']);open('owned-child.pid','w').write(str(p.pid))"])
+        .output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "output drain ignored deadline"
+    );
+    assert_eq!(output.status.code(), Some(137), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).starts_with("FAILED — exit 137:"));
+    assert!(text(&output.stderr).contains("timed out after 1000 ms"));
+    let pid: i32 = std::fs::read_to_string(workspace.repo.join("owned-child.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "output-holding descendant survived"
+    );
+}

@@ -1437,6 +1437,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     let prefix = std::env::temp_dir().join(format!("greppy-verify-{}-{nonce}", std::process::id()));
     let stdout_path = prefix.with_extension("stdout");
     let stderr_path = prefix.with_extension("stderr");
+    let runner_status_path = prefix.with_extension("runner.json");
     let stdout = match std::fs::File::create(&stdout_path) {
         Ok(file) => file,
         Err(error) => {
@@ -1478,6 +1479,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
     if verifier.scope == "tests" {
+        process.env("GREPPY_INTERNAL_VERIFY_STATUS_PATH", &runner_status_path);
         let bound = timeout.as_millis().saturating_sub(250).max(1);
         let bound = std::env::var("GREPPY_BASH_SMART_TIMEOUT_MS")
             .ok()
@@ -1532,15 +1534,32 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     };
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let runner_status = std::fs::read(&runner_status_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| {
+            value["schema"] == "greppy.bash-smart.verify-status.v1"
+                && value["runner_pid"].as_u64() == Some(u64::from(child.id()))
+                && value["exit_code"].as_i64()
+                    == status.and_then(|status| status.code()).map(i64::from)
+        });
+    let _ = std::fs::remove_file(&runner_status_path);
     let _ = std::fs::remove_file(&stdout_path);
     let _ = std::fs::remove_file(&stderr_path);
-    if timed_out
-        || (verifier.scope == "tests" && status.is_some_and(|status| status.code() == Some(124)))
-    {
-        let message = format!(
+    let runner_timed_out = verifier.scope == "tests"
+        && runner_status
+            .as_ref()
+            .is_some_and(|value| value["timed_out"] == true);
+    if timed_out || runner_timed_out {
+        let message = if runner_timed_out {
+            format!("verify: timed out after {}ms — edit remains applied; run `{command}` directly to continue",
+                runner_status.as_ref().and_then(|value| value["elapsed_ms"].as_u64()).unwrap_or_default())
+        } else {
+            format!(
             "verify: timed out after {}s — edit remains applied; run `{command}` directly to continue",
             timeout.as_secs()
-        );
+        )
+        };
         eprintln!("{message}");
         return EditVerification::new(EditVerificationStatus::TimedOut, vec![message]);
     }
@@ -1550,6 +1569,10 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
             vec![format!("verify: failed — no exit status from {command}")],
         );
     };
+    if verifier.scope == "tests" && status.success() && runner_status.is_none() {
+        return EditVerification::new(EditVerificationStatus::Unavailable,
+            vec!["verify: selected test runner returned no valid completion status; tests are not confirmed".into()]);
+    }
     if status.success() {
         let message = format!("verify: passed — {}", verifier.label);
         eprintln!("{message}");

@@ -2254,3 +2254,63 @@ fn verify_selected_tests_timeout_without_undoing_edit() {
         "selected test process survived timeout"
     );
 }
+
+#[test]
+fn verify_does_not_call_immediate_exit_124_a_timeout() {
+    let fixture = Fixture::new("verify-exit124");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .env(
+            "GREPPY_VERIFY_TEST_COMMAND",
+            "python3 -c 'import sys;sys.exit(124)'",
+        )
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "failed");
+    assert!(!combined(&output).contains("timed out"));
+}
+
+#[test]
+fn verify_does_not_leak_private_completion_path_to_test_command() {
+    let fixture = Fixture::new("verify-private-channel");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture.command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "python3 -c 'import os;assert \"GREPPY_INTERNAL_VERIFY_STATUS_PATH\" not in os.environ'")
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "passed");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_reaps_pipe_holding_descendant_after_test_leader_exits() {
+    let fixture = Fixture::new("verify-exited-leader");
+    std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
+    let output = fixture.command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "python3 -c \"import subprocess;p=subprocess.Popen(['sleep','30']);open('owned-test.pid','w').write(str(p.pid))\"")
+        .env("GREPPY_EDIT_VERIFY_TIMEOUT_SECS", "1")
+        .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
+        .output().unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "timed_out");
+    let pid: i32 = std::fs::read_to_string(fixture.repo.join("owned-test.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "pipe-holding test descendant survived timeout"
+    );
+}
