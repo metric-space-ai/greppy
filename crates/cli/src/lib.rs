@@ -7101,11 +7101,13 @@ fn combined_inference_gpu_memory() -> u64 {
     let summary = qwen_summary_config_optional()
         .ok()
         .flatten()
-        .and_then(|cfg| std::fs::metadata(cfg.gguf).ok())
-        .map(|metadata| {
+        .map(|cfg| {
+            let model_bytes = std::fs::metadata(cfg.gguf)
+                .map(|metadata| metadata.len())
+                .unwrap_or(qwen35_assets::GGUF_BYTES);
             greppy_embed_native::estimated_gpu_memory(
                 greppy_embed_native::InferenceModelKind::Qwen35,
-                metadata.len(),
+                model_bytes,
             )
         })
         .unwrap_or(0);
@@ -9649,6 +9651,8 @@ mod embeddinggemma_assets {
 }
 
 mod qwen35_assets {
+    pub const GGUF_BYTES: u64 =
+        include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH")).len() as u64;
     const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
     const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
 
