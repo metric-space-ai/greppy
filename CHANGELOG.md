@@ -12,6 +12,14 @@ Nothing yet.
 Production inference uses Metal on macOS and CUDA on Linux; FSKit stays optional
 acceleration and the ordinary workspace backend provides the same agent behavior.
 
+### Prompt for external agents
+
+- The signed prompt (`AGENTS.md`, `greppy prompt --external`) now states that the
+  task is a change to deliver: make the edits with greppy and verify them, do
+  not stop at an analysis. Routing picks one compact command for the next step
+  of the task. Without this, some models answered a bare issue with an analysis
+  instead of a patch.
+
 ### Built-in coding agent (`greppy agent`, `greppy -p`, `greppy agent serve`)
 
 - Every task runs in its own temporary copy-on-write worktree and ends as a
