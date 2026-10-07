@@ -463,6 +463,17 @@ pub(crate) fn dispatch_index_health(
     dispatch_index_health_with_detail(command, json, root, embedding_args, true)
 }
 
+fn js_ts_usage_repair_skip_diagnostic(store: &greppy_store::Store) -> serde_json::Value {
+    match store.conn().query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        [greppy_indexer::JS_TS_USAGE_REPAIR_SKIPS_KEY],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
 fn index_health_output(mut value: serde_json::Value, detailed: bool) -> serde_json::Value {
     if detailed {
         return value;
@@ -1384,6 +1395,7 @@ fn dispatch_index_health_with_detail(
         && inference_healthy
         && background_state != Some("refreshing");
     let status_label = if healthy { "ok" } else { "unhealthy" };
+    let js_ts_usage_repair_skips = js_ts_usage_repair_skip_diagnostic(&store);
 
     if json {
         let value = serde_json::json!({
@@ -1426,6 +1438,7 @@ fn dispatch_index_health_with_detail(
             "dirty_overlay": dirty_overlay.to_json(),
             "store_cow": store_cow,
             "inference": inference_diagnostics,
+            "js_ts_usage_repair_skips": js_ts_usage_repair_skips,
         });
         println!(
             "{}",
@@ -1434,6 +1447,13 @@ fn dispatch_index_health_with_detail(
         );
     } else {
         println!("status: {status_label}");
+        if let Some(count) = js_ts_usage_repair_skips
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|count| *count > 0)
+        {
+            println!("js_ts_usage_repair_skips: {count}");
+        }
         if let Some(w) = &coverage_warning {
             println!("coverage_warning: {w}");
         }

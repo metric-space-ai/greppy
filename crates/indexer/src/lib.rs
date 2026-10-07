@@ -2834,6 +2834,24 @@ pub fn recover_persisted_rust_usages(
 
 pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v4";
 
+/// JSON `{"count":N,"paths":[...]}` for files skipped by
+/// [`recover_persisted_js_ts_usages`] because extraction still violated the
+/// provider contract after degradation. `paths` is sorted and capped at 20;
+/// `count` is the full skip count. Written in the same savepoint as the
+/// completion marker, including `{"count":0,"paths":[]}` so a later repair
+/// clears a stale diagnostic.
+pub const JS_TS_USAGE_REPAIR_SKIPS_KEY: &str = "greppy.js_ts_usage_repair_skips_v1";
+
+// Test-only stand-in for a residual contract failure. Real JS/TS extracts
+// rewrite file identity and confidence, and `validate_or_degrade` drops the
+// invalid spans and blank identities the grammar emits, so a source file
+// cannot currently force the post-degrade error. The repair test arms this
+// for `contract-invalid.js` only.
+#[cfg(test)]
+thread_local! {
+    static FORCE_JS_TS_CONTRACT_SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
     store
         .conn()
@@ -2845,6 +2863,30 @@ pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
         .map_err(sqlite_err)
 }
 
+fn js_ts_usage_repair_skip_json(paths: &[String]) -> String {
+    let mut ordered = paths.to_vec();
+    ordered.sort();
+    let count = ordered.len();
+    ordered.truncate(20);
+    serde_json::json!({
+        "count": count,
+        "paths": ordered,
+    })
+    .to_string()
+}
+
+fn warn_js_ts_usage_repair_skips(paths: &[String]) {
+    let mut ordered = paths.to_vec();
+    ordered.sort();
+    let count = ordered.len();
+    ordered.truncate(20);
+    tracing::warn!(
+        count,
+        paths = %ordered.join(", "),
+        "JS/TS usage repair skipped files that still violate the provider contract"
+    );
+}
+
 /// Fresh indexing and recovery must use the same validated extraction. Grammar
 /// recovery can emit an invalid anonymous record among valid definitions; the
 /// provider contract already filters that record at first use. Reject only an
@@ -2854,6 +2896,14 @@ fn validated_js_ts_repair_extraction(
     relative: &str,
     extraction: greppy_parser::ExtractionResult,
 ) -> Result<greppy_parser::ExtractionResult> {
+    #[cfg(test)]
+    if FORCE_JS_TS_CONTRACT_SKIP.with(|flag| flag.get())
+        && relative.rsplit(['/', '\\']).next() == Some("contract-invalid.js")
+    {
+        return Err(greppy_core::Error::Invalid(format!(
+            "JS/TS usage repair extraction incomplete for {relative}: synthetic residual contract violation (0 invalid records removed)"
+        )));
+    }
     let (validated, dropped, error) = validate_or_degrade(language, relative, extraction);
     if let Some(error) = error {
         return Err(greppy_core::Error::Invalid(format!(
@@ -2899,6 +2949,7 @@ pub fn recover_persisted_js_ts_usages(
         indexed.iter().map(|node| node.file_path.as_str()).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
+    let mut skipped_contract_files = Vec::new();
     for state in states.iter().filter(|state| relevant(&state.rel_path)) {
         if current_discovery_filtered_recovery_identity(state, &discovery_filtered, &indexed_paths)
         {
@@ -2932,7 +2983,17 @@ pub fn recover_persisted_js_ts_usages(
         }
         let language = greppy_parser::language_for_path(relative);
         let extraction = parser_extract(language, &bytes, &state.rel_path)?;
-        let extraction = validated_js_ts_repair_extraction(language, &state.rel_path, extraction)?;
+        // One file that still violates the provider contract must not refuse
+        // the repository. Previously persisted edges for that file stay as
+        // they are; fingerprint and definition-identity failures still abort.
+        let extraction =
+            match validated_js_ts_repair_extraction(language, &state.rel_path, extraction) {
+                Ok(extraction) => extraction,
+                Err(_) => {
+                    skipped_contract_files.push(state.rel_path.clone());
+                    continue;
+                }
+            };
         // Persistence upserts in extraction order by (project, qualified_name).
         // Object-literal methods can share a qualified name: validate the final
         // stored definition, rather than rejecting the overwritten earlier span.
@@ -3036,6 +3097,7 @@ pub fn recover_persisted_js_ts_usages(
         .filter(|edge| edge.edge_type == "USAGE")
         .map(|edge| new_raw_edge_for(project, &edge.file_path, edge))
         .collect::<Vec<_>>();
+    let skip_json = js_ts_usage_repair_skip_json(&skipped_contract_files);
     store
         .conn()
         .execute_batch("SAVEPOINT greppy_js_ts_usage_repair")
@@ -3065,6 +3127,7 @@ pub fn recover_persisted_js_ts_usages(
             }
         }
         store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [JS_TS_USAGE_REPAIR_KEY]).map_err(sqlite_err)?;
+        store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![JS_TS_USAGE_REPAIR_SKIPS_KEY, skip_json]).map_err(sqlite_err)?;
         Ok(())
     })();
     match result {
@@ -3073,6 +3136,9 @@ pub fn recover_persisted_js_ts_usages(
                 .conn()
                 .execute_batch("RELEASE greppy_js_ts_usage_repair")
                 .map_err(sqlite_err)?;
+            if !skipped_contract_files.is_empty() {
+                warn_js_ts_usage_repair_skips(&skipped_contract_files);
+            }
             Ok(true)
         }
         Err(error) => {
@@ -14422,6 +14488,139 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
         );
         assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+    }
+
+    #[test]
+    fn js_ts_usage_repair_skip_json_caps_paths_and_keeps_full_count() {
+        let paths: Vec<String> = (0..25).map(|i| format!("f{i:02}.js")).collect();
+        let value: serde_json::Value =
+            serde_json::from_str(&js_ts_usage_repair_skip_json(&paths)).unwrap();
+        assert_eq!(value["count"], 25);
+        assert_eq!(value["paths"].as_array().unwrap().len(), 20);
+        assert_eq!(value["paths"][0], "f00.js");
+        assert_eq!(value["paths"][19], "f19.js");
+    }
+
+    /// One residual contract failure is skipped. Other files are still repaired,
+    /// and edges already stored for the skipped file are left untouched.
+    ///
+    /// `contract-invalid.js` is the stand-in fixture (see
+    /// `tests/fixtures/contract-invalid.js`). The current provider filter cures
+    /// every real JS/TS extract, so the test arms the residual-contract path
+    /// for that filename only.
+    #[test]
+    fn js_ts_usage_repair_skips_contract_invalid_file_and_repairs_the_rest() {
+        let repo = tempfile::tempdir().unwrap();
+        let good = "function target() { return 1; }\nfunction valid() { return target(); }\n";
+        fs::write(repo.path().join("good.js"), good).unwrap();
+        fs::write(
+            repo.path().join("contract-invalid.js"),
+            include_str!("../tests/fixtures/contract-invalid.js"),
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        store
+            .conn()
+            .execute_batch(
+                "DELETE FROM main.raw_edges WHERE edge_type IN ('USAGE','CALLS'); \
+                 DELETE FROM main.edges WHERE edge_type IN ('USAGE','CALLS');",
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        let skipped = store
+            .get_node_by_qname("test", "contract-invalid.js::Function::skipped")
+            .unwrap()
+            .unwrap();
+        store
+            .insert_raw_edges(&[NewRawEdge {
+                project: "test".into(),
+                file_path: "contract-invalid.js".into(),
+                source_qname: skipped.qualified_name.clone(),
+                target_qname: "preserved-skip-edge".into(),
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"marker": "preserve"}),
+            }])
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO main.edges(project,source_id,target_id,edge_type,properties) \
+                 VALUES('test',?1,?1,'USAGE','{\"marker\":\"preserve\"}')",
+                [skipped.id],
+            )
+            .unwrap();
+        let _guard = ForceJsContractSkip::arm();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        let target = store
+            .get_node_by_qname("test", "good.js::Function::target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .len(),
+            1,
+            "the other file's usages are repaired"
+        );
+        let preserved_raw: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.raw_edges WHERE project='test' \
+                 AND file_path='contract-invalid.js' AND target_qname='preserved-skip-edge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_raw, 1, "skipped file raw edges stay");
+        let preserved_edge: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.edges WHERE source_id=?1 AND properties LIKE '%preserve%'",
+                [skipped.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_edge, 1, "skipped file resolved edges stay");
+        let raw: String = store
+            .conn()
+            .query_row(
+                "SELECT value FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_SKIPS_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let diagnostic: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(diagnostic["count"], 1);
+        assert_eq!(
+            diagnostic["paths"],
+            serde_json::json!(["contract-invalid.js"])
+        );
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+    }
+
+    struct ForceJsContractSkip;
+
+    impl ForceJsContractSkip {
+        fn arm() -> Self {
+            FORCE_JS_TS_CONTRACT_SKIP.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceJsContractSkip {
+        fn drop(&mut self) {
+            FORCE_JS_TS_CONTRACT_SKIP.with(|flag| flag.set(false));
+        }
     }
 
     /// ClickHouse regression: one anonymous node from grammar error-recovery
