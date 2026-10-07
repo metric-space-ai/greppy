@@ -633,7 +633,7 @@ metadata-mismatched recovery journals fail closed before touching Git or the
 working tree.
 
 The same Rust namespace and Chunk-CoW core runs behind Linux FUSE3 and a macOS
-15+ FSKit app extension. The Windows core and Greppy's minimal WinFsp
+15.4+ FSKit app extension. The Windows core and Greppy's minimal WinFsp
 transport fork compile and pass their direct contracts. The fork forwards
 `FileLinkInformation` to the Rust provider instead of rejecting hardlink
 creation in the transport layer. Greppy does not emulate hardlinks with copies

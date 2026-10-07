@@ -9,7 +9,7 @@ worktree folder in `session/new` or `session/load`.
 greppy agent stdio --endpoint http://127.0.0.1:8317 --model MODEL_ID
 ```
 
-`--max-turns` bounds one prompt (default40 assistant turns). The endpoint is an
+`--max-turns N` bounds one prompt to N assistant turns; without it a prompt has no turn cap (default 0) and is bounded by the run deadline. The endpoint is an
 Anthropic Messages-compatible gateway. Authentication reuses `GREPPY_API_KEY`
 from the agent process; ACP clients do not transmit or persist a secret. Model
 selection can be supplied with `--model`, `session/set_model`, or the `model`
