@@ -289,7 +289,7 @@ mod rust_repair_recovery_tests {
         let options = greppy_indexer::IndexOptions::default();
         validate_standalone_embedding_store(&store, &active, &root, "p", &options).unwrap();
         let generation = store
-            .get_workspace_state(root.to_str().unwrap())
+            .get_workspace_state(root.canonicalize().unwrap().to_str().unwrap())
             .unwrap()
             .unwrap()
             .graph_generation;
@@ -300,7 +300,7 @@ mod rust_repair_recovery_tests {
         );
         assert_eq!(
             store
-                .get_workspace_state(root.to_str().unwrap())
+                .get_workspace_state(root.canonicalize().unwrap().to_str().unwrap())
                 .unwrap()
                 .unwrap()
                 .graph_generation,
@@ -1175,6 +1175,9 @@ fn dispatch_index_health_with_detail(
             if let Some(daemons) = &inference_daemons {
                 print_inference_daemons(daemons);
             }
+            if let Some(diagnostic) = dirty_overlay.diagnostic {
+                println!("dirty_overlay: {diagnostic}");
+            }
             if dirty_overlay.git_available && !dirty_overlay.clean {
                 println!(
                     "dirty_overlay: total={} staged={} unstaged={} untracked={} deleted={} renamed={} ignored={}",
@@ -1359,9 +1362,13 @@ fn dispatch_index_health_with_detail(
             .vector_model_ids(&project)
             .map(|v| v.is_empty())
             .unwrap_or(false);
-    let inference_healthy = inference
-        .as_ref()
-        .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
+    // Debug/CI fixtures that explicitly bypass inference still validate the
+    // graph, freshness and provider state without requiring physical GPUs.
+    // Production builds make test_inference_skipped() unconditionally false.
+    let inference_healthy = test_inference_skipped()
+        || inference
+            .as_ref()
+            .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
     let embedding_healthy = embedding_complete || test_inference_skipped();
     let healthy = diag.schema_current
         && diag.integrity_ok
@@ -1501,6 +1508,9 @@ fn dispatch_index_health_with_detail(
             }
         } else {
             println!("project_present: false");
+        }
+        if let Some(diagnostic) = dirty_overlay.diagnostic {
+            println!("dirty_overlay: {diagnostic}");
         }
         if dirty_overlay.git_available && !dirty_overlay.clean {
             println!(
@@ -2603,18 +2613,16 @@ fn index_embeddings_into_temp_store_scoped(
         // model weights and must remain observable instead of leaving status
         // frozen at the misleading `loading_model` phase.
         job.finalization_phase("counting_embeddings");
-        let total_documents = greppy_indexer::count_code_embedding_documents_for_scope(
-            store,
-            target,
-            project,
-            &provider,
-            options,
-            index_prefixes,
-        )?;
         let (backend, device) = provider.backend_plan();
         job.device = device;
-        job.embedding_started(&backend, total_documents);
-        let mut progress = |value| job.embedding_progress(value);
+        let mut started = false;
+        let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
+            if !started {
+                job.embedding_started(&backend, value.total_documents, value.reusable_documents);
+                started = true;
+            }
+            job.embedding_progress(value);
+        };
         greppy_indexer::index_code_embeddings_for_scope_with_progress(
             store,
             target,
@@ -2622,7 +2630,7 @@ fn index_embeddings_into_temp_store_scoped(
             &mut provider,
             options,
             greppy_indexer::EmbeddingIndexProgressContext {
-                total_documents,
+                total_documents: 0,
                 callback: &mut progress,
             },
             index_prefixes,

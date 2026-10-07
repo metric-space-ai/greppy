@@ -5,6 +5,65 @@
 //! all. These assertions are the guard rail: they do not judge the wording,
 //! they hold the few statements that must stay true.
 
+#[test]
+fn owner_approved_reading_guidance_is_preserved() {
+    let text = prompt();
+    for required in [
+        "READING CODE:",
+        "greppy read S [S …]",
+        "greppy read-smart S",
+        "any lines of a file",
+        "If a read tool is missing or fails",
+        "never fall back to cat, sed or head",
+        "never a whole source file to find or edit one definition",
+        "Do not pass FILE:LINE to read;",
+        "resolve that location with graph-locate",
+    ] {
+        assert!(
+            text.contains(required),
+            "signed v3 reading guidance missing: {required}"
+        );
+    }
+}
+
+#[test]
+fn documented_command_rows_use_the_same_executable_prefix() {
+    let text = prompt();
+    let headings = [
+        "ROUTING:",
+        "SEARCH:",
+        "NAVIGATE:",
+        "READING CODE:",
+        "EDIT:",
+        "RUN:",
+        "INDEX:",
+        "AGENT:",
+        "CHAIN:",
+        "BROWSER:",
+    ];
+    let mut sections = std::collections::BTreeSet::new();
+    let mut rows = 0;
+    for line in text.lines() {
+        if headings.contains(&line) {
+            sections.insert(line);
+        }
+        if !line.starts_with("  ") || line.starts_with("    ") {
+            continue;
+        }
+        let row = line.trim_start();
+        assert!(
+            row.starts_with("greppy "),
+            "command row lacks executable prefix: {line}"
+        );
+        rows += 1;
+    }
+    assert_eq!(sections.len(), headings.len());
+    assert!(
+        rows >= 60,
+        "guard must cover code and browser commands: {rows}"
+    );
+}
+
 fn prompt() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../AGENTS.md")
@@ -44,11 +103,13 @@ fn navigate_lists_exactly_the_five_commands() {
     let section = navigate_section(&prompt());
     for verb in [
         "where-am-i",
-        "who-calls S",
-        "callees S",
+        "who-calls S [S …]",
+        "callees S [S …]",
         "brief S",
-        "impact S",
+        "impact S [--depth N]",
+        "impact S --direction outgoing",
         "path --from A --to B",
+        "graph-locate FILE:LINE",
     ] {
         assert!(
             section.contains(verb),
@@ -57,14 +118,11 @@ fn navigate_lists_exactly_the_five_commands() {
     }
     let described = section
         .lines()
-        .filter(|line| {
-            line.starts_with("  ") && !line.starts_with("    ") && !line.starts_with("  --")
-        })
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with("  greppy "))
         .count();
     assert_eq!(
-        described, 7,
-        "NAVIGATE has six commands plus the multi-symbol note; got {described} entries:\n{section}"
+        described, 8,
+        "NAVIGATE has seven verbs with both impact directions: {section}"
     );
 }
 
@@ -93,28 +151,30 @@ fn the_result_shape_is_the_one_the_commands_print() {
 
 #[test]
 fn code_does_not_promise_a_handle() {
-    let section = navigate_section(&prompt());
-    let code_flag = section
-        .lines()
-        .find(|line| line.trim_start().starts_with("--code"))
-        .expect("NAVIGATE must document --code");
-    assert!(
-        !code_flag.contains("handle"),
-        "--code prints the source at the reported location and hides nothing a \
-         handle could point at; got: {code_flag}"
-    );
+    let text = prompt();
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains(
+        "Add --code only when the question needs source and the chosen command supports it"
+    ));
+    assert!(normalized.contains("path returns call sites, not definition bodies"));
+    assert!(normalized.contains("greppy read S --handle"));
+    assert!(normalized
+        .contains("A handle covers only the printed span; it cannot name a folded outline"));
 }
 
 #[test]
 fn multi_symbol_is_promised_only_where_it_holds() {
     let section = navigate_section(&prompt());
-    let note = section
+    for verb in ["who-calls", "callees"] {
+        assert!(section.contains(&format!("greppy {verb} S [S …]")));
+    }
+    let path = section
         .lines()
-        .find(|line| line.contains("several symbols at once"))
-        .expect("NAVIGATE must say which commands take several symbols");
+        .find(|line| line.starts_with("  greppy path "))
+        .unwrap();
     assert!(
-        note.contains("who-calls") && note.contains("callees") && !note.contains("path"),
-        "path takes exactly one --from and one --to; got: {note}"
+        path.contains("--from A --to B") && !path.contains("[S …]"),
+        "path takes one endpoint each: {path}"
     );
 }
 
@@ -158,54 +218,34 @@ fn search_is_one_family_on_one_axis() {
 
 #[test]
 fn footer_flags_hold_for_every_command_in_their_section() {
-    // A flag in a section footer applies to every command of the section; an
-    // option one command needs is part of that command's syntax, spelled in
-    // the command column like `path --from A --to B`. A footer line naming a
-    // command with a colon is the scope-prefix notation coming back.
     let text = prompt();
-    for section in [
-        navigate_section(&text),
-        search_section(&text),
-        read_section(&text),
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for scoped in [
+        "--json returns structured output where offered",
+        "--limit N and --offset K page supported query results",
+        "--all lifts their default cap",
+        "--path P filters supported graph queries",
     ] {
-        for line in section.lines().filter(|l| l.starts_with("  --")) {
-            for verb in [
-                "search:",
-                "search-symbol:",
-                "search-pattern:",
-                "who-calls:",
-                "callees:",
-                "brief:",
-                "impact:",
-                "path:",
-                "read:",
-                "read-smart:",
-                "read-file:",
-            ] {
-                assert!(
-                    !line.contains(verb),
-                    "footer flag scoped to one command: {line}"
-                );
-            }
-        }
+        assert!(
+            normalized.contains(scoped),
+            "signed command scope missing: {scoped}"
+        );
     }
+    assert!(
+        !text.contains("ON EVERY COMMAND:"),
+        "command-specific flags must not be promised universally"
+    );
 }
 
 /// Everything from `READ:` up to the next section heading.
 fn read_section(text: &str) -> String {
-    // The EDIT heading carries prose on the same line ("EDIT: an edit applies
-    // completely…"), so the boundary is: column 0, and everything before the
-    // first colon is upper case.
-    fn is_heading(line: &str) -> bool {
-        line.split(':').next().is_some_and(|head| {
-            !head.is_empty()
-                && line.contains(':')
-                && head.chars().all(|c| c.is_ascii_uppercase() || c == ' ')
-        })
-    }
-    let mut lines = text.lines().skip_while(|line| *line != "READ:");
-    let heading = lines.next().expect("AGENTS.md must have a READ section");
-    let body = lines.take_while(|line| !is_heading(line));
+    let mut lines = text.lines().skip_while(|line| *line != "READING CODE:");
+    let heading = lines
+        .next()
+        .expect("AGENTS.md must have a READING CODE section");
+    let body = lines.take_while(|line| {
+        !(line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_uppercase()))
+    });
     std::iter::once(heading)
         .chain(body)
         .collect::<Vec<_>>()
@@ -226,8 +266,8 @@ fn read_is_bytes_and_the_lossy_view_is_its_own_verb() {
     // folding or summarizing on it belong to read-smart and read-file only.
     let read_line_block: String = section
         .lines()
-        .skip_while(|l| !l.trim_start().starts_with("read S"))
-        .take_while(|l| !l.trim_start().starts_with("read-smart"))
+        .skip_while(|l| !l.trim_start().starts_with("greppy read S"))
+        .take_while(|l| !l.trim_start().starts_with("greppy read-smart"))
         .collect::<Vec<_>>()
         .join("\n");
     for word in ["fold", "paginat", "summar", "semantic"] {
@@ -432,8 +472,7 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // browser commands and action-result guidance to match the shipped CLI.
     // 28.09.2026: owner approved bounded preparation waits, reuse of the
     // existing job, and resumption of full Greppy functionality afterward.
-    const APPROVED_SHA256: &str =
-        "a3b4e024e7169e40b2ea27cf5c9d851ee1d6f10fd2d40d3cefa976cb7123ccf8";
+    use greppy_agent::prompt_contract::APPROVED_SHA256;
 
     let text = prompt();
     let digest = {
@@ -514,7 +553,8 @@ fn the_prompt_is_frozen_byte_for_byte() {
         digest, APPROVED_SHA256,
         "AGENTS.md changed. The system prompt is the product's contract and is \
          frozen: if this change is intended, the owner approves it by updating \
-         APPROVED_SHA256 in this test. If it is not, revert the file."
+         APPROVED_SHA256 in assets/prompts/contract.rs after reviewing the complete \
+         diff. If it is not approved, revert the file."
     );
 }
 
@@ -587,11 +627,7 @@ fn web_subcommands_from_help() -> std::collections::BTreeSet<String> {
 
 /// The canonical browser portion of both shipped prompt surfaces.
 fn beta_web_prompt() -> Option<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/prompts/web-beta.md")
-        .canonicalize()
-        .ok()?;
-    std::fs::read_to_string(path).ok()
+    Some(greppy_agent::browser_prompt().to_owned())
 }
 
 #[test]
@@ -718,14 +754,18 @@ fn delimited_browser_block(text: &str) -> Option<&str> {
 }
 
 #[test]
-fn public_and_builtin_browser_prompts_are_byte_identical() {
+fn builtin_browser_prompt_removes_only_unavailable_stdin_features() {
     let public = prompt();
     let beta = beta_web_prompt().expect("canonical browser prompt must ship");
-    assert_eq!(
-        delimited_browser_block(&public),
-        delimited_browser_block(&beta),
-        "AGENTS.md and assets/prompts/web-beta.md must expose one browser contract"
-    );
+    let expected = delimited_browser_block(&public)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("  greppy web match "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(" or --value-stdin", "");
+    assert_eq!(Some(expected.as_str()), delimited_browser_block(&beta),
+        "built-in browser must derive from the signed contract with only the owner-ordered stdin exclusions");
 }
 
 #[test]

@@ -22,16 +22,13 @@ impl Store {
             ));
         }
         let key = format!("{:x}", Sha256::digest(path.as_bytes()));
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Path::new("/Volumes/tmp/dev-artifacts/greppy/bash-smart-retained").join(key))
+        // A mounted disposable macOS volume keeps large captures off the system
+        // disk; without one (every ordinary Mac) they live next to the store.
+        Ok(match greppy_core::cache::macos_disposable_volume() {
+            Some(volume) => volume.join("dev-artifacts/greppy/bash-smart-retained"),
+            None => Path::new(&path).with_file_name("bash-smart-retained"),
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(Path::new(&path)
-                .with_file_name("bash-smart-retained")
-                .join(key))
-        }
+        .join(key))
     }
 
     pub fn retain_bash_smart_capture(
@@ -43,21 +40,9 @@ impl Store {
         if stdout.len() as u64 > STREAM_CAP_BYTES || stderr.len() as u64 > STREAM_CAP_BYTES {
             return Err(Error::Store("retained capture exceeds stream cap".into()));
         }
+        // retained_capture_dir only selects /Volumes/tmp when it is a mounted
+        // volume of its own; otherwise captures live next to the store.
         let dir = self.retained_capture_dir()?;
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let volume = std::fs::metadata("/Volumes/tmp").map_err(|e| {
-                Error::Store(format!("retained capture tmp volume unavailable: {e}"))
-            })?;
-            let system = std::fs::metadata("/")
-                .map_err(|e| Error::Store(format!("inspect system volume: {e}")))?;
-            if !volume.is_dir() || volume.dev() == system.dev() {
-                return Err(Error::Store(
-                    "retained capture tmp volume is not mounted".into(),
-                ));
-            }
-        }
         let root = dir
             .parent()
             .ok_or_else(|| Error::Store("retained namespace has no owner".into()))?;

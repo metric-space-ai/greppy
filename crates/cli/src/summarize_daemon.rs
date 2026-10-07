@@ -60,9 +60,9 @@ pub(super) fn prewarm_from_env(cfg: &super::QwenSummaryConfig) {
         return;
     };
     let ping = serde_json::json!({"op": "ping"});
-    if matches!(
+    if !matches!(
         inference_daemon::request(&endpoint, ping, Duration::from_secs(1), 4096, 4096),
-        RequestOutcome::Response(_)
+        RequestOutcome::NoDaemon
     ) {
         return;
     }
@@ -76,13 +76,30 @@ pub(super) fn summarize_source_via_daemon(
     model_key: &str,
     path: &str,
     source: &str,
-) -> Option<Vec<String>> {
-    let endpoint = endpoint(model_key)?;
-    match request_brief(&endpoint, model_key, path, source) {
-        RequestOutcome::Response(summary) => return Some(summary),
-        RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
-            report_explicit_backend_failure(cfg, "daemon request failed");
-            return None;
+) -> RequestOutcome<Vec<String>> {
+    summarize_source_via_daemon_with_timeout(cfg, model_key, path, source, CLIENT_READ_TIMEOUT)
+}
+
+fn summarize_source_via_daemon_with_timeout(
+    cfg: &super::QwenSummaryConfig,
+    model_key: &str,
+    path: &str,
+    source: &str,
+    timeout: Duration,
+) -> RequestOutcome<Vec<String>> {
+    let Some(endpoint) = endpoint(model_key) else {
+        report_daemon_failure(cfg, "daemon endpoint unavailable");
+        return RequestOutcome::Failed;
+    };
+    match request_brief(&endpoint, model_key, path, source, timeout) {
+        RequestOutcome::Response(summary) => return RequestOutcome::Response(summary),
+        RequestOutcome::DaemonBusy => {
+            report_daemon_failure(cfg, "shared daemon busy at request deadline");
+            return RequestOutcome::DaemonBusy;
+        }
+        RequestOutcome::Failed => {
+            report_daemon_failure(cfg, "daemon request failed");
+            return RequestOutcome::Failed;
         }
         RequestOutcome::NoDaemon => {}
     }
@@ -91,18 +108,22 @@ pub(super) fn summarize_source_via_daemon(
         inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
     for delay in inference_daemon::retry_delays() {
         std::thread::sleep(delay);
-        match request_brief(&endpoint, model_key, path, source) {
-            RequestOutcome::Response(summary) => return Some(summary),
-            RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
-                report_explicit_backend_failure(cfg, "daemon request failed after restart");
-                return None;
+        match request_brief(&endpoint, model_key, path, source, timeout) {
+            RequestOutcome::Response(summary) => return RequestOutcome::Response(summary),
+            RequestOutcome::DaemonBusy => {
+                report_daemon_failure(cfg, "shared daemon busy at request deadline");
+                return RequestOutcome::DaemonBusy;
+            }
+            RequestOutcome::Failed => {
+                report_daemon_failure(cfg, "daemon request failed after restart");
+                return RequestOutcome::Failed;
             }
             RequestOutcome::NoDaemon => {}
         }
     }
     inference_daemon::record_spawn_failure(&endpoint, spawn_outcome.attempted());
-    report_explicit_backend_failure(cfg, "daemon did not become ready");
-    None
+    report_daemon_failure(cfg, "daemon did not become ready");
+    RequestOutcome::NoDaemon
 }
 
 #[allow(dead_code)]
@@ -119,7 +140,7 @@ pub(super) fn triage_spans_via_daemon(
     match request_triage(&endpoint, model_key, query, spans) {
         RequestOutcome::Response(verdicts) => return Some(verdicts),
         RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
-            report_explicit_backend_failure(cfg, "triage daemon request failed");
+            report_daemon_failure(cfg, "triage daemon request failed");
             return None;
         }
         RequestOutcome::NoDaemon => {}
@@ -132,29 +153,31 @@ pub(super) fn triage_spans_via_daemon(
         match request_triage(&endpoint, model_key, query, spans) {
             RequestOutcome::Response(verdicts) => return Some(verdicts),
             RequestOutcome::DaemonBusy | RequestOutcome::Failed => {
-                report_explicit_backend_failure(cfg, "triage daemon request failed after restart");
+                report_daemon_failure(cfg, "triage daemon request failed after restart");
                 return None;
             }
             RequestOutcome::NoDaemon => {}
         }
     }
     inference_daemon::record_spawn_failure(&endpoint, spawn_outcome.attempted());
-    report_explicit_backend_failure(cfg, "triage daemon did not become ready");
+    report_daemon_failure(cfg, "triage daemon did not become ready");
     None
 }
 
-fn report_explicit_backend_failure(cfg: &super::QwenSummaryConfig, detail: &str) {
-    if !matches!(
-        cfg.device,
-        greppy_qwen35_native::DevicePreference::Metal
-            | greppy_qwen35_native::DevicePreference::Cuda
-    ) {
-        return;
-    }
+pub(super) fn report_configuration_failure(detail: &str) {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
-            "greppy: explicit {} summary inference failed ({detail}); deterministic output preserved",
+            "greppy: summary configuration: {detail}; no in-process summary inference started"
+        );
+    }
+}
+
+fn report_daemon_failure(cfg: &super::QwenSummaryConfig, detail: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "greppy: {} summary daemon: {detail}; no model summary generated and no in-process inference started; retry the original command or inspect greppy doctor --json",
             cfg.device.as_str()
         );
     }
@@ -165,6 +188,7 @@ fn request_brief(
     model_key: &str,
     path: &str,
     source: &str,
+    timeout: Duration,
 ) -> RequestOutcome<Vec<String>> {
     let request = serde_json::json!({
         "pv": greppy_qwen35_native::PROMPT_VERSION,
@@ -177,7 +201,7 @@ fn request_brief(
     match inference_daemon::request(
         endpoint,
         request,
-        CLIENT_READ_TIMEOUT,
+        timeout,
         MAX_REQUEST_BYTES,
         MAX_RESPONSE_BYTES,
     ) {
@@ -492,6 +516,181 @@ fn respond_triage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct SharedSummaryServer {
+        key: String,
+        endpoint: Endpoint,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl SharedSummaryServer {
+        fn new(replies: Vec<serde_json::Value>) -> Self {
+            use std::io::{BufRead, Write};
+            use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+            use std::sync::Arc;
+            static NONCE: AtomicU64 = AtomicU64::new(0);
+            let key = format!(
+                "summary-queue-test-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, Ordering::Relaxed)
+            );
+            let endpoint = endpoint(&key).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(endpoint.address()).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let thread_stop = Arc::clone(&stop);
+            let thread_requests = Arc::clone(&requests);
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut first_id = None;
+                while !thread_stop.load(Ordering::Acquire) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "summary test client did not finish"
+                    );
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            let mut raw = String::new();
+                            std::io::BufReader::new(&mut stream)
+                                .read_line(&mut raw)
+                                .unwrap();
+                            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                            assert_eq!(request["mode"], "brief");
+                            let id = request["request_id"].clone();
+                            if let Some(first) = &first_id {
+                                assert_eq!(&id, first, "capacity retry changed request identity");
+                            }
+                            first_id = Some(id.clone());
+                            let index = thread_requests.fetch_add(1, Ordering::AcqRel);
+                            let mut reply = replies[index.min(replies.len() - 1)].clone();
+                            reply["request_id"] = id;
+                            writeln!(stream, "{reply}").unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => panic!("summary server accept: {error}"),
+                    }
+                }
+            });
+            Self {
+                key,
+                endpoint,
+                stop,
+                requests,
+                worker: Some(worker),
+            }
+        }
+
+        fn config(&self, root: &std::path::Path) -> crate::QwenSummaryConfig {
+            crate::QwenSummaryConfig {
+                model_id: self.key.clone(),
+                gguf: root.join("must-not-load-private.gguf"),
+                tokenizer: root.join("must-not-load-private-tokenizer.json"),
+                device: greppy_qwen35_native::DevicePreference::Auto,
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SharedSummaryServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            let result = self.worker.take().unwrap().join();
+            let _ = std::fs::remove_file(self.endpoint.address());
+            if !std::thread::panicking() {
+                result.expect("shared summary test server failed");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_busy_queue_completes_and_publishes_only_one_summary() {
+        let busy = serde_json::json!({"error": "daemon busy", "error_kind": "capacity", "retryable": true});
+        let server = SharedSummaryServer::new(vec![
+            busy.clone(),
+            busy,
+            serde_json::json!({"s": ["bounds the value"]}),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let cache = greppy_store::SummaryCache::open(root.path()).unwrap();
+        let cfg = server.config(root.path());
+        let invoke = || {
+            crate::summarize_source_cached(
+                &cfg,
+                &server.key,
+                (Some(&cache), None, None),
+                "limits.py",
+                "def clamp(v): return min(max(v, 0), 10)",
+                false,
+            )
+        };
+        assert_eq!(invoke(), Some(vec!["bounds the value".into()]));
+        assert_eq!(server.request_count(), 3);
+        assert_eq!(cache.count().unwrap(), 1);
+        assert_eq!(invoke(), Some(vec!["bounds the value".into()]));
+        assert_eq!(
+            server.request_count(),
+            3,
+            "cached success should not reenter the daemon"
+        );
+        assert!(!cfg.gguf.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_busy_deadline_keeps_typed_outcome_without_private_model() {
+        let server = SharedSummaryServer::new(vec![
+            serde_json::json!({"error": "inference queue full", "error_kind": "capacity", "retryable": true}),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = server.config(root.path());
+        let outcome = summarize_source_via_daemon_with_timeout(
+            &cfg,
+            &server.key,
+            "limits.py",
+            "def clamp(v): return min(v, 10)",
+            Duration::from_millis(75),
+        );
+        assert_eq!(outcome, RequestOutcome::DaemonBusy);
+        assert!(server.request_count() > 0);
+        assert!(!cfg.gguf.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_model_failure_is_not_capacity_and_does_not_publish_cache() {
+        let server =
+            SharedSummaryServer::new(vec![serde_json::json!({"error": "model unavailable"})]);
+        let root = tempfile::tempdir().unwrap();
+        let cache = greppy_store::SummaryCache::open(root.path()).unwrap();
+        let cfg = server.config(root.path());
+        assert!(crate::summarize_source_cached(
+            &cfg,
+            &server.key,
+            (Some(&cache), None, None),
+            "limits.py",
+            "def clamp(v): return min(v, 10)",
+            false
+        )
+        .is_none());
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(cache.count().unwrap(), 0);
+        assert!(!cfg.gguf.exists());
+    }
 
     #[test]
     fn default_ttls_cover_agent_session_bursts() {

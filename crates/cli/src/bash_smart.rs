@@ -21,6 +21,37 @@ const HEAD_LINES: usize = 20;
 const SUCCESS_TAIL_LINES: usize = 30;
 const FAILURE_TAIL_LINES: usize = 60;
 const EXPAND_PAGE_LINES: usize = 400;
+const EXPAND_TEXT_METADATA_RESERVE: usize = 1024;
+const EXPAND_JSON_METADATA_RESERVE: usize = 2048;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExpandWindow {
+    pub offset: usize,
+    pub limit: Option<usize>,
+    pub max_bytes: Option<usize>,
+}
+fn expand_retry_command(
+    id: &str,
+    window: ExpandWindow,
+    json: bool,
+    offset: Option<usize>,
+) -> String {
+    let mut command = format!("greppy expand {id}");
+    if json {
+        command.push_str(" --json");
+    }
+    if let Some(offset) = offset {
+        command.push_str(&format!(" --offset {offset}"));
+    }
+    if let Some(limit) = window.limit {
+        command.push_str(&format!(" --limit {limit}"));
+    }
+    if let Some(max_bytes) = window.max_bytes {
+        command.push_str(&format!(" --max-bytes {max_bytes}"));
+    }
+    command
+}
+
 const EMBED_BATCH_LINES: usize = 16;
 const NOVELTY_TOP_K: usize = 3;
 const NOVELTY_DISTANCE_FLOOR: f32 = 0.12;
@@ -77,9 +108,11 @@ static RUST_ERROR_FIELD_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     .expect("bash-smart Rust error field regex")
 });
 
+// A `warn!(..)` macro or `warn(..)` call at the start of a line is source
+// code (e.g. a `git diff` context line), not an emitted warning.
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:|[0-9]+:[0-9]+[\t ]+warning[\t ]+)",
+        r"(?i-u)^[\t ]*(?:warn(?:ing)?(?:[^a-z0-9_!(]|$)|deprecat|note:|[0-9]+:[0-9]+[\t ]+warning[\t ]+)",
     )
     .expect("bash-smart warning marker regex")
 });
@@ -101,6 +134,15 @@ static TYPESCRIPT_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|
     )
     .expect("bash-smart TypeScript diagnostic regex")
 });
+// CMake headers end in a colon, optionally with an at/in source location.
+// Requiring the terminator avoids counting prose mentioning CMake warnings.
+static CMAKE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*CMake (Error|Warning)(?: \(dev\))?(?::| (?:at|in) [^\r\n]+:)[\t ]*$",
+    )
+    .expect("bash-smart CMake diagnostic regex")
+});
+
 // GCC/Clang put a numeric file location before the severity. Keep the
 // classifier byte-oriented (paths need not be UTF-8) and require the complete
 // location/severity syntax rather than promoting arbitrary stderr prose.
@@ -313,6 +355,9 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
 
     let mut command = command_for_argv(argv)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A private completion channel belongs to the enclosing edit verifier.
+    // Never leak it to the arbitrary project test command or nested greppy calls.
+    command.env_remove("GREPPY_INTERNAL_VERIFY_STATUS_PATH");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -368,37 +413,43 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
                 .map_err(|error| Error::io("wait for interrupted bash-smart command", error))?;
         }
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                let elapsed = started.elapsed();
-                if elapsed >= next_heartbeat {
-                    let latest =
-                        heartbeat_tail(&stderr_path).or_else(|| heartbeat_tail(&stdout_path));
-                    if let Some(latest) = latest {
-                        eprintln!(
+            Ok(Some(status)) => {
+                if stdout_thread.is_finished() && stderr_thread.is_finished() {
+                    break status;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(Error::io("wait for bash-smart command", error)),
+        }
+        // Descendants may retain output pipes after the leader exits. Keep
+        // deadline and signal handling alive until both drainers are done.
+        {
+            let elapsed = started.elapsed();
+            if elapsed >= next_heartbeat {
+                let latest = heartbeat_tail(&stderr_path).or_else(|| heartbeat_tail(&stdout_path));
+                if let Some(latest) = latest {
+                    eprintln!(
                             "bash-smart: command still running — pid={}, elapsed={}s; latest child output: {latest}",
                             child.id(),
                             elapsed.as_secs()
                         );
-                    } else {
-                        eprintln!(
+                } else {
+                    eprintln!(
                             "bash-smart: command still running — pid={}, elapsed={}s; child output is being captured and will be summarized on exit",
                             child.id(),
                             elapsed.as_secs()
                         );
-                    }
-                    next_heartbeat = next_heartbeat.saturating_add(heartbeat_interval);
                 }
-                if timeout_ms.is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) {
-                    timed_out = true;
-                    kill_child_tree(&mut child);
-                    break child.wait().map_err(|error| {
-                        Error::io("wait for timed-out bash-smart command", error)
-                    })?;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                next_heartbeat = next_heartbeat.saturating_add(heartbeat_interval);
             }
-            Err(error) => return Err(Error::io("wait for bash-smart command", error)),
+            if timeout_ms.is_some_and(|limit| started.elapsed().as_millis() >= limit as u128) {
+                timed_out = true;
+                kill_child_tree(&mut child);
+                break child
+                    .wait()
+                    .map_err(|error| Error::io("wait for timed-out bash-smart command", error))?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     };
     let capture_end_micros = started.elapsed().as_micros();
@@ -412,7 +463,13 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         .flatten();
     let exit_code = forwarded_signal
         .map(|signal| 128 + signal)
-        .unwrap_or_else(|| child_exit_code(&status));
+        .unwrap_or_else(|| {
+            if timed_out && status.success() {
+                137
+            } else {
+                child_exit_code(&status)
+            }
+        });
     let raw = StoredRaw::from_capture(stdout_capture, stderr_capture)?;
     let stdout_lines = split_lines(&raw.stdout);
     let stderr_lines = split_lines(&raw.stderr);
@@ -456,6 +513,26 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     // Kills and timeouts always receive an id, even when the partial wall is
     // short. Normal short output keeps its raw skeleton bytes after the verdict
     // only. Oversized individual lines are previews with raw-log recovery.
+    // Every completed capture publishes the private verifier status, including
+    // the short-output fast path below. The project child never receives it.
+    if let Some(path) = std::env::var_os("GREPPY_INTERNAL_VERIFY_STATUS_PATH") {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(Error::Invalid(
+                "private verifier status path must be absolute".into(),
+            ));
+        }
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": "greppy.bash-smart.verify-status.v1",
+            "runner_pid": std::process::id(),
+            "timed_out": timed_out,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "exit_code": exit_code,
+        }))
+        .map_err(|error| Error::Invalid(format!("encode verifier completion: {error}")))?;
+        greppy_core::cache::atomic_write(&path, &data)
+            .map_err(|error| Error::io("write verifier completion", error))?;
+    }
     if verbatim_short {
         if let Some(store) = store.as_ref() {
             let ranges = full_line_range(&stdout_lines);
@@ -773,6 +850,7 @@ fn detect_blocks(
                 TYPESCRIPT_DIAGNOSTIC_RE
                     .captures(lines[index].content)
                     .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(lines[index].content))
+                    .or_else(|| CMAKE_DIAGNOSTIC_RE.captures(lines[index].content))
                     .map(|captures| {
                         if captures[1].eq_ignore_ascii_case(b"warning") {
                             BlockKind::Warning
@@ -975,6 +1053,7 @@ pub(crate) fn expand(
     store: &greppy_store::Store,
     pack: greppy_store::ExpandPack,
     json: bool,
+    window: ExpandWindow,
 ) -> Result<i32> {
     let reason = pack_decode_failure(&pack);
     let Some((pack, raw)) = relocate_or_refuse(store, pack)? else {
@@ -992,8 +1071,53 @@ pub(crate) fn expand(
         &raw.stdout
     };
     let lines = split_lines(bytes);
+    crate::command_owns_output();
+    let metadata_reserve = if json {
+        EXPAND_JSON_METADATA_RESERVE
+    } else {
+        EXPAND_TEXT_METADATA_RESERVE
+    };
+    if let Some(max_bytes) = window
+        .max_bytes
+        .filter(|max_bytes| *max_bytes < metadata_reserve)
+    {
+        return Err(Error::Invalid(format!(
+            "bash-smart expand --max-bytes {max_bytes} is below the {metadata_reserve}-byte {} metadata minimum; raise --max-bytes or omit it",
+            if json { "JSON" } else { "text" }
+        )));
+    }
     let ranges = pack_line_ranges(&pack, lines.len());
-    let (page_ranges, remaining_ranges) = take_range_page(&ranges, EXPAND_PAGE_LINES);
+    let (skipped_ranges, ranges) = skip_range_lines(&ranges, window.offset);
+    let page_limit = window
+        .limit
+        .unwrap_or(EXPAND_PAGE_LINES)
+        .min(EXPAND_PAGE_LINES);
+    let (candidate_ranges, mut remaining_ranges) = take_range_page(&ranges, page_limit);
+    let raw_byte_budget = window.max_bytes.map(|max_bytes| {
+        let available = max_bytes - metadata_reserve;
+        if json {
+            available / 2
+        } else {
+            available
+        }
+    });
+    let (page_ranges, byte_remaining, oversized_line_bytes) = if json {
+        take_range_json_page(
+            &candidate_ranges,
+            &lines,
+            window
+                .max_bytes
+                .map(|max_bytes| max_bytes - metadata_reserve),
+        )
+    } else {
+        take_range_byte_page(&candidate_ranges, &lines, raw_byte_budget)
+    };
+    if !byte_remaining.is_empty() {
+        byte_remaining
+            .into_iter()
+            .rev()
+            .for_each(|range| remaining_ranges.insert(0, range));
+    }
     let start = page_ranges.first().map(|(start, _)| *start).unwrap_or(1);
     let end_line = page_ranges.last().map(|(_, end)| *end).unwrap_or(0);
     let next_line = remaining_ranges.first().map(|(start, _)| *start);
@@ -1003,6 +1127,8 @@ pub(crate) fn expand(
     } else {
         insert_continuation_pack(store, &pack, &raw, stream, &remaining_ranges).ok()
     };
+    let fallback_offset = (!remaining_ranges.is_empty() && next.is_none())
+        .then_some(window.offset + range_line_count(&page_ranges));
 
     if json {
         let page = page_ranges
@@ -1010,9 +1136,7 @@ pub(crate) fn expand(
             .flat_map(|(start, end)| lines[start - 1..*end].iter())
             .map(|line| hex_encode(line.raw))
             .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let rendered = serde_json::to_vec_pretty(&serde_json::json!({
                 "id": pack.id,
                 "kind": "bash-smart",
                 "stream": stream,
@@ -1020,19 +1144,45 @@ pub(crate) fn expand(
                 "start_line": start,
                 "end_line": end_line,
                 "line_count": lines.len(),
+                "requested_offset": window.offset,
+                "skipped_lines": range_line_count(&skipped_ranges),
+                "exhausted": remaining_ranges.is_empty(),
+                "raw_bytes": range_byte_count(&page_ranges, &lines),
+                "max_bytes": window.max_bytes,
+                "raw_byte_budget": raw_byte_budget,
+                "oversized_complete_line_bytes": oversized_line_bytes,
                 "raw_line_hex": page,
                 "next": next.as_ref().zip(next_line).map(|(id, line)| serde_json::json!({
-                    "id": id,
-                    "line": line,
-                    "command": format!("greppy expand {id}"),
-                })),
+                        "id": id,
+                        "line": line,
+                        "command": expand_retry_command(id, window, true, None),
+                    })).or_else(|| fallback_offset.zip(next_line).map(|(offset, line)| serde_json::json!({
+                        "id": pack.id,
+                        "line": line,
+                        "offset": offset,
+                        "command": expand_retry_command(&pack.id, window, true, Some(offset)),
+                        "warning": "continuation allocation failed; retry the immutable source pack at the exact saved-line offset",
+                    }))),
             }))
-            .map_err(|error| Error::Invalid(format!("serialize bash-smart expand: {error}")))?
-        );
+            .map_err(|error| Error::Invalid(format!("serialize bash-smart expand: {error}")))?;
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&rendered)
+            .and_then(|_| stdout.write_all(b"\n"))
+            .and_then(|_| stdout.flush())
+            .map_err(|error| Error::io("write bash-smart expand JSON", error))?;
         return Ok(0);
     }
 
     let mut stdout = std::io::stdout().lock();
+    if window.offset > 0 {
+        let _ = writeln!(
+            stdout,
+            "offset: {} ({} saved lines skipped by request)",
+            window.offset,
+            range_line_count(&skipped_ranges)
+        );
+    }
     write_line_ranges(&mut stdout, &lines, &page_ranges);
     if let Some((_, end)) = page_ranges.last() {
         if !lines[*end - 1].raw.ends_with(b"\n") {
@@ -1042,15 +1192,26 @@ pub(crate) fn expand(
     if !remaining_ranges.is_empty() {
         if let (Some(next_id), Some(next_line)) = (next, next_line) {
             let remaining = range_line_count(&remaining_ranges);
+            let command = expand_retry_command(&next_id, window, false, None);
             let _ = writeln!(
                 stdout,
-                "… {remaining} lines — greppy expand {next_id} continues at {next_line}"
+                "… {remaining} lines — {command} continues at {next_line}"
             );
-        } else {
-            // If allocating the next page fails, deliver it now rather than
-            // leave a continuation that cannot be opened.
-            write_line_ranges(&mut stdout, &lines, &remaining_ranges);
+        } else if let Some(offset) = fallback_offset {
+            let command = expand_retry_command(&pack.id, window, false, Some(offset));
+            let _ = writeln!(
+                stdout,
+                "continuation allocation failed; retry without loss: {command}"
+            );
         }
+    }
+    if let Some(bytes) = oversized_line_bytes {
+        let _ = writeln!(
+            stdout,
+            "note: one complete raw line is {bytes} bytes and exceeds the {}-byte raw payload allowance within --max-bytes {}; emitted whole to preserve exact bytes",
+            raw_byte_budget.unwrap_or(bytes),
+            window.max_bytes.unwrap_or(bytes)
+        );
     }
     Ok(0)
 }
@@ -1891,6 +2052,96 @@ fn take_range_page(ranges: &[(usize, usize)], page_lines: usize) -> (LineRanges,
     (page, remaining)
 }
 
+fn skip_range_lines(ranges: &[(usize, usize)], mut offset: usize) -> (LineRanges, LineRanges) {
+    let mut skipped = Vec::new();
+    let mut remaining = Vec::new();
+    for &(start, end) in ranges {
+        let count = end - start + 1;
+        if offset == 0 {
+            remaining.push((start, end));
+        } else if offset >= count {
+            skipped.push((start, end));
+            offset -= count;
+        } else {
+            skipped.push((start, start + offset - 1));
+            remaining.push((start + offset, end));
+            offset = 0;
+        }
+    }
+    (skipped, remaining)
+}
+
+fn take_range_byte_page(
+    ranges: &[(usize, usize)],
+    lines: &[RawLine<'_>],
+    max_bytes: Option<usize>,
+) -> (LineRanges, LineRanges, Option<usize>) {
+    let Some(max_bytes) = max_bytes else {
+        return (ranges.to_vec(), Vec::new(), None);
+    };
+    let mut keep = 0usize;
+    let mut used = 0usize;
+    let mut oversized = None;
+    'outer: for &(start, end) in ranges {
+        for line in &lines[start - 1..end] {
+            let bytes = line.raw.len();
+            if keep == 0 && bytes > max_bytes {
+                keep = 1;
+                oversized = Some(bytes);
+                break 'outer;
+            }
+            if used.saturating_add(bytes) > max_bytes {
+                break 'outer;
+            }
+            used += bytes;
+            keep += 1;
+        }
+    }
+    let (page, remaining) = take_range_page(ranges, keep);
+    (page, remaining, oversized)
+}
+
+fn take_range_json_page(
+    ranges: &[(usize, usize)],
+    lines: &[RawLine<'_>],
+    encoded_budget: Option<usize>,
+) -> (LineRanges, LineRanges, Option<usize>) {
+    let Some(encoded_budget) = encoded_budget else {
+        return (ranges.to_vec(), Vec::new(), None);
+    };
+    let mut keep = 0usize;
+    let mut encoded = 0usize;
+    let mut oversized = None;
+    'outer: for &(start, end) in ranges {
+        for line in &lines[start - 1..end] {
+            // Pretty JSON renders each hex string with quotes, indentation,
+            // an optional comma, and a newline. Twelve bytes is a strict
+            // upper bound for that framing at this fixed nesting depth.
+            let line_encoded = line.raw.len().saturating_mul(2).saturating_add(12);
+            if keep == 0 && line_encoded > encoded_budget {
+                keep = 1;
+                oversized = Some(line.raw.len());
+                break 'outer;
+            }
+            if encoded.saturating_add(line_encoded) > encoded_budget {
+                break 'outer;
+            }
+            encoded += line_encoded;
+            keep += 1;
+        }
+    }
+    let (page, remaining) = take_range_page(ranges, keep);
+    (page, remaining, oversized)
+}
+
+fn range_byte_count(ranges: &[(usize, usize)], lines: &[RawLine<'_>]) -> usize {
+    ranges
+        .iter()
+        .flat_map(|(start, end)| &lines[start - 1..*end])
+        .map(|line| line.raw.len())
+        .sum()
+}
+
 fn range_line_count(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|(start, end)| end - start + 1).sum()
 }
@@ -2401,6 +2652,66 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_window_preserves_disjoint_ranges_and_advances_without_gaps() {
+        let ranges = vec![(2, 4), (7, 10)];
+        let (skipped, remaining) = skip_range_lines(&ranges, 2);
+        assert_eq!(skipped, vec![(2, 3)]);
+        assert_eq!(remaining, vec![(4, 4), (7, 10)]);
+
+        let (page, remaining) = take_range_page(&remaining, 3);
+        assert_eq!(page, vec![(4, 4), (7, 8)]);
+        assert_eq!(remaining, vec![(9, 10)]);
+        assert_eq!(range_line_count(&skipped), 2);
+        assert_eq!(range_line_count(&page), 3);
+        assert_eq!(range_line_count(&remaining), 2);
+    }
+
+    #[test]
+    fn expand_byte_window_keeps_complete_lines_and_reports_oversized_first_line() {
+        let raw = b"one\ntwo-two\nthree\n";
+        let lines = split_lines(raw);
+        let ranges = vec![(1, 3)];
+
+        let (page, remaining, oversized) = take_range_byte_page(&ranges, &lines, Some(12));
+        assert_eq!(page, vec![(1, 2)]);
+        assert_eq!(remaining, vec![(3, 3)]);
+        assert_eq!(range_byte_count(&page, &lines), 12);
+        assert_eq!(oversized, None);
+
+        let (page, remaining, oversized) = take_range_byte_page(&ranges, &lines, Some(3));
+        assert_eq!(page, vec![(1, 1)]);
+        assert_eq!(remaining, vec![(2, 3)]);
+        assert_eq!(oversized, Some(4));
+        assert_eq!(write_ranges_to_vec(&lines, &page), b"one\n");
+    }
+
+    #[test]
+    fn expand_json_window_accounts_for_each_short_lines_encoding_overhead() {
+        let raw = b"x\n".repeat(400);
+        let lines = split_lines(&raw);
+        let ranges = vec![(1, 400)];
+        let encoded_budget = 3_000 - EXPAND_JSON_METADATA_RESERVE;
+        let (page, remaining, oversized) =
+            take_range_json_page(&ranges, &lines, Some(encoded_budget));
+        let kept = range_line_count(&page);
+        assert!(kept > 0 && kept < 400);
+        assert_eq!(range_line_count(&remaining), 400 - kept);
+        assert_eq!(oversized, None);
+        let hex = page
+            .iter()
+            .flat_map(|(start, end)| lines[start - 1..*end].iter())
+            .map(|line| hex_encode(line.raw))
+            .collect::<Vec<_>>();
+        assert!(serde_json::to_vec_pretty(&hex).unwrap().len() <= encoded_budget);
+    }
+
+    fn write_ranges_to_vec(lines: &[RawLine<'_>], ranges: &[(usize, usize)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_line_ranges(&mut bytes, lines, ranges);
+        bytes
+    }
 
     #[cfg(any(unix, windows))]
     fn deterministic_daemon_probe_config() -> EmbeddingModelConfig {
@@ -3107,6 +3418,22 @@ mod tests {
     }
 
     #[test]
+    fn cmake_diagnostics_keep_indented_details_and_reject_prose() {
+        let diagnostics = split_lines(b"CMake Error in sample/CMakeLists.txt:\n  Missing path\n\nCMake Warning (dev) at CMakeLists.txt:2 (project):\n  Developer warning\nCMake Warning:\n  Unused variables\n");
+        let blocks = detect_blocks(&diagnostics, &[]);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert_eq!(blocks[0].kind, BlockKind::Error);
+        assert_eq!(blocks[0].lines.len(), 3);
+        assert!(blocks[1..]
+            .iter()
+            .all(|block| block.kind == BlockKind::Warning));
+        let prose = split_lines(
+            b"CMake Error handling documentation\nCMake Warning examples:\nCMake Error_count: 4\n",
+        );
+        assert!(detect_blocks(&prose, &[]).is_empty());
+    }
+
+    #[test]
     fn source_prefixed_compiler_diagnostics_require_location_and_severity() {
         // Colons are valid path bytes, so `header.h:x:8:` could legitimately
         // mean line 8 of a file named `header.h:x`; use no numeric suffix here.
@@ -3130,6 +3457,19 @@ mod tests {
                 "ok — exit 0, 2 warnings"
             );
         }
+    }
+
+    #[test]
+    fn source_warn_macro_and_call_are_not_warnings() {
+        let diff = split_lines(
+            b"@@ -10,6 +10,7 @@ impl Server {\n             warn!(\"timed out waiting for background tasks\");\n-                                warn!(\"receiver lagged\");\n+    warn(\"call\")\n",
+        );
+        assert!(detect_blocks(&diff, &[]).is_empty());
+        let emitted =
+            split_lines(b"warning: unused import\nWARN  pool exhausted\nwarn: deprecated flag\n");
+        let blocks = detect_blocks(&emitted, &[]);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
     }
 
     #[test]

@@ -532,7 +532,7 @@ pub(super) fn spawn_once(endpoint: &Endpoint, spawn: impl FnOnce() -> Option<()>
         Err(error) => {
             return SpawnOutcome::CoordinationFailed(format!(
                 "cannot acquire daemon spawn lock: {error}"
-            ))
+            ));
         }
     };
     let outcome = if spawn().is_some() {
@@ -1275,7 +1275,11 @@ fn status_response(
         "request_id": request_id,
         "protocol": PROTOCOL_VERSION,
         "daemon_pid": std::process::id(),
-        "state": status.state.as_str(),
+        "state": if matches!(status.state, LifecycleState::Ready) && status.active_request_id.is_some() {
+            "busy"
+        } else {
+            status.state.as_str()
+        },
         "state_elapsed_ms": status.state_started.elapsed().as_millis(),
         "active_request_id": status.active_request_id,
         "active_request_elapsed_ms": status
@@ -2444,6 +2448,22 @@ mod tests {
     }
 
     #[test]
+    fn active_loaded_model_reports_busy_without_losing_backend() {
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        set_ready(&status, "cuda".into());
+        set_active(&status, Some("active-summary".into()));
+        let running = status_response(&status, "probe", 2);
+        assert_eq!(running["state"], "busy");
+        assert_eq!(running["backend"], "cuda");
+        assert_eq!(running["active_request_id"], "active-summary");
+        complete(&status, true, None);
+        let finished = status_response(&status, "probe", 1);
+        assert_eq!(finished["state"], "ready");
+        assert_eq!(finished["backend"], "cuda");
+        assert!(finished["active_request_id"].is_null());
+    }
+
+    #[test]
     fn runtime_status_reports_only_the_loaded_backend() {
         let status = Arc::new(Mutex::new(RuntimeStatus::default()));
         assert!(status_response(&status, "starting", 0)["backend"].is_null());
@@ -2655,8 +2675,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_detached_spawn_does_not_hold_redirected_parent_streams() {
-        const TEST_NAME: &str =
-            "inference_daemon::tests::windows_detached_spawn_does_not_hold_redirected_parent_streams";
+        const TEST_NAME: &str = "inference_daemon::tests::windows_detached_spawn_does_not_hold_redirected_parent_streams";
         let executable = std::env::current_exe().unwrap();
         let stem = executable
             .file_stem()

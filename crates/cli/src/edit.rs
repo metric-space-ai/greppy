@@ -49,9 +49,9 @@ pub(crate) fn dispatch_edit_inner(
             )));
         }
     }
-    // All grammar verbs share pending.json and the undo stack. Hold one
-    // workspace-store lock across planning, publication, rollback and close;
-    // file-level CAS alone cannot protect those shared transaction records.
+    // Each literal edit owns its target file through planning and publication.
+    // Disjoint files share a compatibility barrier, while workspace-wide verbs
+    // own it exclusively. Pending records are private; undo-stack append is short.
     // A dry run must remain free of journal/lock side effects.
     let dry_run = match &command {
         EditCommand::Replace { dry_run, .. }
@@ -70,24 +70,125 @@ pub(crate) fn dispatch_edit_inner(
         None
     } else {
         let journal = ensured_workspace_store_path(&root_path)?.with_file_name(EDIT_JOURNAL_DIR);
-        Some(acquire_edit_transaction_lock(&journal)?)
+        Some(acquire_edit_command_locks(&journal, &command, &file_base)?)
     };
     Ok(dispatch_edit_grammar(command, json, root, &root_path, &file_base)?.0)
 }
 
-fn acquire_edit_transaction_lock(
+struct EditCommandLocks {
+    _barrier: greppy_core::cache::FileLock,
+    _files: Vec<greppy_core::cache::FileLock>,
+}
+
+fn edit_lock_until(
     journal: &std::path::Path,
+    name: &str,
+    mode: greppy_core::cache::LockMode,
+    deadline: std::time::Instant,
 ) -> Result<greppy_core::cache::FileLock> {
-    greppy_core::cache::acquire_named_lock_in(
-        journal,
-        "transaction",
-        greppy_core::cache::LockMode::Exclusive,
-        true,
-    )
-    .map_err(|error| Error::io("acquire edit transaction lock", error))?
-    .ok_or_else(|| Error::Lock(
-        "another Greppy edit is active for this workspace; nothing written. Wait for that edit to finish, re-read the affected files, then retry".into(),
-    ))
+    loop {
+        if let Some(lock) = greppy_core::cache::acquire_named_lock_in(journal, name, mode, true)
+            .map_err(|error| Error::io("acquire edit coordination lock", error))?
+        {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Lock(format!(
+                "edit could not obtain {name} within its 120-second coordination deadline; nothing written"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+// Resolve existing aliases and normalize not-yet-created paths before naming
+// the file lock. The grammar still performs its full path/syntax/CAS checks
+// after this lock is acquired, so no pre-wait snapshot is ever published.
+fn edit_lock_identity(path: &std::path::Path) -> std::path::PathBuf {
+    // Existing paths must resolve symlinks before interpreting `..`, exactly
+    // like file reads; lexical folding first can give one target two locks.
+    if let Ok(identity) = path.canonicalize() {
+        return identity;
+    }
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    while ancestor.canonicalize().is_err() {
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let mut identity = ancestor
+        .canonicalize()
+        .unwrap_or_else(|_| ancestor.to_path_buf());
+    for name in tail.into_iter().rev() {
+        identity.push(name);
+    }
+    identity
+}
+
+fn acquire_edit_command_locks(
+    journal: &std::path::Path,
+    command: &EditCommand,
+    file_base: &std::path::Path,
+) -> Result<EditCommandLocks> {
+    let file = match command {
+        EditCommand::ReplaceText { file, .. }
+        | EditCommand::ReplaceLines { file, .. }
+        | EditCommand::DeleteLines { file, .. }
+        | EditCommand::InsertLines { file, .. } => Some(file.as_str()),
+        EditCommand::Write { path, .. } => Some(path.as_str()),
+        _ => None,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    // Old clients and workspace-wide operations take this same barrier
+    // exclusively; literal edits share it and coordinate only their target.
+    let mode = if file.is_some() {
+        greppy_core::cache::LockMode::Shared
+    } else {
+        greppy_core::cache::LockMode::Exclusive
+    };
+    let barrier = edit_lock_until(journal, "transaction", mode, deadline)?;
+    let mut files = Vec::new();
+    if let Some(file) = file {
+        let operand = file_operand_path(file_base, file);
+        // Write's resolver deliberately normalizes its create path lexically.
+        // Follow that resolver's path semantics rather than the read semantics.
+        let operand = if matches!(command, EditCommand::Write { .. }) {
+            let mut normalized = std::path::PathBuf::new();
+            for component in operand.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other.as_os_str()),
+                }
+            }
+            normalized
+        } else {
+            operand
+        };
+        let identity = edit_lock_identity(&operand);
+        let name = format!(
+            "file-{}",
+            edit_sha256_hex(identity.as_os_str().as_encoded_bytes())
+        );
+        files.push(edit_lock_until(
+            journal,
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            deadline,
+        )?);
+    }
+    Ok(EditCommandLocks {
+        _barrier: barrier,
+        _files: files,
+    })
 }
 
 pub(crate) fn edit_sha256_hex(data: &[u8]) -> String {
@@ -698,6 +799,54 @@ pub(crate) fn edit_locate(
     }
 }
 
+/// Where an OLD text that matched nowhere most likely sits: the window of file
+/// lines equal to OLD up to whitespace, or else the window sharing the most
+/// whitespace-normalized lines with it (at least half, one of them substantive).
+/// Returns 1-based inclusive lines, the window's exact text, and whether only
+/// whitespace differs. Models that copy OLD from earlier ranged reads often get
+/// indentation wrong; without this they re-read the same file again and again.
+pub(crate) fn nearest_old_candidate(
+    content: &[u8],
+    needle: &str,
+) -> Option<(usize, usize, String, bool)> {
+    fn norm(line: &str) -> String {
+        line.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let text = String::from_utf8_lossy(content);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let wanted: Vec<String> = needle
+        .trim_end_matches('\n')
+        .split('\n')
+        .map(norm)
+        .collect();
+    let n = wanted.len();
+    if n == 0 || n > 200 || n > lines.len() || wanted.iter().all(|line| line.is_empty()) {
+        return None;
+    }
+    let normalized: Vec<String> = lines.iter().map(|line| norm(line)).collect();
+    let window = |start: usize| lines[start..start + n].join("\n");
+    if let Some(start) =
+        (0..=lines.len() - n).find(|&start| normalized[start..start + n] == wanted[..])
+    {
+        return Some((start + 1, start + n, window(start), true));
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for start in 0..=lines.len() - n {
+        let mut equal = 0;
+        let mut substantive = false;
+        for (offset, line) in wanted.iter().enumerate() {
+            if !line.is_empty() && normalized[start + offset] == *line {
+                equal += 1;
+                substantive |= line.len() >= 8;
+            }
+        }
+        if substantive && equal * 2 >= n && best.is_none_or(|(_, score)| equal > score) {
+            best = Some((start, equal));
+        }
+    }
+    best.map(|(start, _)| (start + 1, start + n, window(start), false))
+}
+
 /// The number of matches a selector is allowed to have. `--old` and
 /// `--pattern` search, so they can find none or many; every other selector
 /// addresses exactly one span by construction.
@@ -763,10 +912,42 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
             message.push_str("\n  ");
             message.push_str(site);
         }
-        return Err(EditRefusal::new("match_count", message, 13)
+        let nearest = (located.kind == SelectorKind::Text && located.ranges.is_empty())
+            .then(|| {
+                located
+                    .needle
+                    .as_deref()
+                    .and_then(|needle| nearest_old_candidate(&located.content, needle))
+            })
+            .flatten();
+        if let Some((first, last, text, whitespace_only)) = &nearest {
+            let shown: Vec<&str> = text.split('\n').take(30).collect();
+            message.push_str(&format!(
+                "\n{} at {}:{first}-{last}; copy these lines exactly as OLD, or use: greppy replace-lines {} {first}:{last} [NEW]\n",
+                if *whitespace_only {
+                    "nearest match differs only in whitespace"
+                } else {
+                    "closest similar lines"
+                },
+                located.rel,
+                located.rel,
+            ));
+            message.push_str(&shown.join("\n"));
+            if text.split('\n').count() > shown.len() {
+                message.push_str("\n…");
+            }
+        }
+        let mut refusal = EditRefusal::new("match_count", message, 13)
             .with("expected", serde_json::json!(expect))
             .with("found", serde_json::json!(located.ranges.len()))
-            .with("matches", serde_json::json!(sites)));
+            .with("matches", serde_json::json!(sites));
+        if let Some((first, last, _, whitespace_only)) = nearest {
+            refusal = refusal.with(
+                "nearest",
+                serde_json::json!({"lines": [first, last], "whitespace_only": whitespace_only}),
+            );
+        }
+        return Err(refusal);
     }
     Ok(())
 }
@@ -821,7 +1002,8 @@ pub(crate) fn edit_positional_payload(
 /// Validate a candidate without writing it. Parser locations refer to the
 /// proposed content, which may have different line numbers from the live file.
 fn edit_validate_syntax(path: &str, before: &[u8], after: &[u8]) -> EditResult<()> {
-    let language = greppy_edit::txn::syntax_language_for_path(std::path::Path::new(path), before);
+    let language =
+        greppy_edit::txn::syntax_language_for_edit(std::path::Path::new(path), before, after);
     if !language.is_supported() {
         return Ok(());
     }
@@ -892,6 +1074,11 @@ pub(crate) fn edit_publish(
         record.already_as_sent = !dry_run;
         record.operations = vec![operation];
         edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
+        if verify && !dry_run {
+            let verification = edit_verify(root_path, &record.files);
+            record.diagnostics = Some(verification.diagnostics.clone());
+            record.verification = Some(verification);
+        }
         return Ok(record);
     }
     edit_validate_syntax(&located.rel, &located.content, &new_content)?;
@@ -911,16 +1098,16 @@ pub(crate) fn edit_publish(
             rel: located.rel.clone(),
             content: Some(located.content.clone()),
         }],
-    );
+    )?;
     edit_journal_crash_hook()?;
     if let Err(error) =
         greppy_edit::publish::publish_atomic(root_path, &located.abs, &new_content, &before_sha)
     {
-        edit_journal_abort(root_path);
+        edit_journal_abort(root_path, transaction.as_deref());
         return Err(EditRefusal::new("publish_failed", error.to_string(), 16));
     }
     if let Some(id) = transaction {
-        edit_journal_close(root_path, &id);
+        edit_journal_close(root_path, &id)?;
         record.transaction_id = Some(id);
     }
     let handle = greppy_edit::EditHandle::for_range(
@@ -936,7 +1123,9 @@ pub(crate) fn edit_publish(
     record.handle = handle;
     record.operations = vec![operation];
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
     Ok(record)
@@ -1052,6 +1241,7 @@ pub(crate) fn edit_op_delete(located: &Located) -> EditedContent {
 
 #[derive(Debug)]
 struct EditVerifier {
+    scope: &'static str,
     label: String,
     program: std::path::PathBuf,
     args: Vec<std::ffi::OsString>,
@@ -1137,6 +1327,7 @@ fn edit_verifiers(
         };
         return (
             vec![EditVerifier {
+                scope: "compile",
                 label: "local TypeScript check".into(),
                 program: tsc,
                 args: ["--noEmit", "--pretty", "false", "--incremental", "false"]
@@ -1158,6 +1349,7 @@ fn edit_verifiers(
                 .is_some_and(|extension| matches!(extension, "js" | "mjs" | "cjs"))
         })
         .map(|file| EditVerifier {
+            scope: "syntax",
             label: format!("JavaScript syntax check for {file}"),
             program: std::path::PathBuf::from("node"),
             args: vec!["--check".into(), file.into()],
@@ -1176,6 +1368,7 @@ fn edit_verifiers(
     {
         return (
             vec![EditVerifier {
+                scope: "compile",
                 label: "Rust workspace check".into(),
                 program: "cargo".into(),
                 args: ["check", "--message-format", "short", "--quiet"]
@@ -1190,6 +1383,7 @@ fn edit_verifiers(
     if extensions.iter().any(|extension| extension == "go") && root_path.join("go.mod").is_file() {
         return (
             vec![EditVerifier {
+                scope: "compile",
                 label: "Go workspace build".into(),
                 program: "go".into(),
                 args: vec!["build".into(), "./...".into()],
@@ -1208,6 +1402,7 @@ fn edit_verifiers(
         args.extend(python_files);
         return (
             vec![EditVerifier {
+                scope: "syntax",
                 label: "Python syntax check".into(),
                 program: "python3".into(),
                 args,
@@ -1222,6 +1417,52 @@ fn edit_verifiers(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditVerificationStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    Unavailable,
+    Skipped,
+}
+
+impl EditVerificationStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Unavailable => "unavailable",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Passed | Self::Skipped => 0,
+            _ => 17,
+        }
+    }
+}
+
+pub(crate) struct EditVerification {
+    pub(crate) status: EditVerificationStatus,
+    pub(crate) diagnostics: Vec<String>,
+    checks: Vec<serde_json::Value>,
+    tests_status: &'static str,
+}
+
+impl EditVerification {
+    fn new(status: EditVerificationStatus, diagnostics: Vec<String>) -> Self {
+        Self {
+            status,
+            diagnostics,
+            checks: Vec::new(),
+            tests_status: "not_run",
+        }
+    }
+}
+
 fn edit_verify_timeout() -> std::time::Duration {
     let seconds = std::env::var("GREPPY_EDIT_VERIFY_TIMEOUT_SECS")
         .ok()
@@ -1231,19 +1472,34 @@ fn edit_verify_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
-fn edit_kill_verifier_tree(child: &mut std::process::Child) {
+fn edit_kill_verifier_tree(child: &mut std::process::Child, graceful: bool) {
     #[cfg(unix)]
     {
         // The verifier owns a process group (configured below). Killing only
         // its shell leaves `sleep`, compilers, or package-manager children
         // alive with inherited descriptors, so callers using captured output
         // still hang until those descendants exit.
+        // A nested bash-smart runner owns its test process group. Give its
+        // signal handler a bounded opportunity to reap that group first.
+        if graceful {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         unsafe {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
     }
     #[cfg(windows)]
     {
+        let _ = graceful;
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdout(std::process::Stdio::null())
@@ -1253,29 +1509,53 @@ fn edit_kill_verifier_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> Vec<String> {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let prefix = std::env::temp_dir().join(format!("greppy-verify-{}-{nonce}", std::process::id()));
-    let stdout_path = prefix.with_extension("stdout");
-    let stderr_path = prefix.with_extension("stderr");
+fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> EditVerification {
+    // Completion publishing uses the private-cache writer. Never give that
+    // writer the shared OS temp root: it secures its parent directory, which
+    // may belong to another user (Linux /tmp) or serve unrelated processes.
+    // Keep all capture files in an owned private namespace with RAII cleanup.
+    let capture = tempfile::Builder::new()
+        .prefix("greppy-verify-")
+        .tempdir()
+        .and_then(|directory| {
+            greppy_core::cache::secure_private_directory(directory.path())?;
+            Ok(directory)
+        });
+    let capture = match capture {
+        Ok(directory) => directory,
+        Err(error) => {
+            return EditVerification::new(
+                EditVerificationStatus::Unavailable,
+                vec![format!(
+                    "verify: unavailable — cannot create private capture directory: {error}"
+                )],
+            )
+        }
+    };
+    let stdout_path = capture.path().join("stdout");
+    let stderr_path = capture.path().join("stderr");
+    let runner_status_path = capture.path().join("runner.json");
     let stdout = match std::fs::File::create(&stdout_path) {
         Ok(file) => file,
         Err(error) => {
-            return vec![format!(
-                "verify: unavailable — cannot capture stdout: {error}"
-            )]
+            return EditVerification::new(
+                EditVerificationStatus::Unavailable,
+                vec![format!(
+                    "verify: unavailable — cannot capture stdout: {error}"
+                )],
+            )
         }
     };
     let stderr = match std::fs::File::create(&stderr_path) {
         Ok(file) => file,
         Err(error) => {
             let _ = std::fs::remove_file(&stdout_path);
-            return vec![format!(
-                "verify: unavailable — cannot capture stderr: {error}"
-            )];
+            return EditVerification::new(
+                EditVerificationStatus::Unavailable,
+                vec![format!(
+                    "verify: unavailable — cannot capture stderr: {error}"
+                )],
+            );
         }
     };
     let command = std::iter::once(verifier.program.as_os_str())
@@ -1295,6 +1575,16 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
         .current_dir(&verifier.cwd)
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
+    if verifier.scope == "tests" {
+        process.env("GREPPY_INTERNAL_VERIFY_STATUS_PATH", &runner_status_path);
+        let bound = timeout.as_millis().saturating_sub(250).max(1);
+        let bound = std::env::var("GREPPY_BASH_SMART_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u128>().ok())
+            .filter(|value| *value > 0)
+            .map_or(bound, |existing| existing.min(bound));
+        process.env("GREPPY_BASH_SMART_TIMEOUT_MS", bound.to_string());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1307,7 +1597,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
             let _ = std::fs::remove_file(&stderr_path);
             let message = format!("verify: unavailable — cannot start {command}: {error}");
             eprintln!("{message}");
-            return vec![message];
+            return EditVerification::new(EditVerificationStatus::Unavailable, vec![message]);
         }
     };
     let started = std::time::Instant::now();
@@ -1316,7 +1606,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
         match child.try_wait() {
             Ok(Some(status)) => break (Some(status), false),
             Ok(None) if started.elapsed() >= timeout => {
-                edit_kill_verifier_tree(&mut child);
+                edit_kill_verifier_tree(&mut child, verifier.scope == "tests");
                 break (child.wait().ok(), true);
             }
             Ok(None) => {
@@ -1331,7 +1621,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
-                edit_kill_verifier_tree(&mut child);
+                edit_kill_verifier_tree(&mut child, verifier.scope == "tests");
                 let _ = child.wait();
                 let message = format!("verify: failed to observe {command}: {error}");
                 eprintln!("{message}");
@@ -1341,23 +1631,49 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
     };
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let runner_status = std::fs::read(&runner_status_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| {
+            value["schema"] == "greppy.bash-smart.verify-status.v1"
+                && value["runner_pid"].as_u64() == Some(u64::from(child.id()))
+                && value["exit_code"].as_i64()
+                    == status.and_then(|status| status.code()).map(i64::from)
+        });
+    let _ = std::fs::remove_file(&runner_status_path);
     let _ = std::fs::remove_file(&stdout_path);
     let _ = std::fs::remove_file(&stderr_path);
-    if timed_out {
-        let message = format!(
+    let runner_timed_out = verifier.scope == "tests"
+        && runner_status
+            .as_ref()
+            .is_some_and(|value| value["timed_out"] == true);
+    if timed_out || runner_timed_out {
+        let message = if runner_timed_out {
+            format!("verify: timed out after {}ms — edit remains applied; run `{command}` directly to continue",
+                runner_status.as_ref().and_then(|value| value["elapsed_ms"].as_u64()).unwrap_or_default())
+        } else {
+            format!(
             "verify: timed out after {}s — edit remains applied; run `{command}` directly to continue",
             timeout.as_secs()
-        );
+        )
+        };
         eprintln!("{message}");
-        return vec![message];
+        return EditVerification::new(EditVerificationStatus::TimedOut, vec![message]);
     }
     let Some(status) = status else {
-        return vec![format!("verify: failed — no exit status from {command}")];
+        return EditVerification::new(
+            EditVerificationStatus::Failed,
+            vec![format!("verify: failed — no exit status from {command}")],
+        );
     };
+    if verifier.scope == "tests" && status.success() && runner_status.is_none() {
+        return EditVerification::new(EditVerificationStatus::Unavailable,
+            vec!["verify: selected test runner returned no valid completion status; tests are not confirmed".into()]);
+    }
     if status.success() {
         let message = format!("verify: passed — {}", verifier.label);
         eprintln!("{message}");
-        return vec![message];
+        return EditVerification::new(EditVerificationStatus::Passed, vec![message]);
     }
     let mut diagnostics = vec![format!(
         "verify: failed (exit {}) — {}",
@@ -1378,26 +1694,84 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
             .map(str::to_string),
     );
     eprintln!("{}", diagnostics[0]);
-    diagnostics
+    EditVerification::new(EditVerificationStatus::Failed, diagnostics)
 }
 
-/// The compiler or linter for the touched file type, when the workspace has a
-/// local one. Verification is observable and bounded; it never downloads a
-/// tool and never silently switches to an unrelated language's workspace.
-pub(crate) fn edit_verify_diagnostics(
-    root_path: &std::path::Path,
-    files: &[String],
-) -> Vec<String> {
+/// Local syntax/build checks plus an explicitly selected project test command.
+/// No guessed whole-workspace test suite, network install or test-success claim.
+pub(crate) fn edit_verify(root_path: &std::path::Path, files: &[String]) -> EditVerification {
     let (verifiers, skipped) = edit_verifiers(root_path, files);
+    let timeout = edit_verify_timeout();
+    let mut result = EditVerification::new(EditVerificationStatus::Passed, Vec::new());
     if let Some(message) = skipped {
         eprintln!("{message}");
-        return vec![message];
+        result.status = EditVerificationStatus::Skipped;
+        result.diagnostics.push(message);
     }
-    let timeout = edit_verify_timeout();
-    verifiers
-        .iter()
-        .flat_map(|verifier| edit_run_verifier(verifier, timeout))
-        .collect()
+    for verifier in &verifiers {
+        let checked = edit_run_verifier(verifier, timeout);
+        result.checks.push(serde_json::json!({
+            "scope": verifier.scope,
+            "label": verifier.label,
+            "status": checked.status.as_str(),
+        }));
+        if result.status.exit_code() == 0 && checked.status.exit_code() != 0 {
+            result.status = checked.status;
+        }
+        result.diagnostics.extend(checked.diagnostics);
+    }
+    // The caller selects the affected tests; --verify never infers that a
+    // successful compiler/linter proves project behavior. Reuse bash-smart's
+    // argv/shell contract (including pipefail) and retain this verifier's bound.
+    match std::env::var("GREPPY_VERIFY_TEST_COMMAND") {
+        Err(std::env::VarError::NotPresent) => {}
+        Ok(command) if !command.trim().is_empty() && result.status.exit_code() == 0 => {
+            let checked = match std::env::current_exe() {
+                Ok(program) => edit_run_verifier(
+                    &EditVerifier {
+                        scope: "tests",
+                        label: "selected project tests".into(),
+                        program,
+                        args: vec!["bash-smart".into(), "--".into(), command.into()],
+                        cwd: root_path.to_path_buf(),
+                    },
+                    timeout,
+                ),
+                Err(error) => EditVerification::new(
+                    EditVerificationStatus::Unavailable,
+                    vec![format!("verify: test runner unavailable: {error}")],
+                ),
+            };
+            result.tests_status = checked.status.as_str();
+            result.checks.push(serde_json::json!({
+                "scope": "tests", "label": "selected project tests",
+                "status": result.tests_status,
+            }));
+            if checked.status.exit_code() != 0 || result.status == EditVerificationStatus::Skipped {
+                result.status = checked.status;
+            }
+            result.diagnostics.extend(checked.diagnostics);
+        }
+        Ok(command) if !command.trim().is_empty() => {}
+        _ => {
+            result.tests_status = "unavailable";
+            result.status = EditVerificationStatus::Unavailable;
+            result.diagnostics.push(
+                "verify: GREPPY_VERIFY_TEST_COMMAND must be nonempty UTF-8; no tests ran".into(),
+            );
+        }
+    }
+    if result.tests_status == "not_run" {
+        let message = "verify: tests not run — select affected tests with GREPPY_VERIFY_TEST_COMMAND or run them through `greppy bash-smart` before finishing";
+        eprintln!("{message}");
+        result.diagnostics.push(message.into());
+    }
+    if result.status.exit_code() != 0 {
+        result.diagnostics.push(
+            "verify: edit remains applied; repair it or use `greppy undo` to restore the previous edit".into(),
+        );
+    }
+    result
 }
 
 pub(crate) fn edit_journal_dir(root_path: &std::path::Path) -> std::path::PathBuf {
@@ -1414,27 +1788,70 @@ pub(crate) fn edit_journal_write(path: &std::path::Path, value: &serde_json::Val
     }
 }
 
-/// Record the pre-images and open a transaction. Anything that dies between
-/// here and [`edit_journal_close`] leaves `pending.json` behind — which is
-/// exactly what `recover` looks for.
+fn edit_pending_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let prefix = EDIT_JOURNAL_PENDING.trim_end_matches(".json");
+    dir.join(format!("{prefix}-{id}.json"))
+}
+
+fn edit_published_failure(
+    code: &'static str,
+    message: impl Into<String>,
+    exit: i32,
+) -> EditRefusal {
+    EditRefusal::new(code, message, exit).with("published", serde_json::json!(true))
+}
+
+fn edit_journal_write_checked(path: &std::path::Path, value: &serde_json::Value) -> EditResult<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        EditRefusal::new(
+            "journal_failed",
+            format!("encode edit journal: {error}"),
+            16,
+        )
+    })?;
+    greppy_core::cache::atomic_write(path, &bytes).map_err(|error| {
+        EditRefusal::new(
+            "journal_failed",
+            format!("persist edit journal {}: {error}", path.display()),
+            16,
+        )
+    })
+}
+
+/// Persist one invocation's pre-images before publication. Pending records are
+/// independent; no disjoint writer can replace or abort another writer's record.
 pub(crate) fn edit_journal_open(
     root_path: &std::path::Path,
     before: &[UndoBefore],
-) -> Option<String> {
+) -> EditResult<Option<String>> {
     if before.is_empty() {
-        return None;
+        return Ok(None);
     }
     let dir = ensured_workspace_store_path(root_path)
-        .ok()?
+        .map_err(|error| {
+            EditRefusal::new(
+                "journal_failed",
+                format!("open edit journal: {error}; nothing written"),
+                16,
+            )
+        })?
         .with_file_name(EDIT_JOURNAL_DIR);
-    std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).ok()?;
+    std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).map_err(|error| {
+        EditRefusal::new(
+            "journal_failed",
+            format!("create edit pre-image directory: {error}; nothing written"),
+            16,
+        )
+    })?;
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let seed = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let id = edit_sha256_hex(seed.as_bytes());
     let mut entries = Vec::new();
@@ -1442,23 +1859,38 @@ pub(crate) fn edit_journal_open(
         let blob = match &item.content {
             Some(bytes) => {
                 let name = format!("{id}-{index}.bin");
-                std::fs::write(dir.join(EDIT_JOURNAL_BLOBS).join(&name), bytes).ok()?;
+                std::fs::write(dir.join(EDIT_JOURNAL_BLOBS).join(&name), bytes).map_err(
+                    |error| {
+                        EditRefusal::new(
+                            "journal_failed",
+                            format!("persist edit pre-image: {error}; nothing written"),
+                            16,
+                        )
+                    },
+                )?;
                 Some(name)
             }
             None => None,
         };
-        entries.push(serde_json::json!({ "path": item.rel, "blob": blob }));
+        let mut entry = serde_json::json!({ "path": item.rel, "blob": blob });
+        // Deletion followed by undo recreates the inode. Preserve its original
+        // permissions alongside the optional byte pre-image.
+        #[cfg(unix)]
+        if item.content.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(root_path.join(&item.rel)) {
+                entry["unix_mode"] = serde_json::json!(metadata.permissions().mode());
+            }
+        }
+        entries.push(entry);
     }
-    edit_journal_write(
-        &dir.join(EDIT_JOURNAL_PENDING),
+    edit_journal_write_checked(
+        &edit_pending_path(&dir, &id),
         &serde_json::json!({ "id": id, "entries": entries }),
-    );
-    Some(id)
+    )?;
+    Ok(Some(id))
 }
 
-/// Die after the journal is on disk and before anything is published, so the
-/// interrupted-edit path can be exercised without killing the process from the
-/// outside. Only ever reached when the environment variable is set.
 pub(crate) fn edit_journal_crash_hook() -> EditResult<()> {
     if std::env::var_os("GREPPY_TEST_CRASH_AFTER_JOURNAL").is_some() {
         return Err(EditRefusal::new(
@@ -1470,16 +1902,22 @@ pub(crate) fn edit_journal_crash_hook() -> EditResult<()> {
     Ok(())
 }
 
-/// Close the transaction: record what the files look like now, and push it onto
-/// the stack. The after-image is what `undo` checks against, so an edit that
-/// somebody else overwrote in the meantime cannot be reversed blindly (D3).
-pub(crate) fn edit_journal_close(root_path: &std::path::Path, id: &str) {
+pub(crate) fn edit_journal_close(root_path: &std::path::Path, id: &str) -> EditResult<()> {
     let dir = edit_journal_dir(root_path);
-    let Some(mut record) = edit_journal_read(&dir.join(EDIT_JOURNAL_PENDING)) else {
-        return;
+    let pending = edit_pending_path(&dir, id);
+    let Some(mut record) = edit_journal_read(&pending) else {
+        return Err(edit_published_failure(
+            "journal_finalize_failed",
+            "source edits were published, but their pending undo record is missing or unreadable",
+            16,
+        ));
     };
     if record["id"].as_str() != Some(id) {
-        return;
+        return Err(edit_published_failure(
+            "journal_finalize_failed",
+            "source edits were published, but their pending undo identity changed",
+            16,
+        ));
     }
     let closed: Vec<serde_json::Value> = record["entries"]
         .as_array()
@@ -1502,25 +1940,44 @@ pub(crate) fn edit_journal_close(root_path: &std::path::Path, id: &str) {
         })
         .collect();
     record["entries"] = serde_json::json!(closed);
-    let mut stack = edit_journal_read(&dir.join(EDIT_JOURNAL_STACK))
-        .and_then(|value| value["transactions"].as_array().cloned())
-        .unwrap_or_default();
+    // Only the read/append/atomic-write of the common undo stack is serialized.
+    let _stack_lock = edit_lock_until(
+        &dir,
+        "undo-stack",
+        greppy_core::cache::LockMode::Exclusive,
+        std::time::Instant::now() + std::time::Duration::from_secs(120),
+    )
+    .map_err(|error| {
+        edit_published_failure(
+            "journal_finalize_failed",
+            format!("source edits were published, but undo finalization failed: {error}"),
+            16,
+        )
+    })?;
+    let stack_path = dir.join(EDIT_JOURNAL_STACK);
+    let mut stack = if stack_path.exists() {
+        edit_journal_read(&stack_path).and_then(|value| value["transactions"].as_array().cloned())
+            .ok_or_else(|| edit_published_failure("journal_finalize_failed",
+                "source edits were published, but the existing undo stack is unreadable; pending evidence retained", 16))?
+    } else {
+        Vec::new()
+    };
     stack.push(record);
     if stack.len() > EDIT_JOURNAL_DEPTH {
         let excess = stack.len() - EDIT_JOURNAL_DEPTH;
         stack.drain(..excess);
     }
-    edit_journal_write(
-        &dir.join(EDIT_JOURNAL_STACK),
-        &serde_json::json!({ "transactions": stack }),
-    );
-    let _ = std::fs::remove_file(dir.join(EDIT_JOURNAL_PENDING));
+    edit_journal_write_checked(&stack_path, &serde_json::json!({ "transactions": stack }))
+        .map_err(|error| edit_published_failure("journal_finalize_failed",
+            format!("source edits were published, but undo finalization failed: {}; pending evidence retained", error.message), 16))?;
+    let _ = std::fs::remove_file(pending);
+    Ok(())
 }
 
-/// Abandon an open transaction without recording it. Used when the work it was
-/// opened for turned out to write nothing after all.
-pub(crate) fn edit_journal_abort(root_path: &std::path::Path) {
-    let _ = std::fs::remove_file(edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING));
+pub(crate) fn edit_journal_abort(root_path: &std::path::Path, id: Option<&str>) {
+    if let Some(id) = id {
+        let _ = std::fs::remove_file(edit_pending_path(&edit_journal_dir(root_path), id));
+    }
 }
 
 /// Put a transaction's files back the way they were. `guarded` is the D3 rule:
@@ -1543,7 +2000,8 @@ pub(crate) fn edit_journal_restore(
                 (Ok(bytes), true) => {
                     edit_sha256_hex(bytes) == entry["after_sha256"].as_str().unwrap_or_default()
                 }
-                (Err(_), false) => true,
+                (Err(_), false) => std::fs::symlink_metadata(root_path.join(rel))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
                 _ => false,
             };
             if !unchanged {
@@ -1575,6 +2033,18 @@ pub(crate) fn edit_journal_restore(
                 std::fs::write(&abs, &bytes).map_err(|error| {
                     EditRefusal::new("publish_failed", format!("{rel}: {error}"), 16)
                 })?;
+                #[cfg(unix)]
+                if let Some(mode) = entry["unix_mode"].as_u64() {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(mode as u32))
+                        .map_err(|error| {
+                            EditRefusal::new(
+                                "publish_failed",
+                                format!("{rel}: restore permissions: {error}"),
+                                16,
+                            )
+                        })?;
+                }
                 restored.push(rel);
             }
             // The file was created by that edit, so putting it back means
@@ -1674,7 +2144,9 @@ pub(crate) fn run_edit_undo(
     );
     record.extra.push(("restored", serde_json::json!(restored)));
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     Ok(record)
 }
@@ -1800,7 +2272,13 @@ pub(crate) fn edit_record_json(
         }),
     );
     value.insert("published".into(), serde_json::json!(record.published));
-    value.insert("exit_code".into(), serde_json::json!(0));
+    value.insert(
+        "exit_code".into(),
+        serde_json::json!(record
+            .verification
+            .as_ref()
+            .map_or(0, |verification| verification.status.exit_code())),
+    );
     if let Some(first) = record.files.first() {
         value.insert("file".into(), serde_json::json!(first));
     }
@@ -1855,7 +2333,13 @@ pub(crate) fn edit_record_json(
         value.insert("diagnostics".into(), serde_json::json!(diagnostics));
         value.insert(
             "verify".into(),
-            serde_json::json!({ "diagnostics": diagnostics }),
+            serde_json::json!({
+                "status": record.verification.as_ref().map(|verification| verification.status.as_str()),
+                "exit_code": record.verification.as_ref().map_or(0, |verification| verification.status.exit_code()),
+                "diagnostics": diagnostics,
+                "checks": record.verification.as_ref().map(|verification| &verification.checks),
+                "tests_status": record.verification.as_ref().map(|verification| verification.tests_status),
+            }),
         );
     }
     if !record.notes.is_empty() {
@@ -1885,8 +2369,19 @@ pub(crate) fn edit_refusal_json(
         "schema_version".into(),
         serde_json::json!(EDIT_RECORD_SCHEMA),
     );
-    value.insert("status".into(), serde_json::json!("refused"));
-    value.insert("published".into(), serde_json::json!(false));
+    let published = refusal
+        .extra
+        .iter()
+        .any(|(key, value)| *key == "published" && value == &serde_json::json!(true));
+    value.insert(
+        "status".into(),
+        serde_json::json!(if published {
+            "published_with_error"
+        } else {
+            "refused"
+        }),
+    );
+    value.insert("published".into(), serde_json::json!(published));
     value.insert("exit_code".into(), serde_json::json!(refusal.exit));
     value.insert("operations".into(), serde_json::json!([]));
     value.insert("error".into(), serde_json::Value::Object(error));
@@ -1964,6 +2459,11 @@ pub(crate) fn run_trained_write(
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
     if before.as_deref() == Some(bytes.as_slice()) {
         record.already_as_sent = !dry_run;
+        if verify && !dry_run {
+            let verification = edit_verify(root_path, &record.files);
+            record.diagnostics = Some(verification.diagnostics.clone());
+            record.verification = Some(verification);
+        }
         return Ok(record);
     }
     if dry_run {
@@ -1984,7 +2484,7 @@ pub(crate) fn run_trained_write(
             rel: rel.clone(),
             content: before.clone(),
         }],
-    );
+    )?;
     edit_journal_crash_hook()?;
     let publish = if let Some(old) = &before {
         greppy_edit::publish::publish_atomic(root_path, &abs, &bytes, &edit_sha256_hex(old))
@@ -2000,7 +2500,7 @@ pub(crate) fn run_trained_write(
             .map_err(|error| error.to_string())
     };
     if let Err(error) = publish {
-        edit_journal_abort(root_path);
+        edit_journal_abort(root_path, transaction.as_deref());
         return Err(EditRefusal::new(
             "publish_failed",
             format!("{path}: {error}"),
@@ -2008,11 +2508,13 @@ pub(crate) fn run_trained_write(
         ));
     }
     if let Some(id) = transaction {
-        edit_journal_close(root_path, &id);
+        edit_journal_close(root_path, &id)?;
         record.transaction_id = Some(id);
     }
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     Ok(record)
 }
@@ -2027,9 +2529,17 @@ struct TrainedPatchHunk {
 }
 
 #[derive(Debug)]
+enum TrainedPatchOperation {
+    Update,
+    Add(Vec<u8>),
+    Delete,
+}
+
+#[derive(Debug)]
 struct TrainedPatchFile {
     path: String,
     hunks: Vec<TrainedPatchHunk>,
+    operation: TrainedPatchOperation,
 }
 
 fn trained_patch_path(header: &str) -> Option<String> {
@@ -2045,9 +2555,102 @@ fn trained_patch_path(header: &str) -> Option<String> {
     )
 }
 
+/// Parse explicit file operations without dropping unknown markers or payload.
+fn parse_marker_patch(text: &str) -> EditResult<Vec<TrainedPatchFile>> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.last() != Some(&"*** End Patch") {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            "marker patch requires a final *** End Patch; nothing written",
+            20,
+        ));
+    }
+    let mut files = Vec::new();
+    let mut index = 1;
+    while index < lines.len() - 1 {
+        let header = lines[index];
+        let (kind, path) = if let Some(path) = header.strip_prefix("*** Update File: ") {
+            (0, path)
+        } else if let Some(path) = header.strip_prefix("*** Add File: ") {
+            (1, path)
+        } else if let Some(path) = header.strip_prefix("*** Delete File: ") {
+            (2, path)
+        } else {
+            return Err(EditRefusal::new("invalid_patch", format!("unsupported marker `{header}`; expected Update File, Add File or Delete File; Move to and End of File are unsupported; nothing written"), 20));
+        };
+        if path.is_empty() || path.trim() != path || path.chars().any(char::is_whitespace) {
+            return Err(EditRefusal::new("invalid_patch", "marker file operation requires one nonempty path without whitespace; nothing written", 20));
+        }
+        index += 1;
+        let start = index;
+        while index < lines.len() - 1 && !lines[index].starts_with("***") {
+            index += 1;
+        }
+        let body = &lines[start..index];
+        let (operation, hunks) = match kind {
+            0 => {
+                let mut diff = format!("--- a/{path}\n+++ b/{path}\n");
+                let mut in_hunk = false;
+                for line in body {
+                    if line == &"@@" || line.starts_with("@@ ") {
+                        diff.push_str("@@\n");
+                        in_hunk = true;
+                    } else {
+                        if !in_hunk || !matches!(line.as_bytes().first(), Some(b' ' | b'-' | b'+'))
+                        {
+                            return Err(EditRefusal::new("invalid_patch", format!("{path}: invalid marker hunk line `{line}`; use @@ and prefixed context/removal/addition lines; nothing written"), 20));
+                        }
+                        diff.push_str(line);
+                        diff.push('\n');
+                    }
+                }
+                let mut parsed = parse_trained_patch(diff.as_bytes())?;
+                (TrainedPatchOperation::Update, parsed.remove(0).hunks)
+            }
+            1 => {
+                let mut content = Vec::new();
+                for line in body {
+                    let Some(line) = line.strip_prefix('+') else {
+                        return Err(EditRefusal::new("invalid_patch", format!("{path}: each Add File content line must start with '+'; nothing written"), 20));
+                    };
+                    content.extend_from_slice(line.as_bytes());
+                    content.push(b'\n');
+                }
+                (TrainedPatchOperation::Add(content), Vec::new())
+            }
+            _ => {
+                if !body.is_empty() {
+                    return Err(EditRefusal::new(
+                        "invalid_patch",
+                        format!("{path}: Delete File takes no content or hunks; nothing written"),
+                        20,
+                    ));
+                }
+                (TrainedPatchOperation::Delete, Vec::new())
+            }
+        };
+        files.push(TrainedPatchFile {
+            path: path.to_string(),
+            hunks,
+            operation,
+        });
+    }
+    if files.is_empty() {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            "marker patch carries no file operation; nothing written",
+            20,
+        ));
+    }
+    Ok(files)
+}
+
 fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
     let text = std::str::from_utf8(diff)
         .map_err(|_| EditRefusal::new("invalid_patch", "the unified diff is not UTF-8", 20))?;
+    if text.starts_with("*** Begin Patch\n") || text.starts_with("*** Begin Patch\r\n") {
+        return parse_marker_patch(text);
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut files = Vec::new();
     let mut index = 0usize;
@@ -2120,8 +2723,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             }
             input_hunk_number += 1;
             let input_line = index + 1;
-            // Positions remain advisory; counts disambiguate actual file
-            // headers from removed/added content beginning with ---/+++.
+            // Positions/counts remain advisory. Header pairs followed by a
+            // hunk introduce a file; otherwise header-shaped text is payload.
             let header_fields: Vec<&str> = lines[index].split_whitespace().collect();
             let declared_counts = (|| {
                 let count = |field: &str, prefix| {
@@ -2168,10 +2771,15 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                         .is_some_and(|next| next.starts_with("+++ "));
                 if header_pair {
                     match declared_counts {
-                        Some((old, new)) if old_lines.len() == old && new_lines.len() == new => {
+                        Some((old, new))
+                            if (old_lines.len() == old && new_lines.len() == new)
+                                || lines
+                                    .get(index + 2)
+                                    .is_some_and(|line| line.starts_with("@@")) =>
+                        {
                             break;
                         }
-                        Some(_) => {} // Still inside the declared hunk: these are payload lines.
+                        Some(_) => {} // No following hunk: these are payload lines.
                         None if old_lines.is_empty() && new_lines.is_empty() => {}
                         None => {
                             return Err(EditRefusal::new(
@@ -2221,19 +2829,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                     20,
                 ));
             }
-            if let Some((old, new)) = declared_counts {
-                if old_lines.len() != old || new_lines.len() != new {
-                    return Err(EditRefusal::new(
-                        "invalid_patch",
-                        format!(
-                            "{path}: hunk {input_hunk_number} at patch input line {input_line} declares {old} old and {new} new lines, but contains {} old and {} new lines; regenerate the unified diff with correct counts — nothing written",
-                            old_lines.len(),
-                            new_lines.len()
-                        ),
-                        20,
-                    ));
-                }
-            }
+            // Count the actual body. Both ranges and their counts are advisory;
+            // complete source-line matching still decides whether it can apply.
             hunks.push(TrainedPatchHunk {
                 input_hunk_number,
                 input_line,
@@ -2249,7 +2846,11 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 20,
             ));
         }
-        files.push(TrainedPatchFile { path, hunks });
+        files.push(TrainedPatchFile {
+            path,
+            hunks,
+            operation: TrainedPatchOperation::Update,
+        });
     }
     if files.is_empty() {
         return Err(EditRefusal::new(
@@ -2311,10 +2912,7 @@ fn apply_trained_patch_file(
                 ))
             }
             many => {
-                let declared = hunk.declared_old_line.saturating_sub(1);
-                if many.contains(&declared) {
-                    declared
-                } else {
+                {
                     const MAX_REPORTED_CANDIDATES: usize = 5;
                     let candidate_ranges = many
                         .iter()
@@ -2369,6 +2967,7 @@ fn apply_trained_patch_file(
 
 /// Undo only writes this invocation actually published. A failed CAS target
 /// belongs to another writer and must never be restored from our pre-image.
+#[cfg(test)]
 fn rollback_patch_file(
     root: &std::path::Path,
     path: &std::path::Path,
@@ -2390,6 +2989,38 @@ pub(crate) fn run_trained_patch(
     run_trained_patch_with_publish_hook(root_path, file_base, diff, dry_run, verify, |_| {})
 }
 
+struct PlannedPatchFile {
+    rel: String,
+    abs: std::path::PathBuf,
+    before: Option<Vec<u8>>,
+    after: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
+    changed: Vec<(usize, usize)>,
+}
+
+fn publish_patch_transition(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    permissions: Option<std::fs::Permissions>,
+) -> std::result::Result<(), String> {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            greppy_edit::publish::publish_atomic(root, path, after, &edit_sha256_hex(before))
+                .map(|_| ())
+        }
+        (None, Some(after)) => {
+            greppy_edit::publish::publish_create_atomic(root, path, after, permissions).map(|_| ())
+        }
+        (Some(before), None) => {
+            greppy_edit::publish::publish_delete_atomic(root, path, &edit_sha256_hex(before))
+        }
+        (None, None) => return Ok(()),
+    }
+    .map_err(|error| error.to_string())
+}
+
 fn run_trained_patch_with_publish_hook(
     root_path: &std::path::Path,
     file_base: &std::path::Path,
@@ -2402,59 +3033,107 @@ fn run_trained_patch_with_publish_hook(
     let mut targets = std::collections::HashSet::new();
     let mut planned = Vec::new();
     for file in parsed {
-        let (rel, abs, content) = edit_read_file(root_path, file_base, &file.path)?;
-        let target = std::fs::canonicalize(&abs).map_err(|error| {
-            EditRefusal::new(
-                "file_unreadable",
-                format!("resolve {}: {error}", file.path),
-                10,
-            )
-        })?;
+        let (rel, abs, before, after, changed) = match file.operation {
+            TrainedPatchOperation::Add(bytes) => {
+                let (rel, abs) = edit_resolve_new_path(root_path, file_base, &file.path)?;
+                let abs = greppy_edit::publish::require_new_inside_workspace(root_path, &abs)
+                    .map_err(|error| {
+                        EditRefusal::new(
+                            "invalid_patch",
+                            format!("{}: {error}; nothing written", file.path),
+                            20,
+                        )
+                    })?;
+                edit_validate_syntax(&rel, &[], &bytes)?;
+                let changed = vec![(0, bytes.len())];
+                (rel, abs, None, Some(bytes), changed)
+            }
+            operation => {
+                let (rel, abs, content) = edit_read_file(root_path, file_base, &file.path)?;
+                match operation {
+                    TrainedPatchOperation::Update => {
+                        let (after, changed) =
+                            apply_trained_patch_file(&rel, &content, &file.hunks)?;
+                        edit_validate_syntax(&rel, &content, &after)?;
+                        (rel, abs, Some(content), Some(after), changed)
+                    }
+                    TrainedPatchOperation::Delete => (rel, abs, Some(content), None, vec![(0, 0)]),
+                    TrainedPatchOperation::Add(_) => unreachable!(),
+                }
+            }
+        };
+        let target = edit_lock_identity(&abs);
         if !targets.insert(target) {
-            return Err(EditRefusal::new(
-                "invalid_patch",
-                format!(
-                    "{}: duplicate patch target; combine all hunks for this file under one ---/+++ header pair before retrying — nothing written",
-                    file.path
-                ),
-                20,
-            ));
+            return Err(EditRefusal::new("invalid_patch", format!("{}: duplicate patch target; combine all hunks for this file under one ---/+++ header pair or one marker operation before retrying — nothing written", file.path), 20));
         }
-        let (after, changed) = apply_trained_patch_file(&rel, &content, &file.hunks)?;
-        edit_validate_syntax(&rel, &content, &after)?;
-        planned.push((rel, abs, content, after, changed));
+        let permissions = if before.is_some() {
+            Some(
+                std::fs::metadata(&abs)
+                    .map_err(|error| {
+                        EditRefusal::new(
+                            "file_unreadable",
+                            format!("stat {}: {error}", file.path),
+                            10,
+                        )
+                    })?
+                    .permissions(),
+            )
+        } else {
+            None
+        };
+        planned.push(PlannedPatchFile {
+            rel,
+            abs,
+            before,
+            after,
+            permissions,
+            changed,
+        });
     }
-    let already = planned
-        .iter()
-        .all(|(_, _, before, after, _)| before == after);
+    let already = planned.iter().all(|file| file.before == file.after);
     let exact_required = planned.len() > 1
         || planned
             .iter()
-            .any(|(_, _, _, _, changed)| changed.len() > 1);
+            .any(|file| file.changed.len() > 1 || file.before.is_none() || file.after.is_none());
     let exact_addresses = planned
         .iter()
-        .map(|(rel, _, _, after, changed)| edit_exact_address(rel, after, changed))
+        .map(|file| {
+            if file.after.is_none() {
+                format!("{} (deleted)", file.rel)
+            } else {
+                edit_exact_address(
+                    &file.rel,
+                    file.after.as_deref().unwrap_or_default(),
+                    &file.changed,
+                )
+            }
+        })
         .collect::<Vec<_>>();
     let mut record = EditRecord {
-        files: planned
-            .iter()
-            .map(|(rel, _, _, _, _)| rel.clone())
-            .collect(),
-        span: planned.first().and_then(|(_, _, _, after, changed)| {
-            let (start, end) = changed.first().copied()?;
-            Some(edit_span_lines(after, start, end.saturating_sub(start)))
+        files: planned.iter().map(|file| file.rel.clone()).collect(),
+        span: planned.first().and_then(|file| {
+            let (start, end) = file.changed.first().copied()?;
+            Some(edit_span_lines(
+                file.after.as_deref().unwrap_or_default(),
+                start,
+                end.saturating_sub(start),
+            ))
         }),
         published: !dry_run,
         already_as_sent: already && !dry_run,
         ..EditRecord::default()
     };
-    for (rel, _, before, after, changed) in &planned {
+    for file in &planned {
         record.operations.push(EditOperation {
-            file: rel.clone(),
-            ranges: changed.clone(),
-            sha_before: Some(edit_sha256_hex(before)),
-            sha_after: Some(edit_sha256_hex(after)),
-            diff: Some(edit_unified_diff(rel, before, after)),
+            file: file.rel.clone(),
+            ranges: file.changed.clone(),
+            sha_before: file.before.as_deref().map(edit_sha256_hex),
+            sha_after: file.after.as_deref().map(edit_sha256_hex),
+            diff: Some(edit_unified_diff(
+                &file.rel,
+                file.before.as_deref().unwrap_or_default(),
+                file.after.as_deref().unwrap_or_default(),
+            )),
             ..EditOperation::default()
         });
     }
@@ -2462,48 +3141,57 @@ fn run_trained_patch_with_publish_hook(
         edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
         return Ok(record);
     }
-    let before: Vec<UndoBefore> = planned
+    let before = planned
         .iter()
-        .map(|(rel, _, content, _, _)| UndoBefore {
-            rel: rel.clone(),
-            content: Some(content.clone()),
+        .map(|file| UndoBefore {
+            rel: file.rel.clone(),
+            content: file.before.clone(),
         })
-        .collect();
-    let transaction = edit_journal_open(root_path, &before);
+        .collect::<Vec<_>>();
+    let transaction = edit_journal_open(root_path, &before)?;
     edit_journal_crash_hook()?;
-    for (published_count, (_, abs, content, after, _)) in planned.iter().enumerate() {
+    for (published_count, file) in planned.iter().enumerate() {
         before_publish(published_count);
-        if let Err(error) =
-            greppy_edit::publish::publish_atomic(root_path, abs, after, &edit_sha256_hex(content))
-        {
+        if let Err(error) = publish_patch_transition(
+            root_path,
+            &file.abs,
+            file.before.as_deref(),
+            file.after.as_deref(),
+            None,
+        ) {
             let mut conflicts = Vec::new();
-            for (rel, path, before, published, _) in planned[..published_count].iter().rev() {
-                if let Err(reason) = rollback_patch_file(root_path, path, before, published) {
-                    conflicts.push(format!("{rel}: {reason}"));
+            for file in planned[..published_count].iter().rev() {
+                // Reverse only a transition we actually published; CAS/absence
+                // guards refuse to overwrite an intervening writer.
+                if let Err(reason) = publish_patch_transition(
+                    root_path,
+                    &file.abs,
+                    file.after.as_deref(),
+                    file.before.as_deref(),
+                    file.permissions.clone(),
+                ) {
+                    conflicts.push(format!("{}: {reason}", file.rel));
                 }
             }
             let journal = edit_journal_dir(root_path);
-            if let Some(pending) = edit_journal_read(&journal.join(EDIT_JOURNAL_PENDING)) {
-                // Another invocation can replace pending.json. Never remove or
-                // restore its journal on behalf of this failed transaction.
+            if let Some(pending) = edit_journal_read(&edit_pending_path(
+                &journal,
+                transaction.as_deref().unwrap_or_default(),
+            )) {
                 if transaction
                     .as_deref()
                     .is_some_and(|id| pending["id"].as_str() == Some(id))
                 {
                     if !conflicts.is_empty() {
-                        // Keep evidence, but do not leave an unsafe automatic
-                        // recovery candidate that could overwrite the conflict.
                         let id = transaction.as_deref().unwrap_or_default();
                         edit_journal_write(
                             &journal.join(format!("rollback-conflict-{id}.json")),
                             &serde_json::json!({
-                                "transaction": pending,
-                                "published_count": published_count,
-                                "conflicts": conflicts,
+                                "transaction": pending, "published_count": published_count, "conflicts": conflicts,
                             }),
                         );
                     }
-                    edit_journal_abort(root_path);
+                    edit_journal_abort(root_path, transaction.as_deref());
                 }
             }
             let recovery = if conflicts.is_empty() {
@@ -2519,11 +3207,13 @@ fn run_trained_patch_with_publish_hook(
         }
     }
     if let Some(id) = transaction {
-        edit_journal_close(root_path, &id);
+        edit_journal_close(root_path, &id)?;
         record.transaction_id = Some(id);
     }
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(record)
@@ -3431,13 +4121,30 @@ pub(crate) fn run_trained_rename(
         ..EditRecord::default()
     };
     if certificate.published {
-        if let Some(id) = edit_journal_open(root_path, &before) {
-            edit_journal_close(root_path, &id);
-            record.transaction_id = Some(id);
+        match edit_journal_open(root_path, &before) {
+            Ok(Some(id)) => {
+                if let Err(error) = edit_journal_close(root_path, &id) {
+                    return Ok(Err(error));
+                }
+                record.transaction_id = Some(id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(Err(edit_published_failure(
+                    "journal_finalize_failed",
+                    format!(
+                        "rename source edits were published, but undo recording failed: {}",
+                        error.message
+                    ),
+                    16,
+                )))
+            }
         }
     }
     if verify && certificate.published {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(Ok(record))
@@ -4019,6 +4726,49 @@ pub(crate) fn edit_operation_line_span(
     let line_count = content.iter().filter(|byte| **byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
     (1, line_count.max(1))
+}
+
+#[cfg(test)]
+mod nearest_old_tests {
+    use super::nearest_old_candidate;
+
+    const FILE: &str =
+        "fn clamp(value: i32) -> i32 {\n    if value > HIGH {\n        return value;\n    }\n    value\n}\n";
+
+    #[test]
+    fn whitespace_only_mismatch_points_at_exact_lines() {
+        let found = nearest_old_candidate(
+            FILE.as_bytes(),
+            "  if value > HIGH {\n    return value;\n  }",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            (
+                2,
+                4,
+                "    if value > HIGH {\n        return value;\n    }".to_string(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn partially_matching_window_is_offered_as_similar() {
+        let found = nearest_old_candidate(
+            FILE.as_bytes(),
+            "if value > HIGH {\n        return HIGH;\n    }",
+        )
+        .unwrap();
+        assert_eq!((found.0, found.1, found.3), (2, 4, false));
+    }
+
+    #[test]
+    fn unrelated_or_trivial_text_offers_nothing() {
+        assert!(nearest_old_candidate(FILE.as_bytes(), "let q = 1;").is_none());
+        assert!(nearest_old_candidate(FILE.as_bytes(), "}\nlet q = 1;").is_none());
+        assert!(nearest_old_candidate(FILE.as_bytes(), "").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -4746,6 +5496,154 @@ mod patch_rollback_tests {
     }
 
     #[test]
+    fn mixed_marker_patch_rolls_back_existence_changes_after_late_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("nested/add.txt");
+        let deleted = dir.path().join("delete.txt");
+        let late = dir.path().join("late.txt");
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: nested/add.txt\n+created\n*** Delete File: delete.txt\n*** Update File: late.txt\n@@\n-late\n+LATE\n*** End Patch\n";
+        for conflict in [false, true] {
+            std::fs::write(&update, b"old\n").unwrap();
+            std::fs::write(&deleted, b"deleted original\n").unwrap();
+            std::fs::write(&late, b"late\n").unwrap();
+            if added.exists() {
+                std::fs::remove_file(&added).unwrap();
+            }
+            let result = run_trained_patch_with_publish_hook(
+                dir.path(),
+                dir.path(),
+                diff.to_vec(),
+                false,
+                false,
+                |index| {
+                    if index == 3 {
+                        std::fs::write(&late, b"other writer\n").unwrap();
+                        if conflict {
+                            std::fs::write(&added, b"other creator\n").unwrap();
+                            std::fs::write(&deleted, b"recreated by other writer\n").unwrap();
+                        }
+                    }
+                },
+            );
+            let refusal = result.err().expect("late stale plan must refuse");
+            assert_eq!(refusal.code, "publish_failed");
+            assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+            assert_eq!(std::fs::read(&late).unwrap(), b"other writer\n");
+            if conflict {
+                assert!(refusal.message.contains("Some patch writes may remain"));
+                assert_eq!(std::fs::read(&added).unwrap(), b"other creator\n");
+                assert_eq!(
+                    std::fs::read(&deleted).unwrap(),
+                    b"recreated by other writer\n"
+                );
+            } else {
+                assert!(refusal.message.contains("were rolled back"));
+                assert!(!added.exists());
+                assert_eq!(std::fs::read(&deleted).unwrap(), b"deleted original\n");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_marker_deletion_race_preserves_the_failed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("add.txt");
+        let deleted = dir.path().join("delete.txt");
+        std::fs::write(&update, b"old\n").unwrap();
+        std::fs::write(&deleted, b"original\n").unwrap();
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: add.txt\n+created\n*** Delete File: delete.txt\n*** End Patch\n";
+        let result = run_trained_patch_with_publish_hook(
+            dir.path(),
+            dir.path(),
+            diff.to_vec(),
+            false,
+            false,
+            |index| {
+                if index == 2 {
+                    std::fs::write(&deleted, b"other writer\n").unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap().code, "publish_failed");
+        assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+        assert!(!added.exists());
+        assert_eq!(std::fs::read(&deleted).unwrap(), b"other writer\n");
+    }
+
+    #[test]
+    fn mixed_marker_interrupted_publication_retains_recoverable_preimages() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("add.txt");
+        let deleted = dir.path().join("delete.txt");
+        std::fs::write(&update, b"old\n").unwrap();
+        std::fs::write(&deleted, b"original\n").unwrap();
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: add.txt\n+created\n*** Delete File: delete.txt\n*** Update File: update2.txt\n@@\n-old\n+new\n*** End Patch\n";
+        std::fs::write(dir.path().join("update2.txt"), b"old\n").unwrap();
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_trained_patch_with_publish_hook(
+                dir.path(),
+                dir.path(),
+                diff.to_vec(),
+                false,
+                false,
+                |index| {
+                    if index == 3 {
+                        panic!("simulate interruption after mixed publication");
+                    }
+                },
+            );
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(std::fs::read(&update).unwrap(), b"new\n");
+        assert!(added.exists());
+        assert!(!deleted.exists());
+        let journal = edit_journal_dir(dir.path());
+        let pending = std::fs::read_dir(&journal)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("pending-")
+            })
+            .unwrap();
+        let record = edit_journal_read(&pending).unwrap();
+        edit_journal_restore(dir.path(), &record, false)
+            .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+        assert!(!added.exists());
+        assert_eq!(std::fs::read(&deleted).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn mixed_marker_creation_collision_rolls_back_only_published_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("add.txt");
+        std::fs::write(&update, b"old\n").unwrap();
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: add.txt\n+created\n*** End Patch\n";
+        let result = run_trained_patch_with_publish_hook(
+            dir.path(),
+            dir.path(),
+            diff.to_vec(),
+            false,
+            false,
+            |index| {
+                if index == 1 {
+                    std::fs::write(&added, b"racing creator\n").unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap().code, "publish_failed");
+        assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+        assert_eq!(std::fs::read(&added).unwrap(), b"racing creator\n");
+    }
+
+    #[test]
     fn failed_patch_never_rolls_back_the_unpublished_conflict_target() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.txt");
@@ -4768,23 +5666,64 @@ mod patch_rollback_tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&first).unwrap(), b"before\n");
         assert_eq!(std::fs::read(&last).unwrap(), b"concurrent-success\n");
-        assert!(!edit_journal_dir(dir.path())
-            .join(EDIT_JOURNAL_PENDING)
-            .exists());
+        assert!(std::fs::read_dir(edit_journal_dir(dir.path()))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pending-")));
         // This test alone created the journal under its unique temporary root hash.
         std::fs::remove_dir_all(edit_journal_dir(dir.path())).unwrap();
     }
 
     #[test]
-    fn transaction_lock_excludes_another_writer_and_releases_on_drop() {
+    fn edit_coordination_waits_and_does_not_exclude_disjoint_files() {
         let dir = tempfile::tempdir().unwrap();
-        let first = acquire_edit_transaction_lock(dir.path()).unwrap();
-        assert!(matches!(
-            acquire_edit_transaction_lock(dir.path()),
-            Err(Error::Lock(_))
-        ));
+        let journal = dir.path().join("journal");
+        let command = |file: &str| EditCommand::ReplaceText {
+            file: file.into(),
+            old: "a".into(),
+            new: Some("b".into()),
+            expect: None,
+            regex: false,
+            dry_run: false,
+            verify: false,
+        };
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "a").unwrap();
+        let first = acquire_edit_command_locks(&journal, &command("a.txt"), dir.path()).unwrap();
+        let other = acquire_edit_command_locks(&journal, &command("b.txt"), dir.path()).unwrap();
+        drop(other);
+        let identity = edit_lock_identity(&dir.path().join("a.txt"));
+        let name = format!(
+            "file-{}",
+            edit_sha256_hex(identity.as_os_str().as_encoded_bytes())
+        );
+        let begin = std::time::Instant::now();
+        assert!(edit_lock_until(
+            &journal,
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            begin + std::time::Duration::from_millis(30)
+        )
+        .is_err());
+        assert!(begin.elapsed() >= std::time::Duration::from_millis(30));
         drop(first);
-        assert!(acquire_edit_transaction_lock(dir.path()).is_ok());
+        assert!(acquire_edit_command_locks(&journal, &command("a.txt"), dir.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_identity_resolves_symlinks_before_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("real/child")).unwrap();
+        std::fs::write(dir.path().join("real/a.txt"), "A").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real/child"), dir.path().join("link")).unwrap();
+        assert_eq!(
+            edit_lock_identity(&dir.path().join("link/../a.txt")),
+            edit_lock_identity(&dir.path().join("real/a.txt"))
+        );
     }
 
     #[test]

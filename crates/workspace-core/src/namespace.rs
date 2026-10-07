@@ -669,9 +669,11 @@ impl WorkspaceCore {
         let Some(pair_state) = pair_state else {
             return Err(Error::NotFound("workspace pair journal is missing".into()));
         };
-        if require_ready && pair_state != "ready" {
+        // A kept pair is retained until expiry or an explicit cleanup removes
+        // it; the caller holds the pair lease, so a live owner is fenced.
+        if require_ready && !matches!(pair_state.as_str(), "ready" | "kept") {
             return Err(Error::InvalidPath(format!(
-                "workspace pair is {pair_state}, not ready"
+                "workspace pair is {pair_state}, not ready or kept"
             )));
         }
         let mut chunks = Vec::new();

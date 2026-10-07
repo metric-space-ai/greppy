@@ -153,6 +153,9 @@ fn request(server: &Server, rx: &Receiver<Value>, id: &str, method: &str, params
             .to_string(),
     );
     let response = next(rx);
+    if method == "_workjet/import_history" && response.get("error").is_some() {
+        eprintln!("import_history RPC failure: {response}");
+    }
     assert_eq!(response["id"], id);
     response
 }

@@ -120,7 +120,13 @@ jobs:
       # failures. Run unit tests single-threaded for deterministic results;
       # real concurrency is covered separately by bench/battle/concurrency.sh.
       - name: cargo test --workspace (single-threaded — env-var test isolation)
-        run: cargo test --workspace --features greppy/ci-test-assets -- --test-threads=1
+        # The unoptimized, generated full CLI parser exceeds the 2 MiB
+        # libtest thread stack. Same-source verification: debug2MiB aborts,
+        # debug8MiB and optimized release2MiB pass. Match the Windows debug
+        # test budget; this changes neither product builds nor timeouts.
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test --workspace --no-fail-fast --features greppy/ci-test-assets -- --test-threads=1
 
       - name: x86 portable CPU dispatch gate
         if: runner.os == 'Linux'

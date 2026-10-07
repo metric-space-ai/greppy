@@ -43,7 +43,7 @@ pub struct AgentWorkspace {
     pair_lease: WorkspacePairLease,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum WorkspaceBackend {
     Provider {
         instance: String,
@@ -194,6 +194,93 @@ impl From<greppy_workspace_core::Error> for WorkspaceError {
     }
 }
 
+const KEPT_WORKSPACE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Serialize, Deserialize)]
+struct KeptWorkspace {
+    run_id: String,
+    expires_at: u64,
+    repo_root: PathBuf,
+    worktree: PathBuf,
+    private_git_dir: PathBuf,
+    private_index: PathBuf,
+    base_commit: String,
+    baseline_hash: String,
+    baseline_tree: String,
+    baseline_view_commit: String,
+    backend: WorkspaceBackend,
+}
+
+fn kept_workspace_path(data_root: &Path, run_id: &str) -> PathBuf {
+    data_root
+        .join("agent-retention")
+        .join(format!("{run_id}.json"))
+}
+
+fn reap_expired_agent_workspaces(data_root: &Path) -> Result<(), WorkspaceError> {
+    let directory = data_root.join("agent-retention");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let record: KeptWorkspace = serde_json::from_slice(&fs::read(entry.path())?)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        validate_run_id(&record.run_id)?;
+        if entry.path() != kept_workspace_path(data_root, &record.run_id) {
+            return Err(WorkspaceError::Unsupported(
+                "agent retention filename/owner mismatch".into(),
+            ));
+        }
+        if record.expires_at > now {
+            continue;
+        }
+        let core = WorkspaceCore::open(data_root.join("core"))?;
+        let Some(pair_lease) = core.try_workspace_pair_lease(&record.run_id)? else {
+            continue;
+        };
+        if core.workspace_pair_records_absent(&record.run_id, &git_workspace_id(&record.run_id))? {
+            fs::remove_file(entry.path())?;
+            continue;
+        }
+        let handle = core.open_workspace(&record.run_id)?;
+        let git_handle = core.open_workspace(&git_workspace_id(&record.run_id))?;
+        let workspace = AgentWorkspace {
+            repo_root: record.repo_root,
+            worktree: record.worktree,
+            private_git_dir: record.private_git_dir,
+            private_index: record.private_index,
+            run_id: record.run_id,
+            base_commit: record.base_commit,
+            baseline_hash: record.baseline_hash,
+            baseline_tree: record.baseline_tree,
+            baseline_view_commit: record.baseline_view_commit,
+            backend: record.backend,
+            data_root: data_root.to_path_buf(),
+            core,
+            handle,
+            git_handle,
+            pair_lease,
+        };
+        workspace.cleanup()?;
+    }
+    Ok(())
+}
+
 impl AgentWorkspace {
     pub fn create(repo_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
         validate_run_id(run_id)?;
@@ -229,6 +316,7 @@ impl AgentWorkspace {
         recover_ordinary_cleanup_journals(&data_root, &core)?;
         recover_proposal_publish_journals(&core)?;
         recover_apply_journals(&core)?;
+        reap_expired_agent_workspaces(&data_root)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
         let (baseline, captured_snapshot_owns_chunks) = if provider.is_some() {
             capture_tracked_repository(repo_root, &core, run_id, started)?
@@ -468,6 +556,74 @@ impl AgentWorkspace {
         &self.base_commit
     }
 
+    /// A shared Base is keyed by clean HEAD and must never contain operator dirt.
+    pub fn baseline_is_clean(&self) -> Result<bool, WorkspaceError> {
+        let tree = git_ok(
+            &self.repo_root,
+            &["rev-parse", &format!("{}^{{tree}}", self.base_commit)],
+        )?;
+        Ok(tree == self.baseline_tree)
+    }
+
+    /// Restore the prior proposal only when its captured operator baseline still matches.
+    pub fn restore_proposal(&self, ref_name: &str) -> Result<(), WorkspaceError> {
+        self.verify_identity()?;
+        let proposal = self.core.proposal(ref_name)?;
+        validate_proposal_git_binding(&self.repo_root, &proposal)?;
+        if proposal.repository != self.repo_root
+            || proposal.baseline_hash != self.baseline_hash
+            || proposal.baseline_tree != self.baseline_tree
+        {
+            return Err(WorkspaceError::DirtyTarget {
+                ref_name: ref_name.into(),
+                detail: "session baseline changed; refusing to resume on unrelated source".into(),
+            });
+        }
+        // Exact bytes: a trimmed or lossily decoded diff loses its final
+        // newline and any binary hunk, and git apply rejects it as corrupt.
+        let patch = git_bytes(
+            &self.repo_root,
+            &[
+                "diff",
+                "--binary",
+                &proposal.baseline_tree,
+                &proposal.final_tree,
+            ],
+        )?;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.worktree)
+            .args(["apply", "--binary", "--whitespace=nowarn", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("missing patch stdin"))?
+            .write_all(&patch)?;
+        output_text("git apply resumed proposal", child.wait_with_output()?)?;
+        for group in &proposal.hardlink_groups {
+            if let Some(first) = group.first() {
+                ensure_safe_path_ancestors(&self.worktree, first, ref_name)?;
+                let source = self.worktree.join(first);
+                if !fs::symlink_metadata(&source)?.file_type().is_file() {
+                    return Err(WorkspaceError::Unsupported(
+                        "resume hardlink source is not a regular file".into(),
+                    ));
+                }
+                for relative in group.iter().skip(1) {
+                    ensure_safe_path_ancestors(&self.worktree, relative, ref_name)?;
+                    let target = self.worktree.join(relative);
+                    fs::remove_file(&target)?;
+                    fs::hard_link(&source, target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_stable(&self) -> bool {
         false
     }
@@ -478,12 +634,60 @@ impl AgentWorkspace {
 
     pub fn keep(&self) -> Result<(), WorkspaceError> {
         self.verify_identity()?;
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(KEPT_WORKSPACE_TTL.as_secs());
+        let record = KeptWorkspace {
+            run_id: self.run_id.clone(),
+            expires_at,
+            repo_root: self.repo_root.clone(),
+            worktree: self.worktree.clone(),
+            private_git_dir: self.private_git_dir.clone(),
+            private_index: self.private_index.clone(),
+            base_commit: self.base_commit.clone(),
+            baseline_hash: self.baseline_hash.clone(),
+            baseline_tree: self.baseline_tree.clone(),
+            baseline_view_commit: self.baseline_view_commit.clone(),
+            backend: self.backend.clone(),
+        };
+        let path = kept_workspace_path(&self.data_root, &self.run_id);
+        fs::create_dir_all(path.parent().expect("retention parent"))?;
+        let bytes =
+            serde_json::to_vec(&record).map_err(|error| io::Error::other(error.to_string()))?;
+        let temporary = path.with_extension(format!("pending-{}", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        sync_directory(path.parent().expect("retention parent"))?;
         self.core
             .keep_workspace_pair(&self.handle, &self.git_handle)?;
         Ok(())
     }
 
     pub fn finish(&self, message: &str) -> Result<RunOutcome, WorkspaceError> {
+        self.finish_with_ref(message, self.ref_name())
+    }
+
+    /// Publish an immutable per-prompt checkpoint while a hosted session remains open.
+    pub fn finish_checkpoint(
+        &self,
+        message: &str,
+        sequence: u64,
+    ) -> Result<RunOutcome, WorkspaceError> {
+        self.finish_with_ref(message, format!("{}-turn-{sequence}", self.ref_name()))
+    }
+
+    fn finish_with_ref(
+        &self,
+        message: &str,
+        ref_name: String,
+    ) -> Result<RunOutcome, WorkspaceError> {
         self.verify_identity()?;
         let backend_changed_paths = match &self.backend {
             WorkspaceBackend::Provider { .. } => self.core.changed_paths(&self.handle)?,
@@ -535,7 +739,7 @@ impl AgentWorkspace {
         let commit = commit_tree(
             &self.worktree,
             &final_tree,
-            &self.base_commit,
+            &self.baseline_view_commit,
             &commit_message,
         )?;
         let export_ref = "refs/greppy/export/proposal";
@@ -562,7 +766,6 @@ impl AgentWorkspace {
             ],
         )?;
 
-        let ref_name = self.ref_name();
         let baseline_ref = format!("refs/greppy/baselines/{}", self.run_id);
         publish_proposal_transaction(
             &self.core,
@@ -641,6 +844,12 @@ impl AgentWorkspace {
             }
             self.core
                 .remove_workspace_pair(self.handle, self.git_handle)?;
+        }
+        let retention = kept_workspace_path(&self.data_root, &self.run_id);
+        match fs::remove_file(retention) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         drop(self.pair_lease);
         Ok(())
@@ -1731,16 +1940,33 @@ fn validate_proposal_git_binding(
         "commit",
     )?;
     let parents = parents.split_ascii_whitespace().collect::<Vec<_>>();
-    if parents.as_slice()
-        != [
-            proposal.proposal_commit.as_str(),
-            proposal.base_commit.as_str(),
-        ]
-    {
+    if parents.len() != 2 {
         return Err(WorkspaceError::Tampered {
             path: repository.to_path_buf(),
-            detail: "proposal commit does not have exactly the pinned base commit as parent".into(),
+            detail: "proposal must have exactly one parent".into(),
         });
+    }
+    // Legacy proposals used clean HEAD directly. New proposals use the pinned
+    // visible baseline commit so git show/cherry-pick contain only agent changes.
+    if parents[1] != proposal.base_commit {
+        let parent_tree = read_git(
+            &["rev-parse", &format!("{}^{{tree}}", parents[1])],
+            "parent tree",
+        )?;
+        let ancestry = read_git(
+            &["rev-list", "--parents", "-n", "1", parents[1]],
+            "baseline parent",
+        )?;
+        if parent_tree != proposal.baseline_tree
+            || ancestry.split_ascii_whitespace().collect::<Vec<_>>()
+                != [parents[1], proposal.base_commit.as_str()]
+        {
+            return Err(WorkspaceError::Tampered {
+                path: repository.to_path_buf(),
+                detail: "proposal parent does not bind the pinned visible baseline and clean HEAD"
+                    .into(),
+            });
+        }
     }
 
     let tree_expression = format!("{}^{{tree}}", proposal.proposal_commit);
@@ -6020,7 +6246,14 @@ mod tests {
             } => (commit, ref_name, patch),
             RunOutcome::Clean => panic!("expected proposal"),
         };
-        assert_eq!(git(&repo, &["rev-parse", &format!("{commit}^1")]), base);
+        // Owner order 2026-10-06 (C.11): the proposal's parent is the private
+        // baseline view, i.e. the user's dirty snapshot on top of HEAD, so the
+        // proposal carries only the agent's change.
+        assert_eq!(git(&repo, &["rev-parse", &format!("{commit}^1^1")]), base);
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}^1:tracked.txt")]),
+            "dirty"
+        );
         assert!(patch.contains("-dirty"));
         assert!(patch.contains("+agent"));
         assert!(!patch.lines().any(|line| line == "-base"));
@@ -6487,6 +6720,47 @@ mod tests {
             RunOutcome::Clean => panic!("expected proposal"),
         };
         assert_eq!(workspace.ref_name(), ref_name);
+        let proposal_paths = git(
+            &repo,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", &commit],
+        );
+        assert_eq!(
+            proposal_paths.trim(),
+            "tracked.txt",
+            "user untracked baseline must not enter proposal diff"
+        );
+        assert!(!workspace.baseline_is_clean().unwrap());
+        let resumed = AgentWorkspace::create(&repo, "resume-dirty-proposal").unwrap();
+        resumed.restore_proposal(&ref_name).unwrap();
+        assert_eq!(
+            fs::read(resumed.worktree_path().join("tracked.txt")).unwrap(),
+            b"agent\n"
+        );
+        assert_eq!(
+            fs::read(resumed.worktree_path().join("untracked.txt")).unwrap(),
+            b"untracked\n"
+        );
+        resumed.cleanup().unwrap();
+        let baseline_mtime = fs::metadata(repo.join("tracked.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::write(repo.join("tracked.txt"), b"changed operator baseline\n").unwrap();
+        let changed = AgentWorkspace::create(&repo, "resume-reject-changed").unwrap();
+        assert!(matches!(
+            changed.restore_proposal(&ref_name),
+            Err(WorkspaceError::DirtyTarget { .. })
+        ));
+        changed.cleanup().unwrap();
+        // The baseline hash covers each dirty path's mtime, so restoring the
+        // operator state means restoring the bytes and the modification time.
+        fs::write(repo.join("tracked.txt"), b"unstaged\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo.join("tracked.txt"))
+            .unwrap()
+            .set_modified(baseline_mtime)
+            .unwrap();
         workspace.apply_to(&repo, &commit).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
         assert_eq!(
@@ -6525,12 +6799,27 @@ mod tests {
         let worktree = workspace.worktree_path().to_path_buf();
         let private_git = workspace.linked_git_dir().to_path_buf();
         workspace.keep().unwrap();
+        let retention_path = kept_workspace_path(&data, workspace.run_id());
+        let mut retention: KeptWorkspace =
+            serde_json::from_slice(&fs::read(&retention_path).unwrap()).unwrap();
+        retention.expires_at = 0;
+        fs::write(&retention_path, serde_json::to_vec(&retention).unwrap()).unwrap();
+        reap_expired_agent_workspaces(&data).unwrap();
+        assert!(
+            workspace.worktree_path().exists(),
+            "live owner must fence expiry cleanup"
+        );
         assert!(worktree.is_dir());
         assert!(private_git.is_dir());
         assert_eq!(
             workspace.core.status(&workspace.handle).unwrap().state,
             "kept"
         );
+        drop(workspace);
+        reap_expired_agent_workspaces(&data).unwrap();
+        assert!(!worktree.exists());
+        assert!(!private_git.exists());
+        assert!(!retention_path.exists());
         match previous {
             Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
             None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),

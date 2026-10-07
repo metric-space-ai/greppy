@@ -395,7 +395,10 @@ pub(crate) fn emit_edit_outcome(
                     }
                 }
             }
-            Ok(0)
+            Ok(record
+                .verification
+                .as_ref()
+                .map_or(0, |verification| verification.status.exit_code()))
         }
         Err(refusal) => {
             let value = edit_refusal_json(&refusal, report_path);
@@ -842,6 +845,11 @@ pub(crate) fn finish_output_capture(
     exit_code: u8,
 ) {
     use std::io::Write as _;
+
+    if OUTPUT_OWNED_BY_COMMAND.with(std::cell::Cell::get) {
+        OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().take());
+        return;
+    }
 
     let captured = OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default());
     let captured = if compact_json {

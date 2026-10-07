@@ -99,10 +99,38 @@ fn spawn_stub_gateway_with_delay(
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 16384];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let first_line = req.lines().next().unwrap_or("");
+                    // Read the whole HTTP request before responding. A single
+                    // TCP read can stop inside a header or a large prompt;
+                    // closing with unread request bytes resets some clients.
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first_line = String::new();
+                    if reader.read_line(&mut first_line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = value.trim().parse().expect("request content length");
+                        }
+                    }
+                    assert!(
+                        content_length <= 2 * 1024 * 1024,
+                        "oversize fixture request"
+                    );
+                    let mut body = vec![0; content_length];
+                    if reader.read_exact(&mut body).is_err() {
+                        continue;
+                    }
+                    drop(reader);
                     if first_line.starts_with("GET /v1/models") {
                         let body = r#"{"data":[{"id":"test"}]}"#;
                         let resp = format!(
@@ -258,6 +286,7 @@ fn greppy_p_json_streams_session_text_and_result() {
         "result status must be clean or proposal, got {status}; stdout={stdout}"
     );
     assert_eq!(last["exit_code"].as_u64(), Some(0));
+    assert_eq!(last["final_answer"], "hi from stub");
     assert!(
         events
             .iter()

@@ -35,7 +35,8 @@ impl Fixture {
         command
             .current_dir(&self.repo)
             .env("GREPPY_STORE_DIR", &self.store)
-            .env("GREPPY_TEST_SKIP_INFERENCE", "1");
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_VERIFY_TEST_COMMAND");
         command
     }
 
@@ -44,7 +45,8 @@ impl Fixture {
         command
             .current_dir(cwd)
             .env("GREPPY_STORE_DIR", &self.store)
-            .env("GREPPY_TEST_SKIP_INFERENCE", "1");
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_VERIFY_TEST_COMMAND");
         command
     }
 
@@ -89,6 +91,279 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
     }
+}
+
+fn concurrent_journal(fixture: &Fixture) -> PathBuf {
+    fixture
+        .store
+        .join("workspaces")
+        .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
+        .join(greppy_core::workspace::workspace_hash(&fixture.repo))
+        .join("edit-journal")
+}
+
+struct OwnedEditChild(Option<std::process::Child>);
+impl std::ops::Deref for OwnedEditChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for OwnedEditChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for OwnedEditChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn bounded_output(mut child: OwnedEditChild) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.0.take().unwrap().wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            panic!(
+                "owned concurrent edit exceeded test deadline: {}",
+                combined(&output)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn spawn_edit(fixture: &Fixture, args: &[&str]) -> OwnedEditChild {
+    OwnedEditChild(Some(
+        fixture
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ))
+}
+
+fn wait_for_file_owner(fixture: &Fixture, file: &str) {
+    use sha2::{Digest, Sha256};
+    let identity = fixture.repo.join(file).canonicalize().unwrap();
+    let name = format!(
+        "file-{:x}",
+        Sha256::digest(identity.as_os_str().as_encoded_bytes())
+    );
+    let journal = concurrent_journal(fixture);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if journal.join("locks").join(&name).exists()
+            && greppy_core::cache::acquire_named_lock_in(
+                &journal,
+                &name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            )
+            .unwrap()
+            .is_none()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first edit did not acquire its file lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn release_stdin(mut child: OwnedEditChild, replacement: &[u8]) -> Output {
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(replacement).unwrap();
+    bounded_output(child)
+}
+
+#[test]
+fn concurrent_six_call_report_and_dozen_agents_preserve_every_edit_and_undo() {
+    for count in [6, 32] {
+        let fixture = Fixture::new("parallel-edit-round");
+        use std::io::Write as _;
+        for i in 0..count {
+            std::fs::write(fixture.repo.join(format!("f{i}.txt")), "A B\n").unwrap();
+        }
+        let mut children = Vec::new();
+        for i in 0..count {
+            let (file, old, new) = if count == 6 && i == 5 {
+                ("f0.txt".to_string(), "B", "Y")
+            } else {
+                (format!("f{i}.txt"), "A", "X")
+            };
+            let child = spawn_edit(&fixture, &["replace-text", &file, old]);
+            if !(count == 6 && i == 5) {
+                wait_for_file_owner(&fixture, &file);
+            }
+            children.push((child, new));
+        }
+        // All disjoint targets demonstrably own their locks simultaneously.
+        // Release payloads together, then wait with bounded kill/reap guards.
+        for (child, new) in &mut children {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(new.as_bytes())
+                .unwrap();
+        }
+        for (child, _) in children {
+            let output = bounded_output(child);
+            assert!(output.status.success(), "{}", combined(&output));
+        }
+        for i in 0..count {
+            let expected = if count == 6 && i == 5 {
+                "A B\n"
+            } else if count == 6 && i == 0 {
+                "X Y\n"
+            } else {
+                "X B\n"
+            };
+            assert_file(&fixture.repo.join(format!("f{i}.txt")), expected);
+        }
+        let stack: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(concurrent_journal(&fixture).join("stack.json")).unwrap(),
+        )
+        .unwrap();
+        let transactions = stack["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), count);
+        let ids: std::collections::HashSet<_> = transactions
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), count);
+        for _ in 0..count {
+            let undo = fixture.run(&["undo"]);
+            assert!(undo.status.success(), "{}", combined(&undo));
+        }
+        for i in 0..count {
+            assert_file(&fixture.repo.join(format!("f{i}.txt")), "A B\n");
+        }
+    }
+}
+
+#[test]
+fn blocked_stdin_does_not_block_disjoint_edit_and_same_file_waiter_rereads() {
+    let fixture = Fixture::new("file-lock-wait");
+    std::fs::write(fixture.repo.join("a.txt"), "A B\n").unwrap();
+    std::fs::write(fixture.repo.join("b.txt"), "A\n").unwrap();
+    let first = spawn_edit(&fixture, &["replace-text", "a.txt", "A"]);
+    wait_for_file_owner(&fixture, "a.txt");
+    let unrelated = spawn_edit(&fixture, &["replace-text", "b.txt", "A", "X"]);
+    let output = bounded_output(unrelated);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("b.txt"), "X\n");
+    let mut same = spawn_edit(&fixture, &["replace-text", "a.txt", "B", "Y"]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        same.try_wait().unwrap().is_none(),
+        "same-file call refused instead of waiting"
+    );
+    let first_output = release_stdin(first, b"X");
+    assert!(first_output.status.success(), "{}", combined(&first_output));
+    let same_output = bounded_output(same);
+    assert!(same_output.status.success(), "{}", combined(&same_output));
+    assert_file(&fixture.repo.join("a.txt"), "X Y\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_parent_alias_serializes_with_the_real_file_and_preserves_both_edits() {
+    let fixture = Fixture::new("symlink-parent-lock");
+    std::fs::create_dir_all(fixture.repo.join("real/child")).unwrap();
+    std::fs::write(fixture.repo.join("real/a.txt"), "A B\n").unwrap();
+    std::fs::write(fixture.repo.join("a.txt"), "SENTINEL\n").unwrap();
+    std::os::unix::fs::symlink(fixture.repo.join("real/child"), fixture.repo.join("link")).unwrap();
+    let first = spawn_edit(&fixture, &["replace-text", "link/../a.txt", "A"]);
+    wait_for_file_owner(&fixture, "real/a.txt");
+    let mut same = spawn_edit(&fixture, &["replace-text", "real/a.txt", "B", "Y"]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(same.try_wait().unwrap().is_none());
+    let first = release_stdin(first, b"X");
+    assert!(first.status.success(), "{}", combined(&first));
+    let same = bounded_output(same);
+    assert!(same.status.success(), "{}", combined(&same));
+    assert_file(&fixture.repo.join("real/a.txt"), "X Y\n");
+    assert_file(&fixture.repo.join("a.txt"), "SENTINEL\n");
+}
+
+#[test]
+fn interrupted_edit_keeps_its_own_pending_evidence_when_another_edit_finishes() {
+    let fixture = Fixture::new("pending-isolation");
+    for file in ["a.txt", "b.txt"] {
+        std::fs::write(fixture.repo.join(file), "A\n").unwrap();
+    }
+    let interrupted = fixture
+        .command()
+        .env("GREPPY_TEST_CRASH_AFTER_JOURNAL", "1")
+        .args(["replace-text", "a.txt", "A", "X"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        interrupted.status.code(),
+        Some(16),
+        "{}",
+        combined(&interrupted)
+    );
+    let journal = concurrent_journal(&fixture);
+    let pending: Vec<_> = std::fs::read_dir(&journal)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pending-")
+        })
+        .collect();
+    assert_eq!(pending.len(), 1);
+    let evidence = std::fs::read(&pending[0]).unwrap();
+    let good = fixture.run(&["replace-text", "b.txt", "A", "X"]);
+    assert!(good.status.success(), "{}", combined(&good));
+    assert_eq!(std::fs::read(&pending[0]).unwrap(), evidence);
+    assert_file(&fixture.repo.join("a.txt"), "A\n");
+    let undo = fixture.run(&["undo"]);
+    assert!(undo.status.success(), "{}", combined(&undo));
+    assert_file(&fixture.repo.join("b.txt"), "A\n");
+}
+
+#[test]
+fn journal_failure_after_publication_reports_that_source_was_written() {
+    let fixture = Fixture::new("journal-truth");
+    std::fs::write(fixture.repo.join("a.txt"), "A\n").unwrap();
+    let first = spawn_edit(&fixture, &["--json", "replace-text", "a.txt", "A"]);
+    wait_for_file_owner(&fixture, "a.txt");
+    std::fs::write(
+        concurrent_journal(&fixture).join("stack.json"),
+        b"broken journal",
+    )
+    .unwrap();
+    let output = release_stdin(first, b"X");
+    assert_eq!(output.status.code(), Some(16), "{}", combined(&output));
+    let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(record["published"], true);
+    assert_eq!(record["status"], "published_with_error");
+    assert!(record["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("pending evidence retained"));
+    assert_file(&fixture.repo.join("a.txt"), "X\n");
 }
 
 fn combined(output: &Output) -> String {
@@ -657,7 +932,11 @@ fn verify_timeout_is_bounded_actionable_and_keeps_the_applied_edit() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(17),
+        "stdout={stdout}\nstderr={stderr}"
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "elapsed={elapsed:?}; stdout={stdout}; stderr={stderr}"
@@ -795,6 +1074,160 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn patch_marker_updates_and_advisory_counts_roundtrip() {
+    let fixture = Fixture::new("patch-marker-counts");
+    std::fs::write(fixture.repo.join("one.txt"), "one\nkeep\n").unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let marker = "*** Begin Patch\n*** Update File: one.txt\n@@ label\n-one\n+ONE\n keep\n*** Update File: two.txt\n@@\n-two\n+TWO\n*** End Patch\n";
+    let preview = fixture.run_with_stdin(&["patch", "--dry-run"], marker.as_bytes());
+    assert!(preview.status.success(), "{}", combined(&preview));
+    assert_file(&fixture.repo.join("one.txt"), "one\nkeep\n");
+    let output = fixture.run_with_stdin(&["patch"], marker.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("one.txt"), "ONE\nkeep\n");
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+    assert!(fixture.run(&["undo"]).status.success());
+    let diff = "--- a/one.txt\n+++ b/one.txt\n@@ -99,50 +99,0 @@\n-one\n+ONE\n keep\n--- a/two.txt\n+++ b/two.txt\n@@ -88,0 +88,200 @@\n-two\n+TWO\n";
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("one.txt"), "ONE\nkeep\n");
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+}
+
+#[test]
+fn patch_marker_mixed_operations_dry_run_apply_and_undo() {
+    let fixture = Fixture::new("patch-marker-mixed");
+    std::fs::write(fixture.repo.join("update.txt"), "old\n").unwrap();
+    std::fs::write(fixture.repo.join("delete.txt"), "remove me\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            fixture.repo.join("delete.txt"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+    }
+    let diff = "*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: nested/add.txt\n+created\n+\n*** Add File: empty.txt\n*** Delete File: delete.txt\n*** End Patch\n";
+    let preview = fixture.run_with_stdin(&["patch", "--dry-run"], diff.as_bytes());
+    assert!(preview.status.success(), "{}", combined(&preview));
+    assert_file(&fixture.repo.join("update.txt"), "old\n");
+    assert_file(&fixture.repo.join("delete.txt"), "remove me\n");
+    assert!(!fixture.repo.join("nested").exists());
+    assert!(!fixture.repo.join("empty.txt").exists());
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("update.txt"), "new\n");
+    assert_file(&fixture.repo.join("nested/add.txt"), "created\n\n");
+    assert_file(&fixture.repo.join("empty.txt"), "");
+    assert!(!fixture.repo.join("delete.txt").exists());
+    let undone = fixture.run(&["undo"]);
+    assert!(undone.status.success(), "{}", combined(&undone));
+    assert_file(&fixture.repo.join("update.txt"), "old\n");
+    assert_file(&fixture.repo.join("delete.txt"), "remove me\n");
+    assert!(!fixture.repo.join("nested/add.txt").exists());
+    assert!(!fixture.repo.join("empty.txt").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(fixture.repo.join("delete.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+    }
+}
+
+#[test]
+fn patch_marker_undo_refuses_a_recreated_deletion_target() {
+    let fixture = Fixture::new("patch-marker-undo-conflict");
+    std::fs::write(fixture.repo.join("delete.txt"), "original\n").unwrap();
+    let diff = "*** Begin Patch\n*** Add File: add.txt\n+created\n*** Delete File: delete.txt\n*** End Patch\n";
+    let applied = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(applied.status.success(), "{}", combined(&applied));
+    std::fs::create_dir(fixture.repo.join("delete.txt")).unwrap();
+    let undone = fixture.run(&["undo"]);
+    assert_eq!(undone.status.code(), Some(12), "{}", combined(&undone));
+    assert_file(&fixture.repo.join("add.txt"), "created\n");
+    assert!(fixture.repo.join("delete.txt").is_dir());
+}
+
+#[test]
+fn patch_marker_late_planning_refusals_leave_existence_unchanged() {
+    let fixture = Fixture::new("patch-marker-plan-refusal");
+    std::fs::write(fixture.repo.join("update.txt"), "old\n").unwrap();
+    std::fs::write(fixture.repo.join("delete.txt"), "keep me\n").unwrap();
+    let first = "*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: nested/add.txt\n+created\n*** Delete File: delete.txt\n";
+    for suffix in [
+        "*** Delete File: missing.txt\n*** End Patch\n",
+        "*** Add File: update.txt\n+collision\n*** End Patch\n",
+        "*** Add File: invalid.rs\n+fn broken(\n*** End Patch\n",
+        "*** Add File: ../outside.txt\n+escape\n*** End Patch\n",
+        "*** Add File: nested/./add.txt\n+duplicate\n*** End Patch\n",
+    ] {
+        for dry_run in [false, true] {
+            let args = if dry_run {
+                vec!["patch", "--dry-run"]
+            } else {
+                vec!["patch"]
+            };
+            let output = fixture.run_with_stdin(&args, format!("{first}{suffix}").as_bytes());
+            assert!(!output.status.success(), "{}", combined(&output));
+            assert_file(&fixture.repo.join("update.txt"), "old\n");
+            assert_file(&fixture.repo.join("delete.txt"), "keep me\n");
+            assert!(!fixture.repo.join("nested").exists());
+            assert!(!fixture.repo.join("invalid.rs").exists());
+            assert!(!fixture.base.join("outside.txt").exists());
+        }
+    }
+}
+
+#[test]
+fn patch_marker_refusals_preserve_the_entire_transaction() {
+    let fixture = Fixture::new("patch-marker-refusal");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    std::fs::write(fixture.repo.join("repeat.txt"), "repeat\nrepeat\n").unwrap();
+    let first = "*** Begin Patch\n*** Update File: one.txt\n@@\n-one\n+ONE\n";
+    for (suffix, status) in [
+        (
+            "*** Add File: new.txt\nnew without prefix\n*** End Patch\n",
+            20,
+        ),
+        (
+            "*** Delete File: repeat.txt\n-unexpected payload\n*** End Patch\n",
+            20,
+        ),
+        (
+            "*** Update File: repeat.txt\n@@\n-repeat\n+REPEAT\n*** End Patch\n",
+            13,
+        ),
+        (
+            "*** Update File: one.txt\n@@\n-one\n+AGAIN\n*** End Patch\n",
+            20,
+        ),
+        ("*** Update File: repeat.txt\ninvalid\n*** End Patch\n", 20),
+        ("*** Unknown: repeat.txt\n*** End Patch\n", 20),
+        ("", 20),
+    ] {
+        for dry_run in [false, true] {
+            let args = if dry_run {
+                vec!["patch", "--dry-run"]
+            } else {
+                vec!["patch"]
+            };
+            let output = fixture.run_with_stdin(&args, format!("{first}{suffix}").as_bytes());
+            assert_eq!(output.status.code(), Some(status), "{}", combined(&output));
+            assert_file(&fixture.repo.join("one.txt"), "one\n");
+            assert_file(&fixture.repo.join("repeat.txt"), "repeat\nrepeat\n");
+            assert!(!fixture.repo.join("new.txt").exists());
+        }
+    }
+}
+
+#[test]
 fn patch_deleted_lua_comment_is_payload_and_roundtrips() {
     let fixture = Fixture::new("patch-lua-comment");
     let path = fixture.repo.join("comment.lua");
@@ -833,16 +1266,13 @@ fn patch_header_shaped_payload_does_not_create_a_phantom_file() {
 }
 
 #[test]
-fn patch_bad_counts_and_count_free_header_ambiguity_are_atomic() {
+fn patch_malformed_ranges_and_count_free_header_ambiguity_are_atomic() {
     let fixture = Fixture::new("patch-header-atomic");
     std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
     std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
     let first = "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\n";
     for (suffix, diagnostic) in [
-        (
-            "--- a/two.txt\n+++ b/two.txt\n@@ -1,2 +1 @@\n-two\n+TWO\n",
-            "declares 2 old and 1 new lines",
-        ),
+
         (
             "--- a/two.txt\n+++ b/two.txt\n@@\n-two\n+TWO\n--- a/phantom.txt\n+++ b/phantom.txt\n@@\n-missing\n+new\n",
             "ambiguous in a count-free hunk",
@@ -967,6 +1397,60 @@ fn replace_text_accepts_raw_borrows_and_preserves_syntax_refusal_atomicity() {
     assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
     assert!(combined(&refused).contains("nothing written"));
     assert_file(&fixture.repo.join("valid.rs"), &expected);
+}
+
+#[test]
+fn replace_text_refuses_js_string_newlines_from_stdin_atomically() {
+    let fixture = Fixture::new("js-linebreak");
+    let source = "const x = document.querySelectorAll('ABC');\n";
+    for path in [
+        "example.js",
+        "example.mjs",
+        "example.cjs",
+        "example.ts",
+        "example.tsx",
+    ] {
+        std::fs::write(fixture.repo.join(path), source).unwrap();
+        for replacement in [b"XYZ\n".as_slice(), b"XYZ\r\n", b"XYZ\r"] {
+            for dry_run in [false, true] {
+                let mut args = vec!["replace-text", path, "ABC"];
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let refused = fixture.run_with_stdin(&args, replacement);
+                assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+                let output = combined(&refused);
+                assert!(output.contains("unescaped line break"), "{output}");
+                assert!(output.contains(&format!("{path}:1:")), "{output}");
+                assert!(output.contains("nothing written"), "{output}");
+                assert_file(&fixture.repo.join(path), source);
+            }
+        }
+        let accepted = fixture.run_with_stdin(&["replace-text", path, "ABC"], b"XYZ\\n");
+        assert!(accepted.status.success(), "{}", combined(&accepted));
+        assert_file(
+            &fixture.repo.join(path),
+            "const x = document.querySelectorAll('XYZ\\n');\n",
+        );
+    }
+}
+
+#[test]
+fn replace_text_preserves_multiline_jsx_attribute_strings() {
+    let fixture = Fixture::new("jsx-attribute");
+    for path in ["example.jsx", "example.tsx"] {
+        std::fs::write(
+            fixture.repo.join(path),
+            "const view = <div title=\"ABC\" />;\n",
+        )
+        .unwrap();
+        let accepted = fixture.run_with_stdin(&["replace-text", path, "ABC"], b"XYZ\n");
+        assert!(accepted.status.success(), "{}", combined(&accepted));
+        assert_file(
+            &fixture.repo.join(path),
+            "const view = <div title=\"XYZ\n\" />;\n",
+        );
+    }
 }
 
 #[test]
@@ -1558,4 +2042,355 @@ fn rust_source_views_and_handles_own_outer_attributes_but_not_the_next_definitio
     let stale = fixture.run(&["replace-span", handle, "    fn take_audio(&mut self) {}\n"]);
     assert!(!stale.status.success(), "{}", combined(&stale));
     assert_file(&file, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_failure_and_unavailable_are_nonzero_in_cli_and_json() {
+    for (tag, compiler, expected) in [
+        (
+            "failed",
+            "#!/bin/sh\nprintf 'error: intended verifier failure\\n' >&2\nexit 7\n",
+            "failed",
+        ),
+        (
+            "unavailable",
+            "#!/greppy-test-missing-interpreter\n",
+            "unavailable",
+        ),
+    ] {
+        let fixture = Fixture::new(tag);
+        std::fs::write(fixture.repo.join("ui.ts"), "const oldValue = 1;\n").unwrap();
+        install_fake_tsc(&fixture, compiler);
+        let output = fixture.run(&[
+            "replace-text",
+            "ui.ts",
+            "oldValue",
+            "newValue",
+            "--verify",
+            "--json",
+        ]);
+        assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["published"], true);
+        assert_eq!(value["exit_code"], 17);
+        assert_eq!(value["verify"]["status"], expected);
+        assert_eq!(value["verify"]["exit_code"], 17);
+        assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
+        assert!(combined(&output).contains("edit remains applied"));
+        // Explicit verification must also run when the requested bytes already exist.
+        for args in [
+            vec![
+                "replace-text",
+                "ui.ts",
+                "newValue",
+                "newValue",
+                "--verify",
+                "--json",
+            ],
+            vec![
+                "write",
+                "ui.ts",
+                "const newValue = 1;\n",
+                "--verify",
+                "--json",
+            ],
+        ] {
+            let repeated = fixture.run(&args);
+            assert_eq!(repeated.status.code(), Some(17), "{}", combined(&repeated));
+            let value: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+            assert_eq!(value["verify"]["status"], expected);
+            assert_eq!(value["exit_code"], 17);
+            assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
+        }
+    }
+}
+
+#[test]
+fn python_body_indentation_is_checked_before_publication() {
+    let fixture = Fixture::new("python-body-indentation");
+    let before = "def clamp(value, lower, upper):\n    return min(lower, max(upper, value))\n";
+    std::fs::write(fixture.repo.join("limits.py"), before).unwrap();
+    let refused = fixture.run(&[
+        "replace",
+        "clamp",
+        "--body",
+        "return max(lower, min(upper, value))",
+    ]);
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert!(combined(&refused).contains("indentation"));
+    assert!(combined(&refused).contains("nothing written"));
+    assert_file(&fixture.repo.join("limits.py"), before);
+    let applied = fixture.run(&[
+        "replace",
+        "clamp",
+        "--body",
+        "    return max(lower, min(upper, value))",
+    ]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    assert_file(
+        &fixture.repo.join("limits.py"),
+        "def clamp(value, lower, upper):\n    return max(lower, min(upper, value))\n",
+    );
+}
+
+#[test]
+fn verify_reports_syntax_success_without_claiming_tests_passed() {
+    let fixture = Fixture::new("verify-syntax-coverage");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture.run(&["replace-text", "a.py", "1", "2", "--verify", "--json"]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "not_run");
+    assert_eq!(value["verify"]["checks"][0]["scope"], "syntax");
+    assert_eq!(value["verify"]["checks"][0]["status"], "passed");
+    assert!(combined(&output).contains("tests not run"));
+}
+
+#[test]
+fn verify_selected_python_tests_catch_import_cycle_despite_valid_syntax() {
+    let fixture = Fixture::new("verify-import-cycle");
+    std::fs::create_dir(fixture.repo.join("tests")).unwrap();
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    std::fs::write(fixture.repo.join("b.py"), "from a import VALUE\n").unwrap();
+    std::fs::write(fixture.repo.join("tests/test_imports.py"),
+        "import unittest\nimport a\nclass TestImports(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(a.VALUE, 1)\n").unwrap();
+    let run = |old, new| {
+        fixture
+            .command()
+            .env(
+                "GREPPY_VERIFY_TEST_COMMAND",
+                "python3 -m unittest discover -s tests",
+            )
+            .args(["replace-text", "a.py", old, new, "--verify", "--json"])
+            .output()
+            .unwrap()
+    };
+    let broken = run("VALUE = 1", "from b import VALUE\nVALUE = 1");
+    assert_eq!(broken.status.code(), Some(17), "{}", combined(&broken));
+    let value: serde_json::Value = serde_json::from_slice(&broken.stdout).unwrap();
+    assert_eq!(value["verify"]["checks"][0]["scope"], "syntax");
+    assert_eq!(value["verify"]["checks"][0]["status"], "passed");
+    assert_eq!(value["verify"]["tests_status"], "failed");
+    assert_eq!(value["verify"]["checks"][1]["scope"], "tests");
+    assert!(
+        combined(&broken).contains("ImportError"),
+        "{}",
+        combined(&broken)
+    );
+    assert!(combined(&broken).contains("edit remains applied"));
+    assert_file(
+        &fixture.repo.join("a.py"),
+        "from b import VALUE\nVALUE = 1\n",
+    );
+    let repaired = run("from b import VALUE\nVALUE = 1", "VALUE = 1");
+    assert!(repaired.status.success(), "{}", combined(&repaired));
+    let value: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "passed");
+    assert_eq!(value["verify"]["checks"][1]["status"], "passed");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_selected_test_pipeline_preserves_failure() {
+    let fixture = Fixture::new("verify-test-pipeline");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .env(
+            "GREPPY_VERIFY_TEST_COMMAND",
+            "python3 -c 'raise RuntimeError(\"pipeline failure\")' | head -1",
+        )
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "failed");
+}
+
+#[test]
+fn verify_rejects_empty_selected_tests_instead_of_claiming_success() {
+    let fixture = Fixture::new("verify-empty-tests");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "  ")
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "unavailable");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_selected_tests_timeout_without_undoing_edit() {
+    let fixture = Fixture::new("verify-test-timeout");
+    std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
+    let output = fixture
+        .command()
+         .env("GREPPY_VERIFY_TEST_COMMAND", "python3 -c \"import os,time;open('owned-test.pid','w').write(str(os.getpid()));time.sleep(30)\"")
+        .env("GREPPY_EDIT_VERIFY_TIMEOUT_SECS", "1")
+        .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "timed_out");
+    assert_file(&fixture.repo.join("a.txt"), "new\n");
+    let pid: i32 = std::fs::read_to_string(fixture.repo.join("owned-test.pid"))
+        .expect("selected test actually started")
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "selected test process survived timeout"
+    );
+}
+
+#[test]
+fn verify_does_not_call_immediate_exit_124_a_timeout() {
+    let fixture = Fixture::new("verify-exit124");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .env(
+            "GREPPY_VERIFY_TEST_COMMAND",
+            "python3 -c 'import sys;sys.exit(124)'",
+        )
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "failed");
+    assert!(!combined(&output).contains("timed out"));
+}
+
+#[test]
+fn verify_does_not_leak_private_completion_path_to_test_command() {
+    let fixture = Fixture::new("verify-private-channel");
+    std::fs::write(fixture.repo.join("a.py"), "VALUE = 1\n").unwrap();
+    let output = fixture.command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "python3 -c 'import os;assert \"GREPPY_INTERNAL_VERIFY_STATUS_PATH\" not in os.environ'")
+        .args(["replace-text", "a.py", "1", "2", "--verify", "--json"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "passed");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_reaps_pipe_holding_descendant_after_test_leader_exits() {
+    let fixture = Fixture::new("verify-exited-leader");
+    std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
+    let output = fixture.command()
+        .env("GREPPY_VERIFY_TEST_COMMAND", "python3 -c \"import subprocess;p=subprocess.Popen(['sleep','30']);open('owned-test.pid','w').write(str(p.pid))\"")
+        .env("GREPPY_EDIT_VERIFY_TIMEOUT_SECS", "1")
+        .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
+        .output().unwrap();
+    assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verify"]["tests_status"], "timed_out");
+    let pid: i32 = std::fs::read_to_string(fixture.repo.join("owned-test.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "pipe-holding test descendant survived timeout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_completion_keeps_shared_temp_permissions_and_cleans_private_capture() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for code in [0, 3] {
+        let fixture = Fixture::new("verify-shared-temp");
+        let shared = fixture.base.join("shared-temp");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::write(fixture.repo.join("a.txt"), "old\n").unwrap();
+        let command = format!(
+            "python3 -c 'import os, pathlib, stat, sys; roots=list(pathlib.Path(os.environ[\"TMPDIR\"]).glob(\"greppy-verify-*\")); assert len(roots)==1; assert stat.S_IMODE(roots[0].stat().st_mode)==0o700; sys.exit({code})'"
+        );
+        let output = fixture
+            .command()
+            .env("TMPDIR", &shared)
+            .env("GREPPY_VERIFY_TEST_COMMAND", command)
+            .args(["replace-text", "a.txt", "old", "new", "--verify", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if code == 0 { 0 } else { 17 }),
+            "{}",
+            combined(&output)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value["verify"]["tests_status"],
+            if code == 0 { "passed" } else { "failed" }
+        );
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+        assert!(
+            !std::fs::read_dir(&shared).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("greppy-verify-")
+            }),
+            "private capture was not removed"
+        );
+    }
+}
+
+#[test]
+fn old_that_matches_nowhere_points_at_the_whitespace_variant() {
+    let fixture = Fixture::new("nearest-old");
+    std::fs::write(
+        fixture.repo.join("a.txt"),
+        "header line\n    if value > HIGH:\n        return value\nfooter\n",
+    )
+    .unwrap();
+    let out = fixture.run(&[
+        "replace-text",
+        "a.txt",
+        "if value > HIGH:\n    return value",
+        "if value > HIGH:\n    return HIGH",
+    ]);
+    assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+    let text = combined(&out);
+    assert!(text.contains("OLD occurs 0 times"), "{text}");
+    assert!(
+        text.contains("nearest match differs only in whitespace at a.txt:2-3"),
+        "{text}"
+    );
+    assert!(text.contains("greppy replace-lines a.txt 2:3"), "{text}");
+    assert!(
+        text.contains("\n    if value > HIGH:\n        return value"),
+        "{text}"
+    );
+    assert_file(
+        &fixture.repo.join("a.txt"),
+        "header line\n    if value > HIGH:\n        return value\nfooter\n",
+    );
 }

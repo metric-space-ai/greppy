@@ -281,11 +281,13 @@ thread_local! {
         std::cell::RefCell::new(CliInferenceOverride::default());
     static CLI_RESULT_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static CLI_RESULT_OFFSET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLI_MAX_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static CLI_INVOCATION: std::cell::RefCell<Vec<std::ffi::OsString>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static CLI_JSON_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OUTPUT_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
+    static OUTPUT_OWNED_BY_COMMAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static NAV_TEXT_WINDOW: std::cell::RefCell<Option<NavTextWindow>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -303,6 +305,10 @@ fn cli_inference_override() -> CliInferenceOverride {
 fn set_cli_result_window(limit: Option<usize>, offset: usize) {
     CLI_RESULT_LIMIT.with(|value| value.set(limit));
     CLI_RESULT_OFFSET.with(|value| value.set(offset));
+}
+
+fn set_cli_max_bytes(max_bytes: Option<usize>) {
+    CLI_MAX_BYTES.with(|value| value.set(max_bytes));
 }
 
 fn set_cli_json_output(enabled: bool) {
@@ -590,6 +596,7 @@ const SUBCOMMANDS: &[&str] = &[
     "agent",
     "index",
     "where-am-i",
+    "prompt",
     "cache",
     "agent",
     "workspace",
@@ -1035,10 +1042,18 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                         );
                     }
                     println!(
-                        "usage: greppy read-file PATH [PATH …] [--lines A:B] [--all] [--json]"
+                        "usage: greppy read-file PATH [PATH …] [--lines A:B|--outline|--all] [--json]"
                     );
                     return 64;
                 }
+            }
+            // A literal-search flag must never turn into a semantic query by
+            // being dropped: that returns plausible but unrelated definitions.
+            if sub == "search" && unknown_flag_name(first).as_deref() == Some("--fixed") {
+                println!(
+                    "`--fixed` requests literal text: use `greppy search-pattern TEXT --fixed` with the same text and path/root filters; no semantic search was performed"
+                );
+                return 64;
             }
             if let Some((reduced, stray)) = argv_without_stray_positional(
                 &argv,
@@ -1382,6 +1397,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
         "where-am-i" => "greppy where-am-i [--json] [--root DIR]",
+        "prompt" => "greppy prompt [--external] [--json]",
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
@@ -1425,7 +1441,8 @@ fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool 
         // These commands do not need a graph. In particular, a missing file
         // must be diagnosed before unrelated cache maintenance can do writes.
         Some(
-            Command::ReadFile { .. }
+            Command::Prompt { .. }
+            | Command::ReadFile { .. }
             | Command::Cache { .. }
             | Command::ReplaceText { .. }
             | Command::ReplaceLines { .. }
@@ -1437,6 +1454,7 @@ fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool 
             | Command::Undo { .. },
         ) => true,
         Some(Command::Index { path, .. }) if path.as_deref() == Some("status") => true,
+        Some(Command::Expand { id: Some(id), .. }) if id.starts_with("agent-output-") => true,
         #[cfg(feature = "bash-smart")]
         Some(Command::BashSmart { .. }) => true,
         _ => false,
@@ -1463,6 +1481,19 @@ fn literal_edits_skip_unrelated_startup_maintenance() {
     assert!(!command_skips_automatic_cache_maintenance(
         cli.command.as_ref()
     ));
+}
+
+#[test]
+fn prompt_export_skips_unrelated_startup_maintenance() {
+    for args in [
+        vec!["greppy", "prompt"],
+        vec!["greppy", "prompt", "--external", "--json"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(command_skips_automatic_cache_maintenance(
+            cli.command.as_ref()
+        ));
+    }
 }
 
 fn prune_expired_evidence_packs_in_existing_store(path: &std::path::Path, now: u64) -> usize {
@@ -1915,6 +1946,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         return Err(Error::Invalid("--max-bytes must be at least 1".into()));
     }
     set_cli_result_window(cli.limit, cli.offset);
+    set_cli_max_bytes(cli.max_bytes);
     set_cli_json_output(command_requests_json(cli.command.as_ref()));
     let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
     if !no_gpu {
@@ -2396,6 +2428,30 @@ fn dispatch_subcommand(
                 }
             }
         }
+        Command::Prompt {
+            external,
+            mode,
+            json,
+        } => {
+            let mode = mode
+                .as_deref()
+                .unwrap_or(if external { "external" } else { "one-shot" });
+            let metadata = greppy_agent::prompt_metadata_for_mode(mode);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&metadata)
+                        .map_err(|e| Error::Invalid(format!("encode prompt: {e}")))?
+                );
+            } else {
+                println!(
+                    "prompt-sha256: {}",
+                    metadata["prompt_sha256"].as_str().unwrap()
+                );
+                print!("{}", metadata["prompt"].as_str().unwrap());
+            }
+            Ok(0)
+        }
         Command::WhereAmI { json } => dispatch_where_am_i(root, json),
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Agent { command } => dispatch_agent_admin(command, root),
@@ -2471,6 +2527,26 @@ fn dispatch_subcommand(
         }
         #[cfg(feature = "bash-smart")]
         Command::BashSmart { regexes, argv } => bash_smart::run(&argv, &regexes, root),
+        Command::Expand { id: Some(id), json } if id.starts_with("agent-output-") => {
+            let owner = resolve_root(root)?;
+            let outcome = greppy_agent::greppy_env::expand_agent_output(
+                &owner,
+                &id,
+                cli_result_offset(),
+                CLI_MAX_BYTES
+                    .with(std::cell::Cell::get)
+                    .unwrap_or(64 * 1024),
+            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"id": id, "content": outcome.content, "is_error": outcome.is_error})
+                );
+            } else {
+                println!("{}", outcome.content);
+            }
+            Ok(if outcome.is_error { 1 } else { 0 })
+        }
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             symbols,
@@ -2499,6 +2575,7 @@ fn dispatch_subcommand(
             paths,
             lines,
             all,
+            outline,
             handle,
             json,
             path_opts,
@@ -2508,6 +2585,7 @@ fn dispatch_subcommand(
                 &paths,
                 lines.as_deref(),
                 all,
+                outline,
                 handle,
                 json,
                 &path_opts,
@@ -5054,6 +5132,7 @@ struct BackgroundJobGuard {
     device: Option<String>,
     completed_documents: usize,
     total_documents: usize,
+    reusable_documents: usize,
     local_store_reuse: usize,
     global_cache_hits: usize,
     global_cache_misses: usize,
@@ -5172,6 +5251,7 @@ impl BackgroundJobGuard {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned),
             completed_documents: 0,
+            reusable_documents: 0,
             local_store_reuse: 0,
             global_cache_hits: 0,
             global_cache_misses: 0,
@@ -5222,10 +5302,16 @@ impl BackgroundJobGuard {
         self.write_state("starting", None);
     }
 
-    fn embedding_started(&mut self, backend: &str, total_documents: usize) {
+    fn embedding_started(
+        &mut self,
+        backend: &str,
+        total_documents: usize,
+        reusable_documents: usize,
+    ) {
         self.backend = Some(backend.to_string());
         self.completed_documents = 0;
         self.total_documents = total_documents;
+        self.reusable_documents = reusable_documents;
         self.local_store_reuse = 0;
         self.global_cache_hits = 0;
         self.global_cache_misses = 0;
@@ -5235,7 +5321,10 @@ impl BackgroundJobGuard {
         self.progress_phase = Some("embedding");
         self.rate_milli_documents_per_second = None;
         self.current_detail = None;
-        self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
+        self.eta_seconds = initial_embedding_eta_seconds(
+            total_documents.saturating_sub(reusable_documents),
+            backend,
+        );
         self.eta_basis = match self.eta_seconds {
             Some(0) => Some("completed_embedding_work"),
             Some(_) => Some("backend_prior"),
@@ -5257,6 +5346,7 @@ impl BackgroundJobGuard {
         self.progress_phase = Some(progress.phase);
         self.completed_documents = progress.completed_files;
         self.total_documents = progress.total_files;
+        self.reusable_documents = 0;
         self.local_store_reuse = 0;
         self.global_cache_hits = 0;
         self.global_cache_misses = 0;
@@ -5302,6 +5392,7 @@ impl BackgroundJobGuard {
         self.progress_phase = Some(phase);
         self.completed_documents = 0;
         self.total_documents = 0;
+        self.reusable_documents = 0;
         self.local_store_reuse = 0;
         self.global_cache_hits = 0;
         self.global_cache_misses = 0;
@@ -5318,22 +5409,32 @@ impl BackgroundJobGuard {
     }
 
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
+        self.embedding_progress_at(progress, std::time::Instant::now());
+    }
+
+    fn embedding_progress_at(
+        &mut self,
+        progress: greppy_indexer::EmbeddingIndexProgress,
+        now: std::time::Instant,
+    ) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
+        self.reusable_documents = progress.reusable_documents;
         self.local_store_reuse = progress.local_store_reuse;
         self.global_cache_hits = progress.global_cache_hits;
         self.global_cache_misses = progress.global_cache_misses;
         self.current_detail = progress.current_symbol;
         if let Some(started) = self.embedding_started {
-            let elapsed_ms = u64::try_from(started.elapsed().as_millis())
+            let elapsed_ms = u64::try_from(now.saturating_duration_since(started).as_millis())
                 .unwrap_or(u64::MAX)
                 .max(1);
-            // Cache copies are not measurements of GPU inference throughput.
-            // Treat unvisited documents as uncached until their reuse is proven.
+            // Validation proves local reuse before the pass begins. Neither
+            // those copies nor global-cache hits measure GPU throughput.
             let (inferred, inference_workload) = embedding_inference_workload(
-                self.completed_documents,
-                self.total_documents,
-                self.local_store_reuse,
+                self.completed_documents
+                    .saturating_sub(self.local_store_reuse),
+                self.total_documents.saturating_sub(self.reusable_documents),
+                0,
                 self.global_cache_hits,
             );
             let observed = observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms);
@@ -5351,7 +5452,6 @@ impl BackgroundJobGuard {
             self.rate_milli_documents_per_second =
                 observed_embedding_rate_milli(inferred, elapsed_ms);
         }
-        let now = std::time::Instant::now();
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
         let publish = finished
             || self.last_progress_write.is_none_or(|last| {
@@ -5368,13 +5468,25 @@ impl BackgroundJobGuard {
         let now = unix_now_secs_cli();
         let eta_unix_secs = self.eta_seconds.map(|eta| now.saturating_add(eta));
         let eta_minutes = self.eta_seconds.map(|eta| eta.saturating_add(59) / 60);
-        let progress_milli_percent = if self.total_documents == 0 {
-            0
+        let embedding = self.progress_phase == Some("embedding");
+        let total_spans = if embedding {
+            self.total_documents.saturating_sub(self.reusable_documents)
+        } else {
+            self.total_documents
+        };
+        let completed_spans = if embedding {
+            self.completed_documents
+                .saturating_sub(self.local_store_reuse)
         } else {
             self.completed_documents
-                .min(self.total_documents)
+        };
+        let progress_milli_percent = if total_spans == 0 {
+            0
+        } else {
+            completed_spans
+                .min(total_spans)
                 .saturating_mul(100_000)
-                .checked_div(self.total_documents)
+                .checked_div(total_spans)
                 .unwrap_or(0)
         };
         let progress_unit = match self.progress_phase {
@@ -5406,8 +5518,15 @@ impl BackgroundJobGuard {
             "state": state,
             "backend": self.backend,
             "device": self.device,
-            "completed_spans": self.completed_documents,
-            "total_spans": self.total_documents,
+            "completed_spans": completed_spans,
+            "total_spans": total_spans,
+            "validated_spans": embedding.then_some(self.total_documents),
+            "reusable_spans": embedding.then_some(self.reusable_documents),
+            "work_assessment": match self.progress_phase {
+                Some("embedding") => Some("validated"),
+                Some("counting_embeddings") | None => Some("pending_validation"),
+                _ => None,
+            },
             "local_store_reuse": self.local_store_reuse,
             "global_cache_hits": self.global_cache_hits,
             "global_cache_misses": self.global_cache_misses,
@@ -5533,6 +5652,7 @@ mod background_progress_tests {
             device: None,
             completed_documents: 0,
             total_documents: 0,
+            reusable_documents: 0,
             local_store_reuse: 0,
             global_cache_hits: 0,
             global_cache_misses: 0,
@@ -5769,17 +5889,6 @@ fn unix_now_secs_cli() -> u64 {
         .unwrap_or(0)
 }
 
-fn current_embedding_candidate_count(root: &std::path::Path) -> usize {
-    let project = workspace_locator::project_identity(root);
-    greppy_store::Store::open_with(
-        &workspace_locator::store_path(root),
-        greppy_store::OpenOptions::read_only(),
-    )
-    .ok()
-    .and_then(|store| greppy_indexer::count_embedding_candidate_nodes(&store, &project).ok())
-    .unwrap_or(0)
-}
-
 /// Start at most one detached refresh for a worktree. A spawn lock closes the
 /// cross-process race and the atomically published job record is the public
 /// progress surface used by semantic-search.
@@ -5882,20 +5991,14 @@ fn spawn_background_job_handle_scoped(
         return None;
     };
     let started_at = unix_now_secs_cli();
-    let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
+    let (backend, device) = if let Some(cfg) = embedding_cfg {
         let (backend, device) = embedding_backend_plan(cfg);
-        let total = if prefixes.is_empty() {
-            current_embedding_candidate_count(&root)
-        } else {
-            0
-        };
-        let eta = initial_embedding_eta_seconds(total, &backend);
-        (Some(backend), device, total, eta)
+        (Some(backend), device)
     } else {
-        (None, None, 0, None)
+        (None, None)
     };
-    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
-    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    // The upcoming refresh may replace graph rows while reusing nearly all
+    // vectors. Counts and ETA are unknown until scoped content validation.
     let inherited_workers = std::env::var_os("GREPPY_WORKERS");
     let worker_count = Some(automatic_index_worker_count(inherited_workers.as_deref()));
     // Publish a launch record before spawning. Otherwise a concurrent status
@@ -5915,12 +6018,13 @@ fn spawn_background_job_handle_scoped(
         "backend": backend,
         "device": device,
         "completed_spans": 0,
-        "total_spans": total_spans,
+        "total_spans": serde_json::Value::Null,
+        "work_assessment": "pending_validation",
         "progress_milli_percent": 0,
         "rate_milli_spans_per_second": serde_json::Value::Null,
-        "eta_seconds": eta_seconds,
-        "eta_minutes": eta_minutes,
-        "eta_unix_secs": eta_unix_secs,
+        "eta_seconds": serde_json::Value::Null,
+        "eta_minutes": serde_json::Value::Null,
+        "eta_unix_secs": serde_json::Value::Null,
         "last_error": serde_json::Value::Null,
     });
     if start_background_job_record(&job_path, &value).is_err() {
@@ -6378,9 +6482,15 @@ fn summarize_source_cached(
         }
     }
     let inference_source = cap_summary_inference_source(source);
-    let bullets =
-        summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, &inference_source)
-            .filter(|bullets| !bullets.is_empty())?;
+    let bullets = match summarize_daemon::summarize_source_via_daemon(
+        cfg,
+        model_key,
+        file_path,
+        &inference_source,
+    ) {
+        inference_daemon::RequestOutcome::Response(bullets) if !bullets.is_empty() => bullets,
+        _ => return None,
+    };
     if let Some(cache) = cache {
         let _ = if unbounded {
             cache.put_unbounded(&cache_key, &hash, &bullets)
@@ -6574,6 +6684,7 @@ struct EditRecord {
     text: Option<String>,
     handle: Option<String>,
     diagnostics: Option<Vec<String>>,
+    verification: Option<edit::EditVerification>,
     notes: Vec<String>,
     operations: Vec<EditOperation>,
     /// What this particular verb owes the caller beyond the common shape: the
@@ -6835,7 +6946,12 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     };
     #[cfg(feature = "bash-smart")]
     if pack.command == "bash-smart" {
-        return bash_smart::expand(&pack_store, pack, json);
+        let window = bash_smart::ExpandWindow {
+            offset: cli_result_offset(),
+            limit: cli_result_limit_raw(),
+            max_bytes: CLI_MAX_BYTES.with(std::cell::Cell::get),
+        };
+        return bash_smart::expand(&pack_store, pack, json, window);
     }
     if pack.command == "read-file" {
         return dispatch_read_expand(&pack_store, &pack, json, root);
@@ -7027,11 +7143,13 @@ fn combined_inference_gpu_memory() -> u64 {
     let summary = qwen_summary_config_optional()
         .ok()
         .flatten()
-        .and_then(|cfg| std::fs::metadata(cfg.gguf).ok())
-        .map(|metadata| {
+        .map(|cfg| {
+            let model_bytes = std::fs::metadata(cfg.gguf)
+                .map(|metadata| metadata.len())
+                .unwrap_or(qwen35_assets::GGUF_BYTES);
             greppy_embed_native::estimated_gpu_memory(
                 greppy_embed_native::InferenceModelKind::Qwen35,
-                metadata.len(),
+                model_bytes,
             )
         })
         .unwrap_or(0);
@@ -7041,6 +7159,7 @@ fn combined_inference_gpu_memory() -> u64 {
 #[derive(Default)]
 struct DirtyOverlay {
     git_available: bool,
+    diagnostic: Option<&'static str>,
     clean: bool,
     total: usize,
     staged_count: usize,
@@ -7088,7 +7207,9 @@ impl DirtyOverlay {
             .collect::<Vec<_>>();
         serde_json::json!({
             "git_available": self.git_available,
-            "clean": self.clean,
+            "clean": self.git_available.then_some(self.clean),
+            "assessment": if self.git_available { "assessed" } else { "unknown" },
+            "diagnostic": self.diagnostic,
             "total": self.total,
             "staged_count": self.staged_count,
             "unstaged_count": self.unstaged_count,
@@ -7113,12 +7234,22 @@ fn dirty_overlay(root_path: &std::path::Path) -> Result<DirtyOverlay> {
             "--untracked-files=all",
         ])
         .current_dir(root_path)
-        .output()
-        .map_err(|e| Error::io("spawn git status for dirty overlay", e))?;
+        .output();
+    let out = match out {
+        Ok(out) => out,
+        // NotFound can also mean the working directory disappeared. Only a
+        // valid repository directory makes a missing executable advisory.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && root_path.is_dir() => {
+            return Ok(DirtyOverlay {
+                diagnostic: Some("git executable unavailable; repository dirtiness is unknown"),
+                ..DirtyOverlay::default()
+            });
+        }
+        Err(e) => return Err(Error::io("spawn git status for dirty overlay", e)),
+    };
     if !out.status.success() {
         return Ok(DirtyOverlay {
-            git_available: false,
-            clean: true,
+            diagnostic: Some("git status unsuccessful; repository dirtiness is unknown"),
             ..DirtyOverlay::default()
         });
     }
@@ -9562,9 +9693,30 @@ mod embeddinggemma_assets {
 }
 
 mod qwen35_assets {
+    pub const GGUF_BYTES: u64 =
+        include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH")).len() as u64;
+    const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
+    const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
+
+    /// Resolve shared-daemon identity without creating or verifying local assets.
+    pub fn identity_paths() -> (String, String) {
+        identity_paths_in(&greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km"))
+    }
+
+    fn identity_paths_in(root: &std::path::Path) -> (String, String) {
+        (
+            root.join(GGUF_SHA)
+                .join("Qwen3.5-0.8B-MTP-Q4_K_M.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            root.join(TOK_SHA)
+                .join("tokenizer.json")
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     pub fn paths() -> Option<(String, String)> {
-        const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
-        const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
         let root = greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km");
         #[cfg(not(debug_assertions))]
         {
@@ -9611,6 +9763,36 @@ mod qwen35_assets {
             bytes: &[u8],
         ) -> Option<String> {
             crate::extract_embedded_asset(root, expected_sha, name, bytes)
+        }
+
+        #[test]
+        fn daemon_identity_does_not_require_writable_local_model_storage() {
+            let tmp = tempfile::tempdir().unwrap();
+            let blocked_root = tmp.path().join("not-a-directory");
+            std::fs::write(&blocked_root, b"block local asset preparation").unwrap();
+            let (gguf, tokenizer) = super::identity_paths_in(&blocked_root);
+            assert_eq!(
+                std::path::Path::new(&gguf)
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap(),
+                super::GGUF_SHA
+            );
+            assert_eq!(
+                std::path::Path::new(&tokenizer)
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap(),
+                super::TOK_SHA
+            );
+            assert!(!std::path::Path::new(&gguf).exists());
+            assert!(!std::path::Path::new(&tokenizer).exists());
+            assert_eq!(
+                std::fs::read(blocked_root).unwrap(),
+                b"block local asset preparation"
+            );
         }
 
         #[test]
@@ -9661,6 +9843,7 @@ impl std::ops::Deref for LoadedQwen35Summarizer {
 }
 
 fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summarizer> {
+    let cfg = qwen_summary_config_materialized(cfg)?;
     let lease = acquire_cached_model_lease(&cfg.gguf)?;
     let options = greppy_qwen35_native::LoadOptions {
         device: cfg.device.clone(),
@@ -11140,8 +11323,13 @@ fn print_multi_unresolved_receivers(page: &UnresolvedReceiverPage, start: usize)
 }
 
 fn begin_output_capture() {
+    OUTPUT_OWNED_BY_COMMAND.with(|owned| owned.set(false));
     NAV_TEXT_WINDOW.with(|window| *window.borrow_mut() = None);
     OUTPUT_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+}
+
+pub(crate) fn command_owns_output() {
+    OUTPUT_OWNED_BY_COMMAND.with(|owned| owned.set(true));
 }
 
 fn retry_with_offset(command: &str, offset: usize) -> String {

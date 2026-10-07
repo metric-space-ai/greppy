@@ -3,6 +3,93 @@
 use std::path::{Path, PathBuf};
 
 #[test]
+fn read_file_clamps_past_eof_without_opening_a_graph() {
+    let (repo, store) = fresh_workspace("clamped-range");
+    std::fs::write(repo.join("sample.txt"), "first\nsecond\nthird").unwrap();
+    std::fs::write(&store, "not a graph directory").unwrap();
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", "sample.txt", "--lines", "2:80"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(out, "sample.txt:2-3\nsecond\nthird");
+    assert_eq!(
+        err,
+        "note: read-file --lines 2:80 ends past EOF; clamped to 2:3\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store).unwrap(),
+        "not a graph directory"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_clamped_json_and_handle_record_only_actual_lines() {
+    let (repo, store) = fresh_workspace("clamped-handle");
+    std::fs::write(repo.join("sample.txt"), "first\nsecond\nthird\n").unwrap();
+    for handle in [false, true] {
+        let mut args = vec!["--json", "read-file", "sample.txt", "--lines", "2:80"];
+        if handle {
+            args.push("--handle");
+        }
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let file = &value["files"][0];
+        assert_eq!(file["start_line"], 2);
+        assert_eq!(file["end_line"], 3);
+        assert_eq!(file["content"], "second\nthird\n");
+        assert_eq!(
+            err,
+            "note: read-file --lines 2:80 ends past EOF; clamped to 2:3\n"
+        );
+        if handle {
+            let h = file["handle"].as_str().unwrap();
+            let (status, result, error) = run(
+                &repo,
+                &store,
+                &["replace-span", h, "REPLACED\n", "--dry-run"],
+            );
+            assert_eq!(status, 0, "{result}\n{error}");
+            assert_eq!(
+                std::fs::read_to_string(repo.join("sample.txt")).unwrap(),
+                "first\nsecond\nthird\n"
+            );
+        }
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_still_rejects_missing_start_and_invalid_range() {
+    let (repo, store) = fresh_workspace("clamped-invalid");
+    std::fs::write(repo.join("sample.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(repo.join("empty.txt"), "").unwrap();
+    for (file, range) in [
+        ("sample.txt", "3:80"),
+        ("empty.txt", "1:80"),
+        ("sample.txt", "0:80"),
+        ("sample.txt", "2:1"),
+    ] {
+        for handle in [false, true] {
+            let mut args = vec!["read-file", file, "--lines", range];
+            if handle {
+                args.push("--handle");
+            }
+            let (code, out, err) = run(&repo, &store, &args);
+            assert_eq!(code, 64, "{range}: {out}\n{err}");
+            assert!(
+                !out.contains("handle:"),
+                "invalid range must not issue a handle"
+            );
+        }
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn enum_variant_read_repairs_legacy_span_and_handle_without_reindex() {
     let (repo, store) = fresh_workspace("enum-variant-span");
     let original =
@@ -23,7 +110,14 @@ fn enum_variant_read_repairs_legacy_span_and_handle_without_reindex() {
             row.get(0)
         })
         .unwrap();
-    conn.execute_batch("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'; DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v14'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.rust_caller_edges_repair.v13','complete');").unwrap();
+    conn.execute_batch("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.rust_caller_edges_repair.v14','complete');").unwrap();
+    // Simulate a real legacy store, not external corruption falsely certified
+    // by the currently complete repair version.
+    conn.execute(
+        "DELETE FROM schema_meta WHERE key=?1",
+        [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
+    )
+    .unwrap();
     drop(conn);
     let (code, stdout, stderr) = run(
         &repo,
@@ -364,6 +458,22 @@ fn only_graph_db_below(root: &Path) -> PathBuf {
     found.pop().unwrap()
 }
 
+fn has_graph_or_index_job_below(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let child = entry.path();
+        if child.is_dir() {
+            has_graph_or_index_job_below(&child)
+        } else {
+            child
+                .file_name()
+                .is_some_and(|name| name == "graph.db" || name == "index.job")
+        }
+    })
+}
+
 #[test]
 fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
     use std::io::Write;
@@ -636,16 +746,12 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with(
-            "Source outline for `lib.rs` — large indexed source; text: --lines A:B or --all:"
-        ),
+        stdout
+            .starts_with("Source outline for `lib.rs` — fingerprint-verified indexed definitions:"),
         "{stdout}"
     );
     assert!(!stdout.contains("731"), "{stdout}");
-    assert!(
-        stdout.contains("full text: greppy read-file lib.rs --all"),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("--all"), "{stdout}");
     assert!(!stdout.contains("private source content"), "{stdout}");
     assert!(
         !stdout.lines().any(|line| line.starts_with("handle: ")),
@@ -697,6 +803,88 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
         std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
         source
     );
+}
+
+#[test]
+fn explicit_outline_is_verified_structured_and_handle_truthful() {
+    let (repo, store) = fresh_workspace("outline-explicit");
+    std::fs::write(repo.join("lib.rs"), "pub fn target() -> i32 { 731 }\n").unwrap();
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "lib.rs", "--outline", "--handle", "--json"],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let file = &value["files"][0];
+    assert_eq!(file["kind"], "outline");
+    assert_eq!(file["fingerprint_verified"], true);
+    assert!(file["content"].as_str().unwrap().contains("target"));
+    assert!(file["handle"].is_null());
+    assert!(file["handle_unavailable"]
+        .as_str()
+        .unwrap()
+        .contains("--lines A:B"));
+    assert_eq!(file["lines_command"], "greppy read-file lib.rs --lines A:B");
+    assert!(!stdout.contains("--all"), "{stdout}");
+}
+
+#[test]
+fn explicit_outline_reports_cold_stale_and_definition_free_sources_without_indexing() {
+    let (cold_repo, cold_store) = fresh_workspace("outline-explicit-cold");
+    std::fs::write(cold_repo.join("cold.rs"), "pub fn cold() {}\n").unwrap();
+    let (code, stdout, stderr) = run(
+        &cold_repo,
+        &cold_store,
+        &["read-file", "cold.rs", "--outline", "--json"],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    let cold: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(cold["files"][0]["kind"], "outline_unavailable");
+    assert!(cold["files"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("no index"));
+    assert!(!has_graph_or_index_job_below(&cold_store));
+
+    let (repo, store) = fresh_workspace("outline-explicit-unavailable");
+    std::fs::write(repo.join("lib.rs"), "pub fn before() {}\n").unwrap();
+    std::fs::write(repo.join("notes.txt"), "plain text only\n").unwrap();
+    index(&repo, &store);
+    std::fs::write(repo.join("lib.rs"), "pub fn after_() {}\n").unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--outline"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(stdout.contains("fingerprint is stale"), "{stdout}");
+    assert!(stdout.contains("--lines A:B"), "{stdout}");
+    assert!(!stdout.contains("pub fn before"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "notes.txt", "--outline"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("no eligible definitions") || stdout.contains("not indexed"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn explicit_outline_conflicts_with_exact_range_and_all_modes() {
+    let (repo, store) = fresh_workspace("outline-explicit-conflicts");
+    std::fs::write(repo.join("lib.rs"), "pub fn target() {}\n").unwrap();
+    for tail in [
+        &["--outline", "--all"][..],
+        &["--outline", "--lines", "1:1"][..],
+    ] {
+        let mut args = vec!["read-file", "lib.rs"];
+        args.extend_from_slice(tail);
+        let (code, stdout, stderr) = run(&repo, &store, &args);
+        assert_ne!(code, 0, "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("cannot be used with") || stdout.contains("cannot be used with"),
+            "{stdout}\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -842,6 +1030,149 @@ fn read_smart_folds_by_structure_and_expand_chains() {
         "{expanded}"
     );
     assert!(expanded.ends_with("    }\n"), "{expanded}");
+}
+
+#[test]
+fn read_smart_python_class_keeps_members_and_expands_exact_bodies() {
+    let (repo, store) = fresh_workspace("smart-python-class");
+    let mut source = String::from(
+        "class Inventory:\n    tax_rate = 0.2\n\n    @staticmethod\n    def tiny(): return 1\n",
+    );
+    for number in 0..12 {
+        source.push_str(&format!(
+            "\n    @classmethod\n    def compute_{number}(cls, value: int) -> int:\n"
+        ));
+        source.push_str(
+            "        subtotal = value + 12345\n        tax = subtotal * cls.tax_rate\n        discount = subtotal / 10\n        delivery = subtotal / 20\n        handling = subtotal / 40\n        net = subtotal - discount\n        gross = net + tax\n        shipped = gross + delivery\n        final = shipped + handling\n        return int(final)\n",
+        );
+    }
+    std::fs::write(repo.join("inventory.py"), &source).unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Inventory"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(compact.contains("class Inventory:"), "{compact}");
+    assert!(compact.contains("    tax_rate = 0.2"), "{compact}");
+    assert!(compact.contains("    def tiny(): return 1"), "{compact}");
+    assert_eq!(compact.matches("    @classmethod\n").count(), 12);
+    assert_eq!(compact.matches("method body — greppy expand ").count(), 12);
+    assert!(!compact.contains("subtotal = value"), "{compact}");
+    let (code, handled, error) = run(&repo, &store, &["read-smart", "Inventory", "--handle"]);
+    assert_eq!(code, 0, "{handled}\n{error}");
+    assert!(
+        handled.contains("no edit handle for folded source"),
+        "{handled}"
+    );
+    assert!(
+        !handled.lines().any(|line| line.starts_with("handle: ")),
+        "{handled}"
+    );
+    for number in 0..12 {
+        assert!(
+            compact.contains(&format!("def compute_{number}(cls, value: int) -> int:")),
+            "{compact}"
+        );
+    }
+    let (_, full, error) = run(&repo, &store, &["read", "Inventory"]);
+    assert!(full.ends_with(&source), "{full}\n{error}");
+    assert!(
+        compact.len() < full.len() / 2,
+        "compact={} full={}",
+        compact.len(),
+        full.len()
+    );
+    let gap = compact
+        .lines()
+        .find(|line| line.contains("method body — greppy expand "))
+        .unwrap();
+    let range = gap
+        .split('…')
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let (start, end) = range.split_once('-').unwrap();
+    let (start, end) = (
+        start.parse::<usize>().unwrap(),
+        end.parse::<usize>().unwrap(),
+    );
+    let expected = source
+        .lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let id = gap.split("greppy expand ").nth(1).unwrap();
+    let (code, expanded, error) = run(&repo, &store, &["expand", id]);
+    assert_eq!(code, 0, "{expanded}\n{error}");
+    assert_eq!(expanded, expected);
+}
+
+#[test]
+fn read_smart_typescript_class_preserves_signatures_braces_and_inline_members() {
+    let (repo, store) = fresh_workspace("smart-typescript-class");
+    let source = "class Counter {\n  value = 0;\n  // Public increment API.\n  increment(\n    amount: number,\n  ): number {\n    const before = this.value;\n    this.value += amount;\n    return this.value - before;\n  }\n  tiny(): number { if (this.value > 0) { return 1; } return 0; }\n}\n";
+    std::fs::write(repo.join("counter.ts"), source).unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(compact.contains("  value = 0;\n  // Public increment API.\n  increment(\n    amount: number,\n  ): number {\n"), "{compact}");
+    assert!(
+        compact.contains("    … 7-9 method body — greppy expand "),
+        "{compact}"
+    );
+    assert!(
+        compact.contains(
+            "\n  }\n  tiny(): number { if (this.value > 0) { return 1; } return 0; }\n}\n"
+        ),
+        "{compact}"
+    );
+    let id = compact
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .unwrap();
+    let (code, expanded, error) = run(&repo, &store, &["expand", id]);
+    assert_eq!(code, 0, "{expanded}\n{error}");
+    assert_eq!(expanded, "    const before = this.value;\n    this.value += amount;\n    return this.value - before;\n");
+}
+
+#[test]
+fn read_smart_class_depth_two_keeps_outer_method_body() {
+    let (repo, store) = fresh_workspace("smart-class-depth");
+    std::fs::write(repo.join("counter.py"), "class Counter:\n    def count(self, xs):\n        total = 0\n        for x in xs:\n            total += x\n        return total\n").unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter", "--depth", "2"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(
+        compact.contains("    def count(self, xs):\n        total = 0\n"),
+        "{compact}"
+    );
+    assert!(
+        compact.contains("        … 4-5 folded source block — greppy expand "),
+        "{compact}"
+    );
+    assert!(compact.ends_with("        return total\n"), "{compact}");
+}
+
+#[test]
+fn read_smart_python_multiline_signature_with_inline_suite_stays_exact() {
+    let (repo, store) = fresh_workspace("smart-python-inline-multiline");
+    let source = "class Counter:\n    def count(\n        self, value: int\n    ) -> int: return value\n\n    def branch(\n        self, value: int\n    ) -> int: return value if value > 0 else 0\n";
+    std::fs::write(repo.join("counter.py"), source).unwrap();
+    index(&repo, &store);
+    let (code, compact, error) = run(&repo, &store, &["read-smart", "Counter"]);
+    assert_eq!(code, 0, "{compact}\n{error}");
+    assert!(compact.ends_with(source), "{compact}");
+    assert!(!compact.contains("greppy expand "), "{compact}");
+    let (code, handled, error) = run(&repo, &store, &["read-smart", "Counter", "--handle"]);
+    assert_eq!(code, 0, "{handled}\n{error}");
+    assert!(handled.contains(source), "{handled}");
+    assert!(
+        handled.lines().any(|line| line.starts_with("handle: ")),
+        "{handled}"
+    );
+    assert!(!handled.contains("no edit handle"), "{handled}");
 }
 
 #[test]
@@ -1021,14 +1352,45 @@ fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() 
     let path = repo.join("huge.txt");
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(&vec![b'x'; 65_537]).unwrap();
-    file.seek(SeekFrom::Start(8 * 1024 * 1024 * 1024)).unwrap();
+    let small_tail = 8 * 1024 * 1024;
+    file.seek(SeekFrom::Start(small_tail)).unwrap();
     file.write_all(b"\xff").unwrap();
     drop(file);
+    // Seeking beyond EOF is not sparse on every scratch filesystem. HFS+
+    // allocated the entire 8 GiB gap and stalled close before Greppy ran.
+    // Probe an 8 MiB gap first; retain the >u32::MAX fixture only when the
+    // filesystem actually stores holes. Both paths test the same bounded
+    // preview and invalid, unobserved tail without requiring a giant write.
+    #[cfg(unix)]
+    let sparse = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path)
+            .unwrap()
+            .blocks()
+            .saturating_mul(512)
+            < small_tail / 2
+    };
+    #[cfg(not(unix))]
+    let sparse = false;
+    let tail_offset = if sparse {
+        8 * 1024 * 1024 * 1024
+    } else {
+        small_tail
+    };
+    if sparse {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(tail_offset)).unwrap();
+        file.write_all(b"\xff").unwrap();
+        drop(file);
+    }
     let (code, out, err) = run(&repo, &store, &["read-file", "huge.txt"]);
     assert_eq!(code, 0, "{err}");
     assert!(out.len() < 66_500);
     assert!(out.contains("total line count unknown"));
-    assert!(out.contains("8589869057 source bytes omitted according to file size at open"));
+    assert!(out.contains(&format!(
+        "{} source bytes omitted according to file size at open",
+        tail_offset + 1 - 65_536
+    )));
     assert!(out.contains("--lines 1:1\n"));
     // Ordinary successful commands may maintain the cache GC receipt/lock.
     // That is not an initialized graph or an indexing/model job.
