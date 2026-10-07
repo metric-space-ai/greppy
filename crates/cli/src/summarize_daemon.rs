@@ -602,7 +602,9 @@ mod tests {
             let thread_stop = Arc::clone(&stop);
             let thread_requests = Arc::clone(&requests);
             let worker = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                // The client can spend a couple of seconds on capacity retries.
+                // Keep this well above that, and far below a stuck 60s read.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 let mut first_id = None;
                 while !thread_stop.load(Ordering::Acquire) {
                     assert!(
