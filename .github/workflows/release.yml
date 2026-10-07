@@ -838,8 +838,10 @@ jobs:
             MODEL-REDISTRIBUTION.lock.json; do
             test -s "$deb_licenses/$license"
           done
-          bash "$clean/deb/usr/lib/greppy/release-tests/release_package_smoke.sh" \
-            "$deb_bin/greppy" "$clean/work"
+          # Product builds refuse CPU inference and hosted Linux runners have no
+          # GPU: the inference smoke for the CUDA package runs on the self-hosted
+          # CUDA lane (gpu3), not here. Structural package checks stay above.
+          "$deb_bin/greppy" --version
 
       - name: Smoke-test packaged artifact (macOS)
         if: runner.os == 'macOS'
@@ -1047,10 +1049,8 @@ jobs:
           test -x "$rpm_bin/greppy-workspace-provider"
           cmp "$deb_bin/greppy" "$rpm_bin/greppy"
           cmp "$deb_bin/greppy-workspace-provider" "$rpm_bin/greppy-workspace-provider"
-          bash "$deb_root/usr/lib/greppy/release-tests/release_package_smoke.sh" \
-            "$deb_bin/greppy" "$PWD/smoke"
-          bash "$deb_root/usr/lib/greppy/release-tests/release_daemon_stress.sh" \
-            "$deb_bin/greppy" "$PWD/daemon-stress"
+          # CUDA inference smoke runs on the self-hosted CUDA lane (no GPU here).
+          "$deb_bin/greppy" --version
           ! ldd "$deb_bin/greppy" | grep -E 'cudart|cublas|nvrtc'
           workspace_parent="$RUNNER_TEMP/greppy-installed-workspace"
           export GREPPY_WORKSPACE_DIR="$workspace_parent/data"
@@ -1161,8 +1161,10 @@ jobs:
             spctl --assess --type install --verbose=2 "package/${{ matrix.asset }}"
           fi
           "$cli" --version
-          bash "$docs/release_package_smoke.sh" "$cli" "$PWD/smoke"
-          bash "$docs/release_daemon_stress.sh" "$cli" "$PWD/daemon-stress"
+          GREPPY_SMOKE_DEVICE=auto GREPPY_SMOKE_BACKEND=metal \
+            bash "$docs/release_package_smoke.sh" "$cli" "$PWD/smoke"
+          GREPPY_SMOKE_DEVICE=auto \
+            bash "$docs/release_daemon_stress.sh" "$cli" "$PWD/daemon-stress"
           if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]; then
             test -s package/runtime-footprint-macos-arm64-metal.json
           fi

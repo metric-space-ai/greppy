@@ -89,7 +89,7 @@ export GREPPY_STORE_DIR="$WORK/store"
 # One device identity for every code path (spawn, prewarm, doctor, queries):
 # the endpoint hash includes the device (Endpoint::for_identity), so a mixed
 # cpu/auto session would talk to two different daemons.
-export GREPPY_DEVICE=cpu
+export GREPPY_DEVICE="${GREPPY_SMOKE_DEVICE:-cpu}"
 # Long embedding TTLs while the stress sections run (no surprise exits
 # between sections); the dedicated eviction section respawns with short TTLs.
 export GREPPY_EMBED_DAEMON_MODEL_TTL_S=600

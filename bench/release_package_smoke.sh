@@ -32,6 +32,11 @@ printf '%s\n' 'legacy-0.3.1-cache' >"$WORK/store/embedded-model/legacy.marker"
 printf '%s\n' 'stale-model-placeholder' >"$WORK/store/models/v1/unmanaged-old/model.gguf"
 printf '%s\n' 'stale-workspace-placeholder' >"$WORK/store/workspaces/v2/unmanaged-old/graph.db"
 
+# Product builds refuse CPU inference. Callers on GPU hosts pass the device
+# (auto picks Metal on macOS, CUDA on Linux) and the backend doctor must report.
+SMOKE_DEVICE="${GREPPY_SMOKE_DEVICE:-cpu}"
+SMOKE_BACKEND="${GREPPY_SMOKE_BACKEND:-$SMOKE_DEVICE}"
+
 section() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -187,13 +192,13 @@ if [ "$(uname -s)" = Darwin ]; then
   fi
   "$BIN" web runtime stop --json >/dev/null
 fi
-"$BIN" --device cpu --root "$WORK/repo" doctor --json >"$WORK/doctor.json" || test $? -eq 1
-jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' "$WORK/doctor.json" >/dev/null
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" doctor --json >"$WORK/doctor.json" || test $? -eq 1
+jq -e --arg backend "$SMOKE_BACKEND" '.command == "doctor" and .inference.registry.selected_backend == $backend' "$WORK/doctor.json" >/dev/null
 
-"$BIN" --device cpu --root "$WORK/repo" index "$WORK/repo" >"$WORK/index.txt"
-"$BIN" --device cpu --root "$WORK/repo" where-am-i >"$WORK/where-am-i.txt"
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" index "$WORK/repo" >"$WORK/index.txt"
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" where-am-i >"$WORK/where-am-i.txt"
 test -s "$WORK/where-am-i.txt" || fail "packaged legacy-cache index: where-am-i returned no repository overview"
-"$BIN" --device cpu --root "$WORK/repo" brief apply_limit --json >"$WORK/brief.json"
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" brief apply_limit --json >"$WORK/brief.json"
 jq -e '
   .schema_version == "greppy.brief.v1" and
   .status == "ok" and
@@ -207,7 +212,7 @@ brief_expand="$(jq -r '.expand_id' "$WORK/brief.json")"
 "$BIN" --root "$WORK/repo" expand "$brief_expand" --json >"$WORK/brief-expand.json"
 jq -e --arg id "$brief_expand" '.id == $id and (.payload_text | contains("apply_limit"))' "$WORK/brief-expand.json" >/dev/null
 
-"$BIN" --device cpu --root "$WORK/repo" search --json \
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" search --json \
   "restrict a numeric value to an allowed range" >"$WORK/semantic.json"
 jq -e '
   .schema_version == "greppy.semantic-search.v1" and
@@ -240,7 +245,7 @@ jq -e --arg id "$semantic_expand" --argjson omitted "$semantic_omitted" '
 #   prefix of text mode, and JSON scores must be non-increasing.
 section "text output mode: prescribed shape and deterministic ordering"
 
-"$BIN" --device cpu --root "$WORK/repo" brief apply_limit >"$WORK/brief.txt"
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" brief apply_limit >"$WORK/brief.txt"
 first_match_line() { grep -n "$1" "$2" | head -1 | cut -d: -f1 || true; }
 purpose_line="$(first_match_line '^.*range 0 to 100\.$' "$WORK/brief.txt")"
 locator_line="$(first_match_line '^src/lib.rs:1$' "$WORK/brief.txt")"
@@ -262,7 +267,7 @@ semantic_locs_from_text() {
   awk -F '  ' '$1 ~ /^[^ ]+:[0-9]+$/ && NF >= 2 { print $1 }' "$1"
 }
 
-"$BIN" --device cpu --root "$WORK/repo" search \
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" search \
   "restrict a numeric value to an allowed range" >"$WORK/semantic.txt"
 semantic_locs_from_text "$WORK/semantic.txt" >"$WORK/semantic-locs-text.txt"
 [ -s "$WORK/semantic-locs-text.txt" ] || fail "semantic-search text: no hit locator lines found"
@@ -279,7 +284,7 @@ cmp -s "$WORK/semantic-locs-text-prefix.txt" "$WORK/semantic-locs-json.txt" \
        fail "semantic-search: JSON rows are not a prefix of ranked text rows"; }
 
 # Repeating the query must reproduce the same ordering (determinism).
-"$BIN" --device cpu --root "$WORK/repo" search \
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" search \
   "restrict a numeric value to an allowed range" >"$WORK/semantic-rerun.txt"
 semantic_locs_from_text "$WORK/semantic-rerun.txt" >"$WORK/semantic-locs-rerun.txt"
 cmp -s "$WORK/semantic-locs-text.txt" "$WORK/semantic-locs-rerun.txt" \
@@ -295,7 +300,7 @@ section "exact serde-repo hits: apply_to_field, rename_by_rules, serialize_name"
 
 assert_brief_exact() {
   local symbol="$1"
-  "$BIN" --device cpu --root "$WORK/repo" brief "$symbol" --json >"$WORK/brief-$symbol.json"
+  "$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" brief "$symbol" --json >"$WORK/brief-$symbol.json"
   jq -e --arg sym "$symbol" '
     .status == "ok" and
     ([.definitions[].qualified_name] | any(contains($sym))) and
@@ -311,7 +316,7 @@ assert_semantic_retrieves() {
   local symbol="$1"
   local query="$2"
   local out="$WORK/semantic-$symbol.json"
-  "$BIN" --device cpu --root "$WORK/repo" search --json "$query" >"$out"
+  "$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" search --json "$query" >"$out"
   jq -e '.status == "ok" and (.hits | length) >= 1' "$out" >/dev/null \
     || fail "semantic-search '$query': expected status ok with hits"
   jq -r '.hits[].qualified_name' "$out" >"$WORK/semantic-$symbol-names.txt"
@@ -335,8 +340,8 @@ assert_semantic_retrieves serialize_name "return the field name used when serial
 section "text/JSON parity: JSON display is a prefix of text ranking"
 
 parity_query="apply a rename case rule to a struct field"
-"$BIN" --device cpu --root "$WORK/repo" search "$parity_query" >"$WORK/parity.txt"
-"$BIN" --device cpu --root "$WORK/repo" search --json "$parity_query" >"$WORK/parity.json"
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" search "$parity_query" >"$WORK/parity.txt"
+"$BIN" --device "$SMOKE_DEVICE" --root "$WORK/repo" search --json "$parity_query" >"$WORK/parity.json"
 jq -e '.status == "ok"' "$WORK/parity.json" >/dev/null
 semantic_locs_from_text "$WORK/parity.txt" | LC_ALL=C sort >"$WORK/parity-locs-text.txt"
 jq -r '.hits[] | "\(.file):\(.start_line)"' \
@@ -556,8 +561,8 @@ run_installed() {
     HOME="$FAKE_HOME" TMPDIR="$FAKE_TMP" \
     "$PREFIX/bin/greppy" "$@"
 }
-run_installed --device cpu --root "$PREFIX/smoke-repo" index "$PREFIX/smoke-repo" >"$WORK/install-index.txt"
-run_installed --device cpu --root "$PREFIX/smoke-repo" search --json \
+run_installed --device "$SMOKE_DEVICE" --root "$PREFIX/smoke-repo" index "$PREFIX/smoke-repo" >"$WORK/install-index.txt"
+run_installed --device "$SMOKE_DEVICE" --root "$PREFIX/smoke-repo" search --json \
   "restrict a numeric value to an allowed range" >"$WORK/install-semantic.json"
 jq -e '.status == "ok" and (.hits | length) >= 1' "$WORK/install-semantic.json" >/dev/null \
   || fail "installed binary: semantic-search returned no hits"
