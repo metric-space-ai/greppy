@@ -125,6 +125,32 @@ static CARGO_WARNING_SUMMARY_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|
     )
     .expect("bash-smart Cargo warning summary regex")
 });
+// Unittest `FAILED (failures=N, errors=M)` and pytest's `= N failed …` banner
+// restate blocks already counted. They are recaps, like Cargo's warning summary.
+static UNITTEST_FAILED_RECAP_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i-u)^[\t ]*FAILED[\t ]+\(([^)\r\n]*)\)[\t ]*$")
+        .expect("bash-smart unittest failure recap regex")
+});
+static PYTEST_FAILED_RECAP_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i-u)^[\t ]*=+[\t ]*([0-9]+)[\t ]+failed\b[^\r\n]*=+[\t ]*$")
+        .expect("bash-smart pytest failure recap regex")
+});
+// A lone success status is not a diagnostic. Test-status lines are highlighted
+// only when they carry a failure marker (`FAILED`, `FAIL:`); `ok` / `PASS` do not.
+static SUCCESS_STATUS_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[\t ]*(?:ok|pass(?:ed)?)[\t ]*$|^[\t ]*test\b[^\r\n]*\.\.\.[\t ]+ok[\t ]*$|^[\t ]*ok[\t ]+\S",
+    )
+    .expect("bash-smart success status regex")
+});
+// Column-0 Python `*Error:` / `*Exception:` that ends a traceback. Case-sensitive
+// so a lowercase `error:` diagnostic and an uppercase `ERROR:` header stay distinct.
+static EXCEPTION_TERMINATOR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)?(?:Error|Exception):(?:[\t ]|$)",
+    )
+    .expect("bash-smart exception terminator regex")
+});
 // tsc/tsgo place the source location before the severity, unlike Rust's
 // leading `error:`. Require a numeric location and TS code, not arbitrary
 // prose containing the word "error". Match both plain compiler layouts.
@@ -511,8 +537,9 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
     // Kills and timeouts always receive an id, even when the partial wall is
-    // short. Normal short output keeps its raw skeleton bytes after the verdict
-    // only. Oversized individual lines are previews with raw-log recovery.
+    // short. Normal short output is printed verbatim and is not retained, so no
+    // expand id is shown for it. Oversized individual lines are previews with
+    // raw-log recovery.
     // Every completed capture publishes the private verifier status, including
     // the short-output fast path below. The project child never receives it.
     if let Some(path) = std::env::var_os("GREPPY_INTERNAL_VERIFY_STATUS_PATH") {
@@ -534,18 +561,16 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
             .map_err(|error| Error::io("write verifier completion", error))?;
     }
     if verbatim_short {
-        if let Some(store) = store.as_ref() {
-            let ranges = full_line_range(&stdout_lines);
-            let _ = insert_pack(store, &project, &query, &raw, "stdout", &ranges);
-        }
         write_stream(false, &raw.stdout);
         write_stream(true, &raw.stderr);
         return Ok(exit_code);
     }
 
-    let stdout_folded = !short || interrupted;
+    // Empty streams never fold: an empty stdout used to print
+    // `… partial output — greppy expand ID` and retain a 0-byte capture.
+    let stdout_folded = !stdout_lines.is_empty() && (!short || interrupted);
     let stderr_folded =
-        stderr_lines.len() > STDERR_VERBATIM_LINES || (interrupted && !stderr_lines.is_empty());
+        !stderr_lines.is_empty() && (stderr_lines.len() > STDERR_VERBATIM_LINES || interrupted);
     let stdout_all_groups = collapse_groups(&stdout_lines);
     let stderr_all_groups = collapse_groups(&stderr_lines);
     // The embedding lift runs only when the command FAILED. On success the
@@ -572,16 +597,39 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     let stderr_groups = folded_middle_groups(&stderr_lines, exit_code, &stderr_all_groups);
     let stdout_ranges = expansion_ranges(&stdout_lines, exit_code, &stdout_groups, &lifted_stdout);
     let stderr_ranges = expansion_ranges(&stderr_lines, exit_code, &stderr_groups, &lifted_stderr);
-    let stdout_id = store.as_ref().and_then(|store| {
-        insert_pack(store, &project, &query, &raw, "stdout", &stdout_ranges).ok()
-    });
-    let stderr_id = if stderr_folded {
-        store.as_ref().and_then(|store| {
-            insert_pack(store, &project, &query, &raw, "stderr", &stderr_ranges).ok()
-        })
+    let mut retention_error: Option<greppy_store::Error> = None;
+    let stdout_id = if stdout_folded {
+        retain_stream(
+            store.as_ref(),
+            &project,
+            &query,
+            &raw,
+            "stdout",
+            &stdout_ranges,
+            &mut retention_error,
+        )
     } else {
         None
     };
+    let stderr_id = if stderr_folded {
+        retain_stream(
+            store.as_ref(),
+            &project,
+            &query,
+            &raw,
+            "stderr",
+            &stderr_ranges,
+            &mut retention_error,
+        )
+    } else {
+        None
+    };
+    if let Some(error) = &retention_error {
+        let _ = writeln!(
+            std::io::stderr(),
+            "greppy: output not retained ({error}); expand ids unavailable for this run"
+        );
+    }
 
     if stdout_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stdout_id.as_deref()) {
@@ -834,11 +882,18 @@ fn detect_blocks(
                 }
                 formatting_diff = false;
             }
-            let kind = if (ERROR_MARKER_RE.is_match(lines[index].content)
-                || NODE_ERROR_RE.is_match(lines[index].content))
-                && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
-                && !AAPT_XML_ELEMENT_RE.is_match(lines[index].content)
-                && !RUST_ERROR_FIELD_RE.is_match(lines[index].content)
+            // `ok` / `test … ok` are success statuses. Highlighting them would
+            // require a failure marker, which these lines do not have.
+            if is_success_status(content) {
+                index += 1;
+                continue;
+            }
+            let kind = if error_recap_count(lines[index].content).is_some()
+                || ((ERROR_MARKER_RE.is_match(lines[index].content)
+                    || NODE_ERROR_RE.is_match(lines[index].content))
+                    && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
+                    && !AAPT_XML_ELEMENT_RE.is_match(lines[index].content)
+                    && !RUST_ERROR_FIELD_RE.is_match(lines[index].content))
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content)
@@ -868,6 +923,9 @@ fn detect_blocks(
             let mut end = index + 1;
             while end < lines.len() {
                 let content = lines[end].content;
+                if is_success_status(content) {
+                    break;
+                }
                 if indentation(content) > marker_indent || blank(content) || detail_prefix(content)
                 {
                     end += 1;
@@ -887,9 +945,21 @@ fn detect_blocks(
             });
             index = end;
         }
+        let stream_blocks = coalesce_traceback_blocks(stream_blocks, lines);
         let mut filtered_blocks = Vec::with_capacity(stream_blocks.len());
         let mut substantive_warnings = 0usize;
+        let mut substantive_errors = 0usize;
         for block in stream_blocks {
+            if let Some(summary_count) = error_recap_count(&block.lines[0].bytes) {
+                // A recap closes the preceding failure group. Only suppress it
+                // when the emitted error-block count proves it is redundant;
+                // otherwise retain the uncertain recap (same rule as Cargo).
+                if summary_count != substantive_errors {
+                    filtered_blocks.push(block);
+                }
+                substantive_errors = 0;
+                continue;
+            }
             let summary = (block.kind == BlockKind::Warning)
                 .then(|| CARGO_WARNING_SUMMARY_RE.captures(&block.lines[0].bytes))
                 .flatten();
@@ -908,12 +978,170 @@ fn detect_blocks(
                 if block.kind == BlockKind::Warning {
                     substantive_warnings += 1;
                 }
+                if block.kind == BlockKind::Error {
+                    substantive_errors += 1;
+                }
                 filtered_blocks.push(block);
             }
         }
         blocks.extend(filtered_blocks);
     }
     blocks
+}
+
+fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn is_success_status(bytes: &[u8]) -> bool {
+    SUCCESS_STATUS_RE.is_match(bytes) && !ERROR_MARKER_RE.is_match(bytes)
+}
+
+fn is_unittest_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"FAIL:") || bytes.starts_with(b"ERROR:")
+}
+
+fn is_traceback_start(bytes: &[u8]) -> bool {
+    trim_ascii_start(bytes).starts_with(b"Traceback")
+}
+
+fn is_exception_terminator(bytes: &[u8]) -> bool {
+    EXCEPTION_TERMINATOR_RE.is_match(bytes)
+}
+
+fn is_rule_banner(bytes: &[u8]) -> bool {
+    let trimmed = trim_ascii_start(bytes);
+    let end = trimmed
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let trimmed = &trimmed[..end];
+    trimmed.len() >= 3 && trimmed.iter().all(|byte| matches!(byte, b'=' | b'-'))
+}
+
+fn line_is_blank(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+fn gap_is_banner_or_blank(lines: &[RawLine<'_>], end_line: usize, start_line: usize) -> bool {
+    if start_line <= end_line || end_line > lines.len() || start_line - 1 > lines.len() {
+        return false;
+    }
+    lines[end_line..start_line - 1]
+        .iter()
+        .all(|line| line_is_blank(line.content) || is_rule_banner(line.content))
+}
+
+fn block_has_traceback(block: &DiagnosticBlock) -> bool {
+    block
+        .lines
+        .iter()
+        .any(|line| is_traceback_start(&line.bytes))
+}
+
+fn error_recap_count(bytes: &[u8]) -> Option<usize> {
+    if let Some(captures) = PYTEST_FAILED_RECAP_RE.captures(bytes) {
+        return std::str::from_utf8(&captures[1]).ok()?.parse().ok();
+    }
+    let captures = UNITTEST_FAILED_RECAP_RE.captures(bytes)?;
+    let body = &captures[1];
+    let failures = keyed_count(body, b"failures");
+    let errors = keyed_count(body, b"errors");
+    match (failures, errors) {
+        (None, None) => None,
+        (failures, errors) => Some(failures.unwrap_or(0).saturating_add(errors.unwrap_or(0))),
+    }
+}
+
+fn keyed_count(body: &[u8], key: &[u8]) -> Option<usize> {
+    let lower = body.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let mut needle = key.to_vec();
+    needle.push(b'=');
+    let start = lower
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())?
+        + needle.len();
+    let digits = body[start..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    std::str::from_utf8(&body[start..start + digits])
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn coalesce_traceback_blocks(
+    mut blocks: Vec<DiagnosticBlock>,
+    lines: &[RawLine<'_>],
+) -> Vec<DiagnosticBlock> {
+    let mut merged = Vec::with_capacity(blocks.len());
+    let mut index = 0usize;
+    while index < blocks.len() {
+        let mut block = blocks[index].clone();
+        index += 1;
+        if is_unittest_header(&block.lines[0].bytes)
+            && index < blocks.len()
+            && is_traceback_start(&blocks[index].lines[0].bytes)
+            && gap_is_banner_or_blank(
+                lines,
+                block.lines.last().map(|line| line.line).unwrap_or(0),
+                blocks[index].lines[0].line,
+            )
+        {
+            block.lines.extend(std::mem::take(&mut blocks[index].lines));
+            index += 1;
+        }
+        if block_has_traceback(&block) {
+            absorb_exception_terminator(&mut block, &mut blocks, &mut index, lines);
+        }
+        merged.push(block);
+    }
+    merged
+}
+
+fn absorb_exception_terminator(
+    block: &mut DiagnosticBlock,
+    blocks: &mut [DiagnosticBlock],
+    index: &mut usize,
+    lines: &[RawLine<'_>],
+) {
+    let Some(last_line) = block.lines.last().map(|line| line.line) else {
+        return;
+    };
+    let next_line = last_line + 1;
+    let Some(raw) = lines.get(next_line - 1) else {
+        return;
+    };
+    if !is_exception_terminator(raw.content) {
+        return;
+    }
+    if *index < blocks.len()
+        && blocks[*index]
+            .lines
+            .first()
+            .is_some_and(|line| line.line == next_line)
+    {
+        block
+            .lines
+            .extend(std::mem::take(&mut blocks[*index].lines));
+        *index += 1;
+        return;
+    }
+    let stream = block.lines[0].stream;
+    block.lines.push(AnswerLine {
+        stream,
+        line: next_line,
+        bytes: raw.content.to_vec(),
+    });
 }
 
 fn collect_matches(
@@ -1702,6 +1930,30 @@ fn open_pack_store(root: Option<&str>) -> Result<greppy_store::Store> {
         .map_err(Error::from)
 }
 
+fn retain_stream(
+    store: Option<&greppy_store::Store>,
+    project: &str,
+    query: &str,
+    raw: &StoredRaw,
+    stream: &str,
+    line_ranges: &[(usize, usize)],
+    retention_error: &mut Option<greppy_store::Error>,
+) -> Option<String> {
+    let Some(store) = store else {
+        return None;
+    };
+    match insert_pack(store, project, query, raw, stream, line_ranges) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            // One notice per run, even when both streams fail to publish.
+            if retention_error.is_none() {
+                *retention_error = Some(error);
+            }
+            None
+        }
+    }
+}
+
 fn insert_pack(
     store: &greppy_store::Store,
     project: &str,
@@ -2205,6 +2457,11 @@ fn render_folded(
     groups: &[CollapseGroup],
     lifted: &[LiftedLine],
 ) {
+    // An empty capture has nothing to fold and must not invent a partial-output
+    // line or an expand id for zero bytes.
+    if lines.is_empty() {
+        return;
+    }
     let mut writer: Box<dyn Write> = if stderr {
         Box::new(std::io::stderr().lock())
     } else {
@@ -2490,6 +2747,7 @@ fn rank_novelty(
             && group.start > HEAD_LINES
             && group.start <= middle_end
             && *distance >= threshold
+            && !is_success_status(lines[group.start - 1].content)
     });
     distances.sort_by(|left, right| {
         right
@@ -3586,6 +3844,180 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.bytes.starts_with(b"note:")));
+        assert!(blocks.iter().all(|block| {
+            block
+                .lines
+                .iter()
+                .all(|line| line.bytes != b"test tests::works ... ok")
+        }));
+    }
+
+    fn error_blocks(bytes: &[u8]) -> Vec<DiagnosticBlock> {
+        detect_blocks(&split_lines(bytes), &[])
+            .into_iter()
+            .filter(|block| block.kind == BlockKind::Error)
+            .collect()
+    }
+
+    #[test]
+    fn unittest_failure_transcript_counts_as_one_error() {
+        let stdout = b"\
+======================================================================\n\
+FAIL: test_one (test_mod.Example)\n\
+----------------------------------------------------------------------\n\
+Traceback (most recent call last):\n\
+  File \"test_mod.py\", line 4, in test_one\n\
+    self.assertEqual(1, 2)\n\
+AssertionError: 1 != 2\n\
+\n\
+----------------------------------------------------------------------\n\
+Ran 1 test in 0.001s\n\
+\n\
+FAILED (failures=1)\n\
+";
+        for (stdout_bytes, stderr_bytes) in [(stdout.as_slice(), &b""[..]), (&b""[..], stdout)] {
+            let blocks = detect_blocks(&split_lines(stdout_bytes), &split_lines(stderr_bytes));
+            let errors: Vec<_> = blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Error)
+                .collect();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let lines: Vec<_> = errors[0]
+                .lines
+                .iter()
+                .map(|line| line.bytes.as_slice())
+                .collect();
+            assert!(lines.iter().any(|line| line.starts_with(b"FAIL:")));
+            assert!(lines.iter().any(|line| line.starts_with(b"Traceback")));
+            assert!(lines
+                .iter()
+                .any(|line| line.starts_with(b"AssertionError:")));
+            assert!(lines.iter().all(|line| !line.starts_with(b"FAILED (")));
+            assert_eq!(
+                verdict_line(1, errors.len(), 0, None),
+                "FAILED — exit 1: 1 error, 0 warnings"
+            );
+        }
+    }
+
+    #[test]
+    fn unittest_exception_terminator_joins_traceback_and_summary_matches() {
+        let stdout = b"\
+ERROR: test_boom (test_mod.Example)\n\
+----------------------------------------------------------------------\n\
+Traceback (most recent call last):\n\
+  File \"test_mod.py\", line 8, in test_boom\n\
+    raise ValueError('bad')\n\
+ValueError: bad\n\
+\n\
+FAILED (errors=1)\n\
+";
+        let errors = error_blocks(stdout);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0]
+            .lines
+            .iter()
+            .any(|line| line.bytes == b"ValueError: bad"));
+        assert!(errors[0]
+            .lines
+            .iter()
+            .any(|line| line.bytes.starts_with(b"ERROR:")));
+
+        let two = b"\
+FAIL: test_one (test_mod.Example)\n\
+----------------------------------------------------------------------\n\
+Traceback (most recent call last):\n\
+  File \"test_mod.py\", line 4, in test_one\n\
+    self.assertEqual(1, 2)\n\
+AssertionError: 1 != 2\n\
+ERROR: test_two (test_mod.Example)\n\
+----------------------------------------------------------------------\n\
+Traceback (most recent call last):\n\
+  File \"test_mod.py\", line 9, in test_two\n\
+    raise RuntimeError('nope')\n\
+RuntimeError: nope\n\
+FAILED (failures=1, errors=1)\n\
+";
+        assert_eq!(error_blocks(two).len(), 2);
+    }
+
+    #[test]
+    fn pytest_failure_recap_is_not_an_extra_error() {
+        let stdout = b"\
+FAILED test_mod.py::test_one - AssertionError: one\n\
+FAILED test_mod.py::test_two - AssertionError: two\n\
+============================== 2 failed in 0.01s ==============================\n\
+";
+        let errors = error_blocks(stdout);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors
+            .iter()
+            .all(|block| { block.lines.iter().all(|line| !line.bytes.contains(&b'=')) }));
+
+        let summary_only =
+            b"============================== 1 failed in 0.01s ==============================\n";
+        assert_eq!(error_blocks(summary_only).len(), 1);
+
+        let mismatched = b"\
+FAILED test_mod.py::test_one - AssertionError: one\n\
+============================== 2 failed in 0.01s ==============================\n\
+";
+        assert_eq!(error_blocks(mismatched).len(), 2);
+    }
+
+    #[test]
+    fn lone_ok_line_is_not_highlighted_without_a_failure_marker() {
+        let stdout =
+            split_lines(b"ok\nOK\npass\nPASSED\ntest tests::works ... ok\nok \tpkg\t0.01s\n");
+        assert!(
+            detect_blocks(&stdout, &[]).is_empty(),
+            "success statuses are not diagnostics"
+        );
+        let mut rendered = Vec::new();
+        write_answer_prefix(&mut rendered, &stdout, &[], &[], &[], "ok — exit 0");
+        assert_eq!(rendered, b"ok \xe2\x80\x94 exit 0\n");
+
+        let mixed = split_lines(b"test tests::works ... ok\ntest tests::fails ... FAILED\n");
+        let blocks = detect_blocks(&mixed, &[]);
+        assert!(blocks.iter().any(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.bytes == b"test tests::fails ... FAILED")
+        }));
+        assert!(blocks.iter().all(|block| {
+            block
+                .lines
+                .iter()
+                .all(|line| line.bytes != b"test tests::works ... ok")
+        }));
+        assert_eq!(
+            detect_blocks(&split_lines(b"FAIL\tpkg\t0.01s\n"), &[]).len(),
+            1
+        );
+
+        let output = format!(
+            "{}ok\n{}",
+            "routine output\n".repeat(64),
+            "routine output\n".repeat(64),
+        );
+        let lines = split_lines(output.as_bytes());
+        let groups = collapse_groups(&lines);
+        let embedded = novelty_candidate_indices(&groups, lines.len())
+            .into_iter()
+            .map(|index| {
+                let vector = if groups[index].count() == 1 {
+                    vec![0.0, 1.0]
+                } else {
+                    vec![1.0, 0.0]
+                };
+                (index, vector)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rank_novelty(&lines, &groups, &embedded).is_empty(),
+            "a lone ok outlier is not lifted"
+        );
     }
 
     #[test]

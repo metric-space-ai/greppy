@@ -1340,3 +1340,92 @@ fn timeout_reaps_pipe_holding_descendant_after_leader_exits_successfully() {
         "output-holding descendant survived"
     );
 }
+
+fn retained_artifacts(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.contains('-') && (name.ends_with(".stdout") || name.ends_with(".stderr")) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn short_verbatim_output_is_not_retained() {
+    let workspace = fresh_workspace("short-no-retain");
+    let output = run(
+        &workspace,
+        &["bash-smart", "--", "sh", "-c", "printf 'hi\\n'"],
+    );
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("hi"), "{stdout}");
+    assert!(!stdout.contains("greppy expand "), "{stdout}");
+    assert!(
+        retained_artifacts(&workspace.store).is_empty(),
+        "verbatim short runs must not publish expand captures"
+    );
+}
+
+#[test]
+fn empty_stdout_does_not_print_a_partial_output_line() {
+    let workspace = fresh_workspace("empty-stdout");
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 100 ]; do printf 'err %s\\n' \"$i\" >&2; i=$((i+1)); done",
+        ],
+    );
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.starts_with("ok — exit 0"), "{stdout}");
+    assert!(!stdout.contains("partial output"), "{stdout}");
+    assert!(!stdout.contains("greppy expand "), "{stdout}");
+}
+
+#[test]
+fn retention_failure_prints_one_stderr_notice() {
+    let workspace = fresh_workspace("retain-notice");
+    let output = command(&workspace)
+        .env("GREPPY_TEST_RETAINED_QUOTA_BYTES", "1")
+        .env("GREPPY_TEST_RETAINED_MAX_FILES", "8")
+        .args([
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 50 ]; do printf 'out %s\\n' \"$i\"; printf 'err %s\\n' \"$i\" >&2; i=$((i+1)); done",
+        ])
+        .output()
+        .expect("run greppy");
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    let notice = "greppy: output not retained (";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("); expand ids unavailable for this run"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("greppy expand "), "{stdout}");
+    assert!(!stderr.contains("greppy expand "), "{stderr}");
+    assert!(stdout.contains("raw log "), "{stdout}");
+}

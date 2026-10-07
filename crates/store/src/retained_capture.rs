@@ -11,6 +11,31 @@ const RETAINED_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
 const RETAINED_MAX_FILES: usize = 2048;
 const STREAM_CAP_BYTES: u64 = 64 * 1024 * 1024 + 256;
 
+/// Byte and file ceilings for one retained-capture namespace.
+///
+/// Production uses the constants above. Tests inject a tiny ceiling through
+/// `RetainedLimits::new` so eviction can be proven without a 512 MiB fixture.
+#[derive(Clone, Copy)]
+struct RetainedLimits {
+    bytes: u64,
+    max_files: usize,
+}
+
+impl RetainedLimits {
+    fn production() -> Self {
+        Self {
+            bytes: RETAINED_QUOTA_BYTES,
+            max_files: RETAINED_MAX_FILES,
+        }
+    }
+
+    /// Test-only constructor. Not used by the production retention path.
+    #[cfg(test)]
+    fn new(bytes: u64, max_files: usize) -> Self {
+        Self { bytes, max_files }
+    }
+}
+
 impl Store {
     fn retained_capture_dir(&self) -> Result<PathBuf> {
         let path: String = self
@@ -70,7 +95,7 @@ impl Store {
             dir.join(format!("{until}-{hash}.stdout")),
             dir.join(format!("{until}-{hash}.stderr")),
         ];
-        check_quota(root, &paths, [stdout, stderr])?;
+        check_quota(root, &paths, [stdout, stderr], active_limits())?;
         for name in ["stdout", "stderr"] {
             if !payload.get(name).is_some_and(serde_json::Value::is_object) {
                 return Err(Error::Store("retained stream metadata missing".into()));
@@ -167,8 +192,26 @@ fn owned_workspaces(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-fn check_quota(root: &Path, paths: &[PathBuf; 2], streams: [&[u8]; 2]) -> Result<()> {
-    let (usage, file_count) = namespace_usage(root)?;
+fn active_limits() -> RetainedLimits {
+    // Both knobs are required so a stray single variable cannot shrink the
+    // machine-wide namespace and evict unrelated captures.
+    if let (Ok(bytes), Ok(max_files)) = (
+        std::env::var("GREPPY_TEST_RETAINED_QUOTA_BYTES"),
+        std::env::var("GREPPY_TEST_RETAINED_MAX_FILES"),
+    ) {
+        if let (Ok(bytes), Ok(max_files)) = (bytes.parse::<u64>(), max_files.parse::<usize>()) {
+            return RetainedLimits { bytes, max_files };
+        }
+    }
+    RetainedLimits::production()
+}
+
+fn check_quota(
+    root: &Path,
+    paths: &[PathBuf; 2],
+    streams: [&[u8]; 2],
+    limits: RetainedLimits,
+) -> Result<()> {
     let extra: u64 = paths
         .iter()
         .zip(streams)
@@ -176,15 +219,91 @@ fn check_quota(root: &Path, paths: &[PathBuf; 2], streams: [&[u8]; 2]) -> Result
         .map(|(_, bytes)| bytes.len() as u64)
         .sum();
     let new_files = paths.iter().filter(|path| !path.exists()).count();
-    if usage.saturating_add(extra) > RETAINED_QUOTA_BYTES
-        || file_count + new_files > RETAINED_MAX_FILES
-    {
+    // A capture that cannot fit even in an empty namespace is refused before
+    // any eviction. Deleting older captures would not make room.
+    if extra > limits.bytes || new_files > limits.max_files {
         return Err(Error::Store(
-            "retained capture quota exhausted; command output remains in its raw capture paths"
-                .into(),
+            "retained capture exceeds quota by itself".into(),
         ));
     }
-    Ok(())
+    loop {
+        let (usage, file_count) = namespace_usage(root)?;
+        if usage.saturating_add(extra) <= limits.bytes && file_count + new_files <= limits.max_files
+        {
+            return Ok(());
+        }
+        // Never refuse while some other capture can be deleted. Oldest deadline
+        // goes first so a full namespace keeps the newest expand ids.
+        if !evict_oldest_capture(root, paths)? {
+            return Err(Error::Store(
+                "retained capture quota exhausted; command output remains in its raw capture paths"
+                    .into(),
+            ));
+        }
+    }
+}
+
+struct ArtifactFile {
+    path: PathBuf,
+    deadline: u64,
+    group: String,
+}
+
+fn list_artifacts(root: &Path) -> Result<Vec<ArtifactFile>> {
+    let mut artifacts = Vec::new();
+    for dir in owned_workspaces(root)? {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| Error::Store(format!("scan retained capture quota: {e}")))?
+        {
+            let entry =
+                entry.map_err(|e| Error::Store(format!("inspect retained artifact quota: {e}")))?;
+            let path = entry.path();
+            let Some(deadline) = artifact_deadline(&path) else {
+                continue;
+            };
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some((group, _)) = name.rsplit_once('.') else {
+                continue;
+            };
+            artifacts.push(ArtifactFile {
+                path,
+                deadline,
+                group: group.to_string(),
+            });
+        }
+    }
+    Ok(artifacts)
+}
+
+/// Delete every stream file of the oldest-deadline capture, except the paths
+/// this retention is about to publish. Returns false when nothing remains to
+/// evict.
+fn evict_oldest_capture(root: &Path, protect: &[PathBuf; 2]) -> Result<bool> {
+    let mut artifacts = list_artifacts(root)?;
+    artifacts.retain(|artifact| !protect.iter().any(|path| path == &artifact.path));
+    artifacts.sort_by(|left, right| {
+        left.deadline
+            .cmp(&right.deadline)
+            .then_with(|| left.group.cmp(&right.group))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let Some(oldest) = artifacts.first() else {
+        return Ok(false);
+    };
+    let deadline = oldest.deadline;
+    let group = oldest.group.clone();
+    let mut removed = false;
+    for artifact in artifacts
+        .into_iter()
+        .filter(|artifact| artifact.deadline == deadline && artifact.group == group)
+    {
+        std::fs::remove_file(&artifact.path)
+            .map_err(|e| Error::Store(format!("evict retained capture: {e}")))?;
+        removed = true;
+    }
+    Ok(removed)
 }
 
 fn namespace_usage(root: &Path) -> Result<(u64, usize)> {
@@ -367,25 +486,101 @@ mod tests {
         assert_eq!(namespace_usage(root.path()).unwrap(), (4, 1));
     }
 
+    fn artifact_hex(dir: &Path, deadline: u64, hex: char, stream: &str, bytes: &[u8]) -> PathBuf {
+        let hash = hex.to_string().repeat(64);
+        let path = dir.join(format!("{deadline}-{hash}.{stream}"));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[test]
-    fn quota_counts_all_workspaces_and_rejects_without_writing() {
+    fn quota_evicts_oldest_deadline_across_workspaces_until_the_capture_fits() {
         let root = tempfile::tempdir().unwrap();
         let old_dir = root.path().join("a".repeat(64));
-        let new_dir = root.path().join("b".repeat(64));
+        let newer_dir = root.path().join("b".repeat(64));
+        let new_dir = root.path().join("c".repeat(64));
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::create_dir(&newer_dir).unwrap();
+        std::fs::create_dir(&new_dir).unwrap();
+        let oldest_stdout = artifact_hex(&old_dir, 10, '1', "stdout", b"0123456789");
+        let oldest_stderr = artifact_hex(&old_dir, 10, '1', "stderr", b"abcdefghij");
+        let newer = artifact_hex(&newer_dir, 50, '2', "stdout", b"wxyz");
+        let paths = [
+            new_dir.join(format!("80-{}.stdout", "3".repeat(64))),
+            new_dir.join(format!("80-{}.stderr", "3".repeat(64))),
+        ];
+        // 10+10+4 existing bytes. The new capture is 6 bytes / 2 files. A 12-byte
+        // ceiling cannot hold the oldest capture plus the new one, but can hold
+        // the newer 4-byte capture once the deadline-10 pair is gone.
+        let limits = RetainedLimits::new(12, 4);
+        check_quota(root.path(), &paths, [b"hello!", b""], limits).unwrap();
+        assert!(!oldest_stdout.exists() && !oldest_stderr.exists());
+        assert_eq!(std::fs::read(&newer).unwrap(), b"wxyz");
+        assert!(!paths[0].exists() && !paths[1].exists());
+        assert_eq!(namespace_usage(root.path()).unwrap(), (4, 1));
+    }
+
+    #[test]
+    fn quota_evicts_for_file_count_and_stops_when_the_capture_fits() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("d".repeat(64));
+        std::fs::create_dir(&dir).unwrap();
+        let first = artifact_hex(&dir, 1, 'a', "stdout", b"a");
+        let second = artifact_hex(&dir, 2, 'b', "stdout", b"b");
+        let third = artifact_hex(&dir, 3, 'c', "stdout", b"c");
+        let paths = [
+            dir.join(format!("9-{}.stdout", "d".repeat(64))),
+            dir.join(format!("9-{}.stderr", "d".repeat(64))),
+        ];
+        check_quota(
+            root.path(),
+            &paths,
+            [b"x", b"y"],
+            RetainedLimits::new(100, 3),
+        )
+        .unwrap();
+        assert!(!first.exists() && !second.exists());
+        assert_eq!(std::fs::read(&third).unwrap(), b"c");
+        assert_eq!(namespace_usage(root.path()).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn quota_refuses_a_capture_that_alone_exceeds_limits_without_evicting() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("e".repeat(64));
+        let new_dir = root.path().join("f".repeat(64));
         std::fs::create_dir(&old_dir).unwrap();
         std::fs::create_dir(&new_dir).unwrap();
-        let old = old_dir.join(format!("100-{}.stdout", "c".repeat(64)));
-        let file = std::fs::File::create(&old).unwrap();
-        // Sparse size proves accounting without a substantial fixture allocation.
-        file.set_len(RETAINED_QUOTA_BYTES).unwrap();
+        let kept = artifact_hex(&old_dir, 10, '9', "stdout", b"kept!");
         let paths = [
-            new_dir.join(format!("100-{}.stdout", "d".repeat(64))),
-            new_dir.join(format!("100-{}.stderr", "d".repeat(64))),
+            new_dir.join(format!("20-{}.stdout", "8".repeat(64))),
+            new_dir.join(format!("20-{}.stderr", "8".repeat(64))),
         ];
-        assert!(check_quota(root.path(), &paths, [b"x", b"y"]).is_err());
+        let error = check_quota(
+            root.path(),
+            &paths,
+            [b"0123456789", b"x"],
+            RetainedLimits::new(8, 4),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds quota by itself"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&kept).unwrap(), b"kept!");
         assert!(!paths[0].exists() && !paths[1].exists());
-        prune_namespace(root.path(), 100).unwrap();
-        assert!(check_quota(root.path(), &paths, [b"x", b"y"]).is_ok());
+
+        let too_many_files = check_quota(
+            root.path(),
+            &paths,
+            [b"x", b"y"],
+            RetainedLimits::new(100, 1),
+        )
+        .unwrap_err();
+        assert!(too_many_files
+            .to_string()
+            .contains("exceeds quota by itself"));
+        assert_eq!(std::fs::read(&kept).unwrap(), b"kept!");
     }
 
     #[test]
