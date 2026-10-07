@@ -958,8 +958,7 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
             }
             _ => unreachable!(),
         };
-        let mut matches: Vec<serde_json::Value> = Vec::new();
-        if located.kind == SelectorKind::Text {
+        let matches: Vec<serde_json::Value> = if located.kind == SelectorKind::Text {
             let lines: Vec<usize> = located
                 .ranges
                 .iter()
@@ -977,10 +976,10 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
                     "\nat {rendered}{ellipsis}\npass --expect {count} to change all of them, or extend OLD so it is unique"
                 ));
             }
-            matches = lines
+            lines
                 .iter()
                 .map(|line| serde_json::json!({"line": line}))
-                .collect();
+                .collect()
         } else {
             let sites: Vec<String> = located
                 .ranges
@@ -1022,14 +1021,14 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
                 message.push_str("\n  ");
                 message.push_str(site);
             }
-            matches = sites.iter().map(|site| serde_json::json!(site)).collect();
             if count == 0 {
                 let next =
                     pattern_zero_match_next(located.needle.as_deref().unwrap_or(""), &located.rel);
                 message.push('\n');
                 message.push_str(&next);
             }
-        }
+            sites.iter().map(|site| serde_json::json!(site)).collect()
+        };
         let want_nearest = count == 0
             && (located.kind == SelectorKind::Text
                 || located
