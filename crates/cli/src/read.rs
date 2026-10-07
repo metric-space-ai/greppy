@@ -749,6 +749,7 @@ fn read_json_miss(
 )]
 pub(crate) fn dispatch_read(
     subjects: &[String],
+    lines: Option<&str>,
     head: Option<usize>,
     tail: Option<usize>,
     with_handle: bool,
@@ -799,6 +800,12 @@ pub(crate) fn dispatch_read(
         } else {
             println!("{note}");
         }
+    }
+
+    // `--lines A:B` is the read-file range, addressed by a symbol or a path.
+    // It is not a definition slice (`--head` / `--tail` remain that).
+    if let Some(raw) = lines {
+        return dispatch_read_line_range(subjects, raw, with_handle, json, path_filters, root);
     }
 
     if !file_intents.iter().any(|is_file| *is_file) {
@@ -860,6 +867,91 @@ pub(crate) fn dispatch_read(
         failed |= code != 0;
     }
     Ok(i32::from(failed))
+}
+
+/// `read SYMBOL|FILE --lines A:B` prints that inclusive file range.
+///
+/// A path is read directly. A symbol selects the file of each resolved
+/// definition (deduped), using the same 1-based coordinates as `read-file
+/// --lines`. Ambiguous symbols therefore still show source instead of a
+/// usage error: the range does not choose one definition.
+fn dispatch_read_line_range(
+    subjects: &[String],
+    raw: &str,
+    with_handle: bool,
+    json: bool,
+    path_filters: &[String],
+    root: Option<&str>,
+) -> Result<i32> {
+    // Reject a malformed range before resolving symbols, so the failure is
+    // the range and not a missing name. EOF clamping happens while reading.
+    read_parse_file_range(raw, usize::MAX)?;
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    let file_base = resolve_file_operand_base(root, &root_path);
+    let mut files = Vec::new();
+    let mut failed = false;
+    let mut opened: Option<(greppy_store::Store, String, QueryPathFilters)> = None;
+    for subject in subjects {
+        let file_intent = looks_like_path(subject)
+            || read_resolve_file(&file_base, &canonical_root, subject).is_some();
+        if file_intent {
+            if !files.iter().any(|existing: &String| existing == subject) {
+                files.push(subject.clone());
+            }
+            continue;
+        }
+        if opened.is_none() {
+            let mut store = open_default_store_query_writer(root)?;
+            maybe_reindex_stale(&mut store, root)?;
+            let project = project_for(root)?;
+            if let Some(code) = graph_stale_gate(
+                &store,
+                root,
+                &project,
+                "read",
+                json,
+                serde_json::json!({ "targets": subjects, "lines": raw }),
+                "hits",
+            )? {
+                return Ok(code);
+            }
+            let filters = prepare_query_path_filters(root, "read", "", path_filters)?;
+            opened = Some((store, project, filters));
+        }
+        let Some((store, project, filters)) = opened.as_ref() else {
+            continue;
+        };
+        let ids = resolve_symbol_nodes(store, Some(subject))?;
+        let mut nodes = read_real_nodes(store, &ids)?;
+        nodes.retain(|node| filters.matches(&node.file_path));
+        if nodes.is_empty() {
+            read_report_missing(store, project, subject, &root_path, filters)?;
+            failed = true;
+            continue;
+        }
+        for node in nodes {
+            if !files.iter().any(|existing| existing == &node.file_path) {
+                files.push(node.file_path);
+            }
+        }
+    }
+    if files.is_empty() {
+        return Ok(1);
+    }
+    let code = dispatch_read_files(
+        &files,
+        Some(raw),
+        false,
+        false,
+        with_handle,
+        json,
+        path_filters,
+        root,
+    )?;
+    Ok(if failed || code != 0 { 1 } else { 0 })
 }
 
 /// Recognize location-shaped misuse before opening a graph or treating the

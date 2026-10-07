@@ -1374,7 +1374,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "brief" => "greppy brief SYMBOL [--path PATH] [--json] [--root DIR]",
         "read" => {
-            "greppy read SYMBOL|FILE [--head M] [--tail N] [--handle] [--code] [--path PATH] [--root DIR]"
+            "greppy read SYMBOL|FILE [--lines A:B] [--head M] [--tail N] [--handle] [--code] [--path PATH] [--root DIR]"
         }
         "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
         "replace-text" => {
@@ -2654,6 +2654,7 @@ fn dispatch_subcommand(
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             symbols,
+            lines,
             head,
             tail,
             handle,
@@ -2663,7 +2664,17 @@ fn dispatch_subcommand(
         } => {
             let subjects = read_targets(&symbols)?;
             validate_path_filters(root, &path_opts, "--path")?;
-            dispatch_read(&subjects, head, tail, handle, code, json, &path_opts, root)
+            dispatch_read(
+                &subjects,
+                lines.as_deref(),
+                head,
+                tail,
+                handle,
+                code,
+                json,
+                &path_opts,
+                root,
+            )
         }
         Command::ReadSmart {
             symbols,
@@ -7980,6 +7991,13 @@ struct NavRow {
     node: greppy_store::Node,
     edge_type: Option<String>,
     hops: Option<usize>,
+    /// Call site for who-calls (CALLS preferred over USAGE); definition line for callees.
+    line: u32,
+    /// `<module>` when a synthetic file anchor is a real module-scope caller.
+    display_name: Option<String>,
+    /// Who-calls rows locate the call. Callees locate the definition, matching
+    /// the single-symbol path.
+    call_site: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8335,12 +8353,13 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             } else {
                 ""
             };
+            let name = row
+                .display_name
+                .clone()
+                .unwrap_or_else(|| nav_short_name(&row.node));
             println!(
                 "{}:{}  {}{}",
-                row.node.file_path,
-                row.node.start_line,
-                nav_short_name(&row.node),
-                test_suffix
+                row.node.file_path, row.line, name, test_suffix
             );
             if req.code {
                 if let Some((source, handle)) = node_source_and_handle(&root_path, &row.node) {
@@ -8377,10 +8396,30 @@ fn nav_rows_for_target(
 ) -> Result<Vec<NavRow>> {
     let out = match kind {
         NavKind::WhoCalls => {
+            // Same evidence as the single-symbol path: every CALLS and USAGE
+            // site line, with CALLS winning, and a file anchor kept only when
+            // it is the source of a real module-scope CALLS edge.
             let mut nodes = std::collections::BTreeMap::new();
+            let mut sites: std::collections::HashMap<i64, Vec<u32>> =
+                std::collections::HashMap::new();
+            let mut call_sites: std::collections::HashMap<i64, Vec<u32>> =
+                std::collections::HashMap::new();
+            let mut module_callers = std::collections::HashSet::new();
             for id in ids {
                 for edge_type in ["CALLS", "USAGE"] {
                     for edge in store.incoming_edges(*id, Some(edge_type), 1024)? {
+                        if let Some(line) = edge.properties.get("line").and_then(|v| v.as_u64()) {
+                            sites.entry(edge.source_id).or_default().push(line as u32);
+                            if edge.edge_type == "CALLS" {
+                                call_sites
+                                    .entry(edge.source_id)
+                                    .or_default()
+                                    .push(line as u32);
+                            }
+                        }
+                        if edge.edge_type == "CALLS" {
+                            module_callers.insert(edge.source_id);
+                        }
                         if let std::collections::btree_map::Entry::Vacant(slot) =
                             nodes.entry(edge.source_id)
                         {
@@ -8392,12 +8431,28 @@ fn nav_rows_for_target(
                 }
             }
             nodes
-                .into_values()
-                .map(|node| NavRow {
-                    target: index,
-                    node,
-                    edge_type: None,
-                    hops: None,
+                .into_iter()
+                .filter(|(_, node)| {
+                    !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+                        || module_callers.contains(&node.id)
+                })
+                .map(|(node_id, node)| {
+                    let site =
+                        sorted_site_lines(call_sites.get(&node_id).or_else(|| sites.get(&node_id)))
+                            .first()
+                            .copied()
+                            .unwrap_or_else(|| node.start_line.max(1) as u32);
+                    let module =
+                        is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name);
+                    NavRow {
+                        target: index,
+                        node,
+                        edge_type: None,
+                        hops: None,
+                        line: site,
+                        display_name: module.then(|| "<module>".to_string()),
+                        call_site: true,
+                    }
                 })
                 .collect()
         }
@@ -8411,13 +8466,21 @@ fn nav_rows_for_target(
                     }
                 }
             }
+            // Same as single-symbol callees: the row is where the callee is
+            // defined, and a synthetic file anchor is not a callee.
             callees
                 .into_values()
+                .filter(|node| {
+                    !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+                })
                 .map(|node| NavRow {
                     target: index,
+                    line: node.start_line.max(1) as u32,
                     node,
                     edge_type: None,
                     hops: None,
+                    display_name: None,
+                    call_site: false,
                 })
                 .collect()
         }
@@ -8432,16 +8495,29 @@ fn nav_row_json(
     root_path: &std::path::Path,
 ) -> serde_json::Value {
     let node = &row.node;
+    let name = row
+        .display_name
+        .clone()
+        .unwrap_or_else(|| display_node_name(node));
+    let (start_line, end_line) = if row.call_site {
+        crate::nav::nav_file_lines(root_path, &node.file_path)
+            .as_ref()
+            .map(|lines| crate::nav::nav_statement_span(lines, row.line))
+            .map(|(start, end)| (i64::from(start), i64::from(end)))
+            .unwrap_or((i64::from(row.line), i64::from(row.line)))
+    } else {
+        (node.start_line, node.end_line)
+    };
     let mut value = serde_json::json!({
         "target": target,
         "qualified_name": &node.qualified_name,
-        "name": display_node_name(node),
+        "name": name,
         "label": &node.label,
         "file": &node.file_path,
-        "line": node.start_line,
+        "line": row.line,
         "file_path": &node.file_path,
-        "start_line": node.start_line,
-        "end_line": node.end_line,
+        "start_line": start_line,
+        "end_line": end_line,
     });
     if let Some(edge_type) = &row.edge_type {
         value["edge_type"] = serde_json::json!(edge_type);

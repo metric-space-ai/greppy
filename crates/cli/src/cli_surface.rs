@@ -272,6 +272,14 @@ pub enum Command {
         /// Symbols to read, or `-` to take symbols from the pipe.
         #[arg(value_name = "SYMBOL", required = true)]
         symbols: Vec<String>,
+        /// Print the inclusive 1-based file range A:B.
+        ///
+        /// Same coordinates as `read-file --lines`: line 1 is the first line of
+        /// the file that contains SYMBOL (or of FILE itself), not a slice of the
+        /// definition. `--head` and `--tail` still slice the definition and
+        /// cannot be combined with `--lines`.
+        #[arg(long, value_name = "A:B", conflicts_with_all = ["head", "tail"])]
+        lines: Option<String>,
         /// Print only the first M lines of each definition.
         #[arg(long, value_name = "M")]
         head: Option<usize>,

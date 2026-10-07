@@ -3136,8 +3136,15 @@ pub(crate) fn nav_refuse_ambiguous(
         if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
             continue;
         }
-        if !sites.iter().any(|(file, _)| file == &node.file_path) {
-            sites.push((node.file_path.clone(), node.start_line.max(1)));
+        // Same definition identity `read` counts: one row per file and start
+        // line. Deduping by file alone under-counted several definitions that
+        // share a file, so who-calls and read disagreed on the number.
+        let start = node.start_line.max(1);
+        if !sites
+            .iter()
+            .any(|(file, line)| file == &node.file_path && *line == start)
+        {
+            sites.push((node.file_path.clone(), start));
         }
     }
     if sites.len() < 2 {
@@ -3221,7 +3228,11 @@ pub(crate) fn print_nav_rows(
     });
 
     let total = rows.len();
-    let summarize = !all && total > NAV_FULL_LIMIT;
+    // An explicit `--limit` is a row budget for text as well as JSON. It wins
+    // over the summary shape, and `--all` does not lift it.
+    let explicit_limit =
+        cli_result_limit_raw().map(|limit| limit.saturating_add(cli_result_offset()));
+    let summarize = explicit_limit.is_none() && !all && total > NAV_FULL_LIMIT;
     if summarize {
         let mut spread: Vec<(&String, &usize)> = per_file.iter().collect();
         spread.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
@@ -3233,7 +3244,9 @@ pub(crate) fn print_nav_rows(
         println!("{total} {noun}: {spread}");
         println!();
     }
-    let shown = if summarize {
+    let shown = if let Some(limit) = explicit_limit {
+        limit.min(total)
+    } else if summarize {
         NAV_SUMMARY_ROWS.min(total)
     } else {
         total
@@ -3268,6 +3281,12 @@ pub(crate) fn print_nav_rows(
             {
                 println!("{line}");
             }
+        }
+    }
+    if let Some(limit) = explicit_limit {
+        let omitted = total.saturating_sub(limit.min(total));
+        if omitted > 0 {
+            println!("… {omitted} more (use --all)");
         }
     }
 }
