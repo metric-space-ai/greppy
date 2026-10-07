@@ -809,7 +809,7 @@ mod tests {
         let previous = std::env::var_os("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS");
         std::env::set_var("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS", "40");
         let started = std::time::Instant::now();
-        let result = std::panic::catch_unwind(|| apply_test_summary_load_delay());
+        let result = std::panic::catch_unwind(apply_test_summary_load_delay);
         let elapsed = started.elapsed();
         if let Some(previous) = previous {
             std::env::set_var("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS", previous);
