@@ -3837,3 +3837,13 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
         .unwrap()
         .contains("last query waiter exited"));
 }
+
+#[test]
+fn bracketed_route_file_in_a_qualified_target_is_not_a_glob() {
+    assert!(validate_nav_target("api/[...path].js::loadState").is_ok());
+    assert!(validate_nav_target("app/[id]/page.tsx::Page").is_ok());
+    assert!(validate_nav_target("src/*.rs::run").is_err());
+    assert!(validate_nav_target("api/[...path].js::load*").is_err());
+    assert!(validate_nav_target("Store[0]").is_err());
+    assert!(validate_nav_target("load*").is_err());
+}

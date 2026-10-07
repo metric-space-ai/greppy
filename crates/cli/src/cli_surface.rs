@@ -656,9 +656,10 @@ pub enum Command {
     },
     /// Definitions whose name contains NAME.
     SearchSymbol {
-        /// The name or name fragment to look up.
+        /// The names or name fragments to look up. Several are answered in
+        /// one call: `greppy search-symbol A B`.
         #[arg(value_name = "NAME")]
-        query: Option<String>,
+        query: Vec<String>,
         /// Restrict matches to one definition kind.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,

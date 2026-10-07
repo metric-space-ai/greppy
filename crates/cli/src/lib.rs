@@ -2879,16 +2879,47 @@ fn dispatch_subcommand(
             path_opts,
         } => {
             let kind = effective_search_kind(kind, json);
-            dispatch_search_symbols(
-                query.as_deref(),
-                kind.as_deref(),
-                code,
-                all,
-                json,
-                &path_opts,
-                EmbeddingCliArgs { device, no_gpu },
-                root,
-            )
+            let names: Vec<&str> = query
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .collect();
+            if names.len() <= 1 {
+                return dispatch_search_symbols(
+                    names.first().copied(),
+                    kind.as_deref(),
+                    code,
+                    all,
+                    json,
+                    &path_opts,
+                    EmbeddingCliArgs { device, no_gpu },
+                    root,
+                );
+            }
+            // Several names are answered in one call, one section (or JSON
+            // document) per name, so an agent never pays a usage error for
+            // asking about two types at once.
+            let mut exit = 1;
+            for (index, name) in names.iter().enumerate() {
+                if !json {
+                    if index > 0 {
+                        println!();
+                    }
+                    println!("== search-symbol {name} ==");
+                }
+                let status = dispatch_search_symbols(
+                    Some(name),
+                    kind.as_deref(),
+                    code,
+                    all,
+                    json,
+                    &path_opts,
+                    EmbeddingCliArgs { device, no_gpu },
+                    root,
+                )?;
+                exit = if index == 0 { status } else { exit.min(status) };
+            }
+            Ok(exit)
         }
         Command::Plus {
             query,
@@ -7406,7 +7437,18 @@ fn looks_like_path(target: &str) -> bool {
 }
 
 fn looks_like_glob(target: &str) -> bool {
-    target.contains('*') || target.contains('?') || (target.contains('[') && target.contains(']'))
+    // In a qualified `file::Symbol` target the brackets of the file part are
+    // literal: route files such as `api/[...path].js` or `app/[id]/page.tsx`
+    // are ordinary names, and greppy prints them that way itself.
+    let (file, symbol) = match target.split_once("::") {
+        Some((file, symbol)) => (file, symbol),
+        None => ("", target),
+    };
+    file.contains('*')
+        || file.contains('?')
+        || symbol.contains('*')
+        || symbol.contains('?')
+        || (symbol.contains('[') && symbol.contains(']'))
 }
 
 /// Rule 1: reject what the grammar does not provide instead of reinterpreting
