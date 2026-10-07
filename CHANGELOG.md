@@ -6,7 +6,7 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 Nothing yet.
 
-## [0.4.1] — Unreleased
+## [0.4.1] — 2026-10-07
 
 0.4.1 includes the unreleased 0.4.0 line below and the changes in this section.
 Production inference uses Metal on macOS and CUDA on Linux; FSKit stays optional
@@ -57,6 +57,10 @@ acceleration and the ordinary workspace backend provides the same agent behavior
 
 ### Fixes
 
+- `replace-text`: when OLD matches nowhere, the refusal names the nearest
+  variant (the lines that differ only in whitespace, or else the most similar
+  lines) with its line range, its exact text and the `greppy replace-lines`
+  alternative. Nothing is written.
 - `bash-smart` no longer counts source lines such as `warn!(...)` in a
   `git diff` as warnings.
 - The TUI prints why `--continue` or `--resume` cannot start instead of only
