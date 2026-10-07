@@ -2316,8 +2316,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn base_routing_new_identity_uses_designated_physical_volume() {
+        // Needs the designated disposable volume; hosted runners have none.
+        let Some(volume) = macos_disposable_volume() else {
+            return;
+        };
         let base = tempdir("base-mounted");
-        let volume = Path::new("/Volumes/tmp");
         let selected =
             agent_base_directory_for(&base, Path::new("repo/generation"), true, volume).unwrap();
         assert_eq!(
