@@ -424,7 +424,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 29)
+        self.assertEqual(len(names), 28)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
@@ -439,6 +439,9 @@ class ReleaseArtifactTests(unittest.TestCase):
         # out of band (hours-long CPU index on the hosted runner), and the
         # edit-regime coding benchmark publishes per commit but does not gate.
         self.assertNotIn("runtime-footprint-windows-x86_64-cpu.json", names)
+        # Product builds refuse CPU inference and the hosted Linux runner has no
+        # GPU: the CUDA package's inference acceptance runs on the CUDA lane.
+        self.assertNotIn("runtime-footprint-linux-x86_64-cpu.json", names)
         self.assertNotIn("greppy-agent-benchmark.tar.gz", names)
         self.assertNotIn("greppy-agent-benchmark.tar.gz.sha256", names)
         self.assertNotIn("greppy-coding-benchmark.tar.gz", names)
@@ -461,8 +464,21 @@ class ReleaseArtifactTests(unittest.TestCase):
                 "greppy-winfsp-source.tar.gz.sha256",
             },
         )
+        summary_quality = [
+            asset
+            for asset in contract["assets"]
+            if asset.get("optional_group") == "summary-quality"
+        ]
+        self.assertEqual(
+            {asset["name"] for asset in summary_quality},
+            {"greppy-summary-quality.tar.gz", "greppy-summary-quality.tar.gz.sha256"},
+        )
         self.assertFalse(
-            any(asset.get("optional_group") for asset in contract["assets"] if asset not in windows)
+            any(
+                asset.get("optional_group")
+                for asset in contract["assets"]
+                if asset not in windows and asset not in summary_quality
+            )
         )
 
     def test_release_publish_excludes_cpu_only_windows_and_unrun_cow_performance(
@@ -853,14 +869,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('if [ "$device" = cpu ]', workflow)
         self.assertIn("measure_runtime_footprint:", workflow)
         self.assertIn(
-            "runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)",
+            "runner.os != 'Windows' && matrix.footprint_devices != '' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)",
             workflow,
         )
         self.assertEqual(
             workflow.count(
                 'if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]'
             ),
-            2,
+            1,
         )
 
         windows_smoke = (

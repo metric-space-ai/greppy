@@ -16,7 +16,7 @@
       "asset": "greppy-linux-x86_64.deb",
       "secondary_asset": "greppy-linux-x86_64.rpm",
       "features": "cuda",
-      "footprint_devices": "cpu",
+      "footprint_devices": "",
       "runner_os": "Linux",
       "runner_arch": "X64",
       "rust_host": "x86_64-unknown-linux-gnu",
