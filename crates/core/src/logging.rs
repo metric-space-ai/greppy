@@ -5,6 +5,8 @@
 //! - `GREPPY_LOG` overrides `RUST_LOG` when set, for users who do not
 //!   want to leak Rust-specific env vars.
 //! - The default level is `info`.
+//! - Diagnostics go to stderr, never stdout: stdout carries command results
+//!   that agents and scripts parse.
 //! - When stderr is a TTY, the formatter uses a compact human format.
 //!   Otherwise it uses a JSON-like line format suitable for log files.
 
@@ -23,9 +25,19 @@ pub fn init() -> Result<(), String> {
     let is_tty = std::io::stderr().is_terminal();
 
     let fmt_layer: FmtLayer<_> = if is_tty {
-        Box::new(fmt::layer().with_target(true).compact())
+        Box::new(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .compact(),
+        )
     } else {
-        Box::new(fmt::layer().with_target(true).json())
+        Box::new(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .json(),
+        )
     };
 
     let result = tracing_subscriber::registry()
