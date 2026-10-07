@@ -261,7 +261,11 @@ fn list_artifacts(root: &Path) -> Result<Vec<ArtifactFile>> {
             let Some(deadline) = artifact_deadline(&path) else {
                 continue;
             };
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+            else {
                 continue;
             };
             let Some((group, _)) = name.rsplit_once('.') else {
