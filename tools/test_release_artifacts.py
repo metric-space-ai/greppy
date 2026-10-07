@@ -584,7 +584,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
 
         self.assertNotIn("--workflow agent-benchmark.yml", workflow)
-        self.assertIn("task-bank-audit.yml filesystem-cow.yml", workflow)
+        self.assertIn("ci.yml codeql.yml security-audit.yml filesystem-cow.yml; do", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
         self.assertIn("cow_performance_ok", workflow)
         self.assertNotIn("greppy-agent-benchmark", workflow)
