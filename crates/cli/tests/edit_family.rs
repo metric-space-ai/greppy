@@ -2394,3 +2394,31 @@ fn old_that_matches_nowhere_points_at_the_whitespace_variant() {
         "header line\n    if value > HIGH:\n        return value\nfooter\n",
     );
 }
+
+#[test]
+fn rename_receipt_lines_stay_exact_when_the_new_name_is_longer() {
+    // changed_byte_ranges are in the original file's coordinates; shifting
+    // them by the length delta moved every later site onto an earlier line.
+    let fixture = Fixture::new("rename-receipt-lines");
+    std::fs::write(
+        fixture.repo.join("lib.rs"),
+        "pub fn a1() {}\n// pad\n// pad\npub fn b() { a1(); }\n// pad\n// pad\npub fn c() { a1(); }\n// pad\n// pad\npub fn d() { a1(); }\n",
+    )
+    .unwrap();
+    let index = fixture.run(&["index", "."]);
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let out = fixture.run(&["rename", "a1", "a_much_longer_replacement_name"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("lib.rs:1,4,7,10"), "{stdout}");
+    let content = std::fs::read_to_string(fixture.repo.join("lib.rs")).unwrap();
+    assert_eq!(content.matches("a_much_longer_replacement_name").count(), 4);
+}

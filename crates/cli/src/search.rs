@@ -182,8 +182,11 @@ fn search_sort_name_rows(query: &str, nodes: &mut [greppy_store::Node]) {
 
 fn search_symbol_name_contains(node: &greppy_store::Node, query: &str) -> bool {
     // Match the same qualified name printed in a successful navigation row,
-    // not only the bare method name stored in `name`.
-    node.name.contains(query) || (query.contains("::") && nav_short_name(node).contains(query))
+    // not only the bare method name stored in `name`. Case-insensitive, like
+    // symbol resolution: `price` finds `Parse_Price` and `parsePrice`.
+    let query = query.to_ascii_lowercase();
+    node.name.to_ascii_lowercase().contains(&query)
+        || (query.contains("::") && nav_short_name(node).to_ascii_lowercase().contains(&query))
 }
 
 fn search_symbol_no_match_status(

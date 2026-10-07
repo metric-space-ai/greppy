@@ -3224,11 +3224,10 @@ pub(crate) fn edit_rename_receipt_addresses(
     certificate: &greppy_edit::certificate::Certificate,
     before: &[UndoBefore],
     old_name: &str,
-    new_name: &str,
+    _new_name: &str,
 ) -> Vec<String> {
     let mut by_file: std::collections::BTreeMap<String, Vec<(usize, usize)>> =
         std::collections::BTreeMap::new();
-    let length_delta = new_name.len() as i128 - old_name.len() as i128;
     for operation in &certificate.operations {
         let file = edit_operation_path(operation, root_path);
         let Some(content) = before
@@ -3244,13 +3243,12 @@ pub(crate) fn edit_rename_receipt_addresses(
         };
         let mut ranges = operation.changed_byte_ranges.clone();
         ranges.sort_unstable();
-        for (index, (after_start, _)) in ranges.into_iter().enumerate() {
-            // Rename replacements cannot add newlines. Translate each result
-            // offset back through the preceding identifier-length shifts, then
-            // read its unchanged line number from the before image. This also
-            // keeps dry-run receipts exact, when the result is not on disk.
-            let before_start = (after_start as i128 - length_delta * index as i128)
-                .clamp(0, content.len() as i128) as usize;
+        for (before_start, _) in ranges {
+            // `changed_byte_ranges` are in the ORIGINAL file's coordinates
+            // (greppy_edit::txn::Applied), so the line number is read from the
+            // before image directly. This also keeps dry-run receipts exact,
+            // when the result is not on disk.
+            let before_start = before_start.min(content.len());
             by_file
                 .entry(file.clone())
                 .or_default()

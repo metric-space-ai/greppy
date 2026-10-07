@@ -75,3 +75,14 @@ fn one_name_keeps_the_single_answer_shape() {
     assert!(!out.contains("== search-symbol"), "{out}");
     assert!(out.contains("beta_value"), "{out}");
 }
+
+#[test]
+fn search_symbol_ignores_case_like_symbol_resolution() {
+    let (repo, store, _scratch) = fixture("case");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed: {out}\n{err}");
+
+    let (code, out, err) = run(&["search-symbol", "alpharecord"], &repo, &store);
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("AlphaRecord"), "{out}");
+}

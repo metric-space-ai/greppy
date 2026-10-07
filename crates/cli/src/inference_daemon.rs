@@ -201,10 +201,37 @@ fn runtime_identity(prefix: &[u8], path: &std::path::Path) -> Vec<u8> {
     identity
 }
 
+/// The build a daemon was spawned from. Two builds that speak the same
+/// protocol can still differ in behaviour, so a client never reuses a daemon
+/// of another release or another binary: the version plus the executable's
+/// size and modification time separate them without hashing the binary.
+fn build_identity() -> &'static [u8] {
+    static IDENTITY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        let mut identity = env!("CARGO_PKG_VERSION").as_bytes().to_vec();
+        if let Some(meta) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::metadata(exe).ok())
+        {
+            identity.extend_from_slice(&meta.len().to_le_bytes());
+            if let Some(modified) = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                identity.extend_from_slice(&modified.as_secs().to_le_bytes());
+            }
+        }
+        identity
+    })
+}
+
 fn endpoint_digest(kind: &str, identity: &str, runtime_identity: Option<&[u8]>) -> String {
     let mut hash = Sha256::new();
     hash.update(b"greppy-inference-daemon\0");
     hash.update(PROTOCOL_VERSION.to_le_bytes());
+    hash.update(b"\0build\0");
+    hash.update(build_identity());
     hash.update(kind.as_bytes());
     hash.update(b"\0");
     hash.update(identity.as_bytes());
@@ -2528,6 +2555,15 @@ mod tests {
         assert_eq!(a.address(), b.address());
         assert_ne!(a.address(), c.address());
         assert!(a.address().contains("summary-"));
+    }
+
+    #[test]
+    fn endpoint_identity_is_stable_and_names_this_build() {
+        assert!(build_identity().starts_with(env!("CARGO_PKG_VERSION").as_bytes()));
+        assert_eq!(
+            endpoint_digest("summary", "model|prompt|auto", None),
+            endpoint_digest("summary", "model|prompt|auto", None)
+        );
     }
 
     #[test]
