@@ -43,7 +43,7 @@ pub struct SummaryCache {
 impl SummaryCache {
     /// Open (creating if needed) the cache DB in `store_dir`.
     pub fn open(store_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(store_dir)
+        greppy_core::workspace::ensure_store_dir(store_dir)
             .map_err(|e| Error::Store(format!("create store dir for summary cache: {e}")))?;
         let path: PathBuf = store_dir.join(SUMMARY_CACHE_DB_FILE);
         let conn = Connection::open(&path)
@@ -64,6 +64,8 @@ impl SummaryCache {
             );",
         )
         .map_err(|e| Error::Store(format!("create summary cache schema: {e}")))?;
+        greppy_core::workspace::ensure_db_mode(&path)
+            .map_err(|e| Error::Store(format!("set summary cache mode: {e}")))?;
         Ok(Self {
             conn,
             global: false,
@@ -74,7 +76,7 @@ impl SummaryCache {
     /// worktree. `GREPPY_STORE_DIR` still isolates factory/test runs.
     pub fn open_global() -> Result<Self> {
         let store_dir = greppy_core::cache::inference_cache_root();
-        std::fs::create_dir_all(&store_dir)
+        greppy_core::workspace::ensure_store_dir(&store_dir)
             .map_err(|e| Error::Store(format!("create global summary cache dir: {e}")))?;
         let path = store_dir.join(SUMMARY_CACHE_DB_FILE);
         let conn = Connection::open(&path).map_err(|e| {
@@ -95,6 +97,8 @@ impl SummaryCache {
              );",
         )
         .map_err(|e| Error::Store(format!("create global summary cache schema: {e}")))?;
+        greppy_core::workspace::ensure_db_mode(&path)
+            .map_err(|e| Error::Store(format!("set global summary cache mode: {e}")))?;
         Ok(Self { conn, global: true })
     }
 
@@ -412,5 +416,22 @@ mod tests {
         assert!(first
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_is_private_including_new_parent_components() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tmp_dir();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nested = parent.join("inference-cache").join("v1");
+        let cache = SummaryCache::open(&nested).unwrap();
+        drop(cache);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&parent), 0o755);
+        assert_eq!(mode(&parent.join("inference-cache")), 0o700);
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&nested.join(SUMMARY_CACHE_DB_FILE)), 0o600);
+        std::fs::remove_dir_all(&parent).ok();
     }
 }

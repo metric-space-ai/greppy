@@ -1677,8 +1677,8 @@ fn diagnostics_json_exposes_provider_incompleteness() {
 
     let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
-        code, 73,
-        "diagnostics must be non-zero while providers are incomplete; stderr={err}\nstdout={out}"
+        code, 0,
+        "non-call-graph gaps and unsupported files must not fail diagnostics; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -1717,6 +1717,217 @@ fn diagnostics_json_exposes_provider_incompleteness() {
             .any(|row| row["reason"] == "unsupported_language" && row["count"] == 1),
         "diagnostics must expose skip counts by reason: {v:?}"
     );
+}
+
+#[test]
+fn diagnostics_exit_0_when_only_route_edges_are_unsupported() {
+    let (repo, store, _scratch) = make_repo("diag-routes", "route_gap_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+    let db = find_graph_db(&store).expect("graph.db after index");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE provider_state
+         SET status = 'partial', files_failed = 0, unsupported_edge_classes = ?1
+         WHERE status != 'unsupported'",
+        [r#"["routes"]"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (code, out, err) = run(&["diagnostics", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "only route gaps must exit 0; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let providers = v["projects"][0]["provider_states"].as_array().unwrap();
+    assert!(providers.iter().any(|provider| {
+        provider["unsupported_edge_classes"]
+            .as_array()
+            .is_some_and(|edges| edges.iter().any(|edge| edge == "routes"))
+    }));
+
+    let (code, out, err) = run(&["diagnostics"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    assert!(
+        out.contains("partial (unsupported: routes)"),
+        "text diagnostics must name the unsupported class; stdout={out}"
+    );
+}
+
+#[test]
+fn doctor_is_fresh_after_copy_and_first_index() {
+    let (origin, _origin_store, scratch) = make_real_git_repo("doctor-copy-origin");
+    let copy = scratch.0.join("copy");
+    let status = Command::new("cp")
+        .args(["-R", origin.to_str().unwrap(), copy.to_str().unwrap()])
+        .status()
+        .expect("spawn cp");
+    assert!(status.success(), "cp -R failed");
+    let store = scratch.0.join("copy-store");
+    let (code, out, err) = run(&["index", "."], &copy, &store);
+    assert_eq!(
+        code, 0,
+        "first index of the copy failed; stderr={err}\nstdout={out}"
+    );
+    let (code, out, err) = run(&["doctor", "--json", "--diagnostics"], &copy, &store);
+    assert_eq!(
+        code, 0,
+        "doctor must be fresh after one index of a copied repo; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["healthy"], true, "{v}");
+    assert_eq!(v["fresh"], true, "{v}");
+    let reasons = v["freshness"]["reasons"].as_array();
+    assert!(
+        reasons.is_none_or(|reasons| {
+            reasons.iter().all(|reason| {
+                !reason
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("index signature changed")
+            })
+        }),
+        "metadata-only index drift must be refreshed: {v}"
+    );
+}
+
+#[test]
+fn workspace_doctor_inactive_provider_reports_ordinary_backend() {
+    let (root, _scratch) = fresh_dir("ws-doctor-inactive");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let (code, out, err) = run_with_env(
+        &["workspace", "doctor", "--json"],
+        &root,
+        &root.join("store"),
+        &[("GREPPY_WORKSPACE_DIR", data.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["healthy"], true, "{v}");
+    assert_eq!(v["backend"], "ordinary", "{v}");
+    assert_eq!(v["provider"], "inactive", "{v}");
+}
+
+#[test]
+fn workspace_doctor_broken_provider_still_fails() {
+    let (root, _scratch) = fresh_dir("ws-doctor-stale");
+    let data = root.join("data");
+    let mount = root.join("mount");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&mount).unwrap();
+    let manifest = serde_json::json!({
+        "protocol_version": 1,
+        "adapter_version": "0.4.2",
+        "adapter_kind": "fuse3",
+        "state": "ready",
+        "instance_id": "doctor-stale",
+        "data_root": data,
+        "mount_root": mount,
+        "heartbeat_unix_ms": 1,
+        "capabilities": {
+            "hard_links": true,
+            "symbolic_links": true,
+            "byte_range_locks": true,
+            "memory_maps": true,
+            "atomic_rename": true,
+            "case_preserving": true
+        }
+    });
+    std::fs::write(
+        data.join("provider.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        mount.join(".greppy-provider.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let (code, out, err) = run_with_env(
+        &["workspace", "doctor", "--json"],
+        &root,
+        &root.join("store"),
+        &[("GREPPY_WORKSPACE_DIR", data.to_str().unwrap())],
+    );
+    assert_eq!(code, 73, "{out}\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["healthy"], false, "{v}");
+    assert_eq!(v["diagnostics"]["checks"]["heartbeat"]["status"], "failed");
+    assert!(
+        !data.join("core").exists(),
+        "broken provider must not open core"
+    );
+}
+
+#[test]
+fn search_rejects_unavailable_gpu_device_up_front() {
+    let (repo, store, _scratch) = make_repo("device-reject", "device_marker");
+    let device = if cfg!(target_os = "macos") {
+        "cuda"
+    } else {
+        "metal"
+    };
+    let (code, out, err) = run(
+        &["search", "--device", device, "device_marker"],
+        &repo,
+        &store,
+    );
+    let combined = format!("{out}\n{err}");
+    assert!(
+        combined.contains("use --device auto (Metal on macOS, CUDA on Linux)"),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains("--device cpu"),
+        "product builds must not advise --device cpu: {combined}"
+    );
+    assert_eq!(code, 64, "{combined}");
+}
+
+#[cfg(unix)]
+#[test]
+fn store_permissions_after_first_index() {
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, store, _scratch) = make_repo("perm-index", "perm_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    fn walk(dir: &Path) {
+        let mode = std::fs::symlink_metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "directory {} is {:o}", dir.display(), mode);
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(&path);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let private_db = name.ends_with(".db")
+                || name.ends_with(".sqlite3")
+                || name.ends_with("-wal")
+                || name.ends_with("-shm");
+            if private_db {
+                let file_mode = meta.permissions().mode() & 0o777;
+                assert_eq!(
+                    file_mode,
+                    0o600,
+                    "database {} is {:o}",
+                    path.display(),
+                    file_mode
+                );
+            }
+        }
+    }
+    walk(&store);
 }
 
 #[test]
@@ -2631,8 +2842,8 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
 
     let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
-        code, 73,
-        "diagnostics should still report provider incompleteness, not store corruption; stderr={err}\nstdout={out}"
+        code, 0,
+        "recovered store must not look corrupt, and route-class gaps must not fail diagnostics; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));

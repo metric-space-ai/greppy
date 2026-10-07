@@ -1112,7 +1112,9 @@ fn dispatch_index_health_with_detail(
     store_bytes_complete = size.is_some();
     store_bytes = serde_json::json!(size);
     status_diagnostic_phase("git_status");
-    let dirty_overlay = dirty_overlay(&effective_root)?;
+    // Doctor must not refresh `.git/index`. Index-status keeps the historical
+    // git-status behaviour.
+    let dirty_overlay = dirty_overlay_locking(&effective_root, command != "doctor")?;
     let inference = (command == "doctor")
         .then(inference_registry_status)
         .transpose()?;
@@ -1275,7 +1277,16 @@ fn dispatch_index_health_with_detail(
     status_diagnostic_phase("graph_integrity");
     let diag = store.diagnostics()?;
     status_diagnostic_phase("source_freshness");
-    let freshness = nav_freshness_json(&store, root, &project);
+    let mut freshness = nav_freshness_json(&store, root, &project);
+    if command == "doctor" {
+        // Same metadata refresh the query path uses: a copied repo can carry an
+        // index signature that drifted with zero stale files. That is fresh.
+        if let Some(refreshed) =
+            super::freshness::try_refresh_metadata_only_fingerprint(root, &freshness)
+        {
+            freshness = refreshed;
+        }
+    }
     status_diagnostic_phase("embedding_completion");
     let fresh = freshness
         .get("fresh")

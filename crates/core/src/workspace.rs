@@ -248,6 +248,9 @@ pub fn dir_mode_default() -> u32 {
 /// mode 0700. Refuses to operate on a symlink. Idempotent: an existing
 /// directory is chmod'd to 0700 (so a store created before this
 /// hardening is tightened).
+///
+/// Only components this call creates are chmod'd. Pre-existing ancestors
+/// (`/tmp`, `$HOME`, …) keep their mode.
 pub fn ensure_store_dir(dir: &Path) -> std::io::Result<()> {
     if let Ok(md) = std::fs::symlink_metadata(dir) {
         if md.file_type().is_symlink() {
@@ -259,14 +262,58 @@ pub fn ensure_store_dir(dir: &Path) -> std::io::Result<()> {
         set_mode_700(dir)?;
         return Ok(());
     }
-    std::fs::create_dir_all(dir)?;
-    set_mode_700(dir)
+
+    let mut current = PathBuf::new();
+    let mut created = Vec::new();
+    for component in dir.components() {
+        current.push(component);
+        if current.as_path() == dir {
+            break;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&current) {
+                    Ok(()) => created.push(current.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => created.push(dir.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    for path in &created {
+        set_mode_700(path)?;
+    }
+    if created.iter().all(|path| path != dir) {
+        set_mode_700(dir)?;
+    }
+    Ok(())
 }
 
-/// Set the DB file at `path` to mode 0600. Refuses to operate on a
-/// symlink. No-op if the file does not yet exist (the writer creates
-/// it with the right mode via `OpenOptions::mode`).
+/// Set the DB file at `path` to mode 0600, and the SQLite `-wal` / `-shm`
+/// sidecars when they are present. Refuses to operate on a symlink. No-op
+/// for a path that does not yet exist (the writer creates it with the right
+/// mode via `OpenOptions::mode`).
 pub fn ensure_db_mode(path: &Path) -> std::io::Result<()> {
+    ensure_one_db_mode(path)?;
+    ensure_one_db_mode(&sqlite_sidecar(path, "-wal"))?;
+    ensure_one_db_mode(&sqlite_sidecar(path, "-shm"))?;
+    Ok(())
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn ensure_one_db_mode(path: &Path) -> std::io::Result<()> {
     let md = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -380,6 +427,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ensure_store_dir_chmods_only_new_components() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir_root("greppy-ensure-store-parents");
+        let parent = tmp.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nested = parent.join("inference-cache").join("v1");
+        ensure_store_dir(&nested).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&parent),
+            0o755,
+            "pre-existing ancestors stay untouched"
+        );
+        assert_eq!(mode(&parent.join("inference-cache")), 0o700);
+        assert_eq!(mode(&nested), 0o700);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ensure_store_dir_refuses_symlink() {
         let tmp = tempdir_root("greppy-symlink-store-dir");
         let real = tmp.join("real");
@@ -416,6 +484,24 @@ mod tests {
         // right mode via OpenOptions::mode).
         let phantom = tmp.join("nope.db");
         ensure_db_mode(&phantom).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = tmp.join(format!("graph.db{suffix}"));
+            std::fs::write(&sidecar, b"sidecar").unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        ensure_db_mode(&db).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = tmp.join(format!("graph.db{suffix}"));
+            let mode = std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{suffix} must be 0600; got {mode:o}");
+        }
+        let linked_db = tmp.join("linked.db");
+        std::fs::write(&linked_db, b"sqlite").unwrap();
+        std::os::unix::fs::symlink(tmp.join("graph.db-wal"), tmp.join("linked.db-wal")).unwrap();
+        assert!(
+            ensure_db_mode(&linked_db).is_err(),
+            "must refuse a symlinked -wal sidecar"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

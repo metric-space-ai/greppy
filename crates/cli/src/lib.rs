@@ -2061,6 +2061,122 @@ fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32
     }
 }
 
+fn inactive_provider_is_broken(diagnostics: &greppy_workspace_core::ProviderDiagnostics) -> bool {
+    let failed = |name: &str| {
+        diagnostics
+            .checks
+            .get(name)
+            .is_some_and(|check| check.status == "failed")
+    };
+    if failed("heartbeat") || failed("identity") || failed("capabilities") {
+        return true;
+    }
+    diagnostics
+        .checks
+        .get("mounted_identity")
+        .is_some_and(|check| {
+            check.status == "failed"
+                && check
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("differ"))
+        })
+}
+
+fn dispatch_workspace_doctor(data_root: &std::path::Path, json: bool) -> Result<i32> {
+    use greppy_workspace_core::{OptionalProvider, ProviderInstallation};
+
+    // A missing data root is not an inactive provider. Diagnosis must not
+    // create it, and the historical contract is exit 73.
+    if !data_root.exists() {
+        let error = match ProviderInstallation::require_healthy(data_root) {
+            Err(error) => error,
+            Ok(_) => greppy_workspace_core::Error::AdapterUnavailable(
+                "workspace provider data root is missing".into(),
+            ),
+        };
+        return workspace_doctor_failure(data_root, &error, "not_run", json);
+    }
+
+    match ProviderInstallation::optional(data_root) {
+        Err(error) => workspace_doctor_failure(data_root, &error, "not_run", json),
+        Ok(OptionalProvider::Ready(provider)) => {
+            if let Err(error) = provider.doctor_io(&format!("doctor-{}", std::process::id())) {
+                return workspace_doctor_failure(data_root, &error, "failed", json);
+            }
+            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let workspaces = core
+                .list_workspaces()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let stats = core
+                .chunks()
+                .stats()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "healthy": true,
+                        "provider": provider.manifest(),
+                        "active_workspaces": workspaces.len(),
+                        "chunks": stats,
+                        "smoke": {
+                            "read": true,
+                            "write": true,
+                            "partial_write": true,
+                            "rename": true,
+                            "delete": true
+                        }
+                    }))
+                    .map_err(|error| Error::Invalid(error.to_string()))?
+                );
+            } else {
+                println!(
+                    "portable workspace provider healthy — {:?}, {} active workspace(s)",
+                    provider.manifest().adapter_kind,
+                    workspaces.len()
+                );
+            }
+            Ok(0)
+        }
+        Ok(OptionalProvider::Inactive) => {
+            let diagnostics = ProviderInstallation::diagnose(data_root);
+            if inactive_provider_is_broken(&diagnostics) {
+                let error = match ProviderInstallation::require_healthy(data_root) {
+                    Err(error) => error,
+                    Ok(_) => greppy_workspace_core::Error::AdapterUnhealthy(
+                        "provider is installed but not healthy".into(),
+                    ),
+                };
+                return workspace_doctor_failure(data_root, &error, "not_run", json);
+            }
+            let status = agent_workspace_status(data_root)
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "healthy": true,
+                        "backend": "ordinary",
+                        "provider": "inactive",
+                        "active_workspaces": status.workspaces.len(),
+                        "chunks": status.chunks,
+                        "data_root": data_root,
+                    }))
+                    .map_err(|error| Error::Invalid(error.to_string()))?
+                );
+            } else {
+                println!(
+                    "workspace backend ordinary; provider inactive; {} active workspace(s)",
+                    status.workspaces.len()
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
 fn workspace_doctor_failure(
     data_root: &std::path::Path,
     error: &dyn std::fmt::Display,
@@ -2117,53 +2233,7 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             );
             Ok(0)
         }
-        WorkspaceCommand::Doctor { json } => {
-            let provider =
-                match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        return workspace_doctor_failure(&data_root, &error, "not_run", json);
-                    }
-                };
-            if let Err(error) = provider.doctor_io(&format!("doctor-{}", std::process::id())) {
-                return workspace_doctor_failure(&data_root, &error, "failed", json);
-            }
-            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let workspaces = core
-                .list_workspaces()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let stats = core
-                .chunks()
-                .stats()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "healthy": true,
-                        "provider": provider.manifest(),
-                        "active_workspaces": workspaces.len(),
-                        "chunks": stats,
-                        "smoke": {
-                            "read": true,
-                            "write": true,
-                            "partial_write": true,
-                            "rename": true,
-                            "delete": true
-                        }
-                    }))
-                    .map_err(|error| Error::Invalid(error.to_string()))?
-                );
-            } else {
-                println!(
-                    "portable workspace provider healthy — {:?}, {} active workspace(s)",
-                    provider.manifest().adapter_kind,
-                    workspaces.len()
-                );
-            }
-            Ok(0)
-        }
+        WorkspaceCommand::Doctor { json } => dispatch_workspace_doctor(&data_root, json),
         WorkspaceCommand::Status { json } => {
             let status = match agent_workspace_status(&data_root) {
                 Ok(status) => status,
@@ -2341,12 +2411,40 @@ mod optional_workspace_status_tests {
     }
 }
 
+fn embed_daemon_busy_message() -> &'static str {
+    #[cfg(feature = "cpu-only")]
+    {
+        "EmbeddingGemma daemon remained busy until the request deadline; \
+         retry, or run with --device cpu to bypass the shared daemon"
+    }
+    #[cfg(not(feature = "cpu-only"))]
+    {
+        "EmbeddingGemma daemon remained busy until the request deadline; retry shortly"
+    }
+}
+
+fn embed_daemon_failed_message() -> &'static str {
+    #[cfg(feature = "cpu-only")]
+    {
+        "EmbeddingGemma daemon answered faulted while holding the model; \
+         it recovers on its idle TTL — retry shortly, or run with \
+         --device cpu to bypass it"
+    }
+    #[cfg(not(feature = "cpu-only"))]
+    {
+        "EmbeddingGemma daemon answered faulted while holding the model; \
+         it recovers on its idle TTL — retry shortly"
+    }
+}
+
 fn dispatch_subcommand(
     cmd: Command,
     root: Option<&str>,
     device: Option<&str>,
     no_gpu: bool,
 ) -> Result<i32> {
+    // A host-impossible --device must fail before index, search, or the loader.
+    let _ = embedding_device_preference(device, no_gpu)?;
     match cmd {
         Command::Passthrough(argv) => dispatch_grep(&argv),
         #[cfg(any(unix, windows))]
@@ -7072,6 +7170,17 @@ fn dispatch_stats(root: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
+fn provider_diagnostics_status(provider: &greppy_store::ProviderState) -> String {
+    if provider.unsupported_edge_classes.is_empty() {
+        return provider.status.clone();
+    }
+    format!(
+        "{} (unsupported: {})",
+        provider.status,
+        provider.unsupported_edge_classes.join(", ")
+    )
+}
+
 fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
     let store = open_default_store(root)?;
     let diag = store.diagnostics()?;
@@ -7138,10 +7247,11 @@ fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
             println!("    skipped {} {}", skip.reason, skip.count);
         }
         for provider in &project.provider_states {
+            let status = provider_diagnostics_status(provider);
             println!(
                 "    provider {} status={} files={}/{} missing_edges={}",
                 provider.language,
-                provider.status,
+                status,
                 provider.files_indexed,
                 provider.files_seen,
                 provider.unsupported_edge_classes.len()
@@ -7264,7 +7374,23 @@ impl DirtyOverlay {
 }
 
 fn dirty_overlay(root_path: &std::path::Path) -> Result<DirtyOverlay> {
-    let out = std::process::Command::new("git")
+    dirty_overlay_locking(root_path, true)
+}
+
+/// `allow_optional_locks` is false for `doctor`. `git status` otherwise takes
+/// an optional index lock and rewrites `.git/index` when stat cache entries
+/// are racy (typical after `cp -R`). That rewrite changes the index signature
+/// with zero stale files and makes a healthy copy look drifted. `GIT_OPTIONAL_LOCKS=0`
+/// keeps the status read-only.
+fn dirty_overlay_locking(
+    root_path: &std::path::Path,
+    allow_optional_locks: bool,
+) -> Result<DirtyOverlay> {
+    let mut command = std::process::Command::new("git");
+    if !allow_optional_locks {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    let out = command
         .args([
             "status",
             "--porcelain=v1",
@@ -10018,19 +10144,10 @@ fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -
             ));
         }
         embed_daemon::EmbedDaemonResult::DaemonBusy => {
-            return Err(Error::Store(
-                "EmbeddingGemma daemon remained busy until the request deadline; \
-                 retry, or run with --device cpu to bypass the shared daemon"
-                    .into(),
-            ));
+            return Err(Error::Store(embed_daemon_busy_message().into()));
         }
         embed_daemon::EmbedDaemonResult::Failed => {
-            return Err(Error::Store(
-                "EmbeddingGemma daemon answered faulted while holding the model; \
-                 it recovers on its idle TTL — retry shortly, or run with \
-                 --device cpu to bypass it"
-                    .into(),
-            ));
+            return Err(Error::Store(embed_daemon_failed_message().into()));
         }
     };
     if let Some(cache) = &cache {

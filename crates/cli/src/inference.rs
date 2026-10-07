@@ -538,6 +538,20 @@ fn enforce_product_gpu(
                 .into(),
         ));
     }
+    // Reject a backend the host cannot load before the native loader starts.
+    // `auto` stays legal and picks Metal on macOS, CUDA on Linux.
+    let unavailable = match preference {
+        #[cfg(target_os = "macos")]
+        greppy_embed_native::DevicePreference::Cuda => Some("CUDA is not available on macOS"),
+        #[cfg(not(target_os = "macos"))]
+        greppy_embed_native::DevicePreference::Metal => Some("Metal is only available on macOS"),
+        _ => None,
+    };
+    if let Some(reason) = unavailable {
+        return Err(Error::Invalid(format!(
+            "{reason}; use --device auto (Metal on macOS, CUDA on Linux)"
+        )));
+    }
     Ok(preference)
 }
 

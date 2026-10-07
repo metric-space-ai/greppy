@@ -29,7 +29,7 @@ pub struct EmbeddingContentCache {
 impl EmbeddingContentCache {
     pub fn open_global() -> Result<Self> {
         let directory = greppy_core::cache::inference_cache_root();
-        std::fs::create_dir_all(&directory).map_err(|error| {
+        greppy_core::workspace::ensure_store_dir(&directory).map_err(|error| {
             Error::Store(format!(
                 "create global inference cache {}: {error}",
                 directory.display()
@@ -42,7 +42,7 @@ impl EmbeddingContentCache {
     /// providers and integration tests.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
-        std::fs::create_dir_all(&directory).map_err(|error| {
+        greppy_core::workspace::ensure_store_dir(&directory).map_err(|error| {
             Error::Store(format!(
                 "create embedding cache directory {}: {error}",
                 directory.display()
@@ -76,6 +76,8 @@ impl EmbeddingContentCache {
              ON document_embeddings(last_accessed);",
         )
         .map_err(|error| Error::Store(format!("create embedding cache schema: {error}")))?;
+        greppy_core::workspace::ensure_db_mode(&path)
+            .map_err(|error| Error::Store(format!("set embedding cache mode: {error}")))?;
         Ok(Self { conn })
     }
 
@@ -635,5 +637,27 @@ mod tests {
             retained_after_second_trim, retained_after_first_trim,
             "freelist pages must not cause progressive eviction below the live-byte budget"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_sets_private_modes_on_wal_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nested = parent.path().join("inference-cache").join("v1");
+        let cache = EmbeddingContentCache::open(&nested).unwrap();
+        drop(cache);
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(parent.path()), 0o755);
+        assert_eq!(mode(&parent.path().join("inference-cache")), 0o700);
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&nested.join("document-embeddings.db")), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = nested.join(format!("document-embeddings.db{suffix}"));
+            assert!(sidecar.exists(), "WAL open should create {suffix}");
+            assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+        }
     }
 }

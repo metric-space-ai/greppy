@@ -1979,18 +1979,34 @@ fn embedding_device_preference_obeys_cli_and_env() {
     unsafe {
         std::env::set_var(ENV_DEVICE, "metal");
     }
-    assert_eq!(
-        embedding_device_preference(None, false).unwrap(),
-        greppy_embed_native::DevicePreference::Metal
-    );
-    assert_eq!(
-        embedding_device_preference(Some("cuda"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cuda
-    );
-    assert_eq!(
-        embedding_device_preference(Some("cuda:2"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cuda
-    );
+    let metal_from_env = embedding_device_preference(None, false);
+    let cuda = embedding_device_preference(Some("cuda"), false);
+    let cuda_indexed = embedding_device_preference(Some("cuda:2"), false);
+    let auto_phrase = "use --device auto (Metal on macOS, CUDA on Linux)";
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            metal_from_env.unwrap(),
+            greppy_embed_native::DevicePreference::Metal
+        );
+        assert!(matches!(
+            cuda,
+            Err(Error::Invalid(message)) if message.contains(auto_phrase)
+        ));
+        assert!(matches!(
+            cuda_indexed,
+            Err(Error::Invalid(message)) if message.contains(auto_phrase)
+        ));
+    } else {
+        assert!(matches!(
+            metal_from_env,
+            Err(Error::Invalid(message)) if message.contains(auto_phrase)
+        ));
+        assert_eq!(cuda.unwrap(), greppy_embed_native::DevicePreference::Cuda);
+        assert_eq!(
+            cuda_indexed.unwrap(),
+            greppy_embed_native::DevicePreference::Cuda
+        );
+    }
     configure_explicit_cuda_device(Some("cuda:2")).unwrap();
     assert_eq!(env_nonempty(ENV_EMBED_CUDA_DEVICE).as_deref(), Some("2"));
     assert_eq!(env_nonempty(ENV_QWEN_CUDA_DEVICE).as_deref(), Some("2"));

@@ -223,6 +223,7 @@ impl WorkspaceCore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        crate::chunk_store::secure_private_dir(&root)?;
         let session_lease = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -322,6 +323,7 @@ impl WorkspaceCore {
                  PRIMARY KEY(ref_name, group_id, path)
              );",
         )?;
+        crate::chunk_store::secure_sqlite_file(&metadata_path)?;
         repository_layers::install_schema(&connection)?;
         repository_tracker::install_schema(&connection)?;
         if recovering {
@@ -3112,6 +3114,27 @@ mod tests {
     use super::*;
 
     const CRASH_CHILD_TEST: &str = "namespace::tests::crash_child_performs_operation";
+
+    #[cfg(unix)]
+    #[test]
+    fn open_keeps_metadata_database_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = parent.path().join("core");
+        let _core = WorkspaceCore::open(&root).unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(parent.path()), 0o755);
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("workspace.sqlite3")), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = root.join(format!("workspace.sqlite3{suffix}"));
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn repository_operation_lease_is_exclusive_and_released_by_drop() {
