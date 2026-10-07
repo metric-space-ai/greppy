@@ -12,6 +12,10 @@ pub enum RepositoryTrackerState {
     Requested,
     Active,
     Gap,
+    /// No workspace still references the repository. The row is kept so a later
+    /// request reuses this epoch; the tracker drops its watcher on the next
+    /// heartbeat because the row is no longer active.
+    Released,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +49,7 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS cow_repository_trackers (
              repository TEXT PRIMARY KEY,
-             state TEXT NOT NULL CHECK(state IN ('requested', 'active', 'gap')),
+             state TEXT NOT NULL CHECK(state IN ('requested', 'active', 'gap', 'released')),
              epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
              generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
              owner_pid INTEGER NOT NULL DEFAULT 0 CHECK(owner_pid >= 0),
@@ -77,6 +81,62 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
         "owner_pid",
         "INTEGER NOT NULL DEFAULT 0 CHECK(owner_pid >= 0)",
     )?;
+    ensure_released_state(connection)?;
+    Ok(())
+}
+
+/// SQLite cannot widen a CHECK constraint in place. Copy the existing rows into
+/// a table that also accepts `released`, then rename it back. No row is deleted
+/// or rewritten; child event and fence rows keep their repository keys.
+fn ensure_released_state(connection: &Connection) -> Result<()> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cow_repository_trackers'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if sql.as_deref().is_none_or(|sql| sql.contains("'released'")) {
+        return Ok(());
+    }
+    connection.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let rebuilt = rebuild_repository_trackers(connection);
+    let restored = connection.execute_batch("PRAGMA foreign_keys=ON");
+    rebuilt?;
+    restored?;
+    let mut violations = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = violations.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        return Err(Error::Corrupt(format!(
+            "repository tracker state migration left a foreign key violation in {table}"
+        )));
+    }
+    Ok(())
+}
+
+fn rebuild_repository_trackers(connection: &Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS cow_repository_trackers_v2;
+         CREATE TABLE cow_repository_trackers_v2 (
+             repository TEXT PRIMARY KEY,
+             state TEXT NOT NULL CHECK(state IN ('requested', 'active', 'gap', 'released')),
+             epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
+             generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+             owner_pid INTEGER NOT NULL DEFAULT 0 CHECK(owner_pid >= 0),
+             heartbeat_unix_ms INTEGER NOT NULL DEFAULT 0 CHECK(heartbeat_unix_ms >= 0),
+             detail TEXT
+         );
+         INSERT INTO cow_repository_trackers_v2(
+             repository, state, epoch, generation, owner_pid, heartbeat_unix_ms, detail
+         )
+         SELECT repository, state, epoch, generation, owner_pid, heartbeat_unix_ms, detail
+         FROM cow_repository_trackers;
+         DROP TABLE cow_repository_trackers;
+         ALTER TABLE cow_repository_trackers_v2 RENAME TO cow_repository_trackers;",
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -388,6 +448,19 @@ pub(crate) fn heartbeat(
     Ok(())
 }
 
+/// Marks a tracker released without discarding its epoch. The row stops
+/// accepting heartbeats, so `supervise` drops the watcher, and a later request
+/// takes the existing re-request path.
+pub(crate) fn release(connection: &Connection, repository: &Path) -> Result<()> {
+    connection.execute(
+        "UPDATE cow_repository_trackers
+         SET state = 'released', owner_pid = 0, detail = NULL
+         WHERE repository = ?1 AND state != 'released'",
+        params![path_text(repository)?],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn status(
     connection: &Connection,
     repository: &Path,
@@ -494,6 +567,7 @@ fn parse_state(value: &str) -> Result<RepositoryTrackerState> {
         "requested" => Ok(RepositoryTrackerState::Requested),
         "active" => Ok(RepositoryTrackerState::Active),
         "gap" => Ok(RepositoryTrackerState::Gap),
+        "released" => Ok(RepositoryTrackerState::Released),
         other => Err(Error::Corrupt(format!(
             "invalid repository tracker state {other}"
         ))),
@@ -680,5 +754,122 @@ mod tests {
             .filter(|column| column == "owner_pid")
             .count();
         assert_eq!(owner_columns, 1);
+    }
+
+    #[test]
+    fn schema_upgrade_preserves_rows_when_adding_released() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cow_repository_trackers (
+                     repository TEXT PRIMARY KEY,
+                     state TEXT NOT NULL CHECK(state IN ('requested', 'active', 'gap')),
+                     epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
+                     generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+                     owner_pid INTEGER NOT NULL DEFAULT 0 CHECK(owner_pid >= 0),
+                     heartbeat_unix_ms INTEGER NOT NULL DEFAULT 0 CHECK(heartbeat_unix_ms >= 0),
+                     detail TEXT
+                 );
+                 CREATE TABLE cow_repository_events (
+                     repository TEXT NOT NULL REFERENCES cow_repository_trackers(repository)
+                         ON DELETE CASCADE,
+                     epoch INTEGER NOT NULL CHECK(epoch >= 0),
+                     generation INTEGER NOT NULL CHECK(generation >= 0),
+                     path TEXT NOT NULL,
+                     PRIMARY KEY(repository, epoch, generation, path)
+                 );
+                 CREATE TABLE cow_repository_fences (
+                     repository TEXT NOT NULL REFERENCES cow_repository_trackers(repository)
+                         ON DELETE CASCADE,
+                     epoch INTEGER NOT NULL CHECK(epoch >= 0),
+                     path TEXT NOT NULL,
+                     observed_unix_ms INTEGER NOT NULL CHECK(observed_unix_ms >= 0),
+                     PRIMARY KEY(repository, epoch, path)
+                 );
+                 INSERT INTO cow_repository_trackers(
+                     repository, state, epoch, generation, owner_pid, heartbeat_unix_ms, detail
+                 ) VALUES('/repo', 'active', 7, 3, 11, 99, 'kept');
+                 INSERT INTO cow_repository_events(repository, epoch, generation, path)
+                 VALUES('/repo', 7, 3, 'src/lib.rs');
+                 INSERT INTO cow_repository_fences(
+                     repository, epoch, path, observed_unix_ms
+                 ) VALUES('/repo', 7, '.git/fence', 99);",
+            )
+            .unwrap();
+
+        install_schema(&connection).unwrap();
+        install_schema(&connection).unwrap();
+
+        let preserved: (String, i64, i64, i64, String) = connection
+            .query_row(
+                "SELECT state, epoch, generation, owner_pid, detail
+                 FROM cow_repository_trackers WHERE repository = '/repo'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, ("active".into(), 7, 3, 11, "kept".into()));
+        let event: String = connection
+            .query_row(
+                "SELECT path FROM cow_repository_events WHERE repository = '/repo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "src/lib.rs");
+        connection
+            .execute(
+                "UPDATE cow_repository_trackers SET state = 'released' WHERE repository = '/repo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            status(&connection, Path::new("/repo"))
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTrackerState::Released
+        );
+    }
+
+    #[test]
+    fn release_keeps_the_epoch_and_fails_the_owner_heartbeat() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        install_schema(&connection).unwrap();
+        let repository = Path::new("/repo");
+        request(&mut connection, repository, 100).unwrap();
+        let active = activate(&mut connection, repository, 101).unwrap();
+        record(&mut connection, repository, &["src/lib.rs".into()], 102).unwrap();
+
+        release(&connection, repository).unwrap();
+        let released = status(&connection, repository).unwrap().unwrap();
+        assert_eq!(released.state, RepositoryTrackerState::Released);
+        assert_eq!(released.epoch, active.epoch);
+        assert_eq!(released.owner_pid, 0);
+        assert_eq!(released.detail, None);
+        assert!(matches!(
+            heartbeat(&connection, repository, 103),
+            Err(Error::ConcurrentRepositoryMutation)
+        ));
+        assert!(changes_since(&connection, repository, active.epoch, 0).is_err());
+
+        request(&mut connection, repository, 104).unwrap();
+        let requested = status(&connection, repository).unwrap().unwrap();
+        assert_eq!(requested.state, RepositoryTrackerState::Requested);
+        assert_eq!(requested.epoch, active.epoch);
+        let restarted = activate(&mut connection, repository, 105).unwrap();
+        assert!(restarted.epoch > active.epoch);
+        assert_eq!(restarted.generation, 0);
+        assert_eq!(restarted.state, RepositoryTrackerState::Active);
     }
 }

@@ -688,6 +688,7 @@ impl WorkspaceCore {
             }
         }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let repositories = tracked_repositories(&transaction, &[content_id, git_id])?;
         transaction.execute(
             "UPDATE cow_workspace_pairs SET state = 'removing'
              WHERE content_id = ?1 AND git_id = ?2",
@@ -701,6 +702,7 @@ impl WorkspaceCore {
             "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
             params![content_id, git_id],
         )?;
+        release_unreferenced_repository_trackers(&transaction, &repositories)?;
         transaction.commit()?;
         for chunk in chunks {
             self.chunks.unpin(chunk)?;
@@ -2005,10 +2007,12 @@ impl WorkspaceCore {
         let mut connection = self.lock_metadata()?;
         let chunks = workspace_chunks(&connection, &workspace.id)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let repositories = tracked_repositories(&transaction, &[&workspace.id])?;
         transaction.execute(
             "DELETE FROM cow_workspaces WHERE id = ?1",
             params![workspace.id],
         )?;
+        release_unreferenced_repository_trackers(&transaction, &repositories)?;
         transaction.commit()?;
         self.promoted_origins
             .lock()
@@ -2051,6 +2055,7 @@ impl WorkspaceCore {
                 let Some(_lease) = lease else {
                     continue;
                 };
+                let repositories = tracked_repositories(&transaction, &[&content_id, &git_id])?;
                 transaction.execute(
                     "DELETE FROM cow_workspaces WHERE id IN (?1, ?2)",
                     params![content_id, git_id],
@@ -2059,6 +2064,7 @@ impl WorkspaceCore {
                     "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
                     params![content_id, git_id],
                 )?;
+                release_unreferenced_repository_trackers(&transaction, &repositories)?;
             }
             transaction.commit()?;
         }
@@ -2935,6 +2941,42 @@ fn normalize_path(path: &Path, allow_root: bool) -> Result<String> {
         return Err(Error::InvalidPath("empty workspace path".into()));
     }
     Ok(normalized)
+}
+
+fn tracked_repositories(connection: &Connection, ids: &[&str]) -> Result<Vec<String>> {
+    let mut repositories = Vec::new();
+    for id in ids {
+        if let Some(repository) = connection
+            .query_row(
+                "SELECT repository FROM cow_workspaces WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            repositories.push(repository);
+        }
+    }
+    repositories.sort();
+    repositories.dedup();
+    Ok(repositories)
+}
+
+fn release_unreferenced_repository_trackers(
+    connection: &Connection,
+    repositories: &[String],
+) -> Result<()> {
+    for repository in repositories {
+        let still_referenced: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE repository = ?1)",
+            params![repository],
+            |row| row.get(0),
+        )?;
+        if !still_referenced {
+            repository_tracker::release(connection, Path::new(repository))?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_workspace_id(id: &str) -> Result<()> {
