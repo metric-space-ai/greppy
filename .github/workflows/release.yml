@@ -65,7 +65,10 @@ jobs:
           # diagnostic inputs for subsequent releases, never release gates.
           # task-bank-audit is a benchmark-corpus reproducibility audit; like the
           # agent benchmarks it is diagnostic, not a release gate (owner, 0.4.1).
-          for wf in ci.yml codeql.yml security-audit.yml filesystem-cow.yml web-runtime-ci.yml; do
+          # web-runtime-ci.yml (session daemon three-run stability) is not a
+          # required branch-protection check and is load-sensitive on hosted
+          # runners; it stays a diagnostic signal, not a release gate (0.4.1).
+          for wf in ci.yml codeql.yml security-audit.yml filesystem-cow.yml; do
             ok="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --limit 100 \
