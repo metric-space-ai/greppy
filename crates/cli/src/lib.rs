@@ -3033,7 +3033,11 @@ fn dispatch_subcommand(
                     EmbeddingCliArgs { device, no_gpu },
                     root,
                 )?;
-                exit = if index == 0 { status } else { exit.min(status) };
+                exit = if index == 0 {
+                    status
+                } else {
+                    combine_search_exit(exit, status)
+                };
             }
             Ok(exit)
         }
@@ -7568,6 +7572,17 @@ fn content_fallback(
 /// `file.rs::Symbol` qualified names greppy itself prints.
 fn looks_like_path(target: &str) -> bool {
     (target.contains('/') || target.contains('\\')) && !target.contains("::")
+}
+
+/// Exit code of a multi-name search: a retryable refusal (75) or an error
+/// outranks results, because the caller must retry rather than read a partial
+/// answer as final; otherwise any match (0) wins over no match (1).
+fn combine_search_exit(previous: i32, status: i32) -> i32 {
+    if status > 1 || previous > 1 {
+        previous.max(status)
+    } else {
+        previous.min(status)
+    }
 }
 
 fn looks_like_glob(target: &str) -> bool {

@@ -1496,11 +1496,7 @@ mod tests {
         loop {
             let watchers = live_watchers.load(Ordering::Acquire);
             let status = core.repository_tracker_status(repository).unwrap();
-            if watchers == 0
-                && status
-                    .as_ref()
-                    .is_some_and(|status| status.state == RepositoryTrackerState::Released)
-            {
+            if watchers == 0 && status.is_none() {
                 return;
             }
             assert!(
@@ -1543,13 +1539,10 @@ mod tests {
         );
 
         core.remove_workspace(second).unwrap();
-        let released = core
+        assert!(core
             .repository_tracker_status(&repository)
             .unwrap()
-            .expect("released tracker row");
-        assert_eq!(released.state, RepositoryTrackerState::Released);
-        assert_eq!(released.epoch, active.epoch);
-        assert_eq!(released.owner_pid, 0);
+            .is_none());
         wait_until_watcher_released(&core, &repository, &live_watchers, "last workspace");
 
         let again = core
@@ -1625,13 +1618,10 @@ mod tests {
             active
         );
         core.remove_workspace(second).unwrap();
-        let released = core
+        assert!(core
             .repository_tracker_status(&repository)
             .unwrap()
-            .unwrap();
-        assert_eq!(released.state, RepositoryTrackerState::Released);
-        assert_eq!(released.epoch, active.epoch);
-        assert_eq!(released.owner_pid, 0);
+            .is_none());
     }
 
     #[test]
@@ -1667,13 +1657,10 @@ mod tests {
                 .state,
             RepositoryTrackerState::Active
         );
-        assert_eq!(
-            core.repository_tracker_status(&only_pair)
-                .unwrap()
-                .unwrap()
-                .state,
-            RepositoryTrackerState::Released
-        );
+        assert!(core
+            .repository_tracker_status(&only_pair)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1704,12 +1691,10 @@ mod tests {
         }
 
         let core = WorkspaceCore::open(&root).unwrap();
-        let released = core
+        assert!(core
             .repository_tracker_status(&repository)
             .unwrap()
-            .unwrap();
-        assert_eq!(released.state, RepositoryTrackerState::Released);
-        assert_eq!(released.owner_pid, 0);
+            .is_none());
         assert!(core.list_workspaces().unwrap().is_empty());
     }
 }

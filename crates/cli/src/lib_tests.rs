@@ -3863,3 +3863,12 @@ fn bracketed_route_file_in_a_qualified_target_is_not_a_glob() {
     assert!(validate_nav_target("Store[0]").is_err());
     assert!(validate_nav_target("load*").is_err());
 }
+
+#[test]
+fn multi_name_search_exit_keeps_a_retryable_refusal() {
+    assert_eq!(combine_search_exit(0, 1), 0);
+    assert_eq!(combine_search_exit(1, 1), 1);
+    assert_eq!(combine_search_exit(0, 75), 75);
+    assert_eq!(combine_search_exit(75, 1), 75);
+    assert_eq!(combine_search_exit(1, 75), 75);
+}

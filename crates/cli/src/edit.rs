@@ -958,77 +958,59 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
             }
             _ => unreachable!(),
         };
-        let matches: Vec<serde_json::Value> = if located.kind == SelectorKind::Text {
-            let lines: Vec<usize> = located
-                .ranges
-                .iter()
-                .take(10)
-                .map(|(start, _)| edit_line_of_offset(&located.content, *start))
-                .collect();
-            if count > 0 {
-                let rendered = lines
+        // Every site with its line text (as before 0.4.2, `matches` keeps its
+        // `file:line:col: text` strings), so a caller can tell which match it
+        // meant; `match_lines` adds the bare line numbers.
+        let sites: Vec<String> = located
+            .ranges
+            .iter()
+            .take(20)
+            .map(|(start, _)| {
+                let ls = located.content[..*start]
                     .iter()
-                    .map(|line| format!("{}:{line}", located.rel))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let ellipsis = if count > lines.len() { " …" } else { "" };
-                message.push_str(&format!(
-                    "\nat {rendered}{ellipsis}\npass --expect {count} to change all of them, or extend OLD so it is unique"
-                ));
+                    .rposition(|&b| b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let le = located.content[*start..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|i| *start + i)
+                    .unwrap_or(located.content.len());
+                format!(
+                    "{}:{}:{}: {}",
+                    located.rel,
+                    edit_line_of_offset(&located.content, *start),
+                    *start - ls + 1,
+                    one_line_truncated(&String::from_utf8_lossy(&located.content[ls..le]), 200)
+                )
+            })
+            .collect();
+        for site in &sites {
+            message.push_str("\n  ");
+            message.push_str(site);
+        }
+        if located.kind == SelectorKind::Text && count > 0 {
+            if count > sites.len() {
+                message.push_str(&format!("\n  … {} more", count - sites.len()));
             }
-            lines
-                .iter()
-                .map(|line| serde_json::json!({"line": line}))
-                .collect()
-        } else {
-            let sites: Vec<String> = located
-                .ranges
-                .iter()
-                .take(20)
-                .map(|(start, _)| {
-                    format!(
-                        "{}:{}:{}: {}",
-                        located.rel,
-                        edit_line_of_offset(&located.content, *start),
-                        {
-                            let ls = located.content[..*start]
-                                .iter()
-                                .rposition(|&b| b == b'\n')
-                                .map(|i| i + 1)
-                                .unwrap_or(0);
-                            *start - ls + 1
-                        },
-                        {
-                            let ls = located.content[..*start]
-                                .iter()
-                                .rposition(|&b| b == b'\n')
-                                .map(|i| i + 1)
-                                .unwrap_or(0);
-                            let le = located.content[*start..]
-                                .iter()
-                                .position(|&b| b == b'\n')
-                                .map(|i| *start + i)
-                                .unwrap_or(located.content.len());
-                            one_line_truncated(
-                                &String::from_utf8_lossy(&located.content[ls..le]),
-                                200,
-                            )
-                        }
-                    )
-                })
-                .collect();
-            for site in &sites {
-                message.push_str("\n  ");
-                message.push_str(site);
-            }
-            if count == 0 {
-                let next =
-                    pattern_zero_match_next(located.needle.as_deref().unwrap_or(""), &located.rel);
-                message.push('\n');
-                message.push_str(&next);
-            }
-            sites.iter().map(|site| serde_json::json!(site)).collect()
-        };
+            message.push_str(&format!(
+                "\npass --expect {count} to change all of them, or extend OLD so it is unique"
+            ));
+        }
+        if located.kind == SelectorKind::Pattern && count == 0 {
+            let next =
+                pattern_zero_match_next(located.needle.as_deref().unwrap_or(""), &located.rel);
+            message.push('\n');
+            message.push_str(&next);
+        }
+        let matches: Vec<serde_json::Value> =
+            sites.iter().map(|site| serde_json::json!(site)).collect();
+        let match_lines: Vec<serde_json::Value> = located
+            .ranges
+            .iter()
+            .take(20)
+            .map(|(start, _)| serde_json::json!({"line": edit_line_of_offset(&located.content, *start)}))
+            .collect();
         let want_nearest = count == 0
             && (located.kind == SelectorKind::Text
                 || located
@@ -1042,7 +1024,8 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
             .with("expected", serde_json::json!(expect))
             .with("count", serde_json::json!(count))
             .with("found", serde_json::json!(count))
-            .with("matches", serde_json::json!(matches));
+            .with("matches", serde_json::json!(matches))
+            .with("match_lines", serde_json::json!(match_lines));
         if located.kind == SelectorKind::Pattern && count == 0 {
             refusal = refusal.with(
                 "next",

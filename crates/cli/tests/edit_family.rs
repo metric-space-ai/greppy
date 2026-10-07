@@ -2501,7 +2501,8 @@ fn repeated_old_names_both_lines_and_the_expect_flag() {
         text.contains("OLD occurs 2 times, expected 1 — nothing written"),
         "{text}"
     );
-    assert!(text.contains("at repeated.txt:1, repeated.txt:3"), "{text}");
+    assert!(text.contains("repeated.txt:1:1: alpha"), "{text}");
+    assert!(text.contains("repeated.txt:3:1: alpha"), "{text}");
     assert!(text.contains("pass --expect 2"), "{text}");
     assert_file(&fixture.repo.join("repeated.txt"), before);
 
@@ -2510,8 +2511,8 @@ fn repeated_old_names_both_lines_and_the_expect_flag() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["error"]["count"], 2);
     assert_eq!(value["error"]["expected"], 1);
-    assert_eq!(value["error"]["matches"][0]["line"], 1);
-    assert_eq!(value["error"]["matches"][1]["line"], 3);
+    assert_eq!(value["error"]["match_lines"][0]["line"], 1);
+    assert_eq!(value["error"]["match_lines"][1]["line"], 3);
     assert_file(&fixture.repo.join("repeated.txt"), before);
 }
 
