@@ -116,8 +116,10 @@ fn ensure_released_state(connection: &Connection) -> Result<()> {
 }
 
 fn rebuild_repository_trackers(connection: &Connection) -> Result<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(
+    // `install_schema` only has a shared connection. An explicit transaction
+    // still makes the copy-and-rename atomic without requiring `&mut`.
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let rebuilt = connection.execute_batch(
         "DROP TABLE IF EXISTS cow_repository_trackers_v2;
          CREATE TABLE cow_repository_trackers_v2 (
              repository TEXT PRIMARY KEY,
@@ -135,8 +137,12 @@ fn rebuild_repository_trackers(connection: &Connection) -> Result<()> {
          FROM cow_repository_trackers;
          DROP TABLE cow_repository_trackers;
          ALTER TABLE cow_repository_trackers_v2 RENAME TO cow_repository_trackers;",
-    )?;
-    transaction.commit()?;
+    );
+    if rebuilt.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    rebuilt?;
+    connection.execute_batch("COMMIT")?;
     Ok(())
 }
 
