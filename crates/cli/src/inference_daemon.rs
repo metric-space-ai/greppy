@@ -19,6 +19,12 @@ const CAPACITY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const CAPACITY_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
 const ENV_RUNTIME_DIR: &str = "GREPPY_RUNTIME_DIR";
 const ENV_WEB_RUNTIME_DIR: &str = "GREPPY_WEB_RUNTIME_DIR";
+/// Cold Qwen loads on a busy Mac can exceed a minute. Summary requests do not
+/// spend that time against the inference deadline; the embedding daemon does
+/// not use this budget.
+pub(super) const SUMMARY_MODEL_LOAD_BUDGET: Duration = Duration::from_secs(180);
+const SUMMARY_LOG_PREFIX: &str = "summarize-daemon";
+const LOADING_STATUS_POLL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestOutcome<T> {
@@ -306,6 +312,7 @@ pub(super) struct ServerPolicy {
 struct RequestJob {
     id: String,
     raw: String,
+    enqueued: Instant,
     deadline: Instant,
     stream: TransportStream,
 }
@@ -511,6 +518,135 @@ fn retryable_capacity_response(response: &serde_json::Value) -> bool {
         )
 }
 
+#[cfg(debug_assertions)]
+fn configured_summary_model_load_budget() -> Duration {
+    const ENV_TEST_MODEL_LOAD_BUDGET: &str = "GREPPY_TEST_MODEL_LOAD_BUDGET_MS";
+    if let Some(ms) = std::env::var(ENV_TEST_MODEL_LOAD_BUDGET)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    SUMMARY_MODEL_LOAD_BUDGET
+}
+
+#[cfg(not(debug_assertions))]
+fn configured_summary_model_load_budget() -> Duration {
+    // Release builds ignore GREPPY_TEST_MODEL_LOAD_BUDGET_MS. The variable is a
+    // debug/test seam only, same as GREPPY_TEST_SKIP_INFERENCE.
+    SUMMARY_MODEL_LOAD_BUDGET
+}
+
+pub(super) fn summary_model_load_budget() -> Duration {
+    configured_summary_model_load_budget()
+}
+
+fn model_load_budget_for(log_prefix: &str) -> Option<Duration> {
+    if log_prefix == SUMMARY_LOG_PREFIX {
+        Some(summary_model_load_budget())
+    } else {
+        None
+    }
+}
+
+/// `ready` is when the model became ready. Time from `enqueued` until `ready`
+/// does not count against `request_deadline`, and that exemption cannot exceed
+/// `load_budget`. A `ready` in the future (or `ready == now` while the load is
+/// still running) keeps exempting until the budget is spent. A model that was
+/// already ready (`ready <= enqueued`) grants no exemption.
+fn queued_request_expired(
+    enqueued: Instant,
+    ready: Instant,
+    now: Instant,
+    request_deadline: Duration,
+    load_budget: Duration,
+) -> bool {
+    let elapsed = now.saturating_duration_since(enqueued);
+    let loading_end = if ready > now { now } else { ready };
+    let exempt = loading_end
+        .saturating_duration_since(enqueued)
+        .min(load_budget);
+    elapsed.saturating_sub(exempt) >= request_deadline
+}
+
+fn model_ready_instant(status: &RuntimeStatus, enqueued: Instant, now: Instant) -> Instant {
+    match status.state {
+        LifecycleState::Loading => now,
+        LifecycleState::Ready if status.state_started > enqueued => status.state_started,
+        _ => enqueued,
+    }
+}
+
+fn request_deadline_expired(
+    status: &Arc<Mutex<RuntimeStatus>>,
+    job: &RequestJob,
+    policy: ServerPolicy,
+    log_prefix: &str,
+) -> bool {
+    let Some(load_budget) = model_load_budget_for(log_prefix) else {
+        return Instant::now() >= job.deadline;
+    };
+    let now = Instant::now();
+    let ready = status
+        .lock()
+        .map(|status| model_ready_instant(&status, job.enqueued, now))
+        .unwrap_or(job.enqueued);
+    queued_request_expired(
+        job.enqueued,
+        ready,
+        now,
+        policy.request_deadline,
+        load_budget,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadWaitDecision {
+    Continue,
+    Fail,
+}
+
+/// After the caller's read timeout, keep the same in-flight request only while
+/// the daemon is still loading the model (or is busy with this request) and the
+/// total wait is inside `load_budget + read_timeout`.
+fn load_wait_decision(
+    state: &str,
+    active_request_id: Option<&str>,
+    request_id: &str,
+    elapsed: Duration,
+    load_budget: Duration,
+    read_timeout: Duration,
+) -> LoadWaitDecision {
+    let limit = read_timeout.saturating_add(load_budget);
+    if elapsed >= limit {
+        return LoadWaitDecision::Fail;
+    }
+    let loading = state == "loading";
+    let our_request = state == "busy" && active_request_id == Some(request_id);
+    if loading || our_request {
+        LoadWaitDecision::Continue
+    } else {
+        LoadWaitDecision::Fail
+    }
+}
+
+fn worker_watchdog_timed_out(
+    state: LifecycleState,
+    state_elapsed: Duration,
+    active_elapsed: Option<Duration>,
+    hard_timeout: Duration,
+    load_budget: Option<Duration>,
+) -> bool {
+    match load_budget {
+        Some(load_budget) if state == LifecycleState::Loading => state_elapsed >= load_budget,
+        Some(_) => active_elapsed.is_some_and(|elapsed| elapsed >= hard_timeout),
+        None => {
+            active_elapsed.is_some_and(|elapsed| elapsed >= hard_timeout)
+                || (state == LifecycleState::Loading && state_elapsed >= hard_timeout)
+        }
+    }
+}
+
 pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
     let request = serde_json::json!({"op": "status"});
     match self::request(
@@ -542,6 +678,179 @@ pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
             "state": "faulted",
             "last_error": "daemon status request failed",
         }),
+    }
+}
+
+/// Like [`request`], but a read timeout while the summary model is loading does
+/// not fail the call and does not send a second infer. Capacity retries keep
+/// the original `read_timeout` and the same request id.
+pub(super) fn request_waiting_for_model_load(
+    endpoint: &Endpoint,
+    mut value: serde_json::Value,
+    read_timeout: Duration,
+    load_budget: Duration,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+    mut on_wait: impl FnMut(Duration, &str),
+) -> RequestOutcome<serde_json::Value> {
+    let Some(request_id) = prepare_request_identity(&mut value) else {
+        return RequestOutcome::Failed;
+    };
+    let encoded = match serialize_json_frame(&value, max_request_bytes) {
+        Ok(encoded) => encoded,
+        Err(_) => return RequestOutcome::Failed,
+    };
+    let started = Instant::now();
+    let wait = ModelLoadWait {
+        started,
+        read_timeout,
+        load_budget,
+        request_id,
+    };
+    let capacity_deadline = started + read_timeout;
+    let mut retry_delay = CAPACITY_RETRY_INITIAL_DELAY;
+    let mut capacity_seen = false;
+    loop {
+        if capacity_seen && Instant::now() >= capacity_deadline {
+            return RequestOutcome::DaemonBusy;
+        }
+        let connect_timeout = if capacity_seen {
+            capacity_deadline.saturating_duration_since(Instant::now())
+        } else {
+            read_timeout.max(Duration::from_millis(1))
+        };
+        if connect_timeout.is_zero() {
+            return if capacity_seen {
+                RequestOutcome::DaemonBusy
+            } else {
+                RequestOutcome::Failed
+            };
+        }
+        match send_infer_and_wait_for_model(
+            endpoint,
+            &encoded,
+            &wait,
+            max_response_bytes,
+            connect_timeout,
+            &mut on_wait,
+        ) {
+            RequestAttempt::Response(response) if retryable_capacity_response(&response) => {
+                capacity_seen = true;
+                let Some(remaining) = capacity_deadline.checked_duration_since(Instant::now())
+                else {
+                    return RequestOutcome::DaemonBusy;
+                };
+                if remaining.is_zero() {
+                    return RequestOutcome::DaemonBusy;
+                }
+                std::thread::sleep(retry_delay.min(remaining));
+                retry_delay = retry_delay
+                    .checked_mul(2)
+                    .unwrap_or(CAPACITY_RETRY_MAX_DELAY)
+                    .min(CAPACITY_RETRY_MAX_DELAY);
+            }
+            RequestAttempt::Response(response) => return RequestOutcome::Response(response),
+            RequestAttempt::NoDaemon => return RequestOutcome::NoDaemon,
+            RequestAttempt::Failed if capacity_seen => return RequestOutcome::DaemonBusy,
+            RequestAttempt::Failed | RequestAttempt::RetryableCapacity => {
+                return RequestOutcome::Failed;
+            }
+        }
+    }
+}
+
+struct ModelLoadWait {
+    started: Instant,
+    read_timeout: Duration,
+    load_budget: Duration,
+    request_id: String,
+}
+
+fn prepare_request_identity(value: &mut serde_json::Value) -> Option<String> {
+    let object = value.as_object_mut()?;
+    object.insert("protocol".into(), PROTOCOL_VERSION.into());
+    object
+        .entry("request_id")
+        .or_insert_with(|| request_id().into());
+    object
+        .entry("client_id")
+        .or_insert_with(|| std::process::id().to_string().into());
+    object
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn send_infer_and_wait_for_model(
+    endpoint: &Endpoint,
+    encoded: &[u8],
+    wait: &ModelLoadWait,
+    max_response_bytes: usize,
+    connect_timeout: Duration,
+    on_wait: &mut impl FnMut(Duration, &str),
+) -> RequestAttempt<serde_json::Value> {
+    let mut stream = match TransportStream::connect(endpoint, connect_timeout) {
+        Ok(stream) => stream,
+        Err(error) if no_daemon_error(&error) => return RequestAttempt::NoDaemon,
+        Err(_) => return RequestAttempt::Failed,
+    };
+    let write_timeout = CONNECTION_WRITE_TIMEOUT.min(connect_timeout);
+    if stream.set_timeouts(write_timeout, connect_timeout).is_err() {
+        return RequestAttempt::Failed;
+    }
+    if write_frame(&mut stream, encoded, write_timeout).is_err() {
+        return RequestAttempt::Failed;
+    }
+    let mut pending = Vec::new();
+    let total = wait.read_timeout.saturating_add(wait.load_budget);
+    loop {
+        let elapsed = wait.started.elapsed();
+        if elapsed >= total {
+            return RequestAttempt::Failed;
+        }
+        let remaining = total.saturating_sub(elapsed);
+        let slice = LOADING_STATUS_POLL
+            .min(wait.read_timeout.max(Duration::from_millis(1)))
+            .min(remaining);
+        match read_frame_buffered(&mut stream, &mut pending, max_response_bytes, slice) {
+            Ok(frame) => {
+                if wait.started.elapsed() >= total {
+                    return RequestAttempt::Failed;
+                }
+                return match serde_json::from_str(&frame) {
+                    Ok(response) => RequestAttempt::Response(response),
+                    Err(_) => RequestAttempt::Failed,
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                let elapsed = wait.started.elapsed();
+                let status = diagnostic(endpoint);
+                let state = status
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let active = status
+                    .get("active_request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                on_wait(elapsed, &state);
+                if elapsed >= wait.read_timeout
+                    && load_wait_decision(
+                        &state,
+                        active.as_deref(),
+                        &wait.request_id,
+                        elapsed,
+                        wait.load_budget,
+                        wait.read_timeout,
+                    ) == LoadWaitDecision::Fail
+                {
+                    return RequestAttempt::Failed;
+                }
+            }
+            Err(_) => return RequestAttempt::Failed,
+        }
     }
 }
 
@@ -1020,6 +1329,7 @@ where
         Arc::clone(&status),
         Arc::clone(&stop),
         policy.hard_request_timeout,
+        model_load_budget_for(log_prefix),
         log_prefix,
     );
 
@@ -1043,7 +1353,7 @@ where
 
     loop {
         if let Some(mut job) = job_queue.pop_timeout(LOOP_INTERVAL) {
-            if Instant::now() >= job.deadline {
+            if request_deadline_expired(&status, &job, policy, log_prefix) {
                 reject(&status);
                 write_response(
                     &mut job.stream,
@@ -1278,12 +1588,14 @@ fn read_and_queue(
         }
         _ => {}
     }
-    let deadline = Instant::now() + policy.request_deadline;
+    let enqueued = Instant::now();
+    let deadline = enqueued + policy.request_deadline;
     jobs.push(
         client_id,
         RequestJob {
             id: id.clone(),
             raw,
+            enqueued,
             deadline,
             stream,
         },
@@ -1454,10 +1766,33 @@ fn read_frame(
     max_bytes: usize,
     timeout: Duration,
 ) -> std::io::Result<String> {
+    read_frame_buffered(stream, &mut Vec::new(), max_bytes, timeout)
+}
+
+/// Like [`read_frame`], but bytes already pulled from the socket stay in
+/// `pending` when the slice times out so a later read on the same connection
+/// cannot skip a partial frame.
+fn read_frame_buffered(
+    stream: &mut TransportStream,
+    pending: &mut Vec<u8>,
+    max_bytes: usize,
+    timeout: Duration,
+) -> std::io::Result<String> {
     let deadline = Instant::now() + timeout;
-    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
     let mut buffer = [0u8; 4096];
     loop {
+        if let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut frame: Vec<u8> = pending.drain(..=newline).collect();
+            frame.pop();
+            if frame.len() > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "daemon frame exceeds limit",
+                ));
+            }
+            return String::from_utf8(frame)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(std::io::Error::new(
@@ -1482,19 +1817,13 @@ fn read_frame(
                 ));
             }
             Ok(read) => {
-                let remaining = max_bytes.saturating_add(1).saturating_sub(bytes.len());
-                bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-                if bytes.len() > max_bytes {
+                let room = max_bytes.saturating_add(1).saturating_sub(pending.len());
+                pending.extend_from_slice(&buffer[..read.min(room)]);
+                if pending.len() > max_bytes {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "daemon frame exceeds limit",
                     ));
-                }
-                if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
-                    bytes.truncate(newline);
-                    return String::from_utf8(bytes).map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                    });
                 }
             }
             Err(error) if retryable_io(&error) => {
@@ -1567,6 +1896,7 @@ fn spawn_hung_worker_watchdog(
     status: Arc<Mutex<RuntimeStatus>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     timeout: Option<Duration>,
+    load_budget: Option<Duration>,
     log_prefix: &'static str,
 ) {
     let Some(timeout) = timeout else {
@@ -1576,11 +1906,15 @@ fn spawn_hung_worker_watchdog(
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             std::thread::sleep(LOOP_INTERVAL);
             let timed_out = status.lock().ok().is_some_and(|status| {
-                status
-                    .active_request_started
-                    .is_some_and(|started| started.elapsed() >= timeout)
-                    || (status.state == LifecycleState::Loading
-                        && status.state_started.elapsed() >= timeout)
+                worker_watchdog_timed_out(
+                    status.state,
+                    status.state_started.elapsed(),
+                    status
+                        .active_request_started
+                        .map(|started| started.elapsed()),
+                    timeout,
+                    load_budget,
+                )
             });
             if timed_out {
                 if log_enabled(log_prefix) {
@@ -3521,6 +3855,7 @@ mod tests {
     const CRASH_HELPER_IDENTITY: &str = "GREPPY_TEST_DAEMON_CRASH_IDENTITY";
     const HANG_HELPER: &str = "GREPPY_TEST_DAEMON_HANG";
     const HANG_LOAD_HELPER: &str = "GREPPY_TEST_DAEMON_HANG_LOAD";
+    const WATCHDOG_PREFIX: &str = "GREPPY_TEST_DAEMON_WATCHDOG_PREFIX";
 
     #[test]
     fn daemon_subprocess_helper() {
@@ -3531,6 +3866,10 @@ mod tests {
         let address = endpoint.address().to_string();
         let hang = std::env::var_os(HANG_HELPER).is_some();
         let hang_load = std::env::var_os(HANG_LOAD_HELPER).is_some();
+        let log_prefix = match std::env::var(WATCHDOG_PREFIX).ok().as_deref() {
+            Some(SUMMARY_LOG_PREFIX) => SUMMARY_LOG_PREFIX,
+            _ => "crash-test",
+        };
         let code = run_server(
             endpoint,
             &address,
@@ -3557,7 +3896,7 @@ mod tests {
                 }
                 serde_json::json!({"ok": model.is_some()})
             },
-            "crash-test",
+            log_prefix,
         );
         assert_eq!(code, 0);
     }
@@ -3865,5 +4204,411 @@ mod tests {
             read_frame(&mut TransportStream(reader), 16, Duration::from_millis(30)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn queued_request_expired_starts_at_ready_and_caps_the_load_budget() {
+        let enqueued = Instant::now();
+        let deadline = Duration::from_secs(60);
+        let budget = Duration::from_secs(180);
+        let ready = enqueued + Duration::from_secs(63);
+        assert!(
+            !queued_request_expired(enqueued, ready, ready, deadline, budget),
+            "a request that only waited on the load has not started its deadline"
+        );
+        assert!(!queued_request_expired(
+            enqueued,
+            ready,
+            ready + Duration::from_secs(59),
+            deadline,
+            budget
+        ));
+        assert!(queued_request_expired(
+            enqueued,
+            ready,
+            ready + Duration::from_secs(60),
+            deadline,
+            budget
+        ));
+
+        let already_ready = enqueued.checked_sub(Duration::from_secs(10)).unwrap();
+        assert!(!queued_request_expired(
+            enqueued,
+            already_ready,
+            enqueued + Duration::from_secs(59),
+            deadline,
+            budget
+        ));
+        assert!(queued_request_expired(
+            enqueued,
+            already_ready,
+            enqueued + Duration::from_secs(60),
+            deadline,
+            budget
+        ));
+
+        let still_loading = enqueued + Duration::from_secs(200);
+        assert!(!queued_request_expired(
+            enqueued,
+            still_loading,
+            enqueued + Duration::from_secs(239),
+            deadline,
+            budget
+        ));
+        assert!(
+            queued_request_expired(
+                enqueued,
+                still_loading,
+                enqueued + Duration::from_secs(240),
+                deadline,
+                budget
+            ),
+            "exemption stops at the load budget even if the model is not ready"
+        );
+    }
+
+    #[test]
+    fn load_wait_decision_continues_only_for_loading_or_our_busy_request() {
+        let budget = Duration::from_secs(180);
+        let read = Duration::from_secs(60);
+        assert_eq!(
+            load_wait_decision("loading", None, "id", Duration::from_secs(61), budget, read),
+            LoadWaitDecision::Continue
+        );
+        assert_eq!(
+            load_wait_decision(
+                "loading",
+                Some("other"),
+                "id",
+                Duration::from_secs(239),
+                budget,
+                read
+            ),
+            LoadWaitDecision::Continue
+        );
+        assert_eq!(
+            load_wait_decision(
+                "loading",
+                None,
+                "id",
+                Duration::from_secs(240),
+                budget,
+                read
+            ),
+            LoadWaitDecision::Fail
+        );
+        assert_eq!(
+            load_wait_decision(
+                "busy",
+                Some("id"),
+                "id",
+                Duration::from_secs(70),
+                budget,
+                read
+            ),
+            LoadWaitDecision::Continue
+        );
+        assert_eq!(
+            load_wait_decision(
+                "busy",
+                Some("other"),
+                "id",
+                Duration::from_secs(70),
+                budget,
+                read
+            ),
+            LoadWaitDecision::Fail
+        );
+        assert_eq!(
+            load_wait_decision("ready", None, "id", Duration::from_secs(70), budget, read),
+            LoadWaitDecision::Fail
+        );
+        assert_eq!(
+            load_wait_decision("faulted", None, "id", Duration::from_secs(10), budget, read),
+            LoadWaitDecision::Fail
+        );
+    }
+
+    #[test]
+    fn summary_watchdog_uses_the_load_budget_and_embedding_does_not() {
+        let hard = Duration::from_secs(75);
+        let load = Duration::from_secs(180);
+        assert!(!worker_watchdog_timed_out(
+            LifecycleState::Loading,
+            Duration::from_secs(75),
+            Some(Duration::from_secs(75)),
+            hard,
+            Some(load),
+        ));
+        assert!(worker_watchdog_timed_out(
+            LifecycleState::Loading,
+            Duration::from_secs(180),
+            Some(Duration::from_secs(180)),
+            hard,
+            Some(load),
+        ));
+        assert!(!worker_watchdog_timed_out(
+            LifecycleState::Ready,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(74)),
+            hard,
+            Some(load),
+        ));
+        assert!(worker_watchdog_timed_out(
+            LifecycleState::Ready,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(75)),
+            hard,
+            Some(load),
+        ));
+        assert!(
+            worker_watchdog_timed_out(
+                LifecycleState::Loading,
+                Duration::from_secs(75),
+                None,
+                hard,
+                None,
+            ),
+            "embedding keeps the hard timeout while loading"
+        );
+        let _lock = test_env_lock();
+        assert!(model_load_budget_for("embed-daemon").is_none());
+        std::env::remove_var("GREPPY_TEST_MODEL_LOAD_BUDGET_MS");
+        assert_eq!(
+            model_load_budget_for(SUMMARY_LOG_PREFIX),
+            Some(SUMMARY_MODEL_LOAD_BUDGET)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_build_honors_model_load_budget_override() {
+        let _lock = test_env_lock();
+        let _guard = EnvVarGuard::set("GREPPY_TEST_MODEL_LOAD_BUDGET_MS", "15");
+        assert_eq!(summary_model_load_budget(), Duration::from_millis(15));
+        assert_eq!(
+            model_load_budget_for(SUMMARY_LOG_PREFIX),
+            Some(Duration::from_millis(15))
+        );
+        assert!(model_load_budget_for("embed-daemon").is_none());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn summary_loading_watchdog_uses_model_load_budget() {
+        let _lock = test_env_lock();
+        let identity = format!("{}-{}", std::process::id(), request_id());
+        let endpoint = Endpoint::for_identity("crash-test", &identity).unwrap();
+        let mut hung = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("inference_daemon::tests::daemon_subprocess_helper")
+            .arg("--nocapture")
+            .env(CRASH_HELPER_IDENTITY, &identity)
+            .env(HANG_LOAD_HELPER, "1")
+            .env(WATCHDOG_PREFIX, SUMMARY_LOG_PREFIX)
+            .env("GREPPY_TEST_MODEL_LOAD_BUDGET_MS", "800")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn summary load watchdog child");
+        let observe_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if hung
+                .try_wait()
+                .expect("poll summary load watchdog")
+                .is_some()
+            {
+                panic!("summary model load exited before its load budget");
+            }
+            let status = diagnostic(&endpoint);
+            if status["state"] == "loading" {
+                break;
+            }
+            if Instant::now() >= observe_deadline {
+                let _ = hung.kill();
+                let _ = hung.wait();
+                panic!("summary model load did not report loading: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The helper's ready-request hard timeout is 100ms. Loading must survive it.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            hung.try_wait()
+                .expect("poll summary load watchdog")
+                .is_none(),
+            "summary model load was killed by the ready-request hard timeout"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = hung.try_wait().expect("poll summary load watchdog") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = hung.kill();
+                let _ = hung.wait();
+                panic!("summary model-load budget did not stop the worker");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(70));
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(endpoint.address());
+        let _ = std::fs::remove_file(endpoint.cooldown_path());
+    }
+
+    #[test]
+    fn cold_summary_load_keeps_one_infer_for_the_queued_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _lock = test_env_lock();
+        let endpoint = Endpoint::for_identity(
+            "summary-cold-load",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let server_endpoint = endpoint.clone();
+        let server_address = endpoint.address().to_string();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let infers = Arc::new(AtomicUsize::new(0));
+        let server_loads = Arc::clone(&loads);
+        let server_infers = Arc::clone(&infers);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            run_server(
+                server_endpoint,
+                &server_address,
+                ServerPolicy {
+                    model_ttl: Duration::from_secs(5),
+                    exit_ttl: Duration::from_secs(3),
+                    request_deadline: Duration::from_millis(250),
+                    hard_request_timeout: None,
+                    max_request_bytes: 4096,
+                    max_response_bytes: 4096,
+                },
+                false,
+                move || {
+                    server_loads.fetch_add(1, Ordering::SeqCst);
+                    let _ = release_rx.recv_timeout(Duration::from_secs(8));
+                    Ok::<_, String>(())
+                },
+                |_| "test-backend".to_string(),
+                move |raw| {
+                    let value: serde_json::Value =
+                        serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+                    if value.get("op").and_then(serde_json::Value::as_str) == Some("infer") {
+                        server_infers.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+                |_raw, model| serde_json::json!({"ok": model.is_some()}),
+                SUMMARY_LOG_PREFIX,
+            )
+        });
+        let _release = ReleaseOnDrop(Some(release_tx));
+        wait_for_server(&endpoint);
+
+        let client_read = Duration::from_millis(1_500);
+        let load_budget = Duration::from_secs(8);
+        let endpoint_a = endpoint.clone();
+        let first = std::thread::spawn(move || {
+            request_waiting_for_model_load(
+                &endpoint_a,
+                serde_json::json!({"op": "infer"}),
+                client_read,
+                load_budget,
+                4096,
+                4096,
+                |_, _| {},
+            )
+        });
+        let loading_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = diagnostic(&endpoint);
+            if status["state"] == "loading" {
+                break;
+            }
+            assert!(
+                Instant::now() < loading_deadline,
+                "cold load did not start: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let endpoint_b = endpoint.clone();
+        let second = std::thread::spawn(move || {
+            request_waiting_for_model_load(
+                &endpoint_b,
+                serde_json::json!({"op": "infer"}),
+                client_read,
+                load_budget,
+                4096,
+                4096,
+                |_, _| {},
+            )
+        });
+        // Past both the client read timeout and the server request deadline,
+        // and still inside the model-load budget.
+        std::thread::sleep(Duration::from_millis(2_000));
+        drop(_release);
+
+        let first = first.join().expect("first cold-load client");
+        let second = second.join().expect("queued cold-load client");
+        assert!(
+            matches!(first, RequestOutcome::Response(ref value) if value["ok"] == true && value.get("error").is_none()),
+            "first request lost the summary: {first:?}"
+        );
+        assert!(
+            matches!(second, RequestOutcome::Response(ref value) if value["ok"] == true && value.get("error").is_none()),
+            "queued request was dropped while the model loaded: {second:?}"
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "model loaded once");
+        assert_eq!(infers.load(Ordering::SeqCst), 2, "one infer per summary");
+        assert_eq!(
+            diagnostic(&endpoint)["rejected_requests"]
+                .as_u64()
+                .unwrap_or(1),
+            0
+        );
+        assert_eq!(server.join().expect("cold-load server"), 0);
+    }
+
+    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(debug_assertions)]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct ReleaseOnDrop(Option<mpsc::SyncSender<()>>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
     }
 }

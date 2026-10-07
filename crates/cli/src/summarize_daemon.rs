@@ -1,6 +1,7 @@
 //! Warm Qwen3.5 daemon for brief and semantic purpose summaries.
 #![cfg(any(unix, windows))]
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use super::inference_daemon::{self, Endpoint, RequestOutcome, ServerPolicy};
@@ -11,6 +12,9 @@ const DEFAULT_MODEL_TTL_S: u64 = 300;
 const DEFAULT_EXIT_TTL_S: u64 = 1800;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const HARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+const MODEL_LOAD_BUDGET: Duration = inference_daemon::SUMMARY_MODEL_LOAD_BUDGET;
+const SUMMARY_LOADING_PROGRESS: &str = "greppy: loading the summary model (first use) …";
+const LOADING_PROGRESS_AFTER: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
 const TRIAGE_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -198,12 +202,27 @@ fn request_brief(
         "path": path,
         "source": source,
     });
-    match inference_daemon::request(
+    let mut announced = false;
+    match inference_daemon::request_waiting_for_model_load(
         endpoint,
         request,
         timeout,
+        client_model_load_budget(),
         MAX_REQUEST_BYTES,
         MAX_RESPONSE_BYTES,
+        |elapsed, state| {
+            if announced
+                || !should_announce_summary_loading(
+                    elapsed,
+                    state,
+                    summary_loading_progress_enabled(),
+                )
+            {
+                return;
+            }
+            announced = true;
+            eprintln!("{SUMMARY_LOADING_PROGRESS}");
+        },
     ) {
         RequestOutcome::Response(response) => {
             if response.get("error").is_some() {
@@ -346,12 +365,49 @@ pub(super) fn daemon_main(socket: String, cfg: super::QwenSummaryConfig, prewarm
         &socket,
         policy,
         prewarm,
-        || super::load_qwen35_summarizer(&cfg).map_err(|error| error.to_string()),
+        || {
+            #[cfg(debug_assertions)]
+            apply_test_summary_load_delay();
+            super::load_qwen35_summarizer(&cfg).map_err(|error| error.to_string())
+        },
         |model| model.backend_name().to_string(),
         |raw| validate(raw, &model_key),
         respond,
         "summarize-daemon",
     )
+}
+
+fn client_model_load_budget() -> Duration {
+    let configured = inference_daemon::summary_model_load_budget();
+    // A zero debug override must not disable the wait. Production is
+    // `MODEL_LOAD_BUDGET`; shorter `GREPPY_TEST_MODEL_LOAD_BUDGET_MS` values pass.
+    if configured.is_zero() {
+        MODEL_LOAD_BUDGET
+    } else {
+        configured
+    }
+}
+
+fn summary_loading_progress_enabled() -> bool {
+    std::env::var("GREPPY_PROGRESS").ok().as_deref() == Some("1") || std::io::stderr().is_terminal()
+}
+
+fn should_announce_summary_loading(elapsed: Duration, state: &str, progress_enabled: bool) -> bool {
+    progress_enabled && elapsed > LOADING_PROGRESS_AFTER && state == "loading"
+}
+
+/// Test-only pause before the real summary model load. Ignored in release
+/// builds, matching `GREPPY_TEST_SKIP_INFERENCE`.
+#[cfg(debug_assertions)]
+fn apply_test_summary_load_delay() {
+    const ENV_TEST_LOAD_DELAY: &str = "GREPPY_TEST_SUMMARY_LOAD_DELAY_MS";
+    if let Some(ms) = std::env::var(ENV_TEST_LOAD_DELAY)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 }
 
 fn validate(raw: &str, model_key: &str) -> Result<(), serde_json::Value> {
@@ -696,6 +752,74 @@ mod tests {
     fn default_ttls_cover_agent_session_bursts() {
         assert_eq!(DEFAULT_MODEL_TTL_S, 300);
         assert_eq!(DEFAULT_EXIT_TTL_S, 1800);
+    }
+
+    #[test]
+    fn model_load_budget_is_three_minutes() {
+        assert_eq!(MODEL_LOAD_BUDGET, Duration::from_secs(180));
+        assert_eq!(
+            inference_daemon::SUMMARY_MODEL_LOAD_BUDGET,
+            MODEL_LOAD_BUDGET
+        );
+    }
+
+    #[test]
+    fn summary_loading_progress_is_one_stderr_line_after_five_seconds() {
+        assert_eq!(
+            SUMMARY_LOADING_PROGRESS,
+            "greppy: loading the summary model (first use) …"
+        );
+        assert!(!SUMMARY_LOADING_PROGRESS.contains('\n'));
+        assert!(!should_announce_summary_loading(
+            Duration::from_secs(5),
+            "loading",
+            true
+        ));
+        assert!(should_announce_summary_loading(
+            Duration::from_secs(5) + Duration::from_millis(1),
+            "loading",
+            true
+        ));
+        assert!(!should_announce_summary_loading(
+            Duration::from_secs(30),
+            "loading",
+            false
+        ));
+        assert!(!should_announce_summary_loading(
+            Duration::from_secs(30),
+            "busy",
+            true
+        ));
+        assert!(!should_announce_summary_loading(
+            Duration::from_secs(30),
+            "ready",
+            true
+        ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_summary_load_delay_is_ignored_until_configured() {
+        let started = std::time::Instant::now();
+        apply_test_summary_load_delay();
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        let previous = std::env::var_os("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS");
+        std::env::set_var("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS", "40");
+        let started = std::time::Instant::now();
+        let result = std::panic::catch_unwind(|| apply_test_summary_load_delay());
+        let elapsed = started.elapsed();
+        if let Some(previous) = previous {
+            std::env::set_var("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS", previous);
+        } else {
+            std::env::remove_var("GREPPY_TEST_SUMMARY_LOAD_DELAY_MS");
+        }
+        assert!(result.is_ok());
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "configured test load delay was ignored: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
