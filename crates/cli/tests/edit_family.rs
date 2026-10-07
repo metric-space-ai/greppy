@@ -2422,3 +2422,125 @@ fn rename_receipt_lines_stay_exact_when_the_new_name_is_longer() {
     let content = std::fs::read_to_string(fixture.repo.join("lib.rs")).unwrap();
     assert_eq!(content.matches("a_much_longer_replacement_name").count(), 4);
 }
+
+#[test]
+fn replace_lines_syntax_error_names_allow_syntax_errors() {
+    let fixture = Fixture::new("syntax-refuse-next");
+    let before = "fn before() {}\n";
+    std::fs::write(fixture.repo.join("item.rs"), before).unwrap();
+    let refused = fixture.run(&["replace-lines", "item.rs", "1:1", "fn after( {}"]);
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    let text = combined(&refused);
+    assert!(text.contains("--allow-syntax-errors"), "{text}");
+    assert!(
+        text.contains(
+            "next: make the whole change in one `greppy patch` so the file is valid at the end, or re-run with --allow-syntax-errors to write this intermediate state"
+        ),
+        "{text}"
+    );
+    assert_file(&fixture.repo.join("item.rs"), before);
+
+    let output = fixture.run(&["replace-lines", "item.rs", "1:1", "fn after( {}", "--json"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["published"], false);
+    assert_eq!(value["error"]["code"], "invalid_result");
+    let next = value["error"]["next"].as_str().unwrap();
+    assert!(next.contains("--allow-syntax-errors"), "{next}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-syntax-errors"),
+        "{}",
+        combined(&output)
+    );
+    assert_file(&fixture.repo.join("item.rs"), before);
+}
+
+#[test]
+fn allow_syntax_errors_writes_and_reports_new_diagnostics() {
+    let fixture = Fixture::new("syntax-allow");
+    for (file, json) in [("item.rs", false), ("item-json.rs", true)] {
+        let path = fixture.repo.join(file);
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+        let mut args = vec!["replace-lines", file, "1:1", "fn after( {}"];
+        args.push("--allow-syntax-errors");
+        if json {
+            args.push("--json");
+        }
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["published"], true);
+            let message = value["message"].as_str().unwrap();
+            assert!(message.contains("new syntax errors"), "{message}");
+            assert!(
+                message.contains("allowed by --allow-syntax-errors"),
+                "{message}"
+            );
+        } else {
+            let text = combined(&output);
+            assert!(text.contains("new syntax errors"), "{text}");
+            assert!(text.contains("allowed by --allow-syntax-errors"), "{text}");
+        }
+        assert_file(&path, "fn after( {}\n");
+    }
+}
+
+#[test]
+fn repeated_old_names_both_lines_and_the_expect_flag() {
+    let fixture = Fixture::new("old-cardinality");
+    let before = "alpha\nbeta\nalpha\ngamma\n";
+    std::fs::write(fixture.repo.join("repeated.txt"), before).unwrap();
+    let output = fixture.run(&["replace-text", "repeated.txt", "alpha", "ALPHA"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("OLD occurs 2 times, expected 1 — nothing written"),
+        "{text}"
+    );
+    assert!(text.contains("at repeated.txt:1, repeated.txt:3"), "{text}");
+    assert!(text.contains("pass --expect 2"), "{text}");
+    assert_file(&fixture.repo.join("repeated.txt"), before);
+
+    let output = fixture.run(&["replace-text", "repeated.txt", "alpha", "ALPHA", "--json"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["count"], 2);
+    assert_eq!(value["error"]["expected"], 1);
+    assert_eq!(value["error"]["matches"][0]["line"], 1);
+    assert_eq!(value["error"]["matches"][1]["line"], 3);
+    assert_file(&fixture.repo.join("repeated.txt"), before);
+}
+
+#[test]
+fn regex_with_no_matches_names_search_pattern() {
+    let fixture = Fixture::new("regex-zero");
+    std::fs::write(fixture.repo.join("a.txt"), "alpha\n").unwrap();
+    let output = fixture.run(&["replace-text", "a.txt", "absent_token", "unused", "--regex"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("greppy search-pattern absent_token a.txt"),
+        "{text}"
+    );
+    assert_file(&fixture.repo.join("a.txt"), "alpha\n");
+
+    let output = fixture.run(&[
+        "replace-text",
+        "a.txt",
+        "absent_token",
+        "unused",
+        "--regex",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let next = value["error"]["next"].as_str().unwrap();
+    assert!(
+        next.contains("greppy search-pattern absent_token a.txt"),
+        "{next}"
+    );
+}

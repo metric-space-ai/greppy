@@ -524,6 +524,7 @@ pub enum EditCommand {
         regex: bool,
         dry_run: bool,
         verify: bool,
+        allow_syntax_errors: bool,
     },
     ReplaceLines {
         file: String,
@@ -531,6 +532,7 @@ pub enum EditCommand {
         new: Option<String>,
         dry_run: bool,
         verify: bool,
+        allow_syntax_errors: bool,
     },
     ReplaceSpan {
         handle: String,
@@ -543,6 +545,7 @@ pub enum EditCommand {
         new: Option<String>,
         dry_run: bool,
         verify: bool,
+        allow_syntax_errors: bool,
     },
     Delete {
         symbol: String,
@@ -554,6 +557,7 @@ pub enum EditCommand {
         lines: String,
         dry_run: bool,
         verify: bool,
+        allow_syntax_errors: bool,
     },
     InsertLines {
         file: String,
@@ -561,6 +565,7 @@ pub enum EditCommand {
         new: Option<String>,
         dry_run: bool,
         verify: bool,
+        allow_syntax_errors: bool,
     },
     Rename {
         symbol: String,
@@ -577,6 +582,7 @@ pub enum EditCommand {
         diff: Option<String>,
         dry_run: bool,
         verify: bool,
+        allow_syntax_errors: bool,
     },
 }
 
@@ -2622,6 +2628,7 @@ fn dispatch_subcommand(
             regex,
             dry_run,
             verify,
+            allow_syntax_errors,
             json,
         } => dispatch_edit(
             EditCommand::ReplaceText {
@@ -2632,6 +2639,7 @@ fn dispatch_subcommand(
                 regex,
                 dry_run,
                 verify,
+                allow_syntax_errors,
             },
             json,
             root,
@@ -2642,6 +2650,7 @@ fn dispatch_subcommand(
             new,
             dry_run,
             verify,
+            allow_syntax_errors,
             json,
         } => dispatch_edit(
             EditCommand::ReplaceLines {
@@ -2650,6 +2659,7 @@ fn dispatch_subcommand(
                 new,
                 dry_run,
                 verify,
+                allow_syntax_errors,
             },
             json,
             root,
@@ -2678,6 +2688,7 @@ fn dispatch_subcommand(
             new,
             dry_run,
             verify,
+            allow_syntax_errors,
             json,
         } => dispatch_edit(
             EditCommand::Write {
@@ -2685,6 +2696,7 @@ fn dispatch_subcommand(
                 new,
                 dry_run,
                 verify,
+                allow_syntax_errors,
             },
             json,
             root,
@@ -2708,6 +2720,7 @@ fn dispatch_subcommand(
             lines,
             dry_run,
             verify,
+            allow_syntax_errors,
             json,
         } => dispatch_edit(
             EditCommand::DeleteLines {
@@ -2715,6 +2728,7 @@ fn dispatch_subcommand(
                 lines,
                 dry_run,
                 verify,
+                allow_syntax_errors,
             },
             json,
             root,
@@ -2725,6 +2739,7 @@ fn dispatch_subcommand(
             new,
             dry_run,
             verify,
+            allow_syntax_errors,
             json,
         } => dispatch_edit(
             EditCommand::InsertLines {
@@ -2733,6 +2748,7 @@ fn dispatch_subcommand(
                 new,
                 dry_run,
                 verify,
+                allow_syntax_errors,
             },
             json,
             root,
@@ -2771,12 +2787,14 @@ fn dispatch_subcommand(
             diff,
             dry_run,
             verify,
+            allow_syntax_errors,
             json,
         } => dispatch_edit(
             EditCommand::Patch {
                 diff,
                 dry_run,
                 verify,
+                allow_syntax_errors,
             },
             json,
             root,
@@ -6763,16 +6781,6 @@ impl SelectorKind {
             self,
             SelectorKind::Lines | SelectorKind::Symbol | SelectorKind::Target
         )
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            SelectorKind::Text => "--old",
-            SelectorKind::Pattern => "--pattern",
-            SelectorKind::Lines => "--lines",
-            SelectorKind::Symbol => "--symbol",
-            SelectorKind::Target => "--target",
-        }
     }
 }
 

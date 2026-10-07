@@ -368,6 +368,9 @@ pub enum Command {
         /// preserve shell $ROOT). Unknown capture references are refused before anything is written.
         #[arg(long)]
         regex: bool,
+        /// Write even if the result has more syntax errors than the current file.
+        #[arg(long)]
+        allow_syntax_errors: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -384,6 +387,9 @@ pub enum Command {
         lines: String,
         #[arg(value_name = "NEW", allow_hyphen_values = true)]
         new: Option<String>,
+        /// Write even if the result has more syntax errors than the current file.
+        #[arg(long)]
+        allow_syntax_errors: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -412,6 +418,9 @@ pub enum Command {
         path: String,
         #[arg(value_name = "NEW", allow_hyphen_values = true)]
         new: Option<String>,
+        /// Write even if the result has more syntax errors than the current file.
+        #[arg(long)]
+        allow_syntax_errors: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -438,6 +447,9 @@ pub enum Command {
         file: String,
         #[arg(value_name = "A:B", allow_hyphen_values = true)]
         lines: String,
+        /// Write even if the result has more syntax errors than the current file.
+        #[arg(long)]
+        allow_syntax_errors: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -454,6 +466,9 @@ pub enum Command {
         line: usize,
         #[arg(value_name = "NEW", allow_hyphen_values = true)]
         new: Option<String>,
+        /// Write even if the result has more syntax errors than the current file.
+        #[arg(long)]
+        allow_syntax_errors: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -496,6 +511,9 @@ pub enum Command {
     Patch {
         #[arg(value_name = "DIFF", allow_hyphen_values = true)]
         diff: Option<String>,
+        /// Write even if the result has more syntax errors than the current file.
+        #[arg(long)]
+        allow_syntax_errors: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]

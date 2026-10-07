@@ -799,11 +799,67 @@ pub(crate) fn edit_locate(
     }
 }
 
+/// Byte Levenshtein distance, stopping once every partial alignment already
+/// exceeds `max_dist`. Similarity uses byte length, matching `str::len`.
+fn levenshtein_within(left: &[u8], right: &[u8], max_dist: usize) -> bool {
+    let (left, right) = if left.len() > right.len() {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    let mut prev: Vec<usize> = (0..=right.len()).collect();
+    let mut curr = vec![0; right.len() + 1];
+    for (i, &byte) in left.iter().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+        for (j, &other) in right.iter().enumerate() {
+            let best = (curr[j] + 1)
+                .min(prev[j + 1] + 1)
+                .min(prev[j] + usize::from(byte != other));
+            curr[j + 1] = best;
+            row_min = row_min.min(best);
+        }
+        if row_min > max_dist {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[right.len()] <= max_dist
+}
+
+/// Whitespace-normalized lines match at similarity >= 0.8
+/// (`1 - levenshtein/max_len`). Equality stays a fast path.
+fn normalized_line_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let max_len = left.len().max(right.len());
+    if max_len == 0 {
+        return true;
+    }
+    let min_len = left.len().min(right.len());
+    if min_len.saturating_mul(5) < max_len.saturating_mul(4) {
+        return false;
+    }
+    let max_dist = max_len / 5;
+    max_dist > 0 && levenshtein_within(left.as_bytes(), right.as_bytes(), max_dist)
+}
+
+fn pattern_has_regex_metacharacters(pattern: &str) -> bool {
+    pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        )
+    })
+}
+
 /// Where an OLD text that matched nowhere most likely sits: the window of file
-/// lines equal to OLD up to whitespace, or else the window sharing the most
-/// whitespace-normalized lines with it (at least half, one of them substantive).
-/// Returns 1-based inclusive lines, the window's exact text, and whether only
-/// whitespace differs. Models that copy OLD from earlier ranged reads often get
+/// lines equal to OLD up to whitespace, or else the window whose
+/// whitespace-normalized lines are similar (similarity >= 0.8) for at least
+/// half of the lines, one of them substantive (>= 8 chars). Returns 1-based
+/// inclusive lines, the window's exact text, and whether only whitespace
+/// differs. Models that copy OLD from earlier ranged reads often get
 /// indentation wrong; without this they re-read the same file again and again.
 pub(crate) fn nearest_old_candidate(
     content: &[u8],
@@ -835,7 +891,10 @@ pub(crate) fn nearest_old_candidate(
         let mut equal = 0;
         let mut substantive = false;
         for (offset, line) in wanted.iter().enumerate() {
-            if !line.is_empty() && normalized[start + offset] == *line {
+            if line.is_empty() {
+                continue;
+            }
+            if normalized_line_matches(line, &normalized[start + offset]) {
                 equal += 1;
                 substantive |= line.len() >= 8;
             }
@@ -847,6 +906,36 @@ pub(crate) fn nearest_old_candidate(
     best.map(|(start, _)| (start + 1, start + n, window(start), false))
 }
 
+fn pattern_zero_match_next(pattern: &str, rel: &str) -> String {
+    format!("next: test the pattern with `greppy search-pattern {pattern} {rel}`")
+}
+
+fn append_nearest_old_hint(
+    message: &mut String,
+    located: &Located,
+) -> Option<(usize, usize, bool)> {
+    let (first, last, text, whitespace_only) = located
+        .needle
+        .as_deref()
+        .and_then(|needle| nearest_old_candidate(&located.content, needle))?;
+    let shown: Vec<&str> = text.split('\n').take(30).collect();
+    message.push_str(&format!(
+        "\n{} at {}:{first}-{last}; copy these lines exactly as OLD, or use: greppy replace-lines {} {first}:{last} [NEW]\n",
+        if whitespace_only {
+            "nearest match differs only in whitespace"
+        } else {
+            "closest similar lines"
+        },
+        located.rel,
+        located.rel,
+    ));
+    message.push_str(&shown.join("\n"));
+    if text.split('\n').count() > shown.len() {
+        message.push_str("\n…");
+    }
+    Some((first, last, whitespace_only))
+}
+
 /// The number of matches a selector is allowed to have. `--old` and
 /// `--pattern` search, so they can find none or many; every other selector
 /// addresses exactly one span by construction.
@@ -855,93 +944,116 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
         return Ok(());
     }
     let expect = expect.unwrap_or(1);
-    if located.ranges.len() != expect {
+    let count = located.ranges.len();
+    if count != expect {
         // The count alone does not let a caller decide between "pass --expect N"
-        // and "I anchored on the wrong text", so the refusal names what was
-        // searched for and where every match sits.
-        let _subject = located.needle.as_deref().map_or_else(
-            || located.kind.name().to_string(),
-            |text| format!("`{text}`"),
-        );
-        let sites: Vec<String> = located
-            .ranges
-            .iter()
-            .take(20)
-            .map(|(start, _)| {
-                format!(
-                    "{}:{}:{}: {}",
-                    located.rel,
-                    edit_line_of_offset(&located.content, *start),
-                    {
-                        let ls = located.content[..*start]
-                            .iter()
-                            .rposition(|&b| b == b'\n')
-                            .map(|i| i + 1)
-                            .unwrap_or(0);
-                        *start - ls + 1
-                    },
-                    {
-                        let ls = located.content[..*start]
-                            .iter()
-                            .rposition(|&b| b == b'\n')
-                            .map(|i| i + 1)
-                            .unwrap_or(0);
-                        let le = located.content[*start..]
-                            .iter()
-                            .position(|&b| b == b'\n')
-                            .map(|i| *start + i)
-                            .unwrap_or(located.content.len());
-                        one_line_truncated(&String::from_utf8_lossy(&located.content[ls..le]), 200)
-                    }
-                )
-            })
-            .collect();
-        // The needle is not echoed — the caller has it in context (law 5).
+        // and "I anchored on the wrong text", so a text refusal names every
+        // match line and the flag that would edit all of them.
         let mut message = match located.kind {
-            SelectorKind::Text => format!(
-                "OLD occurs {} times — nothing written",
-                located.ranges.len()
-            ),
-            SelectorKind::Pattern => format!(
-                "the pattern occurs {} times, expected {expect} — nothing written",
-                located.ranges.len()
-            ),
+            SelectorKind::Text => {
+                format!("OLD occurs {count} times, expected {expect} — nothing written")
+            }
+            SelectorKind::Pattern => {
+                format!("the pattern occurs {count} times, expected {expect} — nothing written")
+            }
             _ => unreachable!(),
         };
-        for site in &sites {
-            message.push_str("\n  ");
-            message.push_str(site);
-        }
-        let nearest = (located.kind == SelectorKind::Text && located.ranges.is_empty())
-            .then(|| {
-                located
-                    .needle
-                    .as_deref()
-                    .and_then(|needle| nearest_old_candidate(&located.content, needle))
-            })
-            .flatten();
-        if let Some((first, last, text, whitespace_only)) = &nearest {
-            let shown: Vec<&str> = text.split('\n').take(30).collect();
-            message.push_str(&format!(
-                "\n{} at {}:{first}-{last}; copy these lines exactly as OLD, or use: greppy replace-lines {} {first}:{last} [NEW]\n",
-                if *whitespace_only {
-                    "nearest match differs only in whitespace"
-                } else {
-                    "closest similar lines"
-                },
-                located.rel,
-                located.rel,
-            ));
-            message.push_str(&shown.join("\n"));
-            if text.split('\n').count() > shown.len() {
-                message.push_str("\n…");
+        let mut matches: Vec<serde_json::Value> = Vec::new();
+        if located.kind == SelectorKind::Text {
+            let lines: Vec<usize> = located
+                .ranges
+                .iter()
+                .take(10)
+                .map(|(start, _)| edit_line_of_offset(&located.content, *start))
+                .collect();
+            if count > 0 {
+                let rendered = lines
+                    .iter()
+                    .map(|line| format!("{}:{line}", located.rel))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ellipsis = if count > lines.len() { " …" } else { "" };
+                message.push_str(&format!(
+                    "\nat {rendered}{ellipsis}\npass --expect {count} to change all of them, or extend OLD so it is unique"
+                ));
+            }
+            matches = lines
+                .iter()
+                .map(|line| serde_json::json!({"line": line}))
+                .collect();
+        } else {
+            let sites: Vec<String> = located
+                .ranges
+                .iter()
+                .take(20)
+                .map(|(start, _)| {
+                    format!(
+                        "{}:{}:{}: {}",
+                        located.rel,
+                        edit_line_of_offset(&located.content, *start),
+                        {
+                            let ls = located.content[..*start]
+                                .iter()
+                                .rposition(|&b| b == b'\n')
+                                .map(|i| i + 1)
+                                .unwrap_or(0);
+                            *start - ls + 1
+                        },
+                        {
+                            let ls = located.content[..*start]
+                                .iter()
+                                .rposition(|&b| b == b'\n')
+                                .map(|i| i + 1)
+                                .unwrap_or(0);
+                            let le = located.content[*start..]
+                                .iter()
+                                .position(|&b| b == b'\n')
+                                .map(|i| *start + i)
+                                .unwrap_or(located.content.len());
+                            one_line_truncated(
+                                &String::from_utf8_lossy(&located.content[ls..le]),
+                                200,
+                            )
+                        }
+                    )
+                })
+                .collect();
+            for site in &sites {
+                message.push_str("\n  ");
+                message.push_str(site);
+            }
+            matches = sites.iter().map(|site| serde_json::json!(site)).collect();
+            if count == 0 {
+                let next =
+                    pattern_zero_match_next(located.needle.as_deref().unwrap_or(""), &located.rel);
+                message.push('\n');
+                message.push_str(&next);
             }
         }
+        let want_nearest = count == 0
+            && (located.kind == SelectorKind::Text
+                || located
+                    .needle
+                    .as_deref()
+                    .is_some_and(|pattern| !pattern_has_regex_metacharacters(pattern)));
+        let nearest = want_nearest
+            .then(|| append_nearest_old_hint(&mut message, located))
+            .flatten();
         let mut refusal = EditRefusal::new("match_count", message, 13)
             .with("expected", serde_json::json!(expect))
-            .with("found", serde_json::json!(located.ranges.len()))
-            .with("matches", serde_json::json!(sites));
-        if let Some((first, last, _, whitespace_only)) = nearest {
+            .with("count", serde_json::json!(count))
+            .with("found", serde_json::json!(count))
+            .with("matches", serde_json::json!(matches));
+        if located.kind == SelectorKind::Pattern && count == 0 {
+            refusal = refusal.with(
+                "next",
+                serde_json::json!(pattern_zero_match_next(
+                    located.needle.as_deref().unwrap_or(""),
+                    &located.rel,
+                )),
+            );
+        }
+        if let Some((first, last, whitespace_only)) = nearest {
             refusal = refusal.with(
                 "nearest",
                 serde_json::json!({"lines": [first, last], "whitespace_only": whitespace_only}),
@@ -999,35 +1111,78 @@ pub(crate) fn edit_positional_payload(
     Ok(bytes)
 }
 
+const SYNTAX_ALLOW_NEXT: &str = "next: make the whole change in one `greppy patch` so the file is valid at the end, or re-run with --allow-syntax-errors to write this intermediate state";
+
+fn syntax_allowance_message(path: &str, new_errors: usize, diagnostic: Option<&str>) -> String {
+    match diagnostic.and_then(|diagnostic| diagnostic.split(" (").next()) {
+        Some(point) => format!(
+            "written with {new_errors} new syntax errors (first at {path}:{point}); allowed by --allow-syntax-errors"
+        ),
+        None => format!(
+            "written with {new_errors} new syntax errors; allowed by --allow-syntax-errors"
+        ),
+    }
+}
+
+fn edit_record_note_syntax(record: &mut EditRecord, message: impl Into<String>) {
+    if !record.published {
+        return;
+    }
+    let message = message.into();
+    record.notes.push(message.clone());
+    record.extra.push(("message", serde_json::json!(message)));
+}
+
 /// Validate a candidate without writing it. Parser locations refer to the
 /// proposed content, which may have different line numbers from the live file.
-fn edit_validate_syntax(path: &str, before: &[u8], after: &[u8]) -> EditResult<()> {
+/// `Ok(Some(message))` means the caller allowed an increase and should report
+/// `message` once the bytes are actually published.
+fn edit_validate_syntax(
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+    allow_syntax_errors: bool,
+) -> EditResult<Option<String>> {
     let language =
         greppy_edit::txn::syntax_language_for_edit(std::path::Path::new(path), before, after);
     if !language.is_supported() {
-        return Ok(());
+        return Ok(None);
     }
-    if let (Some(before), Some(counts)) = (
+    let (Some(before_counts), Some(counts)) = (
         greppy_edit::txn::syntax_counts(language, before),
         greppy_edit::txn::syntax_counts(language, after),
-    ) {
-        if counts.errors > before.errors || counts.missing > before.missing {
-            let location = greppy_edit::txn::first_syntax_diagnostic(language, after)
-                .map(|diagnostic| format!("{path}:{diagnostic}"))
-                .unwrap_or_else(|| path.to_string());
-            return Err(EditRefusal::new(
-                "invalid_result",
-                format!(
-                    "refused: syntax validation failed in proposed {location}; \
-                     errors {} -> {}, missing nodes {} -> {} — nothing written. \
-                     Location refers to the proposed result, not the unchanged file",
-                    before.errors, counts.errors, before.missing, counts.missing
-                ),
-                13,
-            ));
-        }
+    ) else {
+        return Ok(None);
+    };
+    if counts.errors <= before_counts.errors && counts.missing <= before_counts.missing {
+        return Ok(None);
     }
-    Ok(())
+    let new_errors = counts.errors.saturating_sub(before_counts.errors)
+        + counts.missing.saturating_sub(before_counts.missing);
+    let diagnostic = greppy_edit::txn::first_syntax_diagnostic(language, after);
+    if allow_syntax_errors {
+        return Ok(Some(syntax_allowance_message(
+            path,
+            new_errors,
+            diagnostic.as_deref(),
+        )));
+    }
+    let location = diagnostic
+        .as_ref()
+        .map(|item| format!("{path}:{item}"))
+        .unwrap_or_else(|| path.to_string());
+    Err(EditRefusal::new(
+        "invalid_result",
+        format!(
+            "refused: syntax validation failed in proposed {location}; \
+             errors {} -> {}, missing nodes {} -> {} — nothing written. \
+             Location refers to the proposed result, not the unchanged file\n\
+             {SYNTAX_ALLOW_NEXT}",
+            before_counts.errors, counts.errors, before_counts.missing, counts.missing
+        ),
+        13,
+    )
+    .with("next", serde_json::json!(SYNTAX_ALLOW_NEXT)))
 }
 
 /// Publish one file and answer with the record the contract promises: the
@@ -1040,6 +1195,7 @@ pub(crate) fn edit_publish(
     changed: Vec<(usize, usize)>,
     dry_run: bool,
     verify: bool,
+    allow_syntax_errors: bool,
 ) -> EditResult<EditRecord> {
     let (first_start, first_end) = changed.first().copied().unwrap_or((0, 0));
     let first_end = first_end.min(new_content.len());
@@ -1081,7 +1237,12 @@ pub(crate) fn edit_publish(
         }
         return Ok(record);
     }
-    edit_validate_syntax(&located.rel, &located.content, &new_content)?;
+    let allowance = edit_validate_syntax(
+        &located.rel,
+        &located.content,
+        &new_content,
+        allow_syntax_errors,
+    )?;
     if dry_run {
         // A handle addresses bytes on disk. A dry run wrote none, so handing
         // one back would hand back an address that is already stale.
@@ -1128,6 +1289,9 @@ pub(crate) fn edit_publish(
         record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
+    if let Some(message) = allowance {
+        edit_record_note_syntax(&mut record, message);
+    }
     Ok(record)
 }
 
@@ -2398,6 +2562,7 @@ pub(crate) fn run_trained_write(
     bytes: Vec<u8>,
     dry_run: bool,
     verify: bool,
+    allow_syntax_errors: bool,
 ) -> EditResult<EditRecord> {
     match std::fs::metadata(root_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2455,7 +2620,7 @@ pub(crate) fn run_trained_write(
         }
     }
     let old = before.as_deref().unwrap_or_default();
-    edit_validate_syntax(&rel, old, &bytes)?;
+    let allowance = edit_validate_syntax(&rel, old, &bytes, allow_syntax_errors)?;
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
     if before.as_deref() == Some(bytes.as_slice()) {
         record.already_as_sent = !dry_run;
@@ -2515,6 +2680,9 @@ pub(crate) fn run_trained_write(
         let verification = edit_verify(root_path, &record.files);
         record.diagnostics = Some(verification.diagnostics.clone());
         record.verification = Some(verification);
+    }
+    if let Some(message) = allowance {
+        edit_record_note_syntax(&mut record, message);
     }
     Ok(record)
 }
@@ -2985,8 +3153,17 @@ pub(crate) fn run_trained_patch(
     diff: Vec<u8>,
     dry_run: bool,
     verify: bool,
+    allow_syntax_errors: bool,
 ) -> EditResult<EditRecord> {
-    run_trained_patch_with_publish_hook(root_path, file_base, diff, dry_run, verify, |_| {})
+    run_trained_patch_with_publish_hook(
+        root_path,
+        file_base,
+        diff,
+        dry_run,
+        verify,
+        allow_syntax_errors,
+        |_| {},
+    )
 }
 
 struct PlannedPatchFile {
@@ -3027,11 +3204,13 @@ fn run_trained_patch_with_publish_hook(
     diff: Vec<u8>,
     dry_run: bool,
     verify: bool,
+    allow_syntax_errors: bool,
     mut before_publish: impl FnMut(usize),
 ) -> EditResult<EditRecord> {
     let parsed = parse_trained_patch(&diff)?;
     let mut targets = std::collections::HashSet::new();
     let mut planned = Vec::new();
+    let mut allowances = Vec::new();
     for file in parsed {
         let (rel, abs, before, after, changed) = match file.operation {
             TrainedPatchOperation::Add(bytes) => {
@@ -3044,7 +3223,10 @@ fn run_trained_patch_with_publish_hook(
                             20,
                         )
                     })?;
-                edit_validate_syntax(&rel, &[], &bytes)?;
+                if let Some(message) = edit_validate_syntax(&rel, &[], &bytes, allow_syntax_errors)?
+                {
+                    allowances.push(message);
+                }
                 let changed = vec![(0, bytes.len())];
                 (rel, abs, None, Some(bytes), changed)
             }
@@ -3054,7 +3236,11 @@ fn run_trained_patch_with_publish_hook(
                     TrainedPatchOperation::Update => {
                         let (after, changed) =
                             apply_trained_patch_file(&rel, &content, &file.hunks)?;
-                        edit_validate_syntax(&rel, &content, &after)?;
+                        if let Some(message) =
+                            edit_validate_syntax(&rel, &content, &after, allow_syntax_errors)?
+                        {
+                            allowances.push(message);
+                        }
                         (rel, abs, Some(content), Some(after), changed)
                     }
                     TrainedPatchOperation::Delete => (rel, abs, Some(content), None, vec![(0, 0)]),
@@ -3216,6 +3402,9 @@ fn run_trained_patch_with_publish_hook(
         record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
+    if !allowances.is_empty() {
+        edit_record_note_syntax(&mut record, allowances.join("\n"));
+    }
     Ok(record)
 }
 
@@ -4429,7 +4618,15 @@ pub(crate) fn dispatch_edit_grammar(
                     );
                 }
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    false,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4441,6 +4638,7 @@ pub(crate) fn dispatch_edit_grammar(
             regex,
             dry_run,
             verify,
+            allow_syntax_errors,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let new_bytes = edit_positional_payload(new, "NEW")?;
@@ -4464,7 +4662,15 @@ pub(crate) fn dispatch_edit_grammar(
                 let located = edit_locate(&spec, kind, root, root_path, file_base)?;
                 edit_check_cardinality(&located, expect)?;
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    allow_syntax_errors,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4474,6 +4680,7 @@ pub(crate) fn dispatch_edit_grammar(
             new,
             dry_run,
             verify,
+            allow_syntax_errors,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let new_bytes = edit_positional_payload(new, "NEW")?;
@@ -4490,7 +4697,15 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, SelectorKind::Lines, root, root_path, file_base)?;
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    allow_syntax_errors,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4515,7 +4730,15 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, SelectorKind::Target, root, root_path, file_base)?;
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    false,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4524,9 +4747,18 @@ pub(crate) fn dispatch_edit_grammar(
             new,
             dry_run,
             verify,
+            allow_syntax_errors,
         } => {
             let outcome = edit_positional_payload(new, "NEW").and_then(|bytes| {
-                run_trained_write(root_path, file_base, &path, bytes, dry_run, verify)
+                run_trained_write(
+                    root_path,
+                    file_base,
+                    &path,
+                    bytes,
+                    dry_run,
+                    verify,
+                    allow_syntax_errors,
+                )
             });
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4549,7 +4781,15 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
                 let (new_content, changed) = edit_op_delete(&located);
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    false,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4558,6 +4798,7 @@ pub(crate) fn dispatch_edit_grammar(
             lines,
             dry_run,
             verify,
+            allow_syntax_errors,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let spec = WhereSpec {
@@ -4573,7 +4814,15 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, SelectorKind::Lines, root, root_path, file_base)?;
                 let (new_content, changed) = edit_op_delete(&located);
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    allow_syntax_errors,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4583,6 +4832,7 @@ pub(crate) fn dispatch_edit_grammar(
             new,
             dry_run,
             verify,
+            allow_syntax_errors,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let mut inserted = edit_positional_payload(new, "NEW")?;
@@ -4624,7 +4874,15 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let mut edits = vec![(at, at, inserted)];
                 let (new_content, changed) = edit_splice(&located.content, &mut edits);
-                edit_publish(root_path, &located, new_content, changed, dry_run, verify)
+                edit_publish(
+                    root_path,
+                    &located,
+                    new_content,
+                    changed,
+                    dry_run,
+                    verify,
+                    allow_syntax_errors,
+                )
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }
@@ -4649,9 +4907,18 @@ pub(crate) fn dispatch_edit_grammar(
             diff,
             dry_run,
             verify,
+            allow_syntax_errors,
         } => {
-            let outcome = edit_positional_payload(diff, "DIFF")
-                .and_then(|bytes| run_trained_patch(root_path, file_base, bytes, dry_run, verify));
+            let outcome = edit_positional_payload(diff, "DIFF").and_then(|bytes| {
+                run_trained_patch(
+                    root_path,
+                    file_base,
+                    bytes,
+                    dry_run,
+                    verify,
+                    allow_syntax_errors,
+                )
+            });
             emit_edit_outcome(outcome, json, None, root_path)?
         }
     };
@@ -4766,6 +5033,33 @@ mod nearest_old_tests {
         assert!(nearest_old_candidate(FILE.as_bytes(), "let q = 1;").is_none());
         assert!(nearest_old_candidate(FILE.as_bytes(), "}\nlet q = 1;").is_none());
         assert!(nearest_old_candidate(FILE.as_bytes(), "").is_none());
+    }
+
+    #[test]
+    fn similarity_threshold_accepts_one_changed_identifier() {
+        assert!(super::normalized_line_matches(
+            "return value;",
+            "return valuX;"
+        ));
+        let found = nearest_old_candidate(
+            FILE.as_bytes(),
+            "    if value > HIGH {\n        return valuX;\n    }",
+        )
+        .unwrap();
+        assert_eq!((found.0, found.1, found.3), (2, 4, false));
+    }
+
+    #[test]
+    fn similarity_below_threshold_is_not_a_match() {
+        assert!(!super::normalized_line_matches(
+            "return value;",
+            "return other;"
+        ));
+        assert!(nearest_old_candidate(
+            FILE.as_bytes(),
+            "    if value > HIGH {\n        return other;\nnot the brace",
+        )
+        .is_none());
     }
 }
 
@@ -5391,6 +5685,7 @@ mod patch_rollback_tests {
                 diff.to_vec(),
                 dry_run,
                 false,
+                false,
                 |_| panic!("partial-line hunk must refuse before any publish"),
             ) {
                 Err(refusal) => refusal,
@@ -5430,6 +5725,7 @@ mod patch_rollback_tests {
             valid.clone(),
             false,
             false,
+            false,
         )
         .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(std::fs::read(dir.path().join("protocol.h")).unwrap(), valid);
@@ -5443,6 +5739,7 @@ mod patch_rollback_tests {
             dir.path(),
             "protocol.h",
             malformed.into_bytes(),
+            false,
             false,
             false,
         ) {
@@ -5468,6 +5765,7 @@ mod patch_rollback_tests {
                     dir.path(),
                     diff.into_bytes(),
                     dry_run,
+                    false,
                     false,
                     |_| panic!("duplicate target must be rejected during planning"),
                 );
@@ -5514,6 +5812,7 @@ mod patch_rollback_tests {
                 diff.to_vec(),
                 false,
                 false,
+                false,
                 |index| {
                     if index == 3 {
                         std::fs::write(&late, b"other writer\n").unwrap();
@@ -5558,6 +5857,7 @@ mod patch_rollback_tests {
             diff.to_vec(),
             false,
             false,
+            false,
             |index| {
                 if index == 2 {
                     std::fs::write(&deleted, b"other writer\n").unwrap();
@@ -5585,6 +5885,7 @@ mod patch_rollback_tests {
                 dir.path(),
                 dir.path(),
                 diff.to_vec(),
+                false,
                 false,
                 false,
                 |index| {
@@ -5630,6 +5931,7 @@ mod patch_rollback_tests {
             diff.to_vec(),
             false,
             false,
+            false,
             |index| {
                 if index == 1 {
                     std::fs::write(&added, b"racing creator\n").unwrap();
@@ -5653,6 +5955,7 @@ mod patch_rollback_tests {
             dir.path(),
             dir.path(),
             diff.to_vec(),
+            false,
             false,
             false,
             |index| {
@@ -5687,6 +5990,7 @@ mod patch_rollback_tests {
             regex: false,
             dry_run: false,
             verify: false,
+            allow_syntax_errors: false,
         };
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         std::fs::write(dir.path().join("b.txt"), "a").unwrap();
