@@ -22,16 +22,13 @@ impl Store {
             ));
         }
         let key = format!("{:x}", Sha256::digest(path.as_bytes()));
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Path::new("/Volumes/tmp/dev-artifacts/greppy/bash-smart-retained").join(key))
+        // A mounted disposable macOS volume keeps large captures off the system
+        // disk; without one (every ordinary Mac) they live next to the store.
+        Ok(match greppy_core::cache::macos_disposable_volume() {
+            Some(volume) => volume.join("dev-artifacts/greppy/bash-smart-retained"),
+            None => Path::new(&path).with_file_name("bash-smart-retained"),
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(Path::new(&path)
-                .with_file_name("bash-smart-retained")
-                .join(key))
-        }
+        .join(key))
     }
 
     pub fn retain_bash_smart_capture(

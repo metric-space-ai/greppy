@@ -57,6 +57,9 @@ acceleration and the ordinary workspace backend provides the same agent behavior
 
 ### Fixes
 
+- macOS: agent Base stores, Base build staging and retained `bash-smart`
+  captures no longer require a separately mounted `/Volumes/tmp`; without one
+  they use the normal per-user locations instead of failing.
 - `replace-text`: when OLD matches nowhere, the refusal names the nearest
   variant (the lines that differ only in whitespace, or else the most similar
   lines) with its line range, its exact text and the `greppy replace-lines`

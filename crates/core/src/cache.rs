@@ -483,14 +483,21 @@ fn reap_base_build_staging(
 /// Existing legacy paths remain authoritative: live readers and CoW descriptors
 /// can keep their original graph path and advisory-lock identity.
 pub fn agent_base_directory(data: &Path, relative_identity: &Path) -> io::Result<PathBuf> {
+    let volume = macos_disposable_volume();
     agent_base_directory_for(
         data,
         relative_identity,
-        cfg!(target_os = "macos")
-            && std::env::var_os("GREPPY_STORE_DIR").is_none()
-            && data == data_root(),
-        Path::new("/Volumes/tmp"),
+        volume.is_some() && std::env::var_os("GREPPY_STORE_DIR").is_none() && data == data_root(),
+        volume.unwrap_or(Path::new("/Volumes/tmp")),
     )
+}
+
+/// The separately mounted macOS volume for disposable caches, when present.
+/// Machines without one (every ordinary Mac) keep the platform default paths
+/// instead of failing: the disposable volume is an optimisation, not a need.
+pub fn macos_disposable_volume() -> Option<&'static Path> {
+    let volume = Path::new("/Volumes/tmp");
+    (cfg!(target_os = "macos") && validate_disposable_volume(volume).is_ok()).then_some(volume)
 }
 
 fn agent_base_directory_for(
@@ -536,8 +543,9 @@ fn disposable_agent_bases_root(volume: &Path) -> PathBuf {
 
 /// Base build staging is disposable even when durable model assets live elsewhere.
 pub fn base_build_scratch_root() -> io::Result<PathBuf> {
-    if cfg!(target_os = "macos") && std::env::var_os("GREPPY_STORE_DIR").is_none() {
-        let volume = Path::new("/Volumes/tmp");
+    if let Some(volume) =
+        macos_disposable_volume().filter(|_| std::env::var_os("GREPPY_STORE_DIR").is_none())
+    {
         let root = volume.join("dev-artifacts/greppy/base-build-staging");
         ensure_disposable_namespace(&root, volume)?;
         return Ok(root);
