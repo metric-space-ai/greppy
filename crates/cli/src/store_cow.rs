@@ -2467,7 +2467,17 @@ fn validate_workspace_inventory(source_path: &Path, worktree_path: &Path) -> Res
 
     let expected = inventory(source_path)?;
     let actual = inventory(worktree_path)?;
-    if expected == actual {
+    // Identical paths with different sizes are not an incomplete mount.
+    // Line-ending normalisation (core.autocrlf / attributes eol) leaves Git
+    // clean while the working tree disagrees with the Base checkout. Those
+    // paths are Store Delta: they are reindexed from the working tree instead
+    // of failing Base publication. Missing or extra paths still fail.
+    let paths_match = expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual.iter())
+            .all(|(left, right)| left.0 == right.0);
+    if paths_match {
         return Ok(expected.len());
     }
     let first_difference = expected
@@ -2916,6 +2926,12 @@ pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<Visib
         )));
     }
     dirty.extend(nul_fields(&untracked.stdout)?);
+    // Git's clean/smudge filters can report a tracked file as unmodified while
+    // its working-tree bytes differ from the checkout indexed into Base
+    // (core.autocrlf, `.gitattributes` eol). One stat per Base file — never a
+    // content read — promotes those paths into Delta. Paths Git already called
+    // dirty or deleted stay as they are.
+    add_size_mismatched_base_paths(root, base_commit, &mut dirty, &deleted)?;
     // A Base path may be removed from Git's index (or renamed) and then
     // recreated as an untracked working-tree file. Git reports both the old
     // deletion and the current file. Current content replaces the Base at
@@ -2924,6 +2940,73 @@ pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<Visib
     deleted.retain(|path| !present.contains(path));
     VisibilityIndex::new(dirty, deleted)
         .map_err(|error| Error::io("validate Store Delta visibility", error))
+}
+
+/// Promote tracked paths whose working-tree length disagrees with the indexed
+/// Base inventory. Only regular files are compared, and only by `stat`.
+fn add_size_mismatched_base_paths(
+    root: &Path,
+    base_commit: &str,
+    dirty: &mut Vec<String>,
+    deleted: &[String],
+) -> Result<()> {
+    let Some((base_path, bound_commit)) = overlay_environment(root)? else {
+        return Ok(());
+    };
+    if bound_commit != base_commit || !base_path.is_file() {
+        return Ok(());
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &base_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        Error::Store(format!(
+            "open Base inventory for Store Delta visibility: {error}"
+        ))
+    })?;
+    let mut statement = connection
+        .prepare("SELECT rel_path, size FROM file_state")
+        .map_err(|error| Error::Store(format!("read Base inventory sizes: {error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| Error::Store(format!("query Base inventory sizes: {error}")))?;
+    let already_dirty = dirty
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let already_deleted = deleted
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut extra = Vec::new();
+    for row in rows {
+        let (rel_path, size) =
+            row.map_err(|error| Error::Store(format!("read Base inventory size row: {error}")))?;
+        if size < 0
+            || already_dirty.contains(rel_path.as_str())
+            || already_deleted.contains(rel_path.as_str())
+        {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(root.join(&rel_path)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Error::io(
+                    format!("stat working tree file {rel_path} against Base inventory"),
+                    error,
+                ));
+            }
+        };
+        if metadata.is_file() && metadata.len() != size as u64 {
+            extra.push(rel_path);
+        }
+    }
+    dirty.extend(extra);
+    Ok(())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -6079,6 +6162,189 @@ export function caller() { target(); }
         let reverted = visibility_against(repo.path(), &base).unwrap();
         assert!(!reverted.hides_base_path("src/a.rs"));
         assert_eq!(reverted.changed_count(), 2);
+    }
+
+    #[test]
+    fn line_ending_size_mismatch_is_indexed_from_the_working_tree() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let _tmp = TmpdirRestore::set(scratch.path());
+        let _environment = EnvRestore::capture(&[
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_BASE_REUSED,
+            ENV_FALLBACK_REASON,
+        ]);
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        for name in [
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_BASE_REUSED,
+            ENV_FALLBACK_REASON,
+        ] {
+            std::env::remove_var(name);
+        }
+
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "cow@test.invalid"]);
+        git(&repo, &["config", "user.name", "Store CoW"]);
+        git(&repo, &["config", "core.autocrlf", "true"]);
+        git(&repo, &["config", "core.safecrlf", "false"]);
+        // LF in the index, CRLF in a clean checkout. The LF working tree stays
+        // git-clean because the clean filter normalises both sides. The
+        // same-size file has no newline, so checkout does not change its bytes.
+        std::fs::write(
+            repo.join(".gitattributes"),
+            ".gitattributes text eol=lf\n*.rs text eol=crlf\n",
+        )
+        .unwrap();
+        let lf_eol = b"fn lf_worktree_symbol() {}\n".to_vec();
+        let same_bytes = b"fn same_size_symbol() {}".to_vec();
+        std::fs::write(repo.join("src/eol.rs"), &lf_eol).unwrap();
+        std::fs::write(repo.join("src/same.rs"), &same_bytes).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+
+        let clean = TemporaryBaseWorktree::create(&repo, &commit).unwrap();
+        let clean_eol = std::fs::read(clean.path().join("src/eol.rs")).unwrap();
+        let clean_same = std::fs::read(clean.path().join("src/same.rs")).unwrap();
+        assert!(
+            clean_eol.contains(&b'\r'),
+            "Base checkout must materialize CRLF, bytes={clean_eol:?}"
+        );
+        assert!(
+            !lf_eol.contains(&b'\r'),
+            "working tree fixture must stay LF"
+        );
+        assert_ne!(clean_eol.len(), lf_eol.len());
+        assert_eq!(
+            clean_same, same_bytes,
+            "same-size fixture must be unchanged by checkout"
+        );
+        let status = git(&repo, &["status", "--porcelain"]);
+        assert!(
+            status.is_empty(),
+            "line-ending rewrite must stay git-clean, status={status:?}"
+        );
+        assert!(
+            git(&repo, &["diff", "--name-status", commit.as_str()]).is_empty(),
+            "git diff must not report the LF rewrite"
+        );
+
+        let counted = validate_workspace_inventory(&repo, clean.path()).unwrap();
+        assert!(counted >= 2, "size-only differences must still validate");
+
+        let base_graph = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_graph).unwrap();
+            greppy_indexer::index(&mut base, clean.path(), "p").unwrap();
+        }
+        let base_same = {
+            let base =
+                greppy_store::Store::open_with(&base_graph, greppy_store::OpenOptions::read_only())
+                    .unwrap();
+            let eol_state = base.get_file_state("p", "src/eol.rs").unwrap().unwrap();
+            assert_eq!(eol_state.size as usize, clean_eol.len());
+            assert_eq!(
+                eol_state.sha256,
+                greppy_store::file_state::sha256_hex(&clean_eol)
+            );
+            base.get_file_state("p", "src/same.rs")
+                .unwrap()
+                .unwrap()
+                .size
+        };
+
+        std::env::set_var(ENV_MODE, MODE_OVERLAY);
+        std::env::set_var(ENV_BASE_PATH, &base_graph);
+        std::env::set_var(ENV_BASE_COMMIT, &commit);
+        let visibility = visibility_against(&repo, &commit).unwrap();
+        assert!(
+            visibility.is_dirty_path("src/eol.rs"),
+            "LF bytes that differ in size from Base must be Delta"
+        );
+        assert!(
+            !visibility.is_dirty_path("src/same.rs"),
+            "same-size clean file must stay Base, dirty={:?}",
+            visibility.dirty_paths().collect::<Vec<_>>()
+        );
+        assert!(!visibility.hides_base_path("src/same.rs"));
+        assert!(visibility.deleted_paths().next().is_none());
+
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut overlay =
+                greppy_store::Store::open_overlay(&base_graph, &delta_path, &visibility).unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(visibility.dirty_paths().map(str::to_owned).collect()),
+                ..greppy_indexer::IndexOptions::default()
+            };
+            greppy_indexer::index_with_options(&mut overlay, &repo, "p", &options).unwrap();
+            assert!(
+                overlay
+                    .get_node_by_qname("p", "src/eol.rs::Function::lf_worktree_symbol")
+                    .unwrap()
+                    .is_some(),
+                "overlay must find the symbol from the LF working tree"
+            );
+            assert!(overlay
+                .get_node_by_qname("p", "src/same.rs::Function::same_size_symbol")
+                .unwrap()
+                .is_some());
+        }
+        let delta =
+            greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        let indexed = delta.get_file_state("p", "src/eol.rs").unwrap().unwrap();
+        assert_eq!(indexed.size as usize, lf_eol.len());
+        assert_eq!(
+            indexed.sha256,
+            greppy_store::file_state::sha256_hex(&lf_eol),
+            "Delta must store the LF working-tree bytes, not the CRLF Base checkout"
+        );
+        assert!(delta
+            .get_node_by_qname("p", "src/eol.rs::Function::lf_worktree_symbol")
+            .unwrap()
+            .is_some());
+        assert!(
+            delta.get_file_state("p", "src/same.rs").unwrap().is_none(),
+            "same-size clean file must not be copied into Delta"
+        );
+        assert!(delta
+            .get_node_by_qname("p", "src/same.rs::Function::same_size_symbol")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::metadata(repo.join("src/same.rs")).unwrap().len() as i64,
+            base_same
+        );
+    }
+
+    #[test]
+    fn workspace_inventory_ignores_size_mismatch_but_rejects_missing_paths() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        let mount = scratch.path().join("mount");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(mount.join("src")).unwrap();
+        std::fs::write(source.join("src/eol.rs"), b"fn lf_worktree_symbol() {}\n").unwrap();
+        std::fs::write(mount.join("src/eol.rs"), b"fn lf_worktree_symbol() {}\r\n").unwrap();
+        let counted = validate_workspace_inventory(&source, &mount).unwrap();
+        assert_eq!(counted, 1);
+
+        std::fs::write(source.join("src/extra.rs"), b"fn extra() {}\n").unwrap();
+        let error = validate_workspace_inventory(&source, &mount)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inventory is incomplete"), "{error}");
     }
 
     #[test]
