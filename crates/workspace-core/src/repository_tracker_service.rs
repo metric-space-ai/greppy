@@ -1673,6 +1673,17 @@ mod tests {
             active
         );
         core.remove_workspace(second).unwrap();
+        // The last removal starts the idle clock; the warm tracker stays until
+        // the supervisor's idle release.
+        assert_eq!(
+            core.repository_tracker_status(&repository)
+                .unwrap()
+                .unwrap(),
+            active
+        );
+        assert!(core
+            .release_idle_repository_tracker(&repository, 0)
+            .unwrap());
         assert!(core
             .repository_tracker_status(&repository)
             .unwrap()
@@ -1705,6 +1716,16 @@ mod tests {
             .unwrap();
 
         core.remove_workspace_pair(content, git).unwrap();
+        assert_eq!(
+            core.repository_tracker_status(&shared)
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTrackerState::Active
+        );
+        // Only the repository no workspace references any more is releasable.
+        assert!(!core.release_idle_repository_tracker(&shared, 0).unwrap());
+        assert!(core.release_idle_repository_tracker(&only_pair, 0).unwrap());
         assert_eq!(
             core.repository_tracker_status(&shared)
                 .unwrap()
@@ -1746,10 +1767,14 @@ mod tests {
         }
 
         let core = WorkspaceCore::open(&root).unwrap();
+        assert!(core.list_workspaces().unwrap().is_empty());
+        // Recovery removed the abandoned pair, so its tracker is releasable.
+        assert!(core
+            .release_idle_repository_tracker(&repository, 0)
+            .unwrap());
         assert!(core
             .repository_tracker_status(&repository)
             .unwrap()
             .is_none());
-        assert!(core.list_workspaces().unwrap().is_empty());
     }
 }
