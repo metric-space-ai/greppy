@@ -325,6 +325,58 @@ fn default_gate_lease_is_inherited(_: &Path) -> bool {
     false
 }
 
+/// The default host gate is about to wrap a new child. If another owner
+/// already holds its lease, queueing behind `dev-heavy-run.py` is a silent
+/// multi-minute wait that still ends in exit 75. Record the deferral now.
+pub(crate) fn occupied_gate_deferral() -> Option<String> {
+    let gate = configured_gate().ok().flatten()?;
+    if default_gate_lease_is_inherited(&gate) {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if gate != home.join(".codex/bin/dev-heavy-run.py") {
+        return None;
+    }
+    if !foreign_lock_is_held(&home.join(".codex/run/heavy-job.lock")) {
+        return None;
+    }
+    Some(
+        "Automatic indexing deferred by shared host admission; no index work started. Capacity gate: another owner holds the heavy-job lease. Retry the original command when host capacity is available. For an immediate bounded source read, use greppy read-file PATH --lines A:B. For an edit without a graph refresh, use greppy replace-text PATH OLD NEW; it refuses missing or non-unique matches."
+            .to_string(),
+    )
+}
+
+/// `true` when a different open-file description already holds an exclusive
+/// flock. A missing lock is free. Tests must pass a temporary path, never
+/// the user's real heavy-job lock.
+pub(crate) fn foreign_lock_is_held(lock: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if !lock.is_file() {
+            return false;
+        }
+        let Ok(file) = fs::File::open(lock) else {
+            return false;
+        };
+        unsafe {
+            if libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 {
+                let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                return false;
+            }
+            let error = io::Error::last_os_error();
+            return error.kind() == io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EAGAIN)
+                || error.raw_os_error() == Some(libc::EWOULDBLOCK);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lock;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +533,49 @@ with open(sys.argv[1], 'w+') as lease:
             );
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_lock_reports_only_a_held_lease() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp.path().join("heavy-job.lock");
+        fs::write(&lock, b"{}\n").unwrap();
+        assert!(!foreign_lock_is_held(&lock));
+        let python = if cfg!(target_os = "macos") {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let helper = tmp.path().join("hold.py");
+        fs::write(
+            &helper,
+            "import fcntl,sys,time\n\
+             lease=open(sys.argv[1],'a+')\n\
+             fcntl.flock(lease, fcntl.LOCK_EX|fcntl.LOCK_NB)\n\
+             sys.stdout.write('held\\n')\n\
+             sys.stdout.flush()\n\
+             time.sleep(30)\n",
+        )
+        .unwrap();
+        let mut child = Command::new(python)
+            .arg(&helper)
+            .arg(&lock)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buf = [0u8; 5];
+        let n = stdout.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"held\n");
+        assert!(
+            foreign_lock_is_held(&lock),
+            "a foreign flock holder must not look free"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!foreign_lock_is_held(&lock));
     }
 }

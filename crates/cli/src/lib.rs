@@ -6455,6 +6455,13 @@ fn spawn_background_job_handle_scoped(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
+    if let Some(detail) = index_admission::occupied_gate_deferral() {
+        value["state"] = serde_json::json!("failed");
+        value["preparation_failure_kind"] = serde_json::json!("admission_deferred");
+        value["last_error"] = serde_json::json!(detail);
+        let _ = write_background_job(&job_path, &value);
+        return None;
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {

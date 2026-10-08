@@ -128,6 +128,55 @@ pub(crate) fn search_graph_counts_json(
     Ok(())
 }
 
+fn search_scoped_prefixes(filters: &QueryPathFilters) -> Option<Vec<String>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let prefixes = filters.repo_prefixes();
+    if prefixes.len() != filters.filters.len() || prefixes.iter().any(|prefix| prefix.is_empty()) {
+        return None;
+    }
+    Some(prefixes)
+}
+
+fn search_nodes_for_prefixes(
+    store: &greppy_store::Store,
+    project: &str,
+    prefixes: &[String],
+) -> Result<Vec<greppy_store::Node>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+    for prefix in prefixes {
+        for node in store.list_nodes_for_path_prefix(project, prefix)? {
+            if !seen.insert(node.id)
+                || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+            {
+                continue;
+            }
+            nodes.push(node);
+        }
+    }
+    nodes.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(nodes)
+}
+
+fn search_outside_filter_matches<'a>(
+    nodes: impl IntoIterator<Item = &'a greppy_store::Node>,
+    query: &str,
+    path_filters: &QueryPathFilters,
+) -> usize {
+    nodes
+        .into_iter()
+        .filter(|node| {
+            search_symbol_name_contains(node, query) && !path_filters.matches(&node.file_path)
+        })
+        .count()
+}
+
 fn search_all_nodes(store: &greppy_store::Store, project: &str) -> Result<Vec<greppy_store::Node>> {
     const PAGE: usize = 4096;
     let mut nodes = Vec::new();
@@ -495,14 +544,26 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(1);
     }
 
-    let mut all_nodes = search_all_nodes(&store, &project)?;
-    all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
-    let matches_outside_filter = all_nodes
-        .iter()
-        .filter(|node| {
-            search_symbol_name_contains(node, q) && !path_filters.matches(&node.file_path)
-        })
-        .count();
+    let scoped_prefixes = if kind.is_none() && !q.contains("::") {
+        search_scoped_prefixes(&path_filters)
+    } else {
+        None
+    };
+    let (all_nodes, matches_outside_filter) = if let Some(prefixes) = scoped_prefixes {
+        let nodes = search_nodes_for_prefixes(&store, &project, &prefixes)?;
+        let outside = store
+            .list_nodes_name_containing(&project, q)?
+            .into_iter()
+            .filter(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name))
+            .collect::<Vec<_>>();
+        let outside = search_outside_filter_matches(&outside, q, &path_filters);
+        (nodes, outside)
+    } else {
+        let mut nodes = search_all_nodes(&store, &project)?;
+        nodes.retain(|node| search_kind_matches(&root_path, node, kind));
+        let outside = search_outside_filter_matches(&nodes, q, &path_filters);
+        (nodes, outside)
+    };
     let nodes = all_nodes
         .into_iter()
         .filter(|node| path_filters.matches(&node.file_path))

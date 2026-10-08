@@ -753,6 +753,62 @@ impl Store {
         tx.commit()?;
         Ok(n)
     }
+
+    /// Nodes in one file or in its descendants, using `idx_nodes_file`.
+    ///
+    /// The descendant bound is `successor(prefix + "/")`, not `successor(prefix)`.
+    /// A prefix of `file.rs` must not include `file.rs2`.
+    pub fn list_nodes_for_path_prefix(&self, project: &str, prefix: &str) -> Result<Vec<Node>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut nodes = self.list_nodes_for_file(project, prefix)?;
+        let lower = format!("{prefix}/");
+        let upper = path_prefix_upper_bound(&lower);
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
+             FROM nodes
+             WHERE project = ?1 AND file_path >= ?2 AND file_path < ?3",
+        )?;
+        let descendants = stmt
+            .query_map(params![project, lower, upper], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        nodes.extend(descendants);
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        nodes.dedup_by(|left, right| left.id == right.id);
+        nodes.sort_by(|left, right| {
+            left.qualified_name
+                .cmp(&right.qualified_name)
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(nodes)
+    }
+
+    /// Definitions whose name contains `fragment`, without loading the project.
+    /// `instr` stays case-sensitive, matching `str::contains`.
+    pub fn list_nodes_name_containing(&self, project: &str, fragment: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, '{}'
+             FROM nodes
+             WHERE project = ?1 AND instr(name, ?2) > 0",
+        )?;
+        let rows = stmt
+            .query_map(params![project, fragment], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+fn path_prefix_upper_bound(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.last_mut() {
+        if *last != 0xff {
+            *last += 1;
+            return String::from_utf8(bytes).unwrap_or_else(|_| format!("{prefix}\u{10ffff}"));
+        }
+        bytes.pop();
+    }
+    format!("{prefix}\u{10ffff}")
 }
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -1400,5 +1456,40 @@ mod tests {
         assert!(hits.iter().any(|h| h.node_id == ids[0]));
         // Empty batch is a no-op.
         assert!(s.insert_nodes(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn path_prefix_listing_includes_descendants_not_sibling_suffix() {
+        let mut store = store_with_project("p");
+        for (name, path) in [
+            ("detect_blocks", "crates/cli/src/bash_smart.rs"),
+            ("inside", "crates/cli/src/bash_smart.rs/nested.rs"),
+            ("sibling", "crates/cli/src/bash_smart.rs2"),
+            ("other", "crates/cli/src/other.rs"),
+        ] {
+            store
+                .insert_node(&NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: name.into(),
+                    qualified_name: format!("p.{name}"),
+                    file_path: path.into(),
+                    start_line: 1,
+                    end_line: 2,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+        let rows = store
+            .list_nodes_for_path_prefix("p", "crates/cli/src/bash_smart.rs")
+            .unwrap();
+        let names = rows
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"detect_blocks"), "{names:?}");
+        assert!(names.contains(&"inside"), "{names:?}");
+        assert!(!names.contains(&"sibling"), "{names:?}");
+        assert!(!names.contains(&"other"), "{names:?}");
     }
 }
