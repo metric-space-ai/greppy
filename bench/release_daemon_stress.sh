@@ -89,7 +89,7 @@ export GREPPY_STORE_DIR="$WORK/store"
 # One device identity for every code path (spawn, prewarm, doctor, queries):
 # the endpoint hash includes the device (Endpoint::for_identity), so a mixed
 # cpu/auto session would talk to two different daemons.
-export GREPPY_DEVICE=cpu
+export GREPPY_DEVICE="${GREPPY_SMOKE_DEVICE:-cpu}"
 # Long embedding TTLs while the stress sections run (no surprise exits
 # between sections); the dedicated eviction section respawns with short TTLs.
 export GREPPY_EMBED_DAEMON_MODEL_TTL_S=600
@@ -131,7 +131,7 @@ def round_trip(path, payload, timeout=10.0, raw=None):
         s.close()
 
 def status(path, timeout=5.0):
-    return json.loads(round_trip(path, {"protocol": 3, "op": "status"}, timeout))
+    return json.loads(round_trip(path, {"protocol": 4, "op": "status"}, timeout))
 
 def main():
     mode, path = sys.argv[1], sys.argv[2]
@@ -203,7 +203,7 @@ def main():
                 try:
                     line = round_trip(
                         path,
-                        {"protocol": 3, "op": "ping", "request_id": request_id},
+                        {"protocol": 4, "op": "ping", "request_id": request_id},
                         timeout=timeout,
                     )
                     if not line:
@@ -347,11 +347,11 @@ EMBED_PID="$(daemon_pid "$EMBED_SOCK")"
 pgrep -f -- "-daemon --socket $EMBED_SOCK" | grep -qx "$EMBED_PID" \
   || fail "status daemon_pid $EMBED_PID does not match the daemon process list"
 
-python3 "$CLIENT" req "$EMBED_SOCK" '{"protocol":3,"op":"ping","request_id":"sanity-ping"}' >"$WORK/out/ping.json"
+python3 "$CLIENT" req "$EMBED_SOCK" '{"protocol":4,"op":"ping","request_id":"sanity-ping"}' >"$WORK/out/ping.json"
 jq -e '.ok == true and .request_id == "sanity-ping"' "$WORK/out/ping.json" >/dev/null \
   || fail "ping did not return ok with the echoed request id: $(cat "$WORK/out/ping.json")"
 python3 "$CLIENT" status "$EMBED_SOCK" >"$WORK/out/status.json"
-jq -e '.protocol == 3 and .state == "ready" and (.daemon_pid | tonumber) > 0 and .queue_policy == "fair-round-robin-unbounded"' "$WORK/out/status.json" >/dev/null \
+jq -e '.protocol == 4 and .state == "ready" and (.daemon_pid | tonumber) > 0 and .queue_policy == "fair-round-robin-unbounded"' "$WORK/out/status.json" >/dev/null \
   || fail "warm daemon status is not ready: $(cat "$WORK/out/status.json")"
 python3 "$CLIENT" req "$EMBED_SOCK" '{"protocol":1,"op":"ping"}' >"$WORK/out/proto.json"
 jq -e '.error == "protocol-version mismatch"' "$WORK/out/proto.json" >/dev/null \

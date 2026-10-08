@@ -16,28 +16,18 @@
 //! ```
 //!
 //! The NAME sits on the `header`'s inner `declProc` node (`name:` field, an
-//! `identifier`) — NOT on the outer `defProc`. With the `Capture` name strategy
-//! the definition node is the `@name` identifier's PARENT, which is the
-//! `declProc` header. So the `DefRule` keys on `"declProc"` and one Function is
-//! emitted per procedure/function/method. `kFunction` and `kProcedure` are just
-//! keyword children of the same `declProc` kind, so functions and procedures are
+//! `identifier`) — NOT on the outer `defProc`. The definition query therefore
+//! tags the body-containing `defProc` as `@def` and the header name as `@name`.
+//! `declProc` itself is not a DefRule, so the engine keeps `defProc` and the
+//! stored span covers the body. `kFunction` and `kProcedure` are just keyword
+//! children of the same `declProc` kind, so functions and procedures are
 //! captured uniformly (both are labelled `Function`; no return-value distinction
-//! is drawn).
+//! is drawn). Forward declarations (`declProc` without a `defProc` body) are
+//! not emitted.
 //!
-//! IMPRECISION — CALLS edges are NOT attributed (edge count is 0). A call
-//! (`exprCall`) lives inside the callable's BODY (`body: (block …)`), which is a
-//! SIBLING of the name-bearing `header` (`declProc`) under the wrapping
-//! `defProc`. The generic engine attributes a CALLS edge's *source* to the
-//! nearest def-rule ancestor of the call site whose name it can resolve; here
-//! that ancestor is `defProc`, whose name lives one level down on `header` and
-//! is therefore NOT reachable via the engine's `child_by_field_name("name")`
-//! lookup. Keying defs on `declProc` (correct for definition extraction) means
-//! `declProc` is never an ancestor of a call, so no enclosing callable is found
-//! and no CALLS edge is emitted. The CALLS query below is retained (it correctly
-//! identifies the callee identifier of `exprCall`), but with this grammar's
-//! header/body split the generic engine cannot hang a source endpoint off it
-//! without a bespoke extractor. Definition extraction (the node pass) is
-//! unaffected and complete for plain `function`/`procedure` definitions.
+//! A call (`exprCall`) lives in `body: (block …)`, which is inside `defProc`.
+//! `defProc` has no `name:` field, so the calls pass reuses the qname recorded
+//! for that definition node. Qualified/member calls are still not captured.
 //!
 //! Other imprecision: member/qualified calls (`obj.Method(…)`) and `uses`
 //! clauses are not modelled. Not claimed as `supported` (no verification corpus).
@@ -45,17 +35,14 @@
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};
 
-/// Definitions: `declProc` is the header node that carries the `name:` field
-/// (`Capture` → def node = the name identifier's parent = `declProc`). Both
-/// `function`s and `procedure`s parse as `declProc`, so both become `Function`.
-/// No class/record ownership is modelled (kept experimental/partial).
+/// Definitions: `defProc` is the body-containing node. The name is read from
+/// `header: (declProc name: …)`, which is not itself a DefRule. Both
+/// `function`s and `procedure`s become `Function`. No class/record ownership
+/// is modelled (kept experimental/partial).
 static PASCAL_SPEC: LangSpec = LangSpec {
     name: NameStrategy::Capture,
-    defs: &[DefRule::func("declProc")],
+    defs: &[DefRule::func("defProc")],
     owner_kinds: &[],
-    // The CALLS query captures callee identifiers, but with this grammar's
-    // header/body split the generic engine cannot resolve a call's enclosing
-    // callable (see module docs), so 0 CALLS edges are emitted in practice.
     calls: CallSpec { skip_callees: &[] },
     // Pascal `uses` clauses are not extracted yet (import_query is empty); any
     // variant is inert without a query.
@@ -68,18 +55,16 @@ static PASCAL_SPEC: LangSpec = LangSpec {
 
 /// A `function Foo(...)` / `procedure Bar(...)` parses as
 /// `(defProc header: (declProc name: (identifier) @name …) body: (block …))`.
-/// Capture the header's `name:` identifier; the engine derives the def node as
-/// its parent `declProc` and keys `DefRule::func("declProc")` on it.
+/// Capture the header name and the body-containing `defProc`.
 const DEFINITIONS: &str = r#"
-    (declProc
-      name: (identifier) @name) @def
+    (defProc
+      header: (declProc
+        name: (identifier) @name)) @def
 "#;
 
 /// A call `Foo(...)` parses as `(exprCall entity: (identifier) @callee …)`.
-/// The capture is correct, but the generic engine cannot attribute the call to
-/// its enclosing callable for this grammar (see module docs), so no CALLS edge
-/// is materialised. Qualified/member calls (`obj.Method(…)`) wrap the entity
-/// differently and are not captured (best-effort).
+/// Qualified/member calls (`obj.Method(…)`) wrap the entity differently and are
+/// not captured (best-effort).
 const CALLS: &str = r#"
     (exprCall
       entity: (identifier) @callee)

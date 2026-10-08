@@ -40,7 +40,10 @@
 ///   by caller repair; unchanged-source v8 nodes need full re-extraction.
 ///   v9 -> v10: persist JS/TS computed, private, string and numeric methods;
 ///   unchanged-source v9 graphs lack their reference-source definitions.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v10";
+///   v10 -> v11: CALLS for nine more languages, Rust calls into inline `mod`
+///   blocks, workspace-crate / language-scoped / alias call resolution; their
+///   new node and edge properties exist only after full re-extraction.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v11";
 
 pub mod cache;
 pub mod diag;

@@ -187,7 +187,10 @@ impl EmbeddingIndexReport {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingIndexProgress {
     pub completed_documents: usize,
+    /// Documents validated for the pass, including reusable vectors.
     pub total_documents: usize,
+    /// Reuse proven before processing; excluded from pending computation/ETA.
+    pub reusable_documents: usize,
     pub local_store_reuse: usize,
     pub global_cache_hits: usize,
     pub global_cache_misses: usize,
@@ -212,7 +215,11 @@ pub fn count_embedding_candidate_nodes(store: &Store, project: &str) -> Result<u
         "TypeAlias",
     ];
     LABELS.iter().try_fold(0usize, |total, label| {
-        let count = store.count_nodes_by_label(project, label)?;
+        let count = if store.is_overlay() {
+            store.count_private_nodes_by_label(project, label)?
+        } else {
+            store.count_nodes_by_label(project, label)?
+        };
         let count = usize::try_from(count)
             .map_err(|_| Error::Store(format!("negative embedding node count for {label}")))?;
         Ok(total.saturating_add(count))
@@ -232,6 +239,19 @@ pub fn count_code_embedding_documents_for_project(
     count_code_embedding_documents_for_scope(store, root, project, provider, options, &[])
 }
 
+/// Exact validation and pending-computation counts for one embedding pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingWorkload {
+    pub total_documents: usize,
+    pub reusable_documents: usize,
+}
+
+impl EmbeddingWorkload {
+    pub fn pending_documents(self) -> usize {
+        self.total_documents.saturating_sub(self.reusable_documents)
+    }
+}
+
 /// Count only documents within normalized repository path prefixes.
 pub fn count_code_embedding_documents_for_scope(
     store: &Store,
@@ -241,9 +261,26 @@ pub fn count_code_embedding_documents_for_scope(
     options: EmbeddingIndexOptions,
     prefixes: &[String],
 ) -> Result<usize> {
+    Ok(
+        count_code_embedding_work_for_scope(store, root, project, provider, options, prefixes)?
+            .total_documents,
+    )
+}
+
+/// Validate content hashes before estimating inference work. This uses the
+/// same chunking, model identity, visibility and scope as the embedding pass,
+/// and never loads model weights or writes vectors.
+pub fn count_code_embedding_work_for_scope(
+    store: &Store,
+    root: &Path,
+    project: &str,
+    provider: &dyn CodeEmbeddingProvider,
+    options: EmbeddingIndexOptions,
+    prefixes: &[String],
+) -> Result<EmbeddingWorkload> {
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = 0usize;
-    let mut total = 0usize;
+    let mut work = EmbeddingWorkload::default();
 
     loop {
         let nodes = if store.is_overlay() && prefixes.is_empty() {
@@ -283,10 +320,24 @@ pub fn count_code_embedding_documents_for_scope(
                 provider,
                 options.max_span_bytes,
             )?;
-            total = total.saturating_add(chunks.len());
+            work.total_documents = work.total_documents.saturating_add(chunks.len());
+            for chunk in chunks {
+                let content_sha256 = sha256_hex(chunk.text.as_bytes());
+                if store.has_reusable_vector_embedding(&ReusableVectorEmbeddingKey {
+                    project,
+                    model_id: provider.model_id(),
+                    prompt_version: provider.prompt_version(),
+                    task: provider.task_profile(),
+                    qualified_name: &node.qualified_name,
+                    chunk_idx: chunk.chunk_idx,
+                    content_sha256: &content_sha256,
+                })? {
+                    work.reusable_documents += 1;
+                }
+            }
         }
     }
-    Ok(total)
+    Ok(work)
 }
 
 /// Match exact files or directory descendants, never neighboring prefix names.
@@ -321,9 +372,9 @@ pub fn index_code_embeddings_for_project(
     )
 }
 
-/// Index vectors while reporting completed inference documents. Callers that
-/// expose progress should obtain `total_documents` from
-/// [`count_code_embedding_documents_for_project`] first.
+/// Index vectors while reporting validated documents and proven local reuse.
+/// The pass assesses the exact workload before publishing its first event;
+/// `total_documents` is retained as a compatibility hint, not an ETA basis.
 pub fn index_code_embeddings_for_project_with_progress(
     store: &mut Store,
     root: &Path,
@@ -348,8 +399,8 @@ pub fn index_code_embeddings_for_project_with_progress(
 }
 
 /// Progress reporting configuration for a scoped embedding pass.
-/// The count comes from `count_code_embedding_documents_for_scope` with the
-/// same prefixes/options as the pass; the callback receives the existing events.
+/// The legacy count is a hint only: the pass validates exact chunks and reuse
+/// for its scope before publishing progress, so callers need not pre-count.
 pub struct EmbeddingIndexProgressContext<'a> {
     pub total_documents: usize,
     pub callback: &'a mut dyn FnMut(EmbeddingIndexProgress),
@@ -366,9 +417,13 @@ pub fn index_code_embeddings_for_scope_with_progress(
     prefixes: &[String],
 ) -> Result<EmbeddingIndexReport> {
     let EmbeddingIndexProgressContext {
-        total_documents,
+        total_documents: _,
         callback: progress,
     } = progress_context;
+    // Publish a complete reuse assessment before giving an inference ETA.
+    let work =
+        count_code_embedding_work_for_scope(store, root, project, provider, options, prefixes)?;
+    let total_documents = work.total_documents;
     let mut report = EmbeddingIndexReport::default();
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = 0usize;
@@ -382,6 +437,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
     progress(EmbeddingIndexProgress {
         completed_documents: 0,
         total_documents,
+        reusable_documents: work.reusable_documents,
         local_store_reuse: 0,
         global_cache_hits: 0,
         global_cache_misses: 0,
@@ -495,6 +551,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
+                        reusable_documents: work.reusable_documents,
                         local_store_reuse: report.nodes_reused,
                         global_cache_hits: provider.content_cache_stats().hits,
                         global_cache_misses: provider.content_cache_stats().misses,
@@ -524,6 +581,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
+                        reusable_documents: work.reusable_documents,
                         local_store_reuse: report.nodes_reused,
                         global_cache_hits: cache_stats.hits,
                         global_cache_misses: cache_stats.misses,
@@ -551,6 +609,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
         progress(EmbeddingIndexProgress {
             completed_documents: report.nodes_embedded,
             total_documents,
+            reusable_documents: work.reusable_documents,
             local_store_reuse: report.nodes_reused,
             global_cache_hits: cache_stats.hits,
             global_cache_misses: cache_stats.misses,
@@ -1632,6 +1691,12 @@ mod tests {
                     root_path: root.to_string_lossy().into_owned(),
                 })
                 .unwrap();
+            assert_eq!(overlay.count_nodes("p", "", "").unwrap(), 2);
+            assert_eq!(
+                count_embedding_candidate_nodes(&overlay, "p").unwrap(),
+                0,
+                "immutable Base definitions are not pending Delta embedding work"
+            );
             let prefixes = vec!["src/scrape".to_owned()];
             let options = EmbeddingIndexOptions::for_generation(2);
             let total = count_code_embedding_documents_for_scope(
@@ -1662,6 +1727,16 @@ mod tests {
             assert!(scoped_progress
                 .iter()
                 .all(|event| event.total_documents == total));
+            assert!(scoped_progress
+                .iter()
+                .all(|event| event.reusable_documents == usize::from(warm)));
+            let work = count_code_embedding_work_for_scope(
+                &overlay, &root, "p", &provider, options, &prefixes,
+            )
+            .unwrap();
+            assert_eq!(work.total_documents, 1);
+            assert_eq!(work.reusable_documents, 1);
+            assert_eq!(work.pending_documents(), 0);
             let last = scoped_progress.last().unwrap();
             assert_eq!(last.completed_documents, 1);
             assert_eq!(last.local_store_reuse, usize::from(warm));
@@ -1728,6 +1803,90 @@ mod tests {
     }
 
     #[test]
+    fn warm_changed_file_workload_excludes_reused_spans_before_inference() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() { old_marker(); }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() {}\npub fn c() {}\n").unwrap();
+        let mut store = store_with_project(&root);
+        insert_node(&mut store, "p.a", "a", "Function", "src/a.rs", 1, 1);
+        insert_node(&mut store, "p.b", "b", "Function", "src/b.rs", 1, 1);
+        insert_node(&mut store, "p.c", "c", "Function", "src/b.rs", 2, 2);
+        let mut provider = DeterministicProvider;
+        let cold = count_code_embedding_work_for_scope(
+            &store,
+            &root,
+            "p",
+            &provider,
+            EmbeddingIndexOptions::for_generation(1),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cold.total_documents, 3);
+        assert_eq!(cold.reusable_documents, 0);
+        assert_eq!(cold.pending_documents(), 3);
+        index_code_embeddings_for_project(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            EmbeddingIndexOptions::for_generation(1),
+        )
+        .unwrap();
+        let warm = count_code_embedding_work_for_scope(
+            &store,
+            &root,
+            "p",
+            &provider,
+            EmbeddingIndexOptions::for_generation(2),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(warm.total_documents, 3);
+        assert_eq!(warm.reusable_documents, 3);
+        assert_eq!(warm.pending_documents(), 0);
+        std::fs::write(root.join("src/a.rs"), "pub fn a() { new_marker(); }\n").unwrap();
+        let options = EmbeddingIndexOptions::for_generation(2);
+        let changed =
+            count_code_embedding_work_for_scope(&store, &root, "p", &provider, options, &[])
+                .unwrap();
+        assert_eq!(changed.total_documents, 3);
+        assert_eq!(changed.reusable_documents, 2);
+        assert_eq!(changed.pending_documents(), 1);
+        let mut events = Vec::new();
+        let report = index_code_embeddings_for_project_with_progress(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            options,
+            0,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.nodes_embedded, 3);
+        assert_eq!(report.nodes_reused, 2);
+        assert!(events
+            .iter()
+            .all(|event| event.total_documents == 3 && event.reusable_documents == 2));
+        assert_eq!(events.first().unwrap().completed_documents, 0);
+        assert_eq!(events.last().unwrap().completed_documents, 3);
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(2),
+                )
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
     fn scoped_pass_counts_and_embeds_only_boundary_matched_paths_without_pruning() {
         let root = tempdir_via_env();
         std::fs::create_dir_all(root.join("src/scrape")).unwrap();
@@ -1788,6 +1947,9 @@ mod tests {
         assert_eq!(cold_progress.first().unwrap().completed_documents, 0);
         assert!(cold_progress
             .iter()
+            .all(|event| event.reusable_documents == 0));
+        assert!(cold_progress
+            .iter()
             .all(|event| event.total_documents == cold_total));
         let last = cold_progress.last().unwrap();
         assert_eq!(last.completed_documents, 1);
@@ -1839,6 +2001,9 @@ mod tests {
         assert_eq!(report.nodes_reused, 1);
         assert_eq!(report.stale_rows_pruned, 0);
         assert_eq!(reused_progress.first().unwrap().completed_documents, 0);
+        assert!(reused_progress
+            .iter()
+            .all(|event| event.reusable_documents == 1));
         assert!(reused_progress
             .iter()
             .all(|event| event.total_documents == total));
@@ -1927,6 +2092,7 @@ mod tests {
             Some(&EmbeddingIndexProgress {
                 completed_documents: 0,
                 total_documents: chunks.len(),
+                reusable_documents: 0,
                 local_store_reuse: 0,
                 global_cache_hits: 0,
                 global_cache_misses: 0,

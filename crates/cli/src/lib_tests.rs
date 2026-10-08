@@ -415,7 +415,7 @@ fn semantic_refusal_preserves_admission_reason_and_selected_root() {
     assert!(
         diagnostics.contains(&format!(
             "--root {}",
-            shell_quote_cli(&root.to_string_lossy())
+            shell_quote_cli(&root.canonicalize().unwrap().to_string_lossy())
         )),
         "{diagnostics}"
     );
@@ -1093,15 +1093,19 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     let mut job = BackgroundJobGuard::from_env();
     job.attach_foreground(path.clone());
     job.device = Some("metal:0".into());
-    job.embedding_started("metal", 19_786);
+    job.embedding_started("metal", 19_786, 2_249);
     let initial = read_background_job(&path).unwrap();
-    assert_eq!(initial["eta_seconds"], 2_474);
+    assert_eq!(initial["eta_seconds"], 2_193);
+    assert_eq!(initial["total_spans"], 17_537);
+    assert_eq!(initial["validated_spans"], 19_786);
+    assert_eq!(initial["reusable_spans"], 2_249);
     assert_eq!(initial["eta_basis"], "backend_prior");
 
     job.last_progress_write = None;
     job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
         completed_documents: 2_249,
         total_documents: 19_786,
+        reusable_documents: 2_249,
         local_store_reuse: 2_249,
         global_cache_hits: 0,
         global_cache_misses: 0,
@@ -1118,6 +1122,7 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
         completed_documents: 19_786,
         total_documents: 19_786,
+        reusable_documents: 19_786,
         local_store_reuse: 19_786,
         global_cache_hits: 0,
         global_cache_misses: 0,
@@ -1128,22 +1133,141 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     assert_eq!(finished["eta_basis"], "completed_embedding_work");
     assert!(finished["rate_milli_spans_per_second"].is_null());
 
-    job.embedding_started("metal", 20);
-    job.embedding_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(2_001));
+    job.embedding_started("metal", 20, 0);
+    let started = std::time::Instant::now();
+    job.embedding_started = Some(started);
     job.last_progress_write = None;
-    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
-        completed_documents: 1,
-        total_documents: 20,
-        local_store_reuse: 0,
-        global_cache_hits: 0,
-        global_cache_misses: 1,
-        current_symbol: None,
-    });
+    job.embedding_progress_at(
+        greppy_indexer::EmbeddingIndexProgress {
+            completed_documents: 1,
+            total_documents: 20,
+            reusable_documents: 0,
+            local_store_reuse: 0,
+            global_cache_hits: 0,
+            global_cache_misses: 1,
+            current_symbol: None,
+        },
+        started + std::time::Duration::from_secs(2_001),
+    );
     let slow = read_background_job(&path).unwrap();
     assert_eq!(slow["rate_milli_spans_per_second"], 0);
     assert_eq!(slow["eta_basis"], "observed_inference");
     assert!(slow["eta_seconds"].as_u64().unwrap() >= 38_019);
     job.complete();
+}
+
+#[test]
+fn embedding_progress_before_validation_does_not_estimate_whole_graph_work() {
+    let progress = serde_json::json!({
+        "backend": "cuda",
+        "work_assessment": "pending_validation",
+        "completed_spans": 0,
+        "total_spans": serde_json::Value::Null,
+        "eta_seconds": serde_json::Value::Null,
+    });
+    assert_eq!(
+        embedding_progress_text(&progress),
+        "semantic index building — validating spans, pending work and ETA measuring (backend cuda)"
+    );
+}
+
+#[test]
+fn semantic_wait_announces_assessed_work_once_after_validation() {
+    let mut announced = false;
+    let validating = serde_json::json!({
+        "backend": "cuda",
+        "work_assessment": "pending_validation",
+        "total_spans": serde_json::Value::Null,
+        "eta_seconds": serde_json::Value::Null,
+    });
+    assert!(crate::inference::embedding_validation_progress_update(None, &mut announced).is_none());
+    assert!(crate::inference::embedding_validation_progress_update(
+        Some(&validating),
+        &mut announced,
+    )
+    .is_none());
+    assert!(!announced);
+    let assessed = serde_json::json!({
+        "backend": "cuda",
+        "work_assessment": "validated",
+        "validated_spans": 197,
+        "reusable_spans": 196,
+        "completed_spans": 0,
+        "total_spans": 1,
+        "eta_seconds": 1,
+    });
+    assert_eq!(
+        crate::inference::embedding_validation_progress_update(Some(&assessed), &mut announced,)
+            .as_deref(),
+        Some("semantic index building — 0/1 spans, ETA ~1s (backend cuda)")
+    );
+    assert!(announced);
+    let mut failed = assessed.clone();
+    failed["state"] = serde_json::json!("failed");
+    failed["last_error"] = serde_json::json!("GPU inference stopped");
+    let mut failure_announced = false;
+    assert!(crate::inference::embedding_validation_progress_update(
+        Some(&failed),
+        &mut failure_announced,
+    )
+    .is_none());
+    assert!(!failure_announced);
+    assert!(crate::inference::embedding_validation_progress_update(
+        Some(&assessed),
+        &mut announced,
+    )
+    .is_none());
+}
+
+#[test]
+fn warm_refresh_job_counts_only_uncached_work_after_validation() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
+    let root = test_tempdir("warm-refresh-pending");
+    let path = root.join("index.job");
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::remove_var("GREPPY_BACKGROUND_JOB");
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+    let mut job = BackgroundJobGuard::from_env();
+    job.attach_foreground(path.clone());
+    job.embedding_started("cuda", 197, 196);
+    let initial = read_background_job(&path).unwrap();
+    assert_eq!(initial["completed_spans"], 0);
+    assert_eq!(initial["total_spans"], 1);
+    assert_eq!(initial["validated_spans"], 197);
+    assert_eq!(initial["reusable_spans"], 196);
+    assert_eq!(initial["eta_seconds"], 1);
+    assert!(initial["rate_milli_spans_per_second"].is_null());
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 196,
+        total_documents: 197,
+        reusable_documents: 196,
+        local_store_reuse: 196,
+        ..Default::default()
+    });
+    let reused = read_background_job(&path).unwrap();
+    assert_eq!(reused["completed_spans"], 0);
+    assert_eq!(reused["total_spans"], 1);
+    assert_eq!(reused["eta_seconds"], 1);
+    assert!(reused["rate_milli_spans_per_second"].is_null());
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 197,
+        total_documents: 197,
+        reusable_documents: 196,
+        local_store_reuse: 196,
+        global_cache_hits: 1,
+        ..Default::default()
+    });
+    let finished = read_background_job(&path).unwrap();
+    assert_eq!(finished["completed_spans"], 1);
+    assert_eq!(finished["total_spans"], 1);
+    assert_eq!(finished["eta_seconds"], 0);
+    assert!(finished["rate_milli_spans_per_second"].is_null());
+    job.complete();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1824,6 +1948,20 @@ fn inference_daemon_status_uses_cli_device_for_endpoint_identity() {
             .to_owned()
     };
 
+    // macOS has no CUDA backend: an explicit `--device cuda` is refused with a
+    // pointer to `--device auto` instead of probing a daemon it cannot start.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = endpoint(&auto);
+        assert_eq!(cuda["embedding"]["state"], "faulted", "{cuda}");
+        assert!(
+            cuda["embedding"]["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("CUDA is not available on macOS")),
+            "{cuda}"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     assert_ne!(
         endpoint(&auto),
         endpoint(&cuda),
@@ -1855,18 +1993,34 @@ fn embedding_device_preference_obeys_cli_and_env() {
     unsafe {
         std::env::set_var(ENV_DEVICE, "metal");
     }
-    assert_eq!(
-        embedding_device_preference(None, false).unwrap(),
-        greppy_embed_native::DevicePreference::Metal
-    );
-    assert_eq!(
-        embedding_device_preference(Some("cuda"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cuda
-    );
-    assert_eq!(
-        embedding_device_preference(Some("cuda:2"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cuda
-    );
+    let metal_from_env = embedding_device_preference(None, false);
+    let cuda = embedding_device_preference(Some("cuda"), false);
+    let cuda_indexed = embedding_device_preference(Some("cuda:2"), false);
+    let auto_phrase = "use --device auto (Metal on macOS, CUDA on Linux)";
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            metal_from_env.unwrap(),
+            greppy_embed_native::DevicePreference::Metal
+        );
+        assert!(matches!(
+            cuda,
+            Err(Error::Invalid(message)) if message.contains(auto_phrase)
+        ));
+        assert!(matches!(
+            cuda_indexed,
+            Err(Error::Invalid(message)) if message.contains(auto_phrase)
+        ));
+    } else {
+        assert!(matches!(
+            metal_from_env,
+            Err(Error::Invalid(message)) if message.contains(auto_phrase)
+        ));
+        assert_eq!(cuda.unwrap(), greppy_embed_native::DevicePreference::Cuda);
+        assert_eq!(
+            cuda_indexed.unwrap(),
+            greppy_embed_native::DevicePreference::Cuda
+        );
+    }
     configure_explicit_cuda_device(Some("cuda:2")).unwrap();
     assert_eq!(env_nonempty(ENV_EMBED_CUDA_DEVICE).as_deref(), Some("2"));
     assert_eq!(env_nonempty(ENV_QWEN_CUDA_DEVICE).as_deref(), Some("2"));
@@ -2633,11 +2787,12 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     }
 
     let mut guard = BackgroundJobGuard::from_env();
-    guard.embedding_started("cpu", 10);
+    guard.embedding_started("cpu", 10, 1);
     guard.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
         current_symbol: None,
         completed_documents: 4,
         total_documents: 10,
+        reusable_documents: 1,
         local_store_reuse: 1,
         global_cache_hits: 2,
         global_cache_misses: 1,
@@ -2651,8 +2806,10 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     assert_eq!(job["cause"], "foreground-index");
     assert_eq!(job["kind"], "index");
     assert_eq!(job["state"], "base_graph_ready");
-    assert_eq!(job["completed_spans"], 4);
-    assert_eq!(job["total_spans"], 10);
+    assert_eq!(job["completed_spans"], 3);
+    assert_eq!(job["total_spans"], 9);
+    assert_eq!(job["validated_spans"], 10);
+    assert_eq!(job["reusable_spans"], 1);
     assert_eq!(job["local_store_reuse"], 1);
     assert_eq!(job["global_cache_hits"], 2);
     assert_eq!(job["global_cache_misses"], 1);
@@ -3709,4 +3866,46 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
         .as_str()
         .unwrap()
         .contains("last query waiter exited"));
+}
+
+#[test]
+fn bracketed_route_file_in_a_qualified_target_is_not_a_glob() {
+    assert!(validate_nav_target("api/[...path].js::loadState").is_ok());
+    assert!(validate_nav_target("app/[id]/page.tsx::Page").is_ok());
+    assert!(validate_nav_target("src/*.rs::run").is_err());
+    assert!(validate_nav_target("api/[...path].js::load*").is_err());
+    assert!(validate_nav_target("Store[0]").is_err());
+    assert!(validate_nav_target("load*").is_err());
+}
+
+#[test]
+fn multi_name_search_exit_keeps_a_retryable_refusal() {
+    assert_eq!(combine_search_exit(0, 1), 0);
+    assert_eq!(combine_search_exit(1, 1), 1);
+    assert_eq!(combine_search_exit(0, 75), 75);
+    assert_eq!(combine_search_exit(75, 1), 75);
+    assert_eq!(combine_search_exit(1, 75), 75);
+}
+
+#[test]
+fn graph_reads_do_not_follow_embedding_progress() {
+    assert!(graph_read_follows_background_job(None));
+    assert!(graph_read_follows_background_job(Some(
+        &serde_json::json!({"kind": "index", "state": "extracting_files"})
+    )));
+    assert!(graph_read_follows_background_job(Some(
+        &serde_json::json!({"kind": "index", "state": "writing_graph"})
+    )));
+    // An index job embeds inline before it publishes: keep following it.
+    for state in ["counting_embeddings", "embedding", "loading_model"] {
+        assert!(
+            graph_read_follows_background_job(Some(
+                &serde_json::json!({"kind": "index", "state": state})
+            )),
+            "{state}"
+        );
+    }
+    assert!(!graph_read_follows_background_job(Some(
+        &serde_json::json!({"kind": "embedding", "state": "writing_graph"})
+    )));
 }

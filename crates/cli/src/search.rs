@@ -128,6 +128,55 @@ pub(crate) fn search_graph_counts_json(
     Ok(())
 }
 
+fn search_scoped_prefixes(filters: &QueryPathFilters) -> Option<Vec<String>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let prefixes = filters.repo_prefixes();
+    if prefixes.len() != filters.filters.len() || prefixes.iter().any(|prefix| prefix.is_empty()) {
+        return None;
+    }
+    Some(prefixes)
+}
+
+fn search_nodes_for_prefixes(
+    store: &greppy_store::Store,
+    project: &str,
+    prefixes: &[String],
+) -> Result<Vec<greppy_store::Node>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+    for prefix in prefixes {
+        for node in store.list_nodes_for_path_prefix(project, prefix)? {
+            if !seen.insert(node.id)
+                || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+            {
+                continue;
+            }
+            nodes.push(node);
+        }
+    }
+    nodes.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(nodes)
+}
+
+fn search_outside_filter_matches<'a>(
+    nodes: impl IntoIterator<Item = &'a greppy_store::Node>,
+    query: &str,
+    path_filters: &QueryPathFilters,
+) -> usize {
+    nodes
+        .into_iter()
+        .filter(|node| {
+            search_symbol_name_contains(node, query) && !path_filters.matches(&node.file_path)
+        })
+        .count()
+}
+
 fn search_all_nodes(store: &greppy_store::Store, project: &str) -> Result<Vec<greppy_store::Node>> {
     const PAGE: usize = 4096;
     let mut nodes = Vec::new();
@@ -182,8 +231,11 @@ fn search_sort_name_rows(query: &str, nodes: &mut [greppy_store::Node]) {
 
 fn search_symbol_name_contains(node: &greppy_store::Node, query: &str) -> bool {
     // Match the same qualified name printed in a successful navigation row,
-    // not only the bare method name stored in `name`.
-    node.name.contains(query) || (query.contains("::") && nav_short_name(node).contains(query))
+    // not only the bare method name stored in `name`. Case-insensitive, like
+    // symbol resolution: `price` finds `Parse_Price` and `parsePrice`.
+    let query = query.to_ascii_lowercase();
+    node.name.to_ascii_lowercase().contains(&query)
+        || (query.contains("::") && nav_short_name(node).to_ascii_lowercase().contains(&query))
 }
 
 fn search_symbol_no_match_status(
@@ -492,14 +544,26 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(1);
     }
 
-    let mut all_nodes = search_all_nodes(&store, &project)?;
-    all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
-    let matches_outside_filter = all_nodes
-        .iter()
-        .filter(|node| {
-            search_symbol_name_contains(node, q) && !path_filters.matches(&node.file_path)
-        })
-        .count();
+    let scoped_prefixes = if kind.is_none() && !q.contains("::") {
+        search_scoped_prefixes(&path_filters)
+    } else {
+        None
+    };
+    let (all_nodes, matches_outside_filter) = if let Some(prefixes) = scoped_prefixes {
+        let nodes = search_nodes_for_prefixes(&store, &project, &prefixes)?;
+        let outside = store
+            .list_nodes_name_containing(&project, q)?
+            .into_iter()
+            .filter(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name))
+            .collect::<Vec<_>>();
+        let outside = search_outside_filter_matches(&outside, q, &path_filters);
+        (nodes, outside)
+    } else {
+        let mut nodes = search_all_nodes(&store, &project)?;
+        nodes.retain(|node| search_kind_matches(&root_path, node, kind));
+        let outside = search_outside_filter_matches(&nodes, q, &path_filters);
+        (nodes, outside)
+    };
     let nodes = all_nodes
         .into_iter()
         .filter(|node| path_filters.matches(&node.file_path))
@@ -1698,6 +1762,59 @@ pub(crate) fn dispatch_semantic(
     }
 }
 
+fn should_announce_semantic_work(
+    elapsed: std::time::Duration,
+    progress: Option<&serde_json::Value>,
+) -> bool {
+    // Fast refreshes finish silently. Count/ETA messages are meaningful only
+    // after content reuse has been assessed; generic startup observation is
+    // already owned by the query progress reporter.
+    elapsed >= std::time::Duration::from_secs(10)
+        && progress.is_some_and(|job| {
+            job.get("work_assessment")
+                .and_then(serde_json::Value::as_str)
+                == Some("validated")
+                && job
+                    .get("total_spans")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|n| n > 0)
+        })
+}
+
+#[cfg(test)]
+mod semantic_work_announcement_tests {
+    use super::should_announce_semantic_work;
+    use std::time::Duration;
+
+    #[test]
+    fn fast_unknown_and_reuse_only_refreshes_do_not_emit_compute_estimates() {
+        let known = serde_json::json!({"work_assessment":"validated", "total_spans":1});
+        assert!(!should_announce_semantic_work(
+            Duration::from_millis(9_999),
+            Some(&known)
+        ));
+        assert!(should_announce_semantic_work(
+            Duration::from_secs(10),
+            Some(&known)
+        ));
+        assert!(!should_announce_semantic_work(
+            Duration::from_secs(90),
+            None
+        ));
+        for job in [
+            serde_json::json!({"work_assessment":"pending_validation", "total_spans":197}),
+            serde_json::json!({"work_assessment":"validated", "total_spans":null}),
+            serde_json::json!({"work_assessment":"validated", "total_spans":0}),
+            serde_json::json!({"total_spans":197}),
+        ] {
+            assert!(
+                !should_announce_semantic_work(Duration::from_secs(90), Some(&job)),
+                "{job}"
+            );
+        }
+    }
+}
+
 fn wait_for_embedding_publication(
     root: Option<&str>,
     effective_root: &std::path::Path,
@@ -1707,6 +1824,7 @@ fn wait_for_embedding_publication(
     prefixes: &[String],
 ) -> Result<greppy_store::Store> {
     let mut announced = false;
+    let progress_started = std::time::Instant::now();
     crate::context_status::restricted(
         effective_root,
         requested_generation,
@@ -1721,16 +1839,10 @@ fn wait_for_embedding_publication(
             prefixes,
         )
         .ok_or_else(|| {
-            let detail = background_embedding_failure(embedding_progress_value(
-                effective_root,
-                cfg,
-                requested_generation,
-            ))
-            .unwrap_or_else(|| "the embedding process could not be started".into());
-            Error::Index(format!(
-                "semantic embedding failed for {}: {detail}",
-                effective_root.display()
-            ))
+            let progress = embedding_progress_value(effective_root, cfg, requested_generation);
+            let detail = background_embedding_failure(progress.clone())
+                .unwrap_or_else(|| "the embedding process could not be started".into());
+            semantic_embedding_error(effective_root, Some(&progress), detail)
         })?;
         let initial_job = read_background_job(launch.path());
         let follow_attached_owner = matches!(launch, BackgroundJobLaunch::Attached { .. })
@@ -1742,18 +1854,6 @@ fn wait_for_embedding_publication(
                         .unwrap_or_default()
                         == prefixes
             });
-        if !announced {
-            crate::context_status::restricted(
-                effective_root,
-                requested_generation,
-                crate::context_status::Capability::Semantic,
-            );
-            let progress = initial_job.unwrap_or_else(|| {
-                embedding_progress_value(effective_root, cfg, requested_generation)
-            });
-            eprintln!("semantic-search: {}", embedding_progress_text(&progress));
-            announced = true;
-        }
         loop {
             let owner_active = launch.owner_is_active().map_err(|error| {
                 Error::io(
@@ -1764,15 +1864,26 @@ fn wait_for_embedding_publication(
                     error,
                 )
             })?;
+            let progress = read_background_job(launch.path());
             if matches!(
                 observe_background_embedding(
-                    read_background_job(launch.path()).as_ref(),
+                    progress.as_ref(),
                     owner_active,
                     false,
                     follow_attached_owner,
                 ),
                 BackgroundEmbeddingObservation::Pending
             ) {
+                if !announced
+                    && should_announce_semantic_work(progress_started.elapsed(), progress.as_ref())
+                {
+                    if let Some(message) = crate::inference::embedding_validation_progress_update(
+                        progress.as_ref(),
+                        &mut announced,
+                    ) {
+                        eprintln!("semantic-search: {message}");
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
@@ -1815,10 +1926,11 @@ fn wait_for_embedding_publication(
                 continue;
             }
             BackgroundEmbeddingObservation::Failed(detail) => {
-                return Err(Error::Index(format!(
-                    "semantic embedding failed for {}: {detail}",
-                    effective_root.display()
-                )));
+                return Err(semantic_embedding_error(
+                    effective_root,
+                    read_background_job(launch.path()).as_ref(),
+                    detail,
+                ));
             }
             BackgroundEmbeddingObservation::MissingPublication => {}
             BackgroundEmbeddingObservation::Pending => {
@@ -1861,6 +1973,59 @@ pub(crate) fn observe_background_embedding(
         return BackgroundEmbeddingObservation::FollowIndex;
     }
     BackgroundEmbeddingObservation::MissingPublication
+}
+
+fn semantic_embedding_error(
+    root: &std::path::Path,
+    job: Option<&serde_json::Value>,
+    detail: String,
+) -> Error {
+    let deferred = job.is_some_and(|job| {
+        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+            && job
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("admission_deferred")
+    });
+    if deferred {
+        Error::AdmissionDeferred {
+            root: root.to_path_buf(),
+            detail,
+        }
+    } else {
+        Error::Index(format!(
+            "semantic embedding failed for {}: {detail}",
+            root.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn semantic_preparation_preserves_typed_admission_and_real_failure() {
+    let root = std::path::Path::new("/repo");
+    let admission =
+        serde_json::json!({"state":"failed","preparation_failure_kind":"admission_deferred"});
+    assert!(matches!(
+        semantic_embedding_error(
+            root,
+            Some(&admission),
+            "No work started; another owner".into()
+        ),
+        Error::AdmissionDeferred { .. }
+    ));
+    for job in [
+        None,
+        Some(serde_json::json!({"state":"failed","preparation_failure_kind":"preparation_failed"})),
+        Some(
+            serde_json::json!({"state":"running","preparation_failure_kind":"admission_deferred"}),
+        ),
+    ] {
+        assert!(matches!(
+            semantic_embedding_error(root, job.as_ref(), "GPU load failed".into()),
+            Error::Index(_)
+        ));
+    }
 }
 
 pub(crate) fn background_embedding_failure(job: serde_json::Value) -> Option<String> {

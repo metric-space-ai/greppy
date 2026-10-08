@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use greppy_agent::{sandbox, ExecutionEnv, GreppyEnv, SandboxMode};
+use greppy_agent::{sandbox, ExecutionEnv, GreppyEnv, SandboxMode, ToolOutcome};
 use serde_json::json;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -125,6 +125,13 @@ fn agent_writable_roots(worktree: &Path, scratch: &Path, agent_data: &Path) -> V
         registry,
         git_cache,
     ]
+}
+
+/// A denied write surfaces either as a tool error or as a normal bash-smart
+/// result whose verdict line reports the failed command (red commands are
+/// normal results for the agent); the probe file check stays authoritative.
+fn denied(out: &ToolOutcome) -> bool {
+    out.is_error || out.content.starts_with("FAILED — exit ")
 }
 
 fn sandbox_exec_available() -> bool {
@@ -243,7 +250,7 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
         ]}),
     );
     assert!(
-        home_out.is_error,
+        denied(&home_out),
         "HOME write must be denied; content={}",
         home_out.content
     );
@@ -276,7 +283,7 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
         ]}),
     );
     assert!(
-        base_write.is_error,
+        denied(&base_write),
         "published Base write must be denied; content={}",
         base_write.content
     );
@@ -296,7 +303,7 @@ fn enforce_index_backed_where_am_i_not_permission_denied() {
         ]}),
     );
     assert!(
-        cache_out.is_error,
+        denied(&cache_out),
         "platform-cache write outside worktree must be denied; content={}",
         cache_out.content
     );

@@ -1,4 +1,6 @@
-use greppy_edit::txn::{first_syntax_diagnostic, syntax_counts, syntax_language_for_path};
+use greppy_edit::txn::{
+    first_syntax_diagnostic, syntax_counts, syntax_language_for_edit, syntax_language_for_path,
+};
 use std::path::Path;
 
 #[test]
@@ -26,5 +28,67 @@ fn guarded_protocol_header_preserves_syntax_gate() {
             "{malformed}"
         );
         assert!(first_syntax_diagnostic(language, malformed.as_bytes()).is_some());
+    }
+}
+
+#[test]
+fn compatible_header_can_add_cpp_default_member_without_weakening_c() {
+    let path = Path::new("member.h");
+    let before = b"struct Example { int value; };\n";
+    let after = b"struct Example { int value{}; };\n";
+    for baseline in [b"".as_slice(), before.as_slice()] {
+        let language = syntax_language_for_edit(path, baseline, after);
+        assert_eq!(language, greppy_parser::Language::Cpp);
+        for bytes in [baseline, after.as_slice()] {
+            let counts = syntax_counts(language, bytes).unwrap();
+            assert_eq!((counts.errors, counts.missing), (0, 0));
+        }
+    }
+    let c = b"struct AtomicState { _Atomic(int) value; };\n";
+    assert_eq!(
+        syntax_language_for_edit(path, before, c),
+        greppy_parser::Language::C
+    );
+    assert_eq!(
+        syntax_language_for_edit(Path::new("member.c"), before, after),
+        greppy_parser::Language::C
+    );
+    let broken = b"struct Example { int value{; };\n";
+    let language = syntax_language_for_edit(path, before, broken);
+    let counts = syntax_counts(language, broken).unwrap();
+    assert!(counts.errors > 0 || counts.missing > 0);
+}
+
+#[test]
+fn c11_atomic_type_specifiers_preserve_real_errors_and_expression_rules() {
+    let c = greppy_parser::Language::C;
+    for source in [
+        "_Atomic(int) value;",
+        "struct AtomicState { _Atomic(int) value; };",
+        "_Atomic(unsigned long *) value;",
+        "typedef int MyType; _Atomic(MyType) value;",
+        "void f(void) { _Atomic(int) local; }",
+        "_Atomic int value;",
+        "_Atomic /* type comment */ (int) value;",
+        "_Atomic int first; _Atomic(int) second;",
+        "const char *s = \"_Atomic(int)\"; /* _Atomic() */",
+    ] {
+        let counts = syntax_counts(c, source.as_bytes()).unwrap();
+        assert_eq!((counts.errors, counts.missing), (0, 0), "{source}");
+        assert!(first_syntax_diagnostic(c, source.as_bytes()).is_none());
+    }
+    for source in [
+        "_Atomic() value;",
+        "_Atomic(int value;",
+        "_Atomic(int named) value;",
+        "_Atomic(1 + 2) value;",
+        "struct AtomicState { _Atomic(int) value; }; int broken( ;",
+    ] {
+        let counts = syntax_counts(c, source.as_bytes()).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0, "{source}");
+        assert!(
+            first_syntax_diagnostic(c, source.as_bytes()).is_some(),
+            "{source}"
+        );
     }
 }

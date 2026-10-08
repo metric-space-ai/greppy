@@ -35,7 +35,7 @@ pub(crate) fn embedding_backend_plan(cfg: &EmbeddingModelConfig) -> (String, Opt
         .as_ref()
         .and_then(|registry| registry.selected_backend)
         .map(greppy_embed_native::BackendKind::as_str)
-        .unwrap_or_else(|| cfg.device.as_str())
+        .unwrap_or("unavailable")
         .to_string();
     let device = registry
         .and_then(|registry| registry.selected_device_id)
@@ -140,9 +140,6 @@ pub(crate) fn embedding_progress_value(
     }
 
     let (backend, device) = embedding_backend_plan(cfg);
-    let total_spans = current_embedding_candidate_count(root);
-    let eta_seconds = initial_embedding_eta_seconds(total_spans, &backend);
-    let now = unix_now_secs_cli();
     serde_json::json!({
         "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
         "kind": "embedding",
@@ -152,21 +149,56 @@ pub(crate) fn embedding_progress_value(
         "device": device,
         "graph_generation": graph_generation,
         "completed_spans": 0,
-        "total_spans": total_spans,
+        "total_spans": serde_json::Value::Null,
+        "work_assessment": "pending_validation",
         "progress_milli_percent": 0,
         "rate_milli_spans_per_second": serde_json::Value::Null,
-        "eta_seconds": eta_seconds,
-        "eta_minutes": eta_seconds.map(|eta| eta.saturating_add(59) / 60),
-        "eta_unix_secs": eta_seconds.map(|eta| now.saturating_add(eta)),
+        "eta_seconds": serde_json::Value::Null,
+        "eta_minutes": serde_json::Value::Null,
+        "eta_unix_secs": serde_json::Value::Null,
         "last_error": serde_json::Value::Null,
     })
+}
+
+/// Announce the first assessed workload after the launch/validation status.
+/// This is a phase transition, not a polling log; terminal failures still flow
+/// through the caller's publication observation and error handling.
+pub(crate) fn embedding_validation_progress_update(
+    progress: Option<&serde_json::Value>,
+    announced: &mut bool,
+) -> Option<String> {
+    let progress = progress?;
+    if *announced
+        || progress.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+        || progress
+            .get("last_error")
+            .is_some_and(|error| !error.is_null())
+        || progress
+            .get("work_assessment")
+            .and_then(serde_json::Value::as_str)
+            != Some("validated")
+    {
+        return None;
+    }
+    *announced = true;
+    Some(embedding_progress_text(progress))
 }
 
 pub(crate) fn embedding_progress_text(progress: &serde_json::Value) -> String {
     let backend = progress
         .get("backend")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("cpu");
+        .unwrap_or("unknown");
+    if progress
+        .get("work_assessment")
+        .and_then(serde_json::Value::as_str)
+        == Some("pending_validation")
+        || progress.get("state").and_then(serde_json::Value::as_str) == Some("counting_embeddings")
+    {
+        return format!(
+            "semantic index building — validating spans, pending work and ETA measuring (backend {backend})"
+        );
+    }
     let completed = progress
         .get("completed_spans")
         .and_then(serde_json::Value::as_u64)
@@ -334,15 +366,38 @@ pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>
     if test_inference_skipped() {
         return Ok(None);
     }
-    let Some((gguf, tokenizer)) = qwen35_assets::paths() else {
-        return Ok(None);
-    };
+    let (gguf, tokenizer) = qwen35_assets::identity_paths();
     Ok(Some(QwenSummaryConfig {
         model_id: greppy_qwen35_native::MODEL_ID.to_string(),
         gguf: gguf.into(),
         tokenizer: tokenizer.into(),
         device: qwen_summary_device_preference()?,
     }))
+}
+
+/// Only the actual model owner prepares assets; shared clients need identity alone.
+pub(crate) fn qwen_summary_config_materialized(
+    cfg: &QwenSummaryConfig,
+) -> Result<QwenSummaryConfig> {
+    let (gguf, tokenizer) = qwen35_assets::identity_paths();
+    if cfg.gguf != std::path::Path::new(&gguf) || cfg.tokenizer != std::path::Path::new(&tokenizer)
+    {
+        return Ok(cfg.clone());
+    }
+    let (gguf, tokenizer) = qwen35_assets::paths().ok_or_else(|| {
+        let detail = format!(
+            "Qwen3.5 owner could not prepare model assets under {}; check model-cache permissions, free space and asset integrity",
+            greppy_core::cache::models_root().display()
+        );
+        #[cfg(any(unix, windows))]
+        summarize_daemon::report_configuration_failure(&detail);
+        Error::Config(detail)
+    })?;
+    Ok(QwenSummaryConfig {
+        gguf: gguf.into(),
+        tokenizer: tokenizer.into(),
+        ..cfg.clone()
+    })
 }
 
 pub(crate) fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePreference> {
@@ -482,6 +537,20 @@ fn enforce_product_gpu(
              --device cpu or --no-gpu and unsetting GREPPY_DEVICE=cpu or GREPPY_NO_GPU"
                 .into(),
         ));
+    }
+    // Reject a backend the host cannot load before the native loader starts.
+    // `auto` stays legal and picks Metal on macOS, CUDA on Linux.
+    let unavailable = match preference {
+        #[cfg(target_os = "macos")]
+        greppy_embed_native::DevicePreference::Cuda => Some("CUDA is not available on macOS"),
+        #[cfg(not(target_os = "macos"))]
+        greppy_embed_native::DevicePreference::Metal => Some("Metal is only available on macOS"),
+        _ => None,
+    };
+    if let Some(reason) = unavailable {
+        return Err(Error::Invalid(format!(
+            "{reason}; use --device auto (Metal on macOS, CUDA on Linux)"
+        )));
     }
     Ok(preference)
 }

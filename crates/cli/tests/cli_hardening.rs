@@ -295,6 +295,27 @@ fn run_with_env_and_inference(
 }
 
 #[test]
+fn fixed_literal_search_cannot_silently_run_semantic_search() {
+    let (repo, store, _scratch) = make_repo("fixed-search-routing", "marker");
+    let (code, out, err) = run(
+        &[
+            "search",
+            "Cannot filter a query once a slice has been taken",
+            "--fixed",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 64, "{out} {err}");
+    assert!(out.contains("greppy search-pattern TEXT --fixed"), "{out}");
+    assert!(!out.contains("ignoring unknown option"), "{out}");
+    assert!(
+        !store.exists(),
+        "a refused literal-search shape must not start semantic indexing"
+    );
+}
+
+#[test]
 fn browser_extra_url_is_refused_without_path_recovery_recursion() {
     let (repo, store, _scratch) = make_repo("web-extra-url", "marker");
     for args in [
@@ -539,12 +560,17 @@ fn query_after_releasing_writer(
         }
     }
     let diagnostic = store.join("waiting-query.stderr");
+    let waiting = store.join("waiting-query.ready");
+    if waiting.exists() {
+        std::fs::remove_file(&waiting).unwrap();
+    }
     let mut query = Query(Some(
         Command::new(bin())
             .args(args)
             .current_dir(repo)
             .env("GREPPY_STORE_DIR", store)
             .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_QUERY_PUBLICATION_WAIT_READY", &waiting)
             .env_remove("GREPPY_DISCOVER_INCLUDE")
             .env_remove("GREPPY_DISCOVER_EXCLUDE")
             .stdout(std::process::Stdio::piped())
@@ -562,15 +588,12 @@ fn query_after_releasing_writer(
             writer.child.try_wait().unwrap().is_none(),
             "fixture writer must remain held"
         );
-        if std::fs::read_to_string(&diagnostic)
-            .unwrap()
-            .contains("syncing_snapshot")
-        {
+        if waiting.exists() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "query never reported held publication: {}",
+            "query never joined held publication: {}",
             std::fs::read_to_string(&diagnostic).unwrap()
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1654,8 +1677,8 @@ fn diagnostics_json_exposes_provider_incompleteness() {
 
     let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
-        code, 73,
-        "diagnostics must be non-zero while providers are incomplete; stderr={err}\nstdout={out}"
+        code, 0,
+        "non-call-graph gaps and unsupported files must not fail diagnostics; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -1697,6 +1720,269 @@ fn diagnostics_json_exposes_provider_incompleteness() {
 }
 
 #[test]
+fn diagnostics_exit_0_when_only_route_edges_are_unsupported() {
+    let (repo, store, _scratch) = make_repo("diag-routes", "route_gap_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+    let db = find_graph_db(&store).expect("graph.db after index");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE provider_state
+         SET status = 'partial', files_failed = 0, unsupported_edge_classes = ?1
+         WHERE status != 'unsupported'",
+        [r#"["routes"]"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (code, out, err) = run(&["diagnostics", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "only route gaps must exit 0; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let providers = v["projects"][0]["provider_states"].as_array().unwrap();
+    assert!(providers.iter().any(|provider| {
+        provider["unsupported_edge_classes"]
+            .as_array()
+            .is_some_and(|edges| edges.iter().any(|edge| edge == "routes"))
+    }));
+
+    let (code, out, err) = run(&["diagnostics"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    assert!(
+        out.contains("partial (unsupported: routes)"),
+        "text diagnostics must name the unsupported class; stdout={out}"
+    );
+}
+
+#[test]
+fn doctor_is_fresh_after_copy_and_first_index() {
+    let (origin, _origin_store, scratch) = make_real_git_repo("doctor-copy-origin");
+    let copy = scratch.0.join("copy");
+    let status = Command::new("cp")
+        .args(["-R", origin.to_str().unwrap(), copy.to_str().unwrap()])
+        .status()
+        .expect("spawn cp");
+    assert!(status.success(), "cp -R failed");
+    let store = scratch.0.join("copy-store");
+    let (code, out, err) = run(&["index", "."], &copy, &store);
+    assert_eq!(
+        code, 0,
+        "first index of the copy failed; stderr={err}\nstdout={out}"
+    );
+    let (code, out, err) = run(&["doctor", "--json", "--diagnostics"], &copy, &store);
+    assert_eq!(
+        code, 0,
+        "doctor must be fresh after one index of a copied repo; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["healthy"], true, "{v}");
+    assert_eq!(v["fresh"], true, "{v}");
+    let reasons = v["freshness"]["reasons"].as_array();
+    assert!(
+        reasons.is_none_or(|reasons| {
+            reasons.iter().all(|reason| {
+                !reason
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("index signature changed")
+            })
+        }),
+        "metadata-only index drift must be refreshed: {v}"
+    );
+}
+
+#[test]
+fn workspace_doctor_inactive_provider_reports_ordinary_backend() {
+    let (root, _scratch) = fresh_dir("ws-doctor-inactive");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let (code, out, err) = run_with_env(
+        &["workspace", "doctor", "--json"],
+        &root,
+        &root.join("store"),
+        &[("GREPPY_WORKSPACE_DIR", data.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["healthy"], true, "{v}");
+    assert_eq!(v["backend"], "ordinary", "{v}");
+    assert_eq!(v["provider"], "inactive", "{v}");
+}
+
+#[test]
+fn workspace_doctor_broken_provider_still_fails() {
+    let (root, _scratch) = fresh_dir("ws-doctor-stale");
+    let data = root.join("data");
+    let mount = root.join("mount");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&mount).unwrap();
+    let manifest = serde_json::json!({
+        "protocol_version": 1,
+        "adapter_version": "0.4.2",
+        "adapter_kind": "fuse3",
+        "state": "ready",
+        "instance_id": "doctor-stale",
+        "data_root": data,
+        "mount_root": mount,
+        "heartbeat_unix_ms": 1,
+        "capabilities": {
+            "hard_links": true,
+            "symbolic_links": true,
+            "byte_range_locks": true,
+            "memory_maps": true,
+            "atomic_rename": true,
+            "case_preserving": true
+        }
+    });
+    std::fs::write(
+        data.join("provider.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        mount.join(".greppy-provider.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let (code, out, err) = run_with_env(
+        &["workspace", "doctor", "--json"],
+        &root,
+        &root.join("store"),
+        &[("GREPPY_WORKSPACE_DIR", data.to_str().unwrap())],
+    );
+    assert_eq!(code, 73, "{out}\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["healthy"], false, "{v}");
+    assert_eq!(v["diagnostics"]["checks"]["heartbeat"]["status"], "failed");
+    assert!(
+        !data.join("core").exists(),
+        "broken provider must not open core"
+    );
+}
+
+#[test]
+fn search_rejects_unavailable_gpu_device_up_front() {
+    let (repo, store, _scratch) = make_repo("device-reject", "device_marker");
+    let device = if cfg!(target_os = "macos") {
+        "cuda"
+    } else {
+        "metal"
+    };
+    let (code, out, err) = run(
+        &["search", "--device", device, "device_marker"],
+        &repo,
+        &store,
+    );
+    let combined = format!("{out}\n{err}");
+    assert!(
+        combined.contains("use --device auto (Metal on macOS, CUDA on Linux)"),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains("--device cpu"),
+        "product builds must not advise --device cpu: {combined}"
+    );
+    assert_eq!(code, 64, "{combined}");
+}
+
+#[cfg(unix)]
+#[test]
+fn store_permissions_after_first_index() {
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, store, _scratch) = make_repo("perm-index", "perm_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    fn walk(dir: &Path) {
+        let mode = std::fs::symlink_metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "directory {} is {:o}", dir.display(), mode);
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(&path);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let private_db = name.ends_with(".db")
+                || name.ends_with(".sqlite3")
+                || name.ends_with("-wal")
+                || name.ends_with("-shm");
+            if private_db {
+                let file_mode = meta.permissions().mode() & 0o777;
+                assert_eq!(
+                    file_mode,
+                    0o600,
+                    "database {} is {:o}",
+                    path.display(),
+                    file_mode
+                );
+            }
+        }
+    }
+    walk(&store);
+}
+
+#[test]
+fn doctor_json_without_git_preserves_inference_diagnostics() {
+    let (root, _scratch) = fresh_dir("doctor-without-git");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let empty_path = root.join("empty-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run_with_env(
+        &["doctor", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &[("PATH", empty_path.to_str().unwrap())],
+    );
+    assert_eq!(code, 1, "stderr={err}\nstdout={out}");
+    assert!(err.is_empty(), "stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "no_index");
+    assert_eq!(v["dirty_overlay"]["git_available"], false);
+    assert!(v["dirty_overlay"]["clean"].is_null());
+    assert_eq!(v["dirty_overlay"]["assessment"], "unknown");
+    assert!(v["dirty_overlay"]["diagnostic"]
+        .as_str()
+        .unwrap()
+        .contains("git executable unavailable"));
+    assert!(v["inference"]["registry"].is_object());
+    assert!(v["inference"]["daemons"].is_object());
+    assert!(v["inference"]["models"].is_object());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_git_spawn_permission_error_remains_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, _scratch) = fresh_dir("doctor-git-permission");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let path = root.join("path");
+    std::fs::create_dir_all(&path).unwrap();
+    let git = path.join("git");
+    std::fs::write(&git, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (code, out, err) = run_with_env(
+        &["doctor", "--json", "--diagnostics"],
+        &repo,
+        &root.join("store"),
+        &[("PATH", path.to_str().unwrap())],
+    );
+    assert_eq!(code, 73, "stderr={err}\nstdout={out}");
+    assert!(err.contains("spawn git status for dirty overlay"), "{err}");
+}
+
+#[test]
 fn doctor_json_reports_missing_index_as_structured_status() {
     let (root, _scratch) = fresh_dir("doctor-no-index");
     let repo = root.join("repo");
@@ -1719,6 +2005,14 @@ fn doctor_json_reports_missing_index_as_structured_status() {
     assert_eq!(v["healthy"], false);
     assert_eq!(v["store_exists"], false);
     assert_eq!(v["project"], "repo");
+    // This fixture has a .git directory but no Git repository metadata.
+    assert_eq!(v["dirty_overlay"]["git_available"], false);
+    assert!(v["dirty_overlay"]["clean"].is_null());
+    assert_eq!(v["dirty_overlay"]["assessment"], "unknown");
+    assert!(v["dirty_overlay"]["diagnostic"]
+        .as_str()
+        .unwrap()
+        .contains("git status unsuccessful"));
     assert_eq!(v["project_present"], false);
     assert_eq!(v["fresh"], false);
     assert_eq!(v["store_cow"]["mode"], "single");
@@ -2548,8 +2842,8 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
 
     let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
-        code, 73,
-        "diagnostics should still report provider incompleteness, not store corruption; stderr={err}\nstdout={out}"
+        code, 0,
+        "recovered store must not look corrupt, and route-class gaps must not fail diagnostics; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -3267,6 +3561,38 @@ fn first_use_query_waits_for_healthy_slow_index() {
     check_first_use_query_waits_for_healthy_slow_index(false);
 }
 
+/// Ceiling for a condition that must eventually become true. Host contention
+/// stretches process startup; it must not change the condition itself.
+const LOAD_ROBUST_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(unix)]
+fn poll_until_running(
+    mut still_running: impl FnMut() -> bool,
+    early_exit: &str,
+    failure: &str,
+    mut done: impl FnMut() -> bool,
+) {
+    let deadline = std::time::Instant::now() + LOAD_ROBUST_CEILING;
+    while !done() {
+        assert!(still_running(), "{early_exit}");
+        assert!(std::time::Instant::now() < deadline, "{failure}");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn wait_for_child_output(mut child: std::process::Child, failure: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + LOAD_ROBUST_CEILING;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None => {
+                assert!(std::time::Instant::now() < deadline, "{failure}");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn signal_process(pid: u32, signal: libc::c_int) {
     let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
@@ -3323,11 +3649,11 @@ fn process_is_running(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn wait_for_process_exit(pid: u32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + LOAD_ROBUST_CEILING;
     while process_is_running(pid) {
         assert!(
             std::time::Instant::now() < deadline,
-            "process {pid} remained alive after query demand ended"
+            "process {pid} remained alive after query demand ended (waited {LOAD_ROBUST_CEILING:?})"
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -3352,15 +3678,12 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn first-use query");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() || !demand_ready.exists() {
-        assert!(query.try_wait().unwrap().is_none(), "query exited early");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "writer did not become ready"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || query.try_wait().unwrap().is_none(),
+        "query exited early",
+        "writer did not become ready",
+        || ready.exists() && demand_ready.exists(),
+    );
     let workspace = store
         .join("workspaces")
         .join("v2")
@@ -3371,9 +3694,9 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
     let index_pid = job["pid"].as_u64().unwrap() as u32;
 
     signal_process(query.id(), libc::SIGINT);
-    let status = query.wait().unwrap();
+    let output = wait_for_child_output(query, "cancelled first-use query did not exit");
     assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&status),
+        std::os::unix::process::ExitStatusExt::signal(&output.status),
         Some(libc::SIGINT)
     );
     wait_for_process_exit(index_pid);
@@ -3489,30 +3812,19 @@ fn automatic_index_stops_only_after_last_shared_query_exits() {
     let first_demand = scratch.0.join("first-demand-ready");
     let second_demand = scratch.0.join("second-demand-ready");
     let mut first = spawn(&first_demand);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() || !first_demand.exists() {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "first query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "first writer did not become ready"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || first.try_wait().unwrap().is_none(),
+        "first query exited early",
+        "first writer did not become ready",
+        || ready.exists() && first_demand.exists(),
+    );
     let mut second = spawn(&second_demand);
-    while !second_demand.exists() {
-        assert!(
-            second.try_wait().unwrap().is_none(),
-            "second query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "second query did not attach"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || second.try_wait().unwrap().is_none(),
+        "second query exited early",
+        "second query did not attach",
+        || second_demand.exists(),
+    );
     let job_path = store
         .join("workspaces")
         .join("v2")
@@ -3523,15 +3835,31 @@ fn automatic_index_stops_only_after_last_shared_query_exits() {
     let index_pid = job["pid"].as_u64().unwrap() as u32;
 
     signal_process(first.id(), libc::SIGINT);
-    let _ = first.wait().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = wait_for_child_output(first, "first shared query did not exit after interrupt");
+    // Reaping the first query is the event that drops its demand lock. The
+    // second query still running is what proves a shared waiter remains — not
+    // a fixed sleep long enough for a loaded host to mis-cancel.
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "second query exited before the shared index could be observed"
+    );
     assert!(
         process_is_running(index_pid),
         "shared waiter must keep index alive"
     );
+    let held: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_ne!(
+        held["state"], "cancelled",
+        "cancelling one shared waiter cancelled the automatic index: {held}"
+    );
+    assert_ne!(
+        held["state"], "failed",
+        "cancelling one shared waiter failed the automatic index: {held}"
+    );
 
     signal_process(second.id(), libc::SIGTERM);
-    let _ = second.wait().unwrap();
+    let _ = wait_for_child_output(second, "second shared query did not exit after signal");
     wait_for_process_exit(index_pid);
 }
 
@@ -3554,15 +3882,12 @@ fn cancelling_attached_query_does_not_stop_explicit_foreground_index() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn explicit foreground index");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(writer.try_wait().unwrap().is_none(), "writer exited early");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "writer did not become ready"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || writer.try_wait().unwrap().is_none(),
+        "writer exited early",
+        "writer did not become ready",
+        || ready.exists(),
+    );
 
     let demand_ready = scratch.0.join("explicit-attached-demand-ready");
     let mut query = Command::new(bin())
@@ -3575,20 +3900,27 @@ fn cancelling_attached_query_does_not_stop_explicit_foreground_index() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn attached query");
-    while !demand_ready.exists() {
-        assert!(query.try_wait().unwrap().is_none(), "query exited early");
-        assert!(std::time::Instant::now() < deadline, "query did not attach");
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || query.try_wait().unwrap().is_none(),
+        "query exited early",
+        "query did not attach",
+        || demand_ready.exists(),
+    );
     signal_process(query.id(), libc::SIGINT);
-    let _ = query.wait().unwrap();
+    let _ = wait_for_child_output(query, "attached query did not exit after interrupt");
+    // Query exit is the event. The explicit writer must still be alive then,
+    // and must be able to publish when its own release file appears.
     assert!(
         writer.try_wait().unwrap().is_none(),
         "query cancellation must not stop explicit writer"
     );
 
     std::fs::write(&release, b"release\n").unwrap();
-    let status = writer.wait().unwrap();
+    let status = wait_for_child_output(
+        writer,
+        "explicit foreground index did not finish after release",
+    )
+    .status;
     assert!(status.success(), "explicit writer failed: {status}");
     let (code, out, err) = run(&["search-symbol", "explicit_writer_marker"], &repo, &store);
     assert_eq!(code, 0, "stdout={out}\nstderr={err}");
@@ -3965,6 +4297,7 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
 fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
     let (repo, store, scratch) = make_repo("first-use-two-callers", "two_caller_marker");
     let ready = scratch.0.join("first-use-two-callers-ready");
+    let release = scratch.0.join("first-use-two-callers-release");
     let spawn = |demand_ready: &Path| {
         let mut command = Command::new(bin());
         command
@@ -3974,7 +4307,8 @@ fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
             .env("GREPPY_TEST_SKIP_INFERENCE", "1")
             .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
             .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
-            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "1000")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
             .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
             .env_remove("GREPPY_DISCOVER_INCLUDE")
             .env_remove("GREPPY_DISCOVER_EXCLUDE")
@@ -3984,38 +4318,35 @@ fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
     };
     let first_demand = scratch.0.join("two-callers-first-demand");
     let second_demand = scratch.0.join("two-callers-second-demand");
-    let mut first = spawn(&first_demand);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() || !first_demand.exists() {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "first query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "first writer did not reach publication hold"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    let mut second = spawn(&second_demand);
-    while !second_demand.exists() {
-        assert!(
-            second.try_wait().unwrap().is_none(),
-            "second query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "second query did not attach"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    signal_process(first.id(), libc::SIGINT);
-    let first = first.wait_with_output().unwrap();
-    let second = second.wait_with_output().unwrap();
+    let mut first = ReapedQuery::new(spawn(&first_demand));
+    poll_until_running(
+        || first.try_wait().unwrap().is_none(),
+        "first query exited early",
+        "first writer did not reach publication hold",
+        || ready.exists() && first_demand.exists(),
+    );
+    let mut second = ReapedQuery::new(spawn(&second_demand));
+    poll_until_running(
+        || second.try_wait().unwrap().is_none(),
+        "second query exited early",
+        "second query did not attach",
+        || second_demand.exists(),
+    );
+    signal_process(first.0.as_ref().expect("query child").id(), libc::SIGINT);
+    let first = first.wait_with_output(LOAD_ROBUST_CEILING);
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&first.status),
         Some(libc::SIGINT)
     );
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "attached query exited before publication was released"
+    );
+    // Publication stays held until both attachment and initiator cancellation
+    // have been observed. A short hold would expire before a loaded host
+    // finished attaching, and the second query could pass without sharing.
+    std::fs::write(&release, b"release\n").unwrap();
+    let second = second.wait_with_output(LOAD_ROBUST_CEILING);
     assert_eq!(second.status.code(), Some(0), "{second:?}");
     assert!(
         String::from_utf8_lossy(&second.stdout).contains("two_caller_marker"),
@@ -4153,20 +4484,28 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
 #[test]
 fn first_use_background_spawn_failure_returns_without_handshake_deadlock() {
     let (repo, store, _scratch) = make_repo("first-use-spawn-fail", "spawn_fail_marker");
-    let started = std::time::Instant::now();
-    let (code, out, err) = run_with_env(
-        &["search-symbol", "spawn_fail_marker"],
-        &repo,
-        &store,
-        &[("GREPPY_TEST_BACKGROUND_SPAWN_FAIL", "1")],
-    );
+    // The failpoint rejects spawn before the ownership handshake. A deadlock
+    // never returns; the ceiling is only the hang detector. Startup under
+    // contention can exceed a few seconds without entering that handshake.
+    let child = Command::new(bin())
+        .args(["search-symbol", "spawn_fail_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BACKGROUND_SPAWN_FAIL", "1")
+        .env_remove("GREPPY_DISCOVER_INCLUDE")
+        .env_remove("GREPPY_DISCOVER_EXCLUDE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn failing first-use query");
+    let output = wait_for_child_output(child, "spawn failure deadlocked the ownership handshake");
+    let code = output.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
     assert_ne!(
         code, 0,
         "spawn failpoint unexpectedly succeeded: {out} {err}"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "spawn failure deadlocked the ownership handshake"
     );
     assert!(err.contains("spawn background index"), "{out}\n{err}");
 }

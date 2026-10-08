@@ -1559,11 +1559,11 @@ pub(super) fn ensure_supervisor(
             }
         }
         let started = Instant::now();
-        let budget = Duration::from_secs(60);
+        let mut saw_starting = false;
         let mut startup_exit = None;
         loop {
-            if let Some(live) = live_runtime_status(&socket, &run_id, &capability) {
-                if live.runtime_image_id == expected_runtime_image_id {
+            match observe_runtime_startup(&socket, &run_id, &capability) {
+                RuntimeProbe::Ready(live) if live.runtime_image_id == expected_runtime_image_id => {
                     let ctx = SupervisorCtx {
                         socket,
                         run_id,
@@ -1574,8 +1574,10 @@ pub(super) fn ensure_supervisor(
                     save_runtime_route(root, &ctx)?;
                     return Ok(ctx);
                 }
+                RuntimeProbe::Starting => saw_starting = true,
+                RuntimeProbe::Ready(_) | RuntimeProbe::Pending => {}
             }
-            if started.elapsed() >= budget {
+            if started.elapsed() >= startup_wait_budget(saw_starting) {
                 break;
             }
             if started.elapsed() >= Duration::from_secs(1) {
@@ -1643,14 +1645,88 @@ fn save_attach_cookie(socket: &Path, token: &str) {
     }
 }
 
+const RUNTIME_READY_BUDGET: Duration = Duration::from_secs(60);
+const RUNTIME_STARTING_BUDGET: Duration = Duration::from_secs(180);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeProbe {
+    Ready(LiveRuntimeStatus),
+    Starting,
+    Pending,
+}
+
+fn startup_wait_budget(saw_starting: bool) -> Duration {
+    if saw_starting {
+        RUNTIME_STARTING_BUDGET
+    } else {
+        RUNTIME_READY_BUDGET
+    }
+}
+
+fn classify_runtime_status(
+    status: &str,
+    error_code: Option<&str>,
+    result: Option<&serde_json::Value>,
+) -> RuntimeProbe {
+    if error_code == Some("starting") {
+        return RuntimeProbe::Starting;
+    }
+    if status == "ok" {
+        if let Some(result) = result {
+            if result.get("state").and_then(|value| value.as_str()) == Some("starting") {
+                return RuntimeProbe::Starting;
+            }
+            if let Some(runtime_image_id) = result
+                .get("runtime_build_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+            {
+                return RuntimeProbe::Ready(LiveRuntimeStatus {
+                    runtime_image_id: runtime_image_id.to_owned(),
+                    sessions: result.get("sessions").and_then(|value| value.as_u64()),
+                });
+            }
+        }
+    }
+    RuntimeProbe::Pending
+}
+
+fn observe_runtime_startup(socket: &Path, run_id: &str, capability: &str) -> RuntimeProbe {
+    #[cfg(unix)]
+    {
+        if !socket.exists() {
+            return RuntimeProbe::Pending;
+        }
+        let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
+        probe.capability = capability.to_owned();
+        let Ok(response) =
+            greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400))
+        else {
+            return RuntimeProbe::Pending;
+        };
+        return classify_runtime_status(
+            &response.status,
+            response.error.as_ref().map(|error| error.code.as_str()),
+            response.result.as_ref(),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, run_id, capability);
+        RuntimeProbe::Pending
+    }
+}
+
 fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> Option<LiveRuntimeStatus> {
     let started = Instant::now();
-    let budget = Duration::from_secs(60);
+    let mut saw_starting = false;
     loop {
-        if let Some(status) = live_runtime_status(socket, run_id, capability) {
-            return Some(status);
+        match observe_runtime_startup(socket, run_id, capability) {
+            RuntimeProbe::Ready(status) => return Some(status),
+            RuntimeProbe::Starting => saw_starting = true,
+            RuntimeProbe::Pending => {}
         }
-        if !socket_connected(socket) || started.elapsed() >= budget {
+        if !socket_connected(socket) || started.elapsed() >= startup_wait_budget(saw_starting) {
             return None;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -2418,6 +2494,37 @@ mod target_tests {
         assert_eq!(
             runtime_disposition(None, false, "image-new"),
             RuntimeDisposition::Spawn
+        );
+    }
+
+    #[test]
+    fn starting_status_extends_the_runtime_wait_to_three_minutes() {
+        assert_eq!(startup_wait_budget(false), Duration::from_secs(60));
+        assert_eq!(startup_wait_budget(true), Duration::from_secs(180));
+        let starting = json!({ "state": "starting", "phase": "content", "elapsed_ms": 10 });
+        assert_eq!(
+            classify_runtime_status("ok", None, Some(&starting)),
+            RuntimeProbe::Starting
+        );
+        assert_eq!(
+            classify_runtime_status("error", Some("starting"), None),
+            RuntimeProbe::Starting
+        );
+        match classify_runtime_status(
+            "ok",
+            None,
+            Some(&json!({ "runtime_build_id": "sha256:abc", "sessions": 2 })),
+        ) {
+            RuntimeProbe::Ready(live) => {
+                assert_eq!(live.runtime_image_id, "sha256:abc");
+                assert_eq!(live.sessions, Some(2));
+            }
+            other => panic!("expected a ready runtime, got {other:?}"),
+        }
+        assert_eq!(
+            classify_runtime_status("ok", None, Some(&json!({ "sessions": 1 }))),
+            RuntimeProbe::Pending,
+            "a body without runtime_build_id is not readiness"
         );
     }
 

@@ -38,7 +38,13 @@ impl Drop for Scratch {
 
 fn fixture(tag: &str, source: &str) -> (PathBuf, PathBuf, Scratch) {
     let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let scratch = std::env::temp_dir().join(format!(
+    // The CLI records workspaces under their canonical path; on macOS the
+    // default temp dir (/var/folders/...) is a symlink into /private/var.
+    #[cfg(target_os = "macos")]
+    let temp = std::env::temp_dir().canonicalize().unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let temp = std::env::temp_dir();
+    let scratch = temp.join(format!(
         "greppy-semantic-fallback-{tag}-{}-{unique}",
         std::process::id()
     ));

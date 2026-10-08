@@ -15,7 +15,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +53,47 @@ mod network_record_tests {
         assert_eq!(record["failure"]["errorText"], "body reset");
         assert_eq!(record["responseHeaders"]["x-test"], "yes");
         assert!(network_record_failed(record));
+    }
+}
+
+#[cfg(test)]
+mod startup_gate_tests {
+    use super::*;
+
+    #[test]
+    fn starting_status_names_the_worker_still_coming_up() {
+        assert_eq!(startup_phase(false), "controller");
+        assert_eq!(startup_phase(true), "content");
+        assert_eq!(
+            starting_status_body("controller", 12),
+            json!({ "state": "starting", "phase": "controller", "elapsed_ms": 12 })
+        );
+        let gate = StartupGate::new();
+        assert!(!gate.is_ready());
+        assert_eq!(gate.phase(), "controller");
+        gate.mark_controller_ready();
+        assert_eq!(gate.phase(), "content");
+        let body = gate.starting_body();
+        assert_eq!(body["state"], "starting");
+        assert_eq!(body["phase"], "content");
+        assert!(body["elapsed_ms"].as_u64().is_some());
+        gate.mark_ready();
+        assert!(gate.is_ready());
+    }
+
+    #[test]
+    fn non_status_requests_are_retryable_while_starting() {
+        let request = Request::new("run", "web.session.create", json!({}));
+        let error = starting_error(&request);
+        assert_eq!(error.code, "starting");
+        assert!(error.retryable);
+        assert_eq!(error.operation_id, request.request_id);
+        assert!(is_startup_status("web.status"));
+        assert!(is_startup_status("status"));
+        assert!(!is_startup_status("web.session.create"));
+        let response = Response::error(&request, error);
+        assert_eq!(response.status, "error");
+        assert!(response.result.is_none());
     }
 }
 
@@ -356,27 +397,52 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             }
         }
     }
+    let startup = Arc::new(StartupGate::new());
     if crate::supervisor::phase_trace_enabled() {
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase start-workers socket={}",
+        eprintln!(
+            "web-runtime: phase bind-socket socket={}",
             config.socket.display()
-        ); }
+        );
     }
-    let mut daemon = Daemon::start(config, attach, Arc::clone(&early_control))?;
-    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase bind-socket socket={}",
-        daemon.socket.display()
-    ); }
-    let listener = bind_socket_healing_stale(&daemon.socket)?;
-    let mut permissions = std::fs::metadata(&daemon.socket)?.permissions();
+    let listener = bind_socket_healing_stale(&config.socket)?;
+    let mut permissions = std::fs::metadata(&config.socket)?.permissions();
     permissions.set_mode(0o600);
-    std::fs::set_permissions(&daemon.socket, permissions)?;
-    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase listening"); } }
+    std::fs::set_permissions(&config.socket, permissions)?;
+    if crate::supervisor::phase_trace_enabled() {
+        eprintln!("web-runtime: phase listening");
+    }
     let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
-    let accept_attach = daemon.attach_capability.clone();
+    let accept_attach = attach.clone();
     let accept_control = Arc::clone(&early_control);
+    let accept_startup = Arc::clone(&startup);
     thread::Builder::new()
         .name("web-runtime-accept".into())
-        .spawn(move || accept_loop(listener, tx, accept_control, accept_attach))
+        .spawn(move || accept_loop(listener, tx, accept_control, accept_attach, accept_startup))
         .map_err(io::Error::other)?;
+    if crate::supervisor::phase_trace_enabled() {
+        eprintln!(
+            "web-runtime: phase start-workers socket={}",
+            config.socket.display()
+        );
+    }
+    // The socket is bound before the workers start. If they fail to start,
+    // remove it at once: otherwise the still-running accept thread keeps
+    // answering "starting" and the next runtime's stale-socket probe would
+    // mistake this dying process for a live one.
+    let socket_path = config.socket.clone();
+    let mut daemon = match Daemon::start(
+        config,
+        attach,
+        Arc::clone(&early_control),
+        Arc::clone(&startup),
+    ) {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            remove_runtime_socket_files(&socket_path);
+            return Err(error);
+        }
+    };
+    startup.mark_ready();
     if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase request-ready elapsed_ms={}",
         started.elapsed().as_millis()
     ); }
@@ -528,6 +594,80 @@ fn remove_runtime_socket_files(socket: &Path) {
 /// saw silence, not a cause. A stale path is only removed once a connect
 /// proves nobody is listening; a live runtime keeps its socket and the
 /// caller gets the real address-in-use error.
+/// Answers `web.status` before controller and content workers finish starting.
+/// The accept thread reads this gate; `serve` opens it only after both handshakes.
+struct StartupGate {
+    started: Instant,
+    controller_ready: AtomicBool,
+    ready: AtomicBool,
+}
+
+impl StartupGate {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            controller_ready: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_controller_ready(&self) {
+        self.controller_ready.store(true, Ordering::Release);
+    }
+
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn phase(&self) -> &'static str {
+        startup_phase(self.controller_ready.load(Ordering::Acquire))
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn starting_body(&self) -> Value {
+        starting_status_body(self.phase(), self.elapsed_ms())
+    }
+}
+
+fn startup_phase(controller_ready: bool) -> &'static str {
+    if controller_ready {
+        "content"
+    } else {
+        "controller"
+    }
+}
+
+fn starting_status_body(phase: &str, elapsed_ms: u64) -> Value {
+    json!({
+        "state": "starting",
+        "phase": phase,
+        "elapsed_ms": elapsed_ms,
+    })
+}
+
+fn is_startup_status(operation: &str) -> bool {
+    matches!(operation, "web.status" | "status")
+}
+
+fn starting_error(request: &Request) -> ErrorObject {
+    let mut error = ErrorObject::new(
+        "starting",
+        "web-runtime workers are still starting",
+        request.request_id.clone(),
+        31,
+        "retry this request",
+    );
+    error.retryable = true;
+    error
+}
+
 fn bind_socket_healing_stale(path: &Path) -> io::Result<UnixListener> {
     match UnixListener::bind(path) {
         Ok(listener) => return Ok(listener),
@@ -565,6 +705,7 @@ fn accept_loop(
     tx: mpsc::Sender<(UnixStream, Request)>,
     control: Arc<RunControl>,
     attach: String,
+    startup: Arc<StartupGate>,
 ) {
     for connection in listener.incoming() {
         let mut stream = match connection {
@@ -586,6 +727,15 @@ fn accept_loop(
                 "use the parent-issued attach token from the inherited channel",
             );
             let _ = write_frame(&mut stream, &Response::error(&request, error));
+            continue;
+        }
+        if !startup.is_ready() {
+            let response = if is_startup_status(&request.operation) {
+                Response::ok(&request, startup.starting_body())
+            } else {
+                Response::error(&request, starting_error(&request))
+            };
+            let _ = write_frame(&mut stream, &response);
             continue;
         }
         match request.operation.as_str() {
@@ -789,6 +939,7 @@ impl Daemon {
         config: DaemonConfig,
         attach_capability: String,
         run_control: Arc<RunControl>,
+        startup: Arc<StartupGate>,
     ) -> io::Result<Self> {
         // Controller (V8) and content (Servo) init independently. Sequential handshake
         // of the 400MB image exceeded the 30s socket wait and panicked wait_for_accepting
@@ -799,12 +950,14 @@ impl Daemon {
         let persistent_profiles = persistent_profiles_root();
         std::fs::create_dir_all(&persistent_profiles)?;
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); } }
+        let controller_startup = Arc::clone(&startup);
         let controller_thread = thread::Builder::new()
             .name("web-spawn-controller".into())
             .spawn(move || {
                 let mut worker = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); } }
                 worker.handshake()?;
+                controller_startup.mark_controller_ready();
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); } }
                 Ok::<_, io::Error>(worker)
             })
@@ -837,6 +990,9 @@ impl Daemon {
         run_control
             .content_pid
             .store(content.pid(), Ordering::Relaxed);
+        // Accept loop and the caller also hold the gate. Dropping this clone
+        // does not open the gate; `serve` does that after `start` returns.
+        drop(startup);
         Ok(Self {
             socket: config.socket,
             run_id: config.run_id.clone(),

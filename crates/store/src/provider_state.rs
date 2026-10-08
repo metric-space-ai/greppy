@@ -26,8 +26,64 @@ pub struct ProviderState {
 }
 
 impl ProviderState {
+    /// Edge classes outside the call graph. A provider whose only gaps are in
+    /// this set is still healthy for `diagnostics` (reported as partial, exit
+    /// 0). Call-graph gaps still fail health: `definitions`, `imports`,
+    /// `calls`, `usages`, `type_refs`, `type_assigns`, `implements`.
+    ///
+    /// `route` is included beside the manifest spelling `routes` so a row that
+    /// uses either name is treated the same.
+    pub const NON_CALL_GRAPH_EDGE_CLASSES: &'static [&'static str] = &[
+        "tests",
+        "routes",
+        "route",
+        "envscan",
+        "infrascan",
+        "k8s",
+        "pkgmap",
+        "configlink",
+        "configures",
+        "complexity",
+        "gitdiff",
+        "githistory",
+        "cross_repo",
+        "semantic",
+        "semantic_edges",
+        "similarity",
+    ];
+
     pub fn is_incomplete(&self) -> bool {
         self.status != "accepted" || !self.unsupported_edge_classes.is_empty()
+    }
+
+    /// Whether this provider should make `StoreDiagnostics::is_healthy` false.
+    ///
+    /// [`is_incomplete`] stays the broader signal used by query footers: a
+    /// partial provider is still disclosed. Diagnostics health fails only for
+    /// a real call-graph gap, a failed file, or a status that is not a
+    /// recognised partial/accepted provider. Unsupported languages and
+    /// non-code extension rows do not fail the repo.
+    pub fn blocks_diagnostics_health(&self) -> bool {
+        if self.status == "unsupported"
+            || self.language.starts_with("file extension .")
+            || self.language == "no file extension"
+        {
+            return false;
+        }
+        if self.files_failed > 0 {
+            return true;
+        }
+        if !matches!(
+            self.status.as_str(),
+            "accepted" | "partial" | "parity_candidate"
+        ) {
+            return true;
+        }
+        self.unsupported_edge_classes.iter().any(|class| {
+            !Self::NON_CALL_GRAPH_EDGE_CLASSES
+                .iter()
+                .any(|exotic| *exotic == class)
+        })
     }
 
     /// Whether this provider emits the given edge class for the project.
@@ -264,6 +320,45 @@ mod tests {
             "a contradictory row must fail closed"
         );
         assert_eq!(s.incomplete_provider_states("p").unwrap(), vec![state]);
+        assert!(
+            got.blocks_diagnostics_health(),
+            "a failed file still fails diagnostics health"
+        );
+    }
+
+    #[test]
+    fn non_call_graph_gaps_do_not_block_diagnostics_health() {
+        let mut state = ProviderState {
+            project: "p".into(),
+            language: "rust".into(),
+            provider_version: "v1".into(),
+            status: "partial".into(),
+            supported_edge_classes: vec!["calls".into()],
+            unsupported_edge_classes: vec!["routes".into(), "k8s".into(), "tests".into()],
+            files_seen: 1,
+            files_indexed: 1,
+            files_failed: 0,
+            diagnostics: Vec::new(),
+            last_indexed_generation: 1,
+            updated_at: ws::now_iso8601(),
+        };
+        assert!(state.is_incomplete());
+        assert!(!state.blocks_diagnostics_health());
+        state.unsupported_edge_classes = vec!["route".into()];
+        assert!(!state.blocks_diagnostics_health());
+        state.unsupported_edge_classes = vec!["calls".into()];
+        assert!(state.blocks_diagnostics_health());
+        state.unsupported_edge_classes = vec!["routes".into()];
+        state.files_failed = 1;
+        assert!(state.blocks_diagnostics_health());
+        state.files_failed = 0;
+        state.status = "failed".into();
+        assert!(state.blocks_diagnostics_health());
+        state.status = "unsupported".into();
+        state.language = "file extension .txt".into();
+        state.unsupported_edge_classes = vec!["calls".into()];
+        state.files_failed = 2;
+        assert!(!state.blocks_diagnostics_health());
     }
 
     #[test]

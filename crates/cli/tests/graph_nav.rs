@@ -1489,7 +1489,19 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
             "kind filter must precede counting: {out}"
         );
         assert_eq!(value["shown"], 1, "{out}");
-        for query in ["QQZZABSENT987654321", "CONTRACT_MAIN"] {
+        // search-symbol matches names case-insensitively (0.4.2, like symbol
+        // resolution); search-pattern stays a case-sensitive text search.
+        if command == "search-symbol" {
+            let (code, out, err) = run(&[command, "CONTRACT_MAIN"], &repo, &store);
+            assert_eq!(code, 0, "case-insensitive name must hit: {out}\n{err}");
+            assert!(out.contains("contract_main"), "{out}");
+        }
+        let misses: &[&str] = if command == "search-symbol" {
+            &["QQZZABSENT987654321"]
+        } else {
+            &["QQZZABSENT987654321", "CONTRACT_MAIN"]
+        };
+        for &query in misses {
             for json in [false, true] {
                 let mut args = vec![command, query];
                 if json {

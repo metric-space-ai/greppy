@@ -101,17 +101,20 @@ pub fn spawn_fake_provider_with_edits(
                 // race to replace each other's tracker owner PID.
                 if !cfg!(target_os = "macos") {
                     if now.saturating_sub(last_tracker_heartbeat) >= 250 {
-                        let tracker = core.repository_tracker_status(&tracked_repo).unwrap();
+                        // Like the real tracker service, treat a concurrent
+                        // owner change (ConcurrentRepositoryMutation) as
+                        // transient and retry on the next tick; a panic here
+                        // killed the provider thread under load and the agent
+                        // then waited 10 s for a tracker that never came.
+                        let tracker = core.repository_tracker_status(&tracked_repo).ok().flatten();
                         if !tracker.as_ref().is_some_and(|status| {
                             status.state == RepositoryTrackerState::Active
                                 && status.owner_pid == std::process::id()
                         }) {
-                            core.request_repository_tracker(&tracked_repo).unwrap();
-                            core.activate_repository_tracker(&tracked_repo, now)
-                                .unwrap();
+                            let _ = core.request_repository_tracker(&tracked_repo);
+                            let _ = core.activate_repository_tracker(&tracked_repo, now);
                         }
-                        core.heartbeat_repository_tracker(&tracked_repo, now)
-                            .unwrap();
+                        let _ = core.heartbeat_repository_tracker(&tracked_repo, now);
                         last_tracker_heartbeat = now;
                     }
                     let current_fences = std::fs::read_dir(&git_dir)
@@ -124,13 +127,15 @@ pub fn spawn_fake_provider_with_edits(
                         .symmetric_difference(&tracker_fences)
                         .map(|name| format!(".git/{name}"))
                         .collect::<Vec<_>>();
-                    if !fence_changes.is_empty() {
-                        core.record_repository_fences(
-                            &tracked_repo,
-                            &fence_changes,
-                            unix_milliseconds(),
-                        )
-                        .unwrap();
+                    if !fence_changes.is_empty()
+                        && core
+                            .record_repository_fences(
+                                &tracked_repo,
+                                &fence_changes,
+                                unix_milliseconds(),
+                            )
+                            .is_ok()
+                    {
                         tracker_fences = current_fences;
                     }
                 }

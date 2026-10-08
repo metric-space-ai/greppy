@@ -49,7 +49,15 @@ const CI_EMBED_TOK_SHA: &str = "91350500ab5af78f0b0027547d4a40b96bf81432b63b06da
 const CI_QWEN_GGUF_SHA: &str = "b14c40dfa0c3e2428232027344341fe7cb1b4495b5086d983835cea46b7267d8";
 const CI_QWEN_TOK_SHA: &str = "8a3b4f437b9ee58c2190c1e409e24c5b31c0b697041f22925705fca5365db5ca";
 
+#[path = "../../assets/prompts/contract.rs"]
+mod prompt_contract;
+
 fn main() {
+    let prompt_root =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+            .join("../..");
+    let prompt_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    prompt_contract::write_snapshots(&prompt_root, &prompt_out).unwrap_or_else(|e| panic!("{e}"));
     let profile = std::env::var("PROFILE").expect("PROFILE");
     let debug_info = std::env::var("DEBUG").as_deref() == Ok("true");
     println!("cargo:rustc-check-cfg=cfg(greppy_debug_profile)");

@@ -6,30 +6,24 @@
 //!
 //! Status: **experimental**. The `tree-sitter-commonlisp` grammar models a
 //! `(defun name (args) ...)` form as a `defun` node containing a
-//! `defun_header` whose `function_name:` field is a `sym_lit`. With the
-//! `Capture` name strategy the definition node is therefore the `defun_header`
-//! (the parent of the `@name` `sym_lit`), which is enough to emit Function
-//! nodes. Every other Lisp form parses as a `list_lit`, and — following the
-//! grammar's own `tags.scm` — a `list_lit` whose first element is a symbol is
-//! treated as a call to that symbol. Because `defun_header` exposes the name
-//! under a `function_name:` field rather than the `name:` field the engine's
-//! enclosing-callable resolver consults, CALLS edges whose *source* is a Lisp
-//! function are NOT resolved (same limitation as Julia). Call extraction is
-//! also structural/heuristic (it cannot distinguish a real function call from a
-//! macro/special-form head such as `let`/`if`), so it is best-effort and NOT
-//! claimed as `supported` (no verification corpus).
+//! `defun_header` whose `function_name:` field is a `sym_lit`. The definition
+//! query tags the body-containing `defun` as `@def` (the header is not a
+//! DefRule), so the Function span covers the body and calls inside it source
+//! from that function. Every other Lisp form parses as a `list_lit`, and —
+//! following the grammar's own `tags.scm` — a `list_lit` whose first element is
+//! a symbol is treated as a call to that symbol. That also treats lambda-list
+//! heads and special forms (`let`/`if`) as calls. Best-effort, NOT claimed as
+//! `supported` (no verification corpus).
 
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};
 
 /// `(defun f (args) ...)` parses as `(defun (defun_header function_name:
-/// (sym_lit) ...))`. Capturing the `sym_lit` as `@name` makes its parent —
-/// the `defun_header` — the definition node, so the rule keys on
-/// `"defun_header"`. `defmacro` / `defun`-family headers all share this node
-/// kind, so a single `DefRule::func("defun_header")` covers them.
+/// (sym_lit) ...))`. The def node is the `defun` (body container), not the
+/// header. `defmacro` is a separate node kind and is not emitted.
 static COMMONLISP_SPEC: LangSpec = LangSpec {
     name: NameStrategy::Capture,
-    defs: &[DefRule::func("defun_header")],
+    defs: &[DefRule::func("defun")],
     owner_kinds: &[],
     calls: CallSpec { skip_callees: &[] },
     // Common Lisp `require` / `defpackage` / `use-package` imports are not
@@ -39,11 +33,12 @@ static COMMONLISP_SPEC: LangSpec = LangSpec {
 };
 
 /// The function name is the `function_name:` field (a `sym_lit`) of a
-/// `defun_header`. Capture it as `@name`; the engine derives the def node as
-/// its parent (`defun_header`) and keys the DefRule on that kind.
+/// `defun_header`. Capture it as `@name` and the enclosing `defun` as `@def`
+/// so the span includes the body forms.
 const DEFINITIONS: &str = r#"
-    (defun_header
-      function_name: (sym_lit) @name) @def
+    (defun
+      (defun_header
+        function_name: (sym_lit) @name)) @def
 "#;
 
 /// Following the grammar's own `tags.scm`: a `list_lit` whose FIRST element is

@@ -23,3 +23,8 @@ bench/** linguist-vendored
 # Model-asset pins must be byte-identical on every OS (the redistribution
 # lock hashes the sidecar/manifest files themselves) - no EOL normalization.
 crates/cli/assets/** -text
+
+# Stable owner-signed prompt bytes on every platform.
+AGENTS.md text eol=lf
+assets/prompts/agent-adapter.md text eol=lf
+assets/prompts/contract.rs text eol=lf

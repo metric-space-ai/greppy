@@ -26,7 +26,7 @@ all assets into an empty directory so the exact release manifest can reject
 missing or unexpected files:
 
 ```bash
-version=v0.3.3
+version=v0.4.2
 mkdir "greppy-$version" && cd "greppy-$version"
 gh release download "$version" --repo metric-space-ai/greppy
 python3 - <<'PY'
@@ -51,7 +51,7 @@ installed. Also verify the selected package itself; this binds its digest to
 the same repository, workflow, and tag identity:
 
 ```bash
-asset=greppy-macos-arm64.tar.gz  # select the package for the current platform
+asset=greppy-macos-arm64.pkg  # or greppy-linux-x86_64.deb / greppy-linux-x86_64.rpm
 gh attestation verify "$asset" \
   --repo metric-space-ai/greppy \
   --signer-workflow metric-space-ai/greppy/.github/workflows/release.yml \
@@ -59,36 +59,36 @@ gh attestation verify "$asset" \
   --deny-self-hosted-runners
 ```
 
-The macOS binary must have a valid hardened-runtime signature:
+The macOS installer package must be signed with a Developer ID and notarized,
+with the ticket stapled:
 
 ```bash
-mkdir unpack && tar -C unpack -xzf greppy-macos-arm64.tar.gz
-codesign --verify --strict --verbose=2 unpack/greppy
-codesign --display --verbose=4 unpack/greppy 2>&1 | grep -E '^(Authority|TeamIdentifier)='
+pkgutil --check-signature greppy-macos-arm64.pkg
+xcrun stapler validate greppy-macos-arm64.pkg
+spctl --assess --type install --verbose=2 greppy-macos-arm64.pkg
 ```
 
-The binary is notarized, but a bare Mach-O executable cannot carry a stapled
-ticket, so `xcrun stapler validate` and `spctl --assess --type execute` report
-errors on it by construction — that is not a defect. Gatekeeper fetches the
-notarization ticket online when the binary first runs.
+v0.4.1 is the one exception to the tag-bound attestations: its packages were
+attested by a signing dry-run of the same commit, so verify them by commit
+instead of tag (`--source-digest 7e6e6ed7d95a48dc7637ba5d406e7a724e589d77` in
+place of `--source-ref`); its `SHA256SUMS` carries no attestation.
 
-For Windows, verify both the aggregate checksum and the Authenticode chain and
-timestamp before running the binary:
+Windows packages (`greppy-windows-x86_64.msi`) are published only when the
+signed driver chain is available; when present, verify the checksum and the
+Authenticode chain and timestamp before installing:
 
 ```powershell
-$version = 'v0.3.3'
+$version = 'v0.4.2'
 gh release download $version --repo metric-space-ai/greppy
-$line = (Select-String 'greppy-windows-x86_64.zip$' SHA256SUMS).Line
+$line = (Select-String 'greppy-windows-x86_64.msi$' SHA256SUMS).Line
 $want = ($line -split '\s+')[0]
-$got = (Get-FileHash greppy-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+$got = (Get-FileHash greppy-windows-x86_64.msi -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($got -ne $want) { throw 'release checksum mismatch' }
-Expand-Archive greppy-windows-x86_64.zip -DestinationPath unpack
-$signature = Get-AuthenticodeSignature unpack/greppy.exe
+$signature = Get-AuthenticodeSignature greppy-windows-x86_64.msi
 if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate) {
     throw "invalid or untimestamped Authenticode signature: $($signature.Status)"
 }
-$signature.SignerCertificate | Format-List Subject,Thumbprint,NotAfter
-gh attestation verify greppy-windows-x86_64.zip `
+gh attestation verify greppy-windows-x86_64.msi `
   --repo metric-space-ai/greppy `
   --signer-workflow metric-space-ai/greppy/.github/workflows/release.yml `
   --source-ref "refs/tags/$version" `
@@ -102,7 +102,7 @@ and is not a substitute for the repository-pinned attestation.
 
 `RELEASE-ASSETS.json` is the machine-readable, exact filename contract.
 `SHA256SUMS` covers every listed asset except itself, including the manifest,
-SBOMs, build-environment records, benchmarks, and Qwen training evidence. Do
+SBOMs, build-environment records, runtime evidence, and Qwen training evidence. Do
 not install a release if any contract, checksum, signature, or attestation
 check fails.
 

@@ -223,6 +223,7 @@ impl WorkspaceCore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        crate::chunk_store::secure_private_dir(&root)?;
         let session_lease = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -322,6 +323,7 @@ impl WorkspaceCore {
                  PRIMARY KEY(ref_name, group_id, path)
              );",
         )?;
+        crate::chunk_store::secure_sqlite_file(&metadata_path)?;
         repository_layers::install_schema(&connection)?;
         repository_tracker::install_schema(&connection)?;
         if recovering {
@@ -669,9 +671,11 @@ impl WorkspaceCore {
         let Some(pair_state) = pair_state else {
             return Err(Error::NotFound("workspace pair journal is missing".into()));
         };
-        if require_ready && pair_state != "ready" {
+        // A kept pair is retained until expiry or an explicit cleanup removes
+        // it; the caller holds the pair lease, so a live owner is fenced.
+        if require_ready && !matches!(pair_state.as_str(), "ready" | "kept") {
             return Err(Error::InvalidPath(format!(
-                "workspace pair is {pair_state}, not ready"
+                "workspace pair is {pair_state}, not ready or kept"
             )));
         }
         let mut chunks = Vec::new();
@@ -686,6 +690,7 @@ impl WorkspaceCore {
             }
         }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let repositories = tracked_repositories(&transaction, &[content_id, git_id])?;
         transaction.execute(
             "UPDATE cow_workspace_pairs SET state = 'removing'
              WHERE content_id = ?1 AND git_id = ?2",
@@ -699,6 +704,7 @@ impl WorkspaceCore {
             "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
             params![content_id, git_id],
         )?;
+        touch_unreferenced_repository_trackers(&transaction, &repositories)?;
         transaction.commit()?;
         for chunk in chunks {
             self.chunks.unpin(chunk)?;
@@ -887,6 +893,19 @@ impl WorkspaceCore {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         repository_tracker::request(&mut connection, repository, repository_tracker_now_ms())
+    }
+
+    /// Releases `repository`'s tracker when no workspace references it and it
+    /// has been unused for `idle_ms`. Returns whether it was released.
+    pub fn release_idle_repository_tracker(&self, repository: &Path, idle_ms: u64) -> Result<bool> {
+        let _writer = self.lock_metadata_writer()?;
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::release_if_idle(
+            &mut connection,
+            repository,
+            repository_tracker_now_ms(),
+            idle_ms,
+        )
     }
 
     pub fn pending_repository_trackers(&self) -> Result<Vec<PathBuf>> {
@@ -2003,10 +2022,12 @@ impl WorkspaceCore {
         let mut connection = self.lock_metadata()?;
         let chunks = workspace_chunks(&connection, &workspace.id)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let repositories = tracked_repositories(&transaction, &[&workspace.id])?;
         transaction.execute(
             "DELETE FROM cow_workspaces WHERE id = ?1",
             params![workspace.id],
         )?;
+        touch_unreferenced_repository_trackers(&transaction, &repositories)?;
         transaction.commit()?;
         self.promoted_origins
             .lock()
@@ -2049,6 +2070,7 @@ impl WorkspaceCore {
                 let Some(_lease) = lease else {
                     continue;
                 };
+                let repositories = tracked_repositories(&transaction, &[&content_id, &git_id])?;
                 transaction.execute(
                     "DELETE FROM cow_workspaces WHERE id IN (?1, ?2)",
                     params![content_id, git_id],
@@ -2057,6 +2079,7 @@ impl WorkspaceCore {
                     "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
                     params![content_id, git_id],
                 )?;
+                touch_unreferenced_repository_trackers(&transaction, &repositories)?;
             }
             transaction.commit()?;
         }
@@ -2935,6 +2958,47 @@ fn normalize_path(path: &Path, allow_root: bool) -> Result<String> {
     Ok(normalized)
 }
 
+fn tracked_repositories(connection: &Connection, ids: &[&str]) -> Result<Vec<String>> {
+    let mut repositories = Vec::new();
+    for id in ids {
+        if let Some(repository) = connection
+            .query_row(
+                "SELECT repository FROM cow_workspaces WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            repositories.push(repository);
+        }
+    }
+    repositories.sort();
+    repositories.dedup();
+    Ok(repositories)
+}
+
+/// Starts the idle clock of every tracker whose last workspace was just
+/// removed. The tracker keeps its watcher (a workspace created right after
+/// reuses it); the supervisor releases it once idle (see
+/// `repository_tracker::release_if_idle`).
+fn touch_unreferenced_repository_trackers(
+    connection: &Connection,
+    repositories: &[String],
+) -> Result<()> {
+    let now = repository_tracker_now_ms();
+    for repository in repositories {
+        let still_referenced: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE repository = ?1)",
+            params![repository],
+            |row| row.get(0),
+        )?;
+        if !still_referenced {
+            repository_tracker::touch(connection, repository, now)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_workspace_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 80
@@ -3068,6 +3132,27 @@ mod tests {
     use super::*;
 
     const CRASH_CHILD_TEST: &str = "namespace::tests::crash_child_performs_operation";
+
+    #[cfg(unix)]
+    #[test]
+    fn open_keeps_metadata_database_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = parent.path().join("core");
+        let _core = WorkspaceCore::open(&root).unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(parent.path()), 0o755);
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("workspace.sqlite3")), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = root.join(format!("workspace.sqlite3{suffix}"));
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn repository_operation_lease_is_exclusive_and_released_by_drop() {

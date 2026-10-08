@@ -73,13 +73,7 @@ fn where_incoming_degrees(
     store: &greppy_store::Store,
     project: &str,
 ) -> Result<std::collections::HashMap<i64, usize>> {
-    let mut degrees = std::collections::HashMap::new();
-    for edge_type in ["CALLS", "USAGE", "USES", "TYPE_REF", "IMPORTS"] {
-        for edge in store.list_edges_by_type(project, edge_type, i64::MAX as usize)? {
-            *degrees.entry(edge.target_id).or_default() += 1;
-        }
-    }
-    Ok(degrees)
+    Ok(store.incoming_degrees(project)?)
 }
 
 fn where_most_used(
@@ -3142,8 +3136,15 @@ pub(crate) fn nav_refuse_ambiguous(
         if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
             continue;
         }
-        if !sites.iter().any(|(file, _)| file == &node.file_path) {
-            sites.push((node.file_path.clone(), node.start_line.max(1)));
+        // Same definition identity `read` counts: one row per file and start
+        // line. Deduping by file alone under-counted several definitions that
+        // share a file, so who-calls and read disagreed on the number.
+        let start = node.start_line.max(1);
+        if !sites
+            .iter()
+            .any(|(file, line)| file == &node.file_path && *line == start)
+        {
+            sites.push((node.file_path.clone(), start));
         }
     }
     if sites.len() < 2 {
@@ -3227,7 +3228,18 @@ pub(crate) fn print_nav_rows(
     });
 
     let total = rows.len();
-    let summarize = !all && total > NAV_FULL_LIMIT;
+    // An explicit `--limit` is a row budget for text as well as JSON: rows
+    // `--offset .. --offset + --limit`, like the JSON window. It wins over the
+    // summary shape, and `--all` does not lift it. The first `--offset` rows
+    // are printed too: the output budget layer drops exactly that many lines
+    // (and adds its offset/total lines), so skipping here would page twice.
+    let explicit_limit = cli_result_limit_raw();
+    let offset = if explicit_limit.is_some() {
+        cli_result_offset().min(total)
+    } else {
+        0
+    };
+    let summarize = explicit_limit.is_none() && !all && total > NAV_FULL_LIMIT;
     if summarize {
         let mut spread: Vec<(&String, &usize)> = per_file.iter().collect();
         spread.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
@@ -3239,13 +3251,15 @@ pub(crate) fn print_nav_rows(
         println!("{total} {noun}: {spread}");
         println!();
     }
-    let shown = if summarize {
+    let shown = if let Some(limit) = explicit_limit {
+        limit.min(total - offset)
+    } else if summarize {
         NAV_SUMMARY_ROWS.min(total)
     } else {
         total
     };
     let mut cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
-    for (index, row) in rows.iter().take(shown).enumerate() {
+    for (index, row) in rows.iter().take(offset + shown).enumerate() {
         let marker = if row.test { "  test" } else { "" };
         if !code {
             println!("{}:{}  {}{}", row.file, row.line, row.name, marker);
@@ -3274,6 +3288,12 @@ pub(crate) fn print_nav_rows(
             {
                 println!("{line}");
             }
+        }
+    }
+    if explicit_limit.is_some() {
+        let omitted = total.saturating_sub(offset + shown);
+        if omitted > 0 {
+            println!("… {omitted} more (next page: --offset {})", offset + shown);
         }
     }
 }

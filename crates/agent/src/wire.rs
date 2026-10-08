@@ -13,18 +13,27 @@ use crate::protocol::{
 
 /// Serialize a [`ModelRequest`] into the Anthropic Messages request body.
 ///
-/// Always sets `stream: true`. System prompt is a plain string when present.
+/// Always sets `stream: true`. Identified Anthropic models receive explicit
+/// system/tool/history cache breakpoints; other models receive no cache fields.
 /// `tool_choice` maps as `auto` / `none` / `any` (Anthropic's "required").
 pub fn to_messages_request_body(req: &ModelRequest) -> Value {
     let mut body = json!({
         "model": req.model,
-        "max_tokens": req.max_tokens,
         "messages": map_messages(&req.messages),
         "stream": true,
     });
 
+    // u64::MAX is the loop budget sentinel, never a provider output limit.
+    if req.max_tokens != u64::MAX {
+        body["max_tokens"] = json!(req.max_tokens);
+    }
+    let cache = req.model.starts_with("claude-") || req.model.starts_with("anthropic/claude-");
     if let Some(system) = &req.system {
-        body["system"] = Value::String(system.clone());
+        body["system"] = if cache {
+            json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}])
+        } else {
+            Value::String(system.clone())
+        };
     }
 
     if !req.tools.is_empty() {
@@ -42,6 +51,26 @@ pub fn to_messages_request_body(req: &ModelRequest) -> Value {
         );
     }
 
+    if cache {
+        if let Some(tool) = body["tools"]
+            .as_array_mut()
+            .and_then(|tools| tools.last_mut())
+        {
+            tool["cache_control"] = json!({"type": "ephemeral"});
+        }
+        // One rolling history breakpoint, excluding thinking blocks (not cacheable).
+        if let Some(messages) = body["messages"].as_array_mut() {
+            if let Some(block) = messages
+                .iter_mut()
+                .rev()
+                .filter_map(|m| m["content"].as_array_mut())
+                .flat_map(|parts| parts.iter_mut().rev())
+                .find(|p| p["type"] != "thinking")
+            {
+                block["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+    }
     body["tool_choice"] = match req.tool_choice {
         ToolChoice::Auto => json!({"type": "auto"}),
         ToolChoice::None => json!({"type": "none"}),
@@ -68,8 +97,11 @@ fn map_messages(messages: &[Message]) -> Vec<Value> {
 }
 
 fn map_content(parts: &[ContentPart]) -> Vec<Value> {
-    parts
-        .iter()
+    // Anthropic requires tool results before other user content, including images.
+    parts.iter().filter(|part| matches!(part, ContentPart::ToolResult { .. }))
+        .chain(parts.iter().filter(|part| !matches!(part, ContentPart::ToolResult { .. })))
+        .filter(|part| !matches!(part, ContentPart::Thinking { .. })
+            && !matches!(part, ContentPart::SignedThinking { signature, .. } if signature.is_empty()))
         .map(|part| match part {
             ContentPart::Text { text } => json!({
                 "type": "text",
@@ -95,9 +127,11 @@ fn map_content(parts: &[ContentPart]) -> Vec<Value> {
                 "content": content,
                 "is_error": is_error,
             }),
-            ContentPart::Thinking { text } => json!({
+            ContentPart::Thinking { .. } => unreachable!("unsigned thinking filtered"),
+            ContentPart::SignedThinking { text, signature } => json!({
                 "type": "thinking",
                 "thinking": text,
+                "signature": signature,
             }),
             ContentPart::Image { media_type, data } => json!({
                 "type": "image",
@@ -565,6 +599,23 @@ impl SseParser {
                 };
                 SseItem::Event(StreamEvent::ThinkingDelta { text })
             }
+            "signature_delta" => {
+                if open_kind != BlockKind::Thinking {
+                    return malformed(
+                        "content_block_delta",
+                        "signature_delta into non-thinking block",
+                    );
+                }
+                match delta.get("signature").and_then(Value::as_str) {
+                    Some(signature) => SseItem::Event(StreamEvent::ThinkingSignatureDelta {
+                        signature: signature.into(),
+                    }),
+                    None => malformed(
+                        "content_block_delta",
+                        "missing or non-string delta.signature",
+                    ),
+                }
+            }
             "input_json_delta" => {
                 if open_kind != BlockKind::ToolUse {
                     return malformed(
@@ -869,7 +920,7 @@ mod tests {
     #[test]
     fn request_body_golden() {
         let body = to_messages_request_body(&sample_request());
-        let expected = json!({
+        let mut expected = json!({
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 1024,
             "system": "You are a coding agent.",
@@ -919,7 +970,57 @@ mod tests {
             "tool_choice": {"type": "auto"},
             "stream": true
         });
+        expected["system"] = json!([{"type":"text", "text":"You are a coding agent.", "cache_control":{"type":"ephemeral"}}]);
+        expected["tools"][0]["cache_control"] = json!({"type":"ephemeral"});
+        expected["messages"][2]["content"][0]["cache_control"] = json!({"type":"ephemeral"});
         assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn unlimited_and_foreign_model_have_no_fabricated_metadata() {
+        let mut req = sample_request();
+        req.model = "gpt-custom".into();
+        req.max_tokens = u64::MAX;
+        let body = to_messages_request_body(&req);
+        assert!(body.get("max_tokens").is_none());
+        assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn signed_thinking_replays_and_results_precede_images() {
+        let parts = map_content(&[
+            ContentPart::Image {
+                media_type: "image/png".into(),
+                data: "image".into(),
+            },
+            ContentPart::ToolResult {
+                call_id: "a".into(),
+                content: "done".into(),
+                is_error: false,
+            },
+            ContentPart::Thinking {
+                text: "unsigned".into(),
+            },
+            ContentPart::SignedThinking {
+                text: "reason".into(),
+                signature: "opaque-provider-signature".into(),
+            },
+        ]);
+        assert_eq!(parts[0]["type"], "tool_result");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[2]["signature"], "opaque-provider-signature");
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn thinking_signature_delta_is_preserved_and_kind_checked() {
+        let fixture = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"real\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        assert!(parse_all(fixture)
+            .unwrap()
+            .contains(&StreamEvent::ThinkingSignatureDelta {
+                signature: "real".into()
+            }));
+        assert!(parse_all(&fixture.replace("\"thinking\"", "\"text\"")).is_err());
     }
 
     /// Full happy-path Anthropic SSE fixture: text then tool_use.

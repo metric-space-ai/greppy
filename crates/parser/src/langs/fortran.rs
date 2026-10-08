@@ -8,23 +8,11 @@
 //! the `tree-sitter-language` 0.1 shim so it links against the workspace
 //! tree-sitter 0.25) models a procedure as a `function` / `subroutine` node
 //! whose *header* `function_statement` / `subroutine_statement` carries the
-//! `name:` field (a `name` node) — NOT the outer `function` / `subroutine`
-//! node. With the `Capture` name strategy the definition node is therefore the
-//! header statement (the `@name` node's parent), so a `DefRule::func` is keyed
-//! on `function_statement` / `subroutine_statement`.
-//!
-//! CALLS caveat (like Julia): a procedure's *body* (where `call_expression`s
-//! live) is a SIBLING of the header statement — both are direct children of the
-//! enclosing `function` / `subroutine` node, so a call's nearest ancestor is
-//! that container, not a captured def node. The engine resolves a CALLS edge's
-//! source by walking to the nearest enclosing node matching a `callable`
-//! DefRule; because the call is not lexically INSIDE the `function_statement`
-//! def node, that walk finds no callable ancestor and no CALLS edge is emitted.
-//! Fortran therefore surfaces DEFINITIONS (procedures / modules / derived types)
-//! but no resolved CALLS edges — an honest limitation of expressing this
-//! grammar's split header/body shape through the uniform declarative engine.
-//! (The CALLS query is still declared: a future engine that keys the callable
-//! walk on the `function` / `subroutine` container would light these up.)
+//! `name:` field (a `name` node). The definition query tags the outer
+//! procedure as `@def`, so the Function span covers the body. Fortran does not
+//! use the generic CALLS pass: `extract_fortran` drops spec edges and attributes
+//! each `call_expression` to the enclosing procedure (falling back to the file
+//! module when the call is not inside one).
 //!
 //! Module / derived-type headers likewise carry the name on the header
 //! statement (`module_statement` has a `name` child; `derived_type_statement`
@@ -46,21 +34,19 @@ use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStr
 /// Definitions:
 ///  * `module_statement`        — a `module NAME` header          → `Module`
 ///  * `derived_type_statement`  — a `type :: NAME` header         → `Type`
-///  * `function_statement`      — a `function NAME(...)` header    → `Function`
-///  * `subroutine_statement`    — a `subroutine NAME(...)` header  → `Function`
+///  * `function`                — a whole function procedure        → `Function`
+///  * `subroutine`              — a whole subroutine procedure      → `Function`
 ///
-/// Every captured def node is the parent of the `@name` (or `@type_name`) node,
-/// so the `Capture` strategy (def = the captured node's parent) lands exactly on
-/// the header statement keyed here. No class/method ownership is modelled
-/// (Fortran module procedures are plain procedures, and the enclosing `module`
-/// node exposes no `name:` field).
+/// Procedure names are captured from the header statement; the def node is the
+/// outer procedure so the span includes the body. Module and type rules stay
+/// on the header statement. No class/method ownership is modelled.
 static FORTRAN_SPEC: LangSpec = LangSpec {
     name: NameStrategy::Capture,
     defs: &[
         DefRule::ty("module_statement", "Module"),
         DefRule::ty("derived_type_statement", "Type"),
-        DefRule::func("function_statement"),
-        DefRule::func("subroutine_statement"),
+        DefRule::func("function"),
+        DefRule::func("subroutine"),
     ],
     owner_kinds: &[],
     calls: CallSpec { skip_callees: &[] },
@@ -73,15 +59,17 @@ static FORTRAN_SPEC: LangSpec = LangSpec {
 };
 
 /// `function area(r) result(a)` parses as `(function (function_statement name:
-/// (name) @name …))`; capture the `name` and the engine derives the def node as
-/// its parent `function_statement`. A derived type's name sits on a `type_name`
-/// child of `derived_type_statement`; a module's on a `name` child of
-/// `module_statement`.
+/// (name) @name …))`. Capture the header name and the outer `function` /
+/// `subroutine` as `@def` so the span covers the body. A derived type's name
+/// sits on a `type_name` child of `derived_type_statement`; a module's on a
+/// `name` child of `module_statement`.
 const DEFINITIONS: &str = r#"
     (module_statement       (name) @name)
     (derived_type_statement (type_name) @name)
-    (function_statement   name: (name) @name)
-    (subroutine_statement name: (name) @name)
+    (function
+      (function_statement name: (name) @name)) @def
+    (subroutine
+      (subroutine_statement name: (name) @name)) @def
 "#;
 
 /// `square(r)` / `area(r)` parse as `(call_expression (identifier) @callee

@@ -4,25 +4,140 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.4.2] — 2026-10-08
 
-## [0.4.1] — Unreleased
+### Navigation and call graph
 
-The owner selected 0.4.1 as the next release on 2026-09-28. No 0.4.0 tag or
-GitHub release was published; 0.4.1 will include the unreleased 0.4.0 line below
-and its subsequent repairs. Version metadata is preparation, not release acceptance.
+- Rust calls into inline `mod` blocks resolve again (a 0.4.0 regression:
+  `crate::trace::f` inside `mod trace { … }` lost its callers), and calls
+  across Cargo workspace member crates resolve.
+- Calls resolve only within their language: a Java call is never bound to a
+  TypeScript definition of the same name, and the same name in another
+  language no longer hides the in-language match. Local aliases bind to their
+  target; one field hop (`self.rule.apply_to_field(…)`) resolves when the
+  field type is known; `Ok`/`Err`/`Some` never bind to user functions.
+- Call edges for PowerShell, CMake, Erlang, Elm, Pascal, Common Lisp, Ada,
+  Haskell (functions passed as arguments) and Fortran (the enclosing
+  procedure is the caller); Ada `read` returns the whole body.
+- `search-symbol` takes several names in one call and matches names
+  case-insensitively. Multi-symbol `who-calls`/`callees` rows show the call
+  line; `--limit`/`--offset` window plain-text rows like `--json`.
+- `read S --lines A:B` reads a file range, like `read-file --lines`.
+- Brackets in a qualified target's file part are literal
+  (`api/[...path].js::loadState`).
+- The index format is `greppy-indexer-v11`: existing indexes are rebuilt once
+  after the upgrade so the new edges exist. `greppy index` on an unchanged,
+  fully indexed checkout answers `index already current` at once.
+- One JS/TS file the extractor cannot repair no longer makes a repository
+  unindexable; it is skipped and counted in `index status`/`doctor`.
 
-- External and built-in agents receive the owner-approved preparation guidance:
-  retain the task, reuse the running index job, use a reported estimate for one
-  bounded wait, and resume full Greppy functionality afterward. This prompt
-  change does not itself implement a runtime ETA.
-- FSKit is optional acceleration. The ordinary workspace backend must provide
-  the same agent/TUI proposal and apply behavior without extension activation;
-  its implementation and acceptance are in progress.
-- Release acceptance remains open for persisted-index/caller repair, native web
-  regressions and real agent/TUI/benchmark workflows. Optional FSKit has separate
-  provider regression and performance checks; activation is not a core prerequisite.
-  Production inference must use Metal on macOS and CUDA on Linux.
+### Editing
+
+- `--allow-syntax-errors` on replace-text, replace-lines, write, delete-lines,
+  insert-lines and patch writes an intermediate state that adds syntax
+  errors; without it the refusal names the next step (one `greppy patch`,
+  or the flag).
+- When OLD occurs a different number of times than expected, the refusal
+  lists every site with its line and says `pass --expect N`; the nearest-OLD
+  hint matches lines by similarity and also helps `--regex`/`--expect`.
+  JSON keeps `matches` and adds `count`, `expected` and `match_lines`.
+- `replace S --body` re-indents a heredoc body to the definition, keeps the
+  file's line endings, and the receipt shows only the changed lines
+  (`changed_span` in JSON).
+- Rename receipts name the right lines when the new name is longer, and
+  refusals point to live commands.
+
+### Reliability
+
+- `brief` waits through a cold summary-model load (up to 3 minutes) instead
+  of returning without a summary.
+- `diagnostics`, `doctor` and `workspace doctor` no longer report healthy
+  repositories as broken (unsupported route/k8s edge classes, a fresh
+  `cp -R` copy, an inactive workspace provider). `--device` rejects a backend
+  the host cannot have; data directories are 0700 and databases 0600.
+- bash-smart evicts its oldest retained captures instead of silently losing
+  expand ids when the machine-wide store is full, counts one unittest failure
+  as one error, and prints no partial-output line for empty output.
+- Inference daemons are bound to the build that started them; a newer greppy
+  never reuses an older build's daemon.
+- The workspace provider releases a repository's watcher five minutes after
+  its last workspace is removed (inotify leak). A workspace created sooner
+  reuses the warm watcher and snapshot.
+- Files that git calls clean but whose bytes differ from the Base checkout
+  (line endings) are indexed from the working tree.
+- Graph reads no longer wait for a deferred embedding job.
+- The web runtime starts without `libwayland-client` (an install hint replaces
+  the panic) and answers `starting` while its workers start.
+- Diagnostics are written to stderr, never stdout.
+
+### Release
+
+- A tag release completes on hosted runners again; the CUDA package's
+  inference acceptance runs on a GPU host (`tools/release_cuda_acceptance.sh`,
+  `docs/releases/RELEASING.md`).
+
+## [0.4.1] — 2026-10-07
+
+0.4.1 includes the unreleased 0.4.0 line below and the changes in this section.
+Production inference uses Metal on macOS and CUDA on Linux; FSKit stays optional
+acceleration and the ordinary workspace backend provides the same agent behavior.
+
+### Prompt for external agents
+
+- The signed prompt (`AGENTS.md`, `greppy prompt --external`) now states that the
+  task is a change to deliver: make the edits with greppy and verify them, do
+  not stop at an analysis. Routing picks one compact command for the next step
+  of the task. Without this, some models answered a bare issue with an analysis
+  instead of a patch.
+
+### Built-in coding agent (`greppy agent`, `greppy -p`, `greppy agent serve`)
+
+- Every task runs in its own temporary copy-on-write worktree and ends as a
+  proposal commit on `refs/greppy/agent/<run-id>`, the pull request. Its parent
+  is the user's baseline including uncommitted work, so the proposal contains
+  only the agent's changes. The worktree is removed once the proposal is saved,
+  also when a limit ends the run (exit 5); it is kept only with
+  `--keep-worktree` or after a failure without a proposal (24 h expiry).
+- The commit message is the agent's final answer. An explicit `Title:` line, or
+  else the line before `Status:`, becomes the subject; the answer is the body.
+- One owner-approved prompt source renders the system prompt per mode:
+  one-shot (`-p`), interactive (TUI), serve and ACP.
+  `greppy prompt --mode one-shot|interactive|serve|acp|external [--json]` prints
+  each rendering with its SHA-256; `greppy prompt --external` keeps the signed
+  external contract.
+- No fixed limits. There is no default turn cap; `--max-turns N` is opt-in and
+  followed by one tool-free report turn. Tools have no fixed timeouts: the run
+  deadline bounds them, and calls issued before the deadline get up to 30 s.
+  Large tool output is folded behind `expand agent-output-ID` instead of cut.
+- No-match searches and failing tests are normal results, not tool failures,
+  and never trigger stop advice. A leading `greppy` in tool argv is accepted.
+  Toolchain caches are redirected into the run's scratch directory, so package
+  managers work inside the sandbox.
+- Long sessions are compacted at complete exchanges into a model-written
+  checkpoint; if a checkpoint cannot be saved, `-p` stops with an error.
+  `--continue` and `--resume` restore the saved proposal into the new
+  worktree, and the TUI refuses a live `/resume` that would not match the files
+  on disk.
+- Claude models get explicit prompt-cache breakpoints for system prompt, tools
+  and history; other providers cache implicitly.
+- The `-p` gateway check allows 2 s to connect and 15 s to answer and prints the
+  cause when it fails.
+- ACP mode still edits the client's folder in place; its prompt makes no
+  worktree or pull-request claim.
+
+### Fixes
+
+- macOS: agent Base stores, Base build staging and retained `bash-smart`
+  captures no longer require a separately mounted `/Volumes/tmp`; without one
+  they use the normal per-user locations instead of failing.
+- `replace-text`: when OLD matches nowhere, the refusal names the nearest
+  variant (the lines that differ only in whitespace, or else the most similar
+  lines) with its line range, its exact text and the `greppy replace-lines`
+  alternative. Nothing is written.
+- `bash-smart` no longer counts source lines such as `warn!(...)` in a
+  `git diff` as warnings.
+- The TUI prints why `--continue` or `--resume` cannot start instead of only
+  "startup stopped".
 
 ## [0.4.0] — Unreleased development history (superseded by 0.4.1)
 

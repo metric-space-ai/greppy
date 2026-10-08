@@ -119,17 +119,37 @@ class ReleaseGateTests(unittest.TestCase):
             run_bench.BENCHMARK_PROMPT_VERSION,
             "greppy-agents-md-0.3.2-single-semantic-query",
         )
-        self.assertIn("greppy who-calls NAME`", prompt)
-        self.assertIn("greppy impact NAME`", prompt)
-        self.assertIn('"what depends on"', prompt)
-        self.assertIn("never run\n`search-symbol` first", prompt)
-        self.assertIn("greppy search-symbol NAME`", prompt)
-        self.assertIn("Add `--code` only when", prompt)
-        self.assertIn("do not add it merely to confirm", prompt)
-        self.assertIn("Stop after a successful command", prompt)
-        self.assertIn("run exactly one `greppy search`", prompt)
-        self.assertIn("Do not paraphrase the question", prompt)
-        self.assertIn("`greppy read` accepts symbols", prompt)
+        self.assert_greppy_routing_contract(prompt)
+
+    def assert_greppy_routing_contract(self, prompt: str) -> None:
+        # Signed v3 uses command rows with S, not the old prose's NAME/backticks.
+        # Preserve behavioral guard coverage without rewriting the signed text.
+        for pattern in (
+            r"greppy who-calls S\s+direct callers",
+            r"greppy impact S\s+transitive callers and change risk",
+            r"greppy search-symbol NAME\s+exact definition",
+        ):
+            self.assertRegex(prompt, pattern)
+        for instruction in (
+            "Default to ONE compact graph command",
+            "Stop when the result contains\nthe requested answer",
+            "do not first search for it",
+            "Add --code only when the question needs source",
+            "For concept discovery, choose the best match from one search",
+            "do not rephrase\nand search again",
+            "greppy read PATH                   indexed source outline",
+        ):
+            self.assertIn(instruction, prompt)
+
+    def test_greppy_routing_guard_rejects_removed_commands_and_stop_rules(self) -> None:
+        prompt = run_bench.gp_sys("/ignored")
+        for required in (
+            "greppy who-calls S", "greppy impact S", "greppy search-symbol NAME",
+            "Default to ONE compact graph command", "do not first search for it",
+            "do not rephrase\nand search again",
+        ):
+            with self.subTest(required=required), self.assertRaises(AssertionError):
+                self.assert_greppy_routing_contract(prompt.replace(required, "REMOVED"))
 
     def test_variable_input_excludes_each_arms_fixed_prompt_on_every_turn(self) -> None:
         def transcript(prompt_inputs: list[int]) -> str:

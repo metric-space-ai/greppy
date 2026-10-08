@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, AgentConfig, Client, ClientError, ExecutionEnv, GreppyEnv,
-    LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent, ToolOutcome,
-    TurnResult, SYSTEM_PROMPT,
+    run_agent_loop_with_history, system_prompt_for_mode, AgentConfig, BuiltinPromptMode, Client,
+    ClientError, ExecutionEnv, GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest,
+    ModelStream, StreamEvent, ToolOutcome, TurnResult,
 };
 use serde_json::{json, Value};
 
@@ -40,7 +40,7 @@ use crate::agent_tui::{
 const PROTOCOL_VERSION: u64 = 1;
 const AUTH_METHOD_ID: &str = "greppy.env";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
-const DEFAULT_MAX_TURNS: usize = 40;
+const DEFAULT_MAX_TURNS: usize = 0;
 
 thread_local! {
     static ACTIVE_TOOL_CALL: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -1056,7 +1056,7 @@ fn run_prompt(
     };
     let agent_config = AgentConfig {
         max_turns: config.max_turns,
-        system: Some(SYSTEM_PROMPT.to_string()),
+        system: Some(system_prompt_for_mode(BuiltinPromptMode::Acp)),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
         ..AgentConfig::default()

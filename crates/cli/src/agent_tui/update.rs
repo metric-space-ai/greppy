@@ -53,6 +53,31 @@ pub enum Action {
     Tick,
 }
 
+/// Live `/resume` swaps only the conversation; the files on disk stay this
+/// session's workspace. Refuse whenever the two could disagree, so a resumed
+/// history never claims edits the workspace does not contain.
+fn live_resume_refusal(
+    app: &App,
+    record: &crate::agent_tui::session::SessionRecord,
+) -> Option<String> {
+    if record.id == app.session_id {
+        return None;
+    }
+    if !record.proposal_ref.is_empty() {
+        return Some(format!(
+            "session {id} saved a proposal that is not in this workspace; quit and run `greppy --resume {id}` to restore it",
+            id = record.id
+        ));
+    }
+    if app.turns > 0 {
+        return Some(format!(
+            "this workspace already holds the current session's work; quit and run `greppy --resume {id}` to continue session {id}",
+            id = record.id
+        ));
+    }
+    None
+}
+
 pub fn update(app: &mut App, action: Action) -> Vec<Effect> {
     match action {
         Action::Resize { cols, rows } => {
@@ -850,6 +875,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                         .find(|record| record.id == item.id)
                         .cloned()
                     {
+                        if let Some(reason) = live_resume_refusal(app, &record) {
+                            app.push_warning(reason);
+                            return Vec::new();
+                        }
                         app.session_id = record.id.clone();
                         app.session_title = record.title.clone();
                         app.session_project = record.project.clone();
@@ -1751,6 +1780,40 @@ mod tests {
             apply_effects(&effects),
             vec![SessionCommand::Resume("sess-other".into())]
         );
+    }
+
+    #[test]
+    fn session_picker_refuses_live_resume_that_would_mismatch_the_workspace() {
+        let mut app = app();
+        let mut proposal = SessionRecord::new(
+            "sess-proposal".into(),
+            "demo".into(),
+            "model".into(),
+            "run-proposal".into(),
+        );
+        proposal.proposal_ref = "refs/greppy/agent/run-proposal".into();
+        app.known_sessions = vec![proposal];
+        app.overlay = Overlay::sessions(&app.known_sessions, "");
+        assert!(update(&mut app, Action::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(app.session_id, "sess");
+
+        let mut app = app_with_turns(2);
+        let other = SessionRecord::new(
+            "sess-other".into(),
+            "demo".into(),
+            "model".into(),
+            "run-other".into(),
+        );
+        app.known_sessions = vec![other];
+        app.overlay = Overlay::sessions(&app.known_sessions, "");
+        assert!(update(&mut app, Action::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(app.session_id, "sess");
+    }
+
+    fn app_with_turns(turns: u64) -> App {
+        let mut app = app();
+        app.turns = turns;
+        app
     }
 
     #[test]

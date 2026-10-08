@@ -50,6 +50,11 @@ pub enum ContentPart {
     Thinking {
         text: String,
     },
+    /// Provider-issued opaque signature, replayed verbatim.
+    SignedThinking {
+        text: String,
+        signature: String,
+    },
     /// PNG (or other still image) shown to the model. Keep out of logs/traces.
     Image {
         media_type: String,
@@ -102,6 +107,9 @@ pub enum StreamEvent {
     },
     ThinkingDelta {
         text: String,
+    },
+    ThinkingSignatureDelta {
+        signature: String,
     },
     ToolCallStarted {
         index: usize,

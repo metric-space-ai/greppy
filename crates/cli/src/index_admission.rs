@@ -149,6 +149,9 @@ fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
             libc::flock(probe.as_raw_fd(), libc::LOCK_UN);
             return false;
         }
+        if io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock {
+            return false;
+        }
     }
     let directory = if cfg!(target_os = "linux") {
         "/proc/self/fd"
@@ -195,7 +198,92 @@ fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
             }
         }
     }
-    false
+    // Shell/Node/Bun subprocess APIs may close inherited descriptors. The
+    // admitted ancestor still waits for the child and holds the real lease.
+    // Authenticate the ancestor and verify its still-held open-file-description
+    // lease. An open descriptor or a stale lock record alone is insufficient.
+    ancestor_lease_witness(owner, &record, &metadata)
+}
+
+#[cfg(unix)]
+fn ancestor_lease_witness(owner: u64, record: &serde_json::Value, metadata: &fs::Metadata) -> bool {
+    use std::io::{BufRead, Write};
+    use std::os::unix::{fs::MetadataExt, io::AsRawFd, net::UnixStream};
+    let Some(socket) = record
+        .get("lease_witness")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let timeout = Some(std::time::Duration::from_millis(500));
+    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
+        return false;
+    }
+    // Authenticate the server's kernel PID, not a PID supplied in its JSON.
+    #[cfg(target_os = "linux")]
+    let peer = {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return false;
+        }
+        unsafe { credentials.assume_init() }.pid
+    };
+    #[cfg(target_os = "macos")]
+    let peer = {
+        let mut pid: libc::pid_t = 0;
+        let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // Darwin sys/un.h: SOL_LOCAL=0, LOCAL_PEERPID=2.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                2,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return false;
+        }
+        pid
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let peer: libc::pid_t = 0;
+    if u64::try_from(peer).ok() != Some(owner) {
+        return false;
+    }
+    let challenge = format!("{}-{:?}", std::process::id(), std::time::SystemTime::now());
+    let request = serde_json::json!({"challenge": challenge});
+    if writeln!(stream, "{request}").is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    if std::io::BufReader::new(std::io::Read::take(stream, 2048))
+        .read_line(&mut line)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(reply) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return false;
+    };
+    reply.get("challenge").and_then(serde_json::Value::as_str) == Some(challenge.as_str())
+        && reply.get("owns_lease").and_then(serde_json::Value::as_bool) == Some(true)
+        && reply.get("dev").and_then(serde_json::Value::as_u64) == Some(metadata.dev())
+        && reply.get("ino").and_then(serde_json::Value::as_u64) == Some(metadata.ino())
 }
 
 #[cfg(unix)]
@@ -235,6 +323,58 @@ fn ancestor_contains(owner: u64) -> bool {
 #[cfg(not(unix))]
 fn default_gate_lease_is_inherited(_: &Path) -> bool {
     false
+}
+
+/// The default host gate is about to wrap a new child. If another owner
+/// already holds its lease, queueing behind `dev-heavy-run.py` is a silent
+/// multi-minute wait that still ends in exit 75. Record the deferral now.
+pub(crate) fn occupied_gate_deferral() -> Option<String> {
+    let gate = configured_gate().ok().flatten()?;
+    if default_gate_lease_is_inherited(&gate) {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if gate != home.join(".codex/bin/dev-heavy-run.py") {
+        return None;
+    }
+    if !foreign_lock_is_held(&home.join(".codex/run/heavy-job.lock")) {
+        return None;
+    }
+    Some(
+        "Automatic indexing deferred by shared host admission; no index work started. Capacity gate: another owner holds the heavy-job lease. Retry the original command when host capacity is available. For an immediate bounded source read, use greppy read-file PATH --lines A:B. For an edit without a graph refresh, use greppy replace-text PATH OLD NEW; it refuses missing or non-unique matches."
+            .to_string(),
+    )
+}
+
+/// `true` when a different open-file description already holds an exclusive
+/// flock. A missing lock is free. Tests must pass a temporary path, never
+/// the user's real heavy-job lock.
+pub(crate) fn foreign_lock_is_held(lock: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if !lock.is_file() {
+            return false;
+        }
+        let Ok(file) = fs::File::open(lock) else {
+            return false;
+        };
+        unsafe {
+            if libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 {
+                let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                return false;
+            }
+            let error = io::Error::last_os_error();
+            return error.kind() == io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EAGAIN)
+                || error.raw_os_error() == Some(libc::EWOULDBLOCK);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lock;
+        false
+    }
 }
 
 #[cfg(test)]
@@ -312,9 +452,55 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn authenticated_ancestor_witness_survives_closed_fds_but_not_foreign_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let python = if cfg!(target_os = "macos") {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/dev_heavy_lease.py");
+        let script = r#"import fcntl,json,os,subprocess,sys,importlib.util
+spec=importlib.util.spec_from_file_location('witness',sys.argv[4]); module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+with open(sys.argv[1],'w+') as lease:
+    fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    with module.LeaseWitness(lease,sys.argv[1]) as witness:
+        json.dump({'pid':os.getpid(),'lease_witness':witness.path},lease);lease.flush()
+        holder=None
+        if sys.argv[3]=='foreign':
+            fcntl.flock(lease,fcntl.LOCK_UN)
+            holder=subprocess.Popen([sys.executable,'-c',"import fcntl,sys,time; f=open(sys.argv[1]);fcntl.flock(f,fcntl.LOCK_EX);print('locked',flush=True);time.sleep(20)",sys.argv[1]],stdout=subprocess.PIPE,text=True)
+            assert holder.stdout.readline().strip()=='locked'
+        env=dict(os.environ,GREPPY_TEST_ADMISSION_LEASE=sys.argv[1],GREPPY_TEST_ADMISSION_INHERITED='no' if holder else 'yes')
+        try: result=subprocess.run([sys.argv[2],'--exact','index_admission::tests::lease_probe_child','--nocapture'],env=env,close_fds=True)
+        finally:
+            if holder: holder.terminate();holder.wait(timeout=5)
+        sys.exit(result.returncode)
+"#;
+        for mode in ["owned", "foreign"] {
+            let output = Command::new(python)
+                .arg("-c")
+                .arg(script)
+                .arg(tmp.path().join("lease.lock"))
+                .arg(std::env::current_exe().unwrap())
+                .arg(mode)
+                .arg(&helper)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn live_ancestor_lease_requires_the_actual_inheritable_descriptor() {
+    fn legacy_gate_without_witness_remains_fail_closed_after_descriptor_closure() {
         let tmp = tempfile::tempdir().unwrap();
         let python = if cfg!(target_os = "macos") {
             "/usr/bin/python3"
@@ -325,12 +511,13 @@ mod tests {
 with open(sys.argv[1], 'w+') as lease:
     fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
     json.dump({'pid':os.getpid()}, lease); lease.flush()
-    env=dict(os.environ,GREPPY_TEST_ADMISSION_LEASE=sys.argv[1],GREPPY_TEST_ADMISSION_INHERITED=sys.argv[3])
-    inherited=(lease.fileno(),) if sys.argv[3]=='yes' else ()
+    env=dict(os.environ,GREPPY_TEST_ADMISSION_LEASE=sys.argv[1],GREPPY_TEST_ADMISSION_INHERITED='yes' if sys.argv[3]=='inherited' else 'no')
+    if sys.argv[3]=='released': fcntl.flock(lease, fcntl.LOCK_UN)
+    inherited=(lease.fileno(),) if sys.argv[3]=='inherited' else ()
     result=subprocess.run([sys.argv[2],'--exact','index_admission::tests::lease_probe_child','--nocapture'],env=env,pass_fds=inherited)
     sys.exit(result.returncode)
 "#;
-        for expected in ["yes", "no"] {
+        for expected in ["inherited", "closed", "released"] {
             let output = Command::new(python)
                 .arg("-c")
                 .arg(script)
@@ -346,5 +533,49 @@ with open(sys.argv[1], 'w+') as lease:
             );
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_lock_reports_only_a_held_lease() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp.path().join("heavy-job.lock");
+        fs::write(&lock, b"{}\n").unwrap();
+        assert!(!foreign_lock_is_held(&lock));
+        let python = if cfg!(target_os = "macos") {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let helper = tmp.path().join("hold.py");
+        fs::write(
+            &helper,
+            "import fcntl,sys,time\n\
+             lease=open(sys.argv[1],'a+')\n\
+             fcntl.flock(lease, fcntl.LOCK_EX|fcntl.LOCK_NB)\n\
+             sys.stdout.write('held\\n')\n\
+             sys.stdout.flush()\n\
+             time.sleep(30)\n",
+        )
+        .unwrap();
+        let mut child = Command::new(python)
+            .arg(&helper)
+            .arg(&lock)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buf = [0u8; 5];
+        let n = stdout.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"held\n");
+        assert!(
+            foreign_lock_is_held(&lock),
+            "a foreign flock holder must not look free"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!foreign_lock_is_held(&lock));
     }
 }

@@ -987,6 +987,12 @@ pub(crate) fn wait_for_index_publication(
         baseline_generation.unwrap_or(0).saturating_add(1),
         crate::context_status::Capability::Graph,
     );
+    #[cfg(any(
+        debug_assertions,
+        feature = "ci-test-assets",
+        feature = "store-cow-release-perf"
+    ))]
+    let mut test_wait_ready = std::env::var_os("GREPPY_TEST_QUERY_PUBLICATION_WAIT_READY");
     loop {
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(
@@ -998,6 +1004,18 @@ pub(crate) fn wait_for_index_publication(
             )
         })?;
         let job = read_background_job(launch.path());
+        // Embedding work does not change the already published graph. Structural
+        // causes may return now; the freshness gate still refuses real drift.
+        if baseline_generation.is_some()
+            && matches!(
+                cause,
+                "structural-workspace-drift" | "first-use" | "rust-graph-repair"
+            )
+            && !graph_read_follows_background_job(job.as_ref())
+        {
+            detach_publication_wait(launch);
+            return Ok(());
+        }
         // Never reopen SQLite while its verified writer is active. Once the
         // lock is released, publication outranks a historical job record,
         // including a stale failed/nonterminal record left by another owner.
@@ -1008,6 +1026,20 @@ pub(crate) fn wait_for_index_publication(
             );
         match observe_first_use_index(job.as_ref(), snapshot_ready, owner_active) {
             FirstUseIndexObservation::Pending => {
+                // Tests synchronize on actual contention, independently of
+                // token-saving progress output. No hook exists in production.
+                #[cfg(any(
+                    debug_assertions,
+                    feature = "ci-test-assets",
+                    feature = "store-cow-release-perf"
+                ))]
+                if owner_active {
+                    if let Some(ready) = test_wait_ready.take() {
+                        std::fs::write(ready, "waiting for publication").map_err(|error| {
+                            Error::io("write test publication-wait marker", error)
+                        })?;
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             FirstUseIndexObservation::Published => {
@@ -1024,6 +1056,20 @@ pub(crate) fn wait_for_index_publication(
                 return Err(index_publication_failure(effective_root, detail));
             }
         }
+    }
+}
+
+fn detach_publication_wait(launch: BackgroundJobLaunch) {
+    if let BackgroundJobLaunch::Owned {
+        mut child, demand, ..
+    } = launch
+    {
+        let _ = std::thread::Builder::new()
+            .name("greppy-index-reaper".into())
+            .spawn(move || {
+                let _demand = demand;
+                let _ = child.wait();
+            });
     }
 }
 

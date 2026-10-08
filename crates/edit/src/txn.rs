@@ -161,6 +161,33 @@ pub fn syntax_language_for_path(path: &Path, before: &[u8]) -> Language {
     language
 }
 
+/// Resolve a C-compatible `.h` edit without interpreting valid new C++ as
+/// broken C. A fallback requires both snapshots to parse completely as C++;
+/// existing recovery diagnostics cannot become a license to change grammar.
+/// Validate both snapshots with the returned grammar.
+pub fn syntax_language_for_edit(path: &Path, before: &[u8], after: &[u8]) -> Language {
+    let language = syntax_language_for_path(path, before);
+    if language != Language::C || path.extension().and_then(|value| value.to_str()) != Some("h") {
+        return language;
+    }
+    if let (Some(c_before), Some(c_after), Some(cpp_before), Some(cpp_after)) = (
+        syntax_counts(Language::C, before),
+        syntax_counts(Language::C, after),
+        syntax_counts(Language::Cpp, before),
+        syntax_counts(Language::Cpp, after),
+    ) {
+        let c_regressed = c_after.errors > c_before.errors || c_after.missing > c_before.missing;
+        let cpp_clean = cpp_before.errors == 0
+            && cpp_before.missing == 0
+            && cpp_after.errors == 0
+            && cpp_after.missing == 0;
+        if c_regressed && cpp_clean {
+            return Language::Cpp;
+        }
+    }
+    language
+}
+
 /// Validation-only recovery for Bash's read/write redirect omitted by the grammar.
 fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     let Ok(tree) = greppy_parser::parse(Language::Bash, content) else {
@@ -220,7 +247,13 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if matches!(language, Language::C | Language::Cpp) {
-        return guarded_linkage_validation_content(language, content);
+        let linkage = guarded_linkage_validation_content(language, content);
+        if language == Language::C {
+            if let Cow::Owned(normalized) = c_atomic_validation_content(&linkage) {
+                return Cow::Owned(normalized);
+            }
+        }
+        return linkage;
     }
     if language.name() == "json" {
         return json_validation_content(content);
@@ -513,23 +546,102 @@ fn json_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 
 /// Validate only a complete unique conventional linkage pair. The body and
 /// other directives stay parsed; spaces preserve diagnostic coordinates.
+/// The C grammar reserves `_Atomic` as a qualifier, preventing its
+/// macro-type rule from recognizing standard C11 `_Atomic(type-name)`.
+/// Substitute an equal-length identifier only for actual qualifier tokens,
+/// and retain it only when the reparse proves a complete type specifier in
+/// a type position. Expressions and malformed type arguments cannot qualify.
+fn c_atomic_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    if !content.windows(7).any(|bytes| bytes == b"_Atomic") {
+        return Cow::Borrowed(content);
+    }
+    let Ok(tree) = greppy_parser::parse(Language::C, content) else {
+        return Cow::Borrowed(content);
+    };
+    let mut candidates = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_qualifier"
+            && content.get(node.byte_range()) == Some(b"_Atomic".as_slice())
+        {
+            candidates.push(node.byte_range());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    if candidates.is_empty() {
+        return Cow::Borrowed(content);
+    }
+    let mut proposed = content.to_vec();
+    for range in &candidates {
+        proposed[range.clone()].copy_from_slice(b"Greppyx");
+    }
+    let Ok(view) = greppy_parser::parse(Language::C, &proposed) else {
+        return Cow::Borrowed(content);
+    };
+    let mut normalized: Option<Vec<u8>> = None;
+    for range in candidates {
+        let Some(name) = view
+            .root_node()
+            .descendant_for_byte_range(range.start, range.end)
+        else {
+            continue;
+        };
+        let Some(specifier) = name
+            .parent()
+            .filter(|node| node.kind() == "macro_type_specifier")
+        else {
+            continue;
+        };
+        let type_position = specifier.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "declaration"
+                    | "field_declaration"
+                    | "parameter_declaration"
+                    | "type_definition"
+                    | "type_descriptor"
+            ) && parent.child_by_field_name("type") == Some(specifier)
+        });
+        if name.byte_range() == range
+            && specifier.child_by_field_name("name") == Some(name)
+            && !specifier.has_error()
+            && specifier
+                .child_by_field_name("type")
+                .is_some_and(|node| node.kind() == "type_descriptor" && !node.has_error())
+            && type_position
+        {
+            normalized.get_or_insert_with(|| content.to_vec())[range].copy_from_slice(b"Greppyx");
+        }
+    }
+    normalized.map_or(Cow::Borrowed(content), Cow::Owned)
+}
+
 fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     const OPEN: &[u8] = b"#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
     const CLOSE: &[u8] = b"#ifdef __cplusplus\n}\n#endif\n";
-    let unique_line = |needle: &[u8]| {
-        let mut matches = content
-            .windows(needle.len())
-            .enumerate()
-            .filter_map(|(i, bytes)| {
-                (bytes == needle && (i == 0 || content[i - 1] == b'\n')).then_some(i)
-            });
+    const OPEN_CRLF: &[u8] = b"#ifdef __cplusplus\r\nextern \"C\" {\r\n#endif\r\n";
+    const CLOSE_CRLF: &[u8] = b"#ifdef __cplusplus\r\n}\r\n#endif\r\n";
+    let unique_line = |variants: [&[u8]; 2]| {
+        let mut matches = variants.into_iter().flat_map(|needle| {
+            content
+                .windows(needle.len())
+                .enumerate()
+                .filter_map(move |(i, bytes)| {
+                    (bytes == needle && (i == 0 || content[i - 1] == b'\n'))
+                        .then_some((i, needle.len()))
+                })
+        });
         let first = matches.next()?;
         matches.next().is_none().then_some(first)
     };
-    let (Some(open), Some(close)) = (unique_line(OPEN), unique_line(CLOSE)) else {
+    let (Some((open, open_len)), Some((close, close_len))) = (
+        unique_line([OPEN, OPEN_CRLF]),
+        unique_line([CLOSE, CLOSE_CRLF]),
+    ) else {
         return Cow::Borrowed(content);
     };
-    if open + OPEN.len() > close {
+    if open + open_len > close {
         return Cow::Borrowed(content);
     }
     let Ok(tree) = greppy_parser::parse(language, content) else {
@@ -554,9 +666,9 @@ fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow
         }
     }
     let mut normalized = content.to_vec();
-    for (start, len) in [(open, OPEN.len()), (close, CLOSE.len())] {
+    for (start, len) in [(open, open_len), (close, close_len)] {
         for byte in &mut normalized[start..start + len] {
-            if *byte != b'\n' {
+            if !matches!(*byte, b'\r' | b'\n') {
                 *byte = b' ';
             }
         }
@@ -599,12 +711,128 @@ fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow
 }
 /// First parser failure in the proposed content. Coordinates are one-based;
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
+// The JS/TS grammars accept raw line breaks in ordinary quoted strings
+// without an ERROR node. ECMAScript does not. JSX attribute strings have
+// different lexical rules and may contain raw line breaks.
+fn js_ts_string_line_breaks(
+    language: Language,
+    kind: &str,
+    jsx_attribute: bool,
+    bytes: &[u8],
+) -> (usize, Option<usize>) {
+    if !matches!(language, Language::JavaScript | Language::TypeScript { .. })
+        || kind != "string"
+        || jsx_attribute
+        || !matches!(bytes.first(), Some(b'\'' | b'"'))
+    {
+        return (0, None);
+    }
+    let mut count = 0;
+    let mut first = None;
+    let mut offset = 1;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\\' => {
+                offset += 1;
+                // A backslash followed by CRLF is one legal continuation.
+                if bytes.get(offset) == Some(&b'\r') && bytes.get(offset + 1) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+            b'\r' | b'\n' => {
+                count += 1;
+                first.get_or_insert(offset);
+                if bytes[offset] == b'\r' && bytes.get(offset + 1) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+            _ => {}
+        }
+        offset += 1;
+    }
+    (count, first)
+}
+
+// tree-sitter accepts empty Python suites and module/class-level returns
+// without ERROR nodes. Those recoveries must not certify a breaking edit.
+// Inspect scope boundaries rather than accepting any outer function ancestor:
+// a class declared inside a function is still not a return-capable scope.
+fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)> {
+    let Ok(tree) = greppy_parser::parse_for_syntax_validation(Language::Python, content) else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let reason = if node.kind() == "block" {
+            let mut cursor = node.walk();
+            let has_statement = node
+                .named_children(&mut cursor)
+                .any(|child| child.kind() != "comment");
+            (!has_statement).then_some("Python suite requires a statement; --body replacements must include indentation (for example, four spaces before return); use pass for an empty body")
+        } else if node.kind() == "return_statement" {
+            let mut ancestor = node.parent();
+            let mut in_function = false;
+            while let Some(scope) = ancestor {
+                match scope.kind() {
+                    "function_definition" => {
+                        in_function = true;
+                        break;
+                    }
+                    "class_definition" | "module" => break,
+                    _ => ancestor = scope.parent(),
+                }
+            }
+            (!in_function).then_some(
+                "Python return must remain inside its function; preserve the body's indentation",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let position = node.start_position();
+            issues.push((position.row + 1, position.column + 1, reason));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    issues.sort_by_key(|&(row, column, _)| (row, column));
+    issues
+}
+
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
+    if language == Language::Python {
+        if let Some((row, column, reason)) = python_syntax_diagnostics(content).first() {
+            return Some(format!(
+                "{row}:{column} ({reason}; column is a byte offset)"
+            ));
+        }
+    }
     let validation_content = syntax_validation_content(language, content);
     let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
+        let (_, line_break) = js_ts_string_line_breaks(
+            language,
+            node.kind(),
+            node.parent().is_some_and(|p| p.kind() == "jsx_attribute"),
+            &validation_content[node.byte_range()],
+        );
+        if let Some(relative) = line_break {
+            let offset = node.start_byte() + relative;
+            let prefix = &validation_content[..offset];
+            let row = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
+            let column = offset
+                - prefix
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map_or(0, |i| i + 1)
+                + 1;
+            return Some(format!(
+                "{row}:{column} (unescaped line break in quoted JavaScript/TypeScript string; use an escaped newline or a template literal; column is a byte offset)"
+            ));
+        }
         if node.is_error() || node.is_missing() {
             let start = node.start_position();
             let reason = if node.is_missing() {
@@ -687,12 +915,23 @@ pub fn structural_context_preserved(
 pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts> {
     let validation_content = syntax_validation_content(language, content);
     let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
-    let mut errors = 0usize;
+    let mut errors = if language == Language::Python {
+        python_syntax_diagnostics(content).len()
+    } else {
+        0
+    };
     let mut missing = 0usize;
     let mut cursor = tree.walk();
     let mut reached_root = false;
     while !reached_root {
         let node = cursor.node();
+        errors += js_ts_string_line_breaks(
+            language,
+            node.kind(),
+            node.parent().is_some_and(|p| p.kind() == "jsx_attribute"),
+            &validation_content[node.byte_range()],
+        )
+        .0;
         if node.is_error() {
             errors += 1;
         }
@@ -718,6 +957,147 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 #[cfg(test)]
 mod tests {
     #[test]
+    fn c_atomic_validation_view_never_rewrites_call_expressions_or_literal_text() {
+        // The upstream C grammar can accept a reserved spelling as a call
+        // identifier. This view must not pretend to repair or validate that
+        // separate grammar limitation by changing expression bytes.
+        for source in [
+            b"typedef int MyType; int f(void) { return _Atomic(MyType); }".as_slice(),
+            b"const char *text = \"_Atomic(int)\"; /* _Atomic() */".as_slice(),
+            b"_Atomic int value;".as_slice(),
+        ] {
+            assert!(matches!(
+                super::c_atomic_validation_content(source),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn python_syntax_counts_reject_empty_suites_and_escaped_returns() {
+        for invalid in [
+            "def f():\nreturn 1\n",
+            "def f():\n    # no statement\n",
+            "if True:\nprint(1)\n",
+            "class Empty:\n# no statement\n",
+            "return 1\n",
+            "def f():\n    pass\nreturn 1\n",
+            "def f():\n    class C:\n        return 1\n",
+        ] {
+            assert!(
+                syntax_counts(Language::Python, invalid.as_bytes())
+                    .unwrap()
+                    .errors
+                    > 0,
+                "{invalid}"
+            );
+            assert!(
+                first_syntax_diagnostic(Language::Python, invalid.as_bytes())
+                    .unwrap()
+                    .contains("Python")
+            );
+        }
+        for valid in [
+            "def f():\n    return 1\n",
+            "def f(): return 1\n",
+            "def f():\n    pass\n",
+            "def f():\n    ...\n",
+            "def f():\n    \"docstring\"\n",
+            "def f():\r\n\treturn 1\r\n",
+            "@decorate\nasync def f():\n    return await g()\n",
+            "def f():\n    class C:\n        def g(self):\n            return 1\n    return C\n",
+            "def f():\n    if True:\n        return \"\"\"multiline\nreturn 2\n\"\"\"\n",
+        ] {
+            assert_eq!(
+                syntax_counts(Language::Python, valid.as_bytes())
+                    .unwrap()
+                    .errors,
+                0,
+                "{valid}"
+            );
+            assert_eq!(
+                first_syntax_diagnostic(Language::Python, valid.as_bytes()),
+                None,
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_ts_quoted_strings_reject_unescaped_line_breaks() {
+        for language in [
+            Language::JavaScript,
+            Language::TypeScript { tsx: false },
+            Language::TypeScript { tsx: true },
+        ] {
+            for invalid in [
+                "const value = 'a\nb';\n",
+                "const value = \"a\r\nb\";\n",
+                "const value = 'a\rb';\n",
+                "const value = 'a\\\\\nb';\n",
+            ] {
+                assert!(syntax_counts(language, invalid.as_bytes()).unwrap().errors > 0);
+                assert!(first_syntax_diagnostic(language, invalid.as_bytes())
+                    .unwrap()
+                    .contains("unescaped line break"));
+            }
+            let invalid = "// π\nconst value = 'a\nb';\n";
+            assert!(first_syntax_diagnostic(language, invalid.as_bytes())
+                .unwrap()
+                .starts_with("2:17 "));
+            let two_breaks = "const value = 'a\nb\nc';\n";
+            assert_eq!(
+                syntax_counts(language, two_breaks.as_bytes())
+                    .unwrap()
+                    .errors,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn js_ts_string_guard_preserves_valid_lexical_contexts() {
+        for language in [
+            Language::JavaScript,
+            Language::TypeScript { tsx: false },
+            Language::TypeScript { tsx: true },
+        ] {
+            for valid in [
+                "const value = 'a\\nb';\n",
+                "const value = 'a\\\nb';\n",
+                "const value = \"a\\\r\nb\";\n",
+                "const value = 'a\\\rb';\n",
+                "const value = `a\nb`;\n",
+                "/* 'a\nb' */ const value = 1;\n",
+                "const value = /['\"]/;\n",
+                "const value = 'a\u{2028}b\u{2029}c';\n",
+            ] {
+                assert_eq!(
+                    syntax_counts(language, valid.as_bytes()).unwrap(),
+                    SyntaxCounts {
+                        errors: 0,
+                        missing: 0
+                    },
+                    "{valid:?}"
+                );
+                assert!(first_syntax_diagnostic(language, valid.as_bytes()).is_none());
+            }
+        }
+        for language in [Language::JavaScript, Language::TypeScript { tsx: true }] {
+            let valid = "const view = <div title=\"a\nb\" />;\n";
+            assert_eq!(
+                syntax_counts(language, valid.as_bytes()).unwrap(),
+                SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                }
+            );
+            let invalid = "const view = <div title={'a\nb'} />;\n";
+            assert!(syntax_counts(language, invalid.as_bytes()).unwrap().errors > 0);
+        }
+    }
+
+    #[test]
     fn c_va_arg_type_operands_use_validation_view_only() {
         let valid = b"#include <stdarg.h>\nvoid *get(int key,...) {va_list ap;va_start(ap,key);void *p=va_arg(ap,void *);va_end(ap);return p;}\n";
         assert_eq!(
@@ -732,6 +1112,36 @@ mod tests {
         let counts = syntax_counts(Language::C, invalid).unwrap();
         assert!(counts.errors > 0 || counts.missing > 0);
         assert!(first_syntax_diagnostic(Language::C, invalid).is_some());
+    }
+
+    #[test]
+    fn guarded_linkage_crlf_keeps_offsets_and_rejects_malformed_source() {
+        let source = b"#ifdef __cplusplus\r\nextern \"C\" {\r\n#endif\r\nint value;\r\n#ifdef __cplusplus\r\n}\r\n#endif\r\n";
+        let view = guarded_linkage_validation_content(Language::C, source);
+        assert!(matches!(view, Cow::Owned(_)));
+        assert_eq!(view.len(), source.len());
+        for (before, after) in source.iter().zip(view.iter()) {
+            if matches!(*before, b'\r' | b'\n') {
+                assert_eq!(before, after);
+            }
+        }
+        assert_eq!(
+            syntax_counts(Language::C, source).unwrap(),
+            SyntaxCounts {
+                errors: 0,
+                missing: 0
+            }
+        );
+        let invalid = String::from_utf8(source.to_vec())
+            .unwrap()
+            .replace("int value;", "int value(");
+        let counts = syntax_counts(Language::C, invalid.as_bytes()).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0);
+        let lookalike = format!("/*\r\n{}*/\r\n", String::from_utf8_lossy(source));
+        assert!(matches!(
+            guarded_linkage_validation_content(Language::C, lookalike.as_bytes()),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

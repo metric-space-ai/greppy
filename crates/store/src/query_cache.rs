@@ -47,7 +47,7 @@ pub struct QueryEmbeddingCache {
 impl QueryEmbeddingCache {
     /// Open (creating if needed) the cache DB in `store_dir`.
     pub fn open(store_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(store_dir)
+        greppy_core::workspace::ensure_store_dir(store_dir)
             .map_err(|e| Error::Store(format!("create store dir for query cache: {e}")))?;
         let path: PathBuf = store_dir.join(QUERY_CACHE_DB_FILE);
         let conn = Connection::open(&path)
@@ -77,6 +77,8 @@ impl QueryEmbeddingCache {
             )
             .map_err(|e| Error::Store(format!("upgrade query cache schema: {e}")))?;
         }
+        greppy_core::workspace::ensure_db_mode(&path)
+            .map_err(|e| Error::Store(format!("set query cache mode: {e}")))?;
         Ok(Self { conn })
     }
 
@@ -319,6 +321,20 @@ mod tests {
         assert!(cache.get("model", "query-099").unwrap().is_some());
         std::env::remove_var("GREPPY_QUERY_CACHE_MAX_MIB");
         drop(cache);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_sets_directory_0700_and_database_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = QueryEmbeddingCache::open(&dir).unwrap();
+        drop(cache);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(QUERY_CACHE_DB_FILE)), 0o600);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

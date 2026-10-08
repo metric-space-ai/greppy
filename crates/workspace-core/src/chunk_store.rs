@@ -96,12 +96,16 @@ struct ChunkLocation {
 impl ChunkStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("segments"))?;
+        let segments = root.join("segments");
+        fs::create_dir_all(&segments)?;
+        secure_private_dir(&root)?;
+        secure_private_dir(&segments)?;
         // Keep CAS reference accounting in its own WAL database. Namespace
         // transactions frequently pin or unpin chunks while their manifest
         // transaction is open; sharing one SQLite file would turn that valid
         // lock ordering into a cross-connection write lock.
-        let connection = Connection::open(root.join("chunks.sqlite3"))?;
+        let db_path = root.join("chunks.sqlite3");
+        let connection = Connection::open(&db_path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -120,6 +124,7 @@ impl ChunkStore {
              );
              INSERT OR IGNORE INTO cow_segments(id, committed_len) VALUES(1, 0);",
         )?;
+        secure_sqlite_file(&db_path)?;
         let store = Self {
             root,
             connection: Mutex::new(connection),
@@ -893,9 +898,98 @@ fn read_exact_at(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io
     Ok(())
 }
 
+/// Directories greppy creates for a workspace core are private. Callers must
+/// not chmod a pre-existing parent; this only tightens `path` itself.
+#[cfg(unix)]
+pub(crate) fn secure_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing symlink at {}", path.display()),
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn secure_private_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// SQLite databases greppy opens are 0600, including `-wal` and `-shm` when
+/// the WAL pragma has already created them. Missing sidecars are a no-op.
+#[cfg(unix)]
+pub(crate) fn secure_sqlite_file(path: &Path) -> Result<()> {
+    secure_one_sqlite(path)?;
+    secure_one_sqlite(&sqlite_sidecar(path, "-wal"))?;
+    secure_one_sqlite(&sqlite_sidecar(path, "-shm"))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn secure_sqlite_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+#[cfg(unix)]
+fn secure_one_sqlite(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing symlink at {}", path.display()),
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_private_directories_and_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = parent.path().join("core");
+        drop(ChunkStore::open(&root).unwrap());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            std::fs::metadata(parent.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("segments")), 0o700);
+        assert_eq!(mode(&root.join("chunks.sqlite3")), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = root.join(format!("chunks.sqlite3{suffix}"));
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn open_waits_for_a_short_concurrent_chunk_writer() {

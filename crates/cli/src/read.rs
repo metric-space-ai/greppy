@@ -749,6 +749,7 @@ fn read_json_miss(
 )]
 pub(crate) fn dispatch_read(
     subjects: &[String],
+    lines: Option<&str>,
     head: Option<usize>,
     tail: Option<usize>,
     with_handle: bool,
@@ -762,11 +763,33 @@ pub(crate) fn dispatch_read(
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
     let file_base = resolve_file_operand_base(root, &root_path);
+    if let Some((path, range)) = read_positional_file_range(subjects, &file_base, &canonical_root) {
+        let mut retry = format!(
+            "greppy read-file {} --lines {}",
+            shell_example_arg(path),
+            shell_example_arg(&range)
+        );
+        if with_handle {
+            retry.push_str(" --handle");
+        }
+        if json {
+            retry.push_str(" --json");
+        }
+        for filter in path_filters {
+            retry.push_str(&format!(" --path {}", shell_example_arg(filter)));
+        }
+        if let Some(root) = root {
+            retry.push_str(&format!(" --root {}", shell_example_arg(root)));
+        }
+        return Err(Error::Invalid(format!(
+            "read expects symbols; a file location or positional line range uses read-file.\nretry: {retry}"
+        )));
+    }
     let file_intents = subjects
         .iter()
         .map(|subject| {
             looks_like_path(subject)
-                || read_open_file(&file_base, &canonical_root, subject).is_some()
+                || read_resolve_file(&file_base, &canonical_root, subject).is_some()
         })
         .collect::<Vec<_>>();
 
@@ -777,6 +800,12 @@ pub(crate) fn dispatch_read(
         } else {
             println!("{note}");
         }
+    }
+
+    // `--lines A:B` is the read-file range, addressed by a symbol or a path.
+    // It is not a definition slice (`--head` / `--tail` remain that).
+    if let Some(raw) = lines {
+        return dispatch_read_line_range(subjects, raw, with_handle, json, path_filters, root);
     }
 
     if !file_intents.iter().any(|is_file| *is_file) {
@@ -818,6 +847,7 @@ pub(crate) fn dispatch_read(
                 std::slice::from_ref(subject),
                 None,
                 false,
+                false,
                 with_handle,
                 false,
                 path_filters,
@@ -837,6 +867,124 @@ pub(crate) fn dispatch_read(
         failed |= code != 0;
     }
     Ok(i32::from(failed))
+}
+
+/// `read SYMBOL|FILE --lines A:B` prints that inclusive file range.
+///
+/// A path is read directly. A symbol selects the file of each resolved
+/// definition (deduped), using the same 1-based coordinates as `read-file
+/// --lines`. Ambiguous symbols therefore still show source instead of a
+/// usage error: the range does not choose one definition.
+fn dispatch_read_line_range(
+    subjects: &[String],
+    raw: &str,
+    with_handle: bool,
+    json: bool,
+    path_filters: &[String],
+    root: Option<&str>,
+) -> Result<i32> {
+    // Reject a malformed range before resolving symbols, so the failure is
+    // the range and not a missing name. EOF clamping happens while reading.
+    read_parse_file_range(raw, usize::MAX)?;
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    let file_base = resolve_file_operand_base(root, &root_path);
+    let mut files = Vec::new();
+    let mut failed = false;
+    let mut opened: Option<(greppy_store::Store, String, QueryPathFilters)> = None;
+    for subject in subjects {
+        let file_intent = looks_like_path(subject)
+            || read_resolve_file(&file_base, &canonical_root, subject).is_some();
+        if file_intent {
+            if !files.iter().any(|existing: &String| existing == subject) {
+                files.push(subject.clone());
+            }
+            continue;
+        }
+        if opened.is_none() {
+            let mut store = open_default_store_query_writer(root)?;
+            maybe_reindex_stale(&mut store, root)?;
+            let project = project_for(root)?;
+            if let Some(code) = graph_stale_gate(
+                &store,
+                root,
+                &project,
+                "read",
+                json,
+                serde_json::json!({ "targets": subjects, "lines": raw }),
+                "hits",
+            )? {
+                return Ok(code);
+            }
+            let filters = prepare_query_path_filters(root, "read", "", path_filters)?;
+            opened = Some((store, project, filters));
+        }
+        let Some((store, project, filters)) = opened.as_ref() else {
+            continue;
+        };
+        let ids = resolve_symbol_nodes(store, Some(subject))?;
+        let mut nodes = read_real_nodes(store, &ids)?;
+        nodes.retain(|node| filters.matches(&node.file_path));
+        if nodes.is_empty() {
+            read_report_missing(store, project, subject, &root_path, filters)?;
+            failed = true;
+            continue;
+        }
+        for node in nodes {
+            if !files.iter().any(|existing| existing == &node.file_path) {
+                files.push(node.file_path);
+            }
+        }
+    }
+    if files.is_empty() {
+        return Ok(1);
+    }
+    let code = dispatch_read_files(
+        &files,
+        Some(raw),
+        false,
+        false,
+        with_handle,
+        json,
+        path_filters,
+        root,
+    )?;
+    Ok(if failed || code != 0 { 1 } else { 0 })
+}
+
+/// Recognize location-shaped misuse before opening a graph or treating the
+/// range as another symbol. Literal filenames and qualified symbols keep their
+/// existing meaning; this only returns a precise, bounded read-file recovery.
+fn read_positional_file_range<'a>(
+    subjects: &'a [String],
+    file_base: &std::path::Path,
+    canonical_root: &std::path::Path,
+) -> Option<(&'a str, String)> {
+    let file_intent = |path: &str| {
+        !path.contains("::")
+            && (looks_like_path(path)
+                || read_resolve_file(file_base, canonical_root, path).is_some())
+    };
+    if let [path, range] = subjects {
+        if file_intent(path) && read_parse_file_range(range, usize::MAX).is_ok() {
+            return Some((path, range.clone()));
+        }
+    }
+    if let [location] = subjects {
+        let (path, line) = location.rsplit_once(':')?;
+        let line = line.parse::<usize>().ok().filter(|line| *line > 0)?;
+        // Existence, not UTF-8 decoding, preserves literal colon filenames.
+        // A readable first page may have binary bytes later in the same file.
+        if read_resolve_file(file_base, canonical_root, location).is_some() {
+            return None;
+        }
+        if file_intent(path) {
+            return Some((path, format!("{line}:{line}")));
+        }
+    }
+    None
 }
 
 pub(crate) fn dispatch_read_symbols(
@@ -1121,6 +1269,16 @@ fn read_structural_kind(kind: &str) -> bool {
     )
 }
 
+fn read_class_member_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition"
+            | "method_definition"
+            | "method_declaration"
+            | "constructor_declaration"
+    )
+}
+
 fn read_node_end_line(row: usize, column: usize) -> usize {
     row + usize::from(column > 0)
 }
@@ -1240,24 +1398,61 @@ fn read_render_smart_source(
             .unwrap_or(selected)
     };
 
-    let mut candidates = Vec::<(usize, usize)>::new();
+    let class_root = definition_root
+        && matches!(
+            selected.kind(),
+            "class_definition" | "class_declaration" | "class_specifier"
+        );
+    let mut candidates = Vec::<(usize, usize, bool)>::new();
     let mut children = traversal_root.walk();
     let mut stack = traversal_root
         .named_children(&mut children)
         .map(|node| (node, 0usize))
         .collect::<Vec<_>>();
     while let Some((node, parent_depth)) = stack.pop() {
-        let candidate = read_structural_kind(node.kind());
+        let member_body = class_root
+            && node.parent().is_some_and(|parent| {
+                read_class_member_kind(parent.kind())
+                    && parent
+                        .child_by_field_name("body")
+                        .is_some_and(|body| body.id() == node.id())
+            });
+        let candidate = read_structural_kind(node.kind()) || member_body;
         let node_depth = parent_depth + usize::from(candidate);
-        let start = node.start_position().row + 1;
-        let end = read_node_end_line(node.end_position().row, node.end_position().column);
+        let mut start = node.start_position().row + 1;
+        let mut end = read_node_end_line(node.end_position().row, node.end_position().column);
+        if member_body {
+            let body = &content[node.start_byte()..node.end_byte()];
+            if body.starts_with('{') {
+                // Keep the member signature/opening brace and closing brace.
+                // A one-line member has no separate body lines to hide.
+                start += 1;
+                end = end.saturating_sub(1);
+            } else if node
+                .parent()
+                .is_some_and(|parent| parent.start_position().row == node.start_position().row)
+                || node
+                    .prev_sibling()
+                    .is_some_and(|header| header.end_position().row == node.start_position().row)
+            {
+                // Python permits an inline suite on the final header line,
+                // including a multiline signature. Preserve that header/suite
+                // instead of hiding any part of the signature.
+                start = end.saturating_add(1);
+            }
+            if start > end {
+                // A nested branch on an inline member's signature line
+                // must not hide that signature either.
+                continue;
+            }
+        }
         if candidate
             && node_depth >= depth
             && start >= shown_start
             && end <= shown_end
             && end >= start
         {
-            candidates.push((start, end));
+            candidates.push((start, end, member_body));
             continue;
         }
         let mut cursor = node.walk();
@@ -1269,15 +1464,24 @@ fn read_render_smart_source(
     candidates.dedup();
     let mut non_overlapping = Vec::new();
     for range in candidates {
-        if non_overlapping.last().is_none_or(|(_, end)| range.0 > *end) {
+        if non_overlapping
+            .last()
+            .is_none_or(|(_, end, _)| range.0 > *end)
+        {
             non_overlapping.push(range);
         }
     }
 
     let mut gaps = Vec::with_capacity(non_overlapping.len());
-    for (start_line, end_line) in non_overlapping {
+    for (start_line, end_line, member_body) in non_overlapping {
         let source = read_line_slice(content, start_line, end_line);
-        let sentence = read_summary_sentence(root_path, path, source);
+        // Class overview keeps each member's name/signature. A mechanical gap
+        // avoids one extra model inference per method just to fold its body.
+        let sentence = if member_body {
+            "method body".to_string()
+        } else {
+            read_summary_sentence(root_path, path, source)
+        };
         let expand_id = read_insert_smart_pack(
             store, project, path, start_line, end_line, source, &sentence,
         )?;
@@ -1373,9 +1577,17 @@ pub(crate) fn dispatch_read_smart(
             definition.end_line,
             nav_short_name(&definition.node)
         );
-        let foldable = matches!(definition.node.label.as_str(), "Function" | "Method");
-        if foldable {
-            group.push_str(&read_render_smart_source(
+        let foldable = matches!(
+            definition.node.label.as_str(),
+            "Function" | "Method" | "Class"
+        );
+        let exact_source = read_line_slice(
+            &definition.content,
+            definition.start_line,
+            definition.end_line,
+        );
+        let rendered = if foldable {
+            read_render_smart_source(
                 &store,
                 &project,
                 &root_path,
@@ -1387,28 +1599,32 @@ pub(crate) fn dispatch_read_smart(
                 definition.end_line,
                 true,
                 depth,
-            )?);
+            )?
         } else {
-            group.push_str(read_line_slice(
-                &definition.content,
-                definition.start_line,
-                definition.end_line,
-            ));
-        }
+            exact_source.to_string()
+        };
+        let folded = rendered != exact_source;
+        group.push_str(&rendered);
         if with_handle {
             if !group.ends_with('\n') {
                 group.push('\n');
             }
-            let full = read_full_handle(
-                &root_path,
-                &definition.node.file_path,
-                definition.content.as_bytes(),
-                definition.start_line,
-                definition.end_line,
-            )?;
-            group.push_str("handle: ");
-            group.push_str(&read_compact_handle(&store, &project, full)?);
-            group.push('\n');
+            if folded {
+                group.push_str(
+                    "note: no edit handle for folded source; request greppy read SYMBOL --handle or read-file PATH --lines A:B --handle\n",
+                );
+            } else {
+                let full = read_full_handle(
+                    &root_path,
+                    &definition.node.file_path,
+                    definition.content.as_bytes(),
+                    definition.start_line,
+                    definition.end_line,
+                )?;
+                group.push_str("handle: ");
+                group.push_str(&read_compact_handle(&store, &project, full)?);
+                group.push('\n');
+            }
         }
         print!("{group}");
         previous_ended_with_newline = group.ends_with('\n');
@@ -1418,16 +1634,6 @@ pub(crate) fn dispatch_read_smart(
 
 fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
     file_operand_path(root_path, subject)
-}
-
-fn read_open_file(
-    root_path: &std::path::Path,
-    canonical_root: &std::path::Path,
-    subject: &str,
-) -> Option<(String, std::path::PathBuf, String)> {
-    let (shown, canonical) = read_resolve_file(root_path, canonical_root, subject)?;
-    let content = std::fs::read_to_string(&canonical).ok()?;
-    Some((shown, canonical, content))
 }
 
 fn read_resolve_file(
@@ -1485,12 +1691,15 @@ fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)>
             "read-file --lines expects 1 <= A <= B, got `{raw}`"
         )));
     }
-    if end > line_count {
+    if start > line_count {
         return Err(Error::Invalid(format!(
-            "read-file --lines ends at {end}, but the file has {line_count} lines"
+            "read-file --lines starts at {start}, but the file has {line_count} lines"
         )));
     }
-    Ok((start, end))
+    if end > line_count {
+        eprintln!("note: read-file --lines {raw} ends past EOF; clamped to {start}:{line_count}");
+    }
+    Ok((start, end.min(line_count)))
 }
 
 /// A plain explicit span needs neither the whole file nor a graph/handle.
@@ -1501,7 +1710,7 @@ fn read_bounded_file_range(
     raw: &str,
     path: &str,
 ) -> Result<(String, usize, usize)> {
-    let (start, end) = read_parse_file_range(raw, usize::MAX)?;
+    let (start, mut end) = read_parse_file_range(raw, usize::MAX)?;
     let mut selected = Vec::new();
     let mut line_count = 0usize;
     while line_count < end {
@@ -1512,9 +1721,16 @@ fn read_bounded_file_range(
         }
         .map_err(|error| Error::io(format!("read-file requested lines in {path}"), error))?;
         if count == 0 {
-            return Err(Error::Invalid(format!(
-                "read-file --lines ends at {end}, but the file has {line_count} lines"
-            )));
+            if line_count < start {
+                return Err(Error::Invalid(format!(
+                    "read-file --lines starts at {start}, but the file has {line_count} lines"
+                )));
+            }
+            eprintln!(
+                "note: read-file --lines {raw} ends past EOF; clamped to {start}:{line_count}"
+            );
+            end = line_count;
+            break;
         }
         line_count += 1;
     }
@@ -1613,29 +1829,48 @@ fn read_file_outline(
     content: &str,
     symbol_read: bool,
 ) -> Option<String> {
+    read_file_outline_result(root, shown, content, symbol_read).ok()
+}
+
+fn read_file_outline_result(
+    root: &std::path::Path,
+    shown: &str,
+    content: &str,
+    symbol_read: bool,
+) -> std::result::Result<String, &'static str> {
     let path = greppy_core::cache::workspace_store_path(root);
     if !path.is_file() {
-        return None;
+        return Err("no index exists for this workspace");
     }
-    let store =
-        greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).ok()?;
-    let store = if let Some((base, commit)) = crate::store_cow::overlay_environment(root).ok()? {
+    let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())
+        .map_err(|_| "the index cannot be opened read-only")?;
+    let store = if let Some((base, commit)) = crate::store_cow::overlay_environment(root)
+        .map_err(|_| "the linked-worktree index identity is unavailable")?
+    {
         let visibility =
-            crate::store_cow::visibility_for_open_connection(root, &commit, store.conn()).ok()?;
-        store.attach_overlay(&base, &visibility).ok()?
+            crate::store_cow::visibility_for_open_connection(root, &commit, store.conn())
+                .map_err(|_| "the linked-worktree visibility is unavailable")?;
+        store
+            .attach_overlay(&base, &visibility)
+            .map_err(|_| "the linked-worktree Base cannot be opened read-only")?
     } else {
         store
     };
     let project = workspace_locator::project_identity(root);
     // Same-length edits can leave obsolete indexed spans in bounds. Unknown
     // or changed fingerprints fall back without index or repair work.
-    let indexed = store.get_file_state(&project, shown).ok()??;
+    let indexed = store
+        .get_file_state(&project, shown)
+        .map_err(|_| "the indexed file state is unavailable")?
+        .ok_or("the file is not indexed")?;
     use sha2::Digest;
     let content_hash = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
     if indexed.sha256 != content_hash {
-        return None;
+        return Err("the indexed fingerprint is stale for the current file");
     }
-    let mut nodes = store.list_nodes_for_file(&project, shown).ok()?;
+    let mut nodes = store
+        .list_nodes_for_file(&project, shown)
+        .map_err(|_| "indexed definitions cannot be read")?;
     let line_count = read_line_count(content) as i64;
     nodes.retain(|node| {
         matches!(
@@ -1656,14 +1891,12 @@ fn read_file_outline(
         }
     }
     if top_level.is_empty() {
-        return None;
+        return Err("the current index has no eligible definitions for this file");
     }
     let mut outline = if symbol_read {
         format!("`{shown}` is a file — read a symbol:\n")
     } else {
-        format!(
-            "Source outline for `{shown}` — large indexed source; text: --lines A:B or --all:\n"
-        )
+        format!("Source outline for `{shown}` — fingerprint-verified indexed definitions:\n")
     };
     for node in &top_level {
         outline.push_str(&format!(
@@ -1675,16 +1908,17 @@ fn read_file_outline(
         ));
     }
     outline.push_str(&format!(
-        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B · full text: greppy read-file {shown} --all\n",
+        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B\n",
         top_level[0].qualified_name
     ));
-    Some(outline)
+    Ok(outline)
 }
 
 pub(crate) fn dispatch_read_files(
     paths: &[String],
     lines: Option<&str>,
     all: bool,
+    outline: bool,
     with_handle: bool,
     json_output: bool,
     path_filter_args: &[String],
@@ -1785,7 +2019,7 @@ pub(crate) fn dispatch_read_files(
             previous_ended_with_newline = group.ends_with('\n');
             continue;
         }
-        let preview = if lines.is_none() && !all {
+        let preview = if lines.is_none() && !all && !outline {
             read_file_preview(&canonical)
         } else {
             std::fs::read_to_string(&canonical).map(|text| (text, None))
@@ -1813,6 +2047,56 @@ pub(crate) fn dispatch_read_files(
             }
         };
         let line_count = read_line_count(&content);
+        if outline {
+            match read_file_outline_result(&root_path, &shown, &content, false) {
+                Ok(result) => {
+                    if json_output {
+                        json_files.push(serde_json::json!({
+                            "path": shown,
+                            "kind": "outline",
+                            "content": result,
+                            "fingerprint_verified": true,
+                            "handle": serde_json::Value::Null,
+                            "handle_unavailable": with_handle.then_some(
+                                "outlines cannot produce an edit handle; request an explicit --lines A:B span"
+                            ),
+                            "lines_command": format!("greppy read-file {shown} --lines A:B"),
+                        }));
+                    } else {
+                        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                        print!("{result}");
+                        if with_handle {
+                            println!(
+                                "note: no handle for an outline; request an explicit --lines A:B span"
+                            );
+                        }
+                        previous_ended_with_newline = true;
+                    }
+                }
+                Err(reason) => {
+                    failed = true;
+                    if json_output {
+                        json_files.push(serde_json::json!({
+                            "path": shown,
+                            "kind": "outline_unavailable",
+                            "error": reason,
+                            "fingerprint_verified": false,
+                            "handle": serde_json::Value::Null,
+                            "handle_unavailable": with_handle.then_some(
+                                "no verified outline exists; request an explicit --lines A:B span"
+                            ),
+                            "lines_command": format!("greppy read-file {shown} --lines A:B"),
+                        }));
+                    } else {
+                        read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                        println!("outline unavailable for `{shown}`: {reason}");
+                        println!("read lines: greppy read-file {shown} --lines A:B");
+                        previous_ended_with_newline = true;
+                    }
+                }
+            }
+            continue;
+        }
         // A line page is not a byte budget: generated JSON/NDJSON can put
         // megabytes on one line. Bound only implicit reads; explicit ranges
         // and --all remain exact. Do this before outlines and pack creation

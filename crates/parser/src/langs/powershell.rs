@@ -16,13 +16,12 @@
 //!
 //! Honesty / imprecision:
 //!   * `function_statement` does NOT expose a `name:` field (the name is a bare
-//!     `function_name` child), so the engine's enclosing-callable resolution
-//!     (`callable_name`, which reads `child_by_field_name("name")`) returns
-//!     `None`. Consequently CALLS edges whose source is a PowerShell function
-//!     are NOT resolved — the same limitation as Julia. Call *targets* are still
-//!     captured (`command_name`), they simply have no enclosing-function source
-//!     to hang off, so no CALLS edge is emitted for calls made inside a
-//!     function body. Top-level commands likewise have no enclosing callable.
+//!     `function_name` child), so `callable_name` cannot re-read it. The
+//!     definition pass records the Function qname against the
+//!     `function_statement` byte span (which already contains the script
+//!     block), and the calls pass reuses that qname. Calls inside a function
+//!     body therefore source from that function. Top-level commands still have
+//!     no enclosing callable.
 //!   * A call parses as `(command command_name: (command_name) @callee …)`;
 //!     the `command_name` text is the invoked command / function.
 //!   * `import`/`using`/dot-sourcing are not expanded into IMPORTS edges (no
@@ -59,9 +58,9 @@ const DEFINITIONS: &str = r#"
 "#;
 
 /// A command invocation parses as `(command command_name: (command_name) @callee
-/// command_elements: …)`. Capture the `command_name` as the callee. Because
-/// `function_statement` has no `name:` field the enclosing-callable source often
-/// does not resolve (see module docs), but the query is correct and harmless.
+/// command_elements: …)`. Capture the `command_name` as the callee. The source
+/// is the enclosing `function_statement` when the definition span covers the
+/// call (see module docs).
 const CALLS: &str = r#"
     (command
       command_name: (command_name) @callee)

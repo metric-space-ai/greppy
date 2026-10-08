@@ -205,6 +205,117 @@ fn expand_id(stdout: &str) -> &str {
 }
 
 #[test]
+fn expand_global_window_is_deterministic_and_owns_truthful_continuation_metadata() {
+    let workspace = fresh_workspace("expand-window");
+    let raw = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1300); do echo line $i; done",
+        ],
+    );
+    assert_eq!(raw.status.code(), Some(0));
+    let id = expand_id(&text(&raw.stdout)).to_string();
+    let expand = || {
+        command(&workspace)
+            .args([
+                "--offset",
+                "20",
+                "--limit",
+                "200",
+                "--max-bytes",
+                "30000",
+                "expand",
+                &id,
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let first = expand();
+    let replay = expand();
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    let page: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let replay_page: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    for key in [
+        "stream",
+        "content_sha256",
+        "start_line",
+        "end_line",
+        "requested_offset",
+        "skipped_lines",
+        "raw_bytes",
+        "raw_line_hex",
+    ] {
+        assert_eq!(page[key], replay_page[key], "unstable replay field {key}");
+    }
+    assert_eq!(page["requested_offset"], 20);
+    assert_eq!(page["skipped_lines"], 20);
+    assert!(page["raw_line_hex"].as_array().unwrap().len() <= 200);
+    assert!(page.get("truncated").is_none(), "{page}");
+    assert!(page.get("total").is_none(), "{page}");
+    assert!(page["next"]["id"].as_str().is_some(), "{page}");
+    let retry = page["next"]["command"].as_str().unwrap();
+    assert!(
+        retry.contains("--json")
+            && retry.contains("--limit 200")
+            && retry.contains("--max-bytes 30000"),
+        "continuation must retain its output contract: {retry}"
+    );
+    assert_eq!(page["next"]["line"], page["end_line"].as_u64().unwrap() + 1);
+    assert!(first.stdout.len() <= 30_000, "{}", first.stdout.len());
+
+    for budget in ["3000", "4096"] {
+        let bounded = command(&workspace)
+            .args(["expand", &id, "--json", "--max-bytes", budget])
+            .output()
+            .unwrap();
+        assert_eq!(bounded.status.code(), Some(0), "{}", text(&bounded.stderr));
+        assert!(
+            bounded.stdout.len() <= budget.parse::<usize>().unwrap(),
+            "budget={budget}, actual={}",
+            bounded.stdout.len()
+        );
+        let bounded: serde_json::Value = serde_json::from_slice(&bounded.stdout).unwrap();
+        assert!(bounded["raw_line_hex"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty()));
+        assert!(bounded["next"]["id"].as_str().is_some());
+    }
+
+    let follow = |next: &serde_json::Value| {
+        command(&workspace)
+            .args(["expand", next["id"].as_str().unwrap(), "--json"])
+            .output()
+            .unwrap()
+    };
+    let next_a = follow(&page["next"]);
+    let next_b = follow(&replay_page["next"]);
+    assert_eq!(next_a.status.code(), Some(0), "{}", text(&next_a.stderr));
+    assert_eq!(next_b.status.code(), Some(0), "{}", text(&next_b.stderr));
+    let next_a: serde_json::Value = serde_json::from_slice(&next_a.stdout).unwrap();
+    let next_b: serde_json::Value = serde_json::from_slice(&next_b.stdout).unwrap();
+    assert_eq!(next_a["start_line"], page["next"]["line"]);
+    assert_eq!(next_b["start_line"], replay_page["next"]["line"]);
+    assert_eq!(next_a["end_line"], next_b["end_line"]);
+    assert_eq!(next_a["raw_line_hex"], next_b["raw_line_hex"]);
+
+    let too_small = command(&workspace)
+        .args(["expand", &id, "--json", "--max-bytes", "100"])
+        .output()
+        .unwrap();
+    assert_eq!(too_small.status.code(), Some(64));
+    assert!(too_small.stdout.is_empty(), "{}", text(&too_small.stdout));
+    assert!(text(&too_small.stderr).contains("2048-byte JSON metadata minimum"));
+    assert!(!text(&too_small.stderr).contains("total: 0"));
+    std::fs::remove_dir_all(&workspace.base).unwrap();
+}
+
+#[test]
 fn raw_output_continuations_and_missing_handles_never_prepare_a_code_index() {
     let workspace = fresh_workspace("expand-no-index");
     let marker = workspace.base.join("gate-was-called");
@@ -249,7 +360,13 @@ fn raw_output_continuations_and_missing_handles_never_prepare_a_code_index() {
                 assert_ne!(next, id);
                 id = next.to_string();
             }
-            None => break,
+            None => {
+                assert_eq!(
+                    page["exhausted"], true,
+                    "the final nonempty page must declare completion"
+                );
+                break;
+            }
         }
         assert!(pages < 10, "continuation did not advance");
     }
@@ -703,6 +820,31 @@ fn compiler_diagnostic_counts_preserve_child_exit_and_raw_bytes() {
             1
         );
         assert_eq!(combined.matches("warning: unused variable").count(), 1);
+    }
+}
+
+#[test]
+fn cmake_diagnostic_verdict_preserves_child_exit_and_stream_bytes() {
+    let workspace = fresh_workspace("cmake-diagnostic");
+    let diagnostics = concat!(
+        "CMake Error in sample/CMakeLists.txt:\n  Imported target includes non-existent path\n\n",
+        "CMake Error at CMakeLists.txt:12 (find_package):\n  Missing package\n\n",
+        "CMake Error:\n  Configuration failed\n\n",
+        "CMake Error at CMakeLists.txt:20 (message):\n  Another failure\n\n",
+        "CMake Warning:\n  Manually-specified variables were not used\n",
+    );
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostics}'{redirect}; exit 1");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let verdict = "FAILED — exit 1: 4 errors, 1 warning\n";
+        if redirect.is_empty() {
+            assert_eq!(text(&output.stdout), format!("{verdict}{diagnostics}"));
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(text(&output.stdout), verdict);
+            assert_eq!(output.stderr, diagnostics.as_bytes());
+        }
     }
 }
 
@@ -1165,4 +1307,125 @@ fn active_index_writer_never_blocks_command_execution() {
         let path: String = serde_json::from_str(path_json).expect("quoted spool path");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     }
+}
+
+#[test]
+fn timeout_reaps_pipe_holding_descendant_after_leader_exits_successfully() {
+    let workspace = fresh_workspace("exited-leader-timeout");
+    let _ = run(&workspace, &["bash-smart", "--", "true"]);
+    let started = Instant::now();
+    let output = command(&workspace)
+        .env("GREPPY_BASH_SMART_TIMEOUT_MS", "1000")
+        .args(["bash-smart", "--", "python3", "-c",
+            "import subprocess;p=subprocess.Popen(['sleep','30']);open('owned-child.pid','w').write(str(p.pid))"])
+        .output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "output drain ignored deadline"
+    );
+    assert_eq!(output.status.code(), Some(137), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).starts_with("FAILED — exit 137:"));
+    assert!(text(&output.stderr).contains("timed out after 1000 ms"));
+    let pid: i32 = std::fs::read_to_string(workspace.repo.join("owned-child.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "output-holding descendant survived"
+    );
+}
+
+fn retained_artifacts(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.contains('-') && (name.ends_with(".stdout") || name.ends_with(".stderr")) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn short_verbatim_output_is_not_retained() {
+    let workspace = fresh_workspace("short-no-retain");
+    let output = run(
+        &workspace,
+        &["bash-smart", "--", "sh", "-c", "printf 'hi\\n'"],
+    );
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("hi"), "{stdout}");
+    assert!(!stdout.contains("greppy expand "), "{stdout}");
+    assert!(
+        retained_artifacts(&workspace.store).is_empty(),
+        "verbatim short runs must not publish expand captures"
+    );
+}
+
+#[test]
+fn empty_stdout_does_not_print_a_partial_output_line() {
+    let workspace = fresh_workspace("empty-stdout");
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 100 ]; do printf 'err %s\\n' \"$i\" >&2; i=$((i+1)); done",
+        ],
+    );
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.starts_with("ok — exit 0"), "{stdout}");
+    assert!(!stdout.contains("partial output"), "{stdout}");
+    assert!(!stdout.contains("greppy expand "), "{stdout}");
+}
+
+#[test]
+fn retention_failure_prints_one_stderr_notice() {
+    let workspace = fresh_workspace("retain-notice");
+    let output = command(&workspace)
+        .env("GREPPY_TEST_RETAINED_QUOTA_BYTES", "1")
+        .env("GREPPY_TEST_RETAINED_MAX_FILES", "8")
+        .args([
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 50 ]; do printf 'out %s\\n' \"$i\"; printf 'err %s\\n' \"$i\" >&2; i=$((i+1)); done",
+        ])
+        .output()
+        .expect("run greppy");
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    let notice = "greppy: output not retained (";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("); expand ids unavailable for this run"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("greppy expand "), "{stdout}");
+    assert!(!stderr.contains("greppy expand "), "{stderr}");
+    assert!(stdout.contains("raw log "), "{stdout}");
 }

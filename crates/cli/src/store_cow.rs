@@ -1862,12 +1862,19 @@ pub(crate) fn try_reuse_base_store(
     let Ok(manifest) = layout.read_verified_manifest() else {
         return Ok(None);
     };
-    if validate_base_contents(workspace.worktree_path(), &layout.graph, &identity).is_err()
-        || validate_base_summary_cache(
-            workspace.worktree_path(),
-            &layout.graph,
-            &layout.summary_cache,
-            &identity,
+    // Validate the authenticated immutable publication, never live dirty source.
+    // The current visible baseline and restored edits belong to private Delta.
+    if validate_base_contents_for_project(
+        &greppy_core::project_identity(workspace.repo_root()),
+        &layout.graph,
+        &identity,
+    )
+    .is_err()
+        || greppy_store::SummaryCache::open_read_only(
+            layout
+                .summary_cache
+                .parent()
+                .ok_or_else(|| Error::Invalid("Base summary cache has no parent".into()))?,
         )
         .is_err()
     {
@@ -2056,11 +2063,19 @@ pub(crate) fn prepare_base_store(
     deadline: Option<std::time::Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
+    if let Some(prepared) = try_reuse_base_store(workspace, shared_data_root)? {
+        return Ok(prepared);
+    }
+    // A cold Base is materialized exclusively from the pinned clean commit.
+    // In particular, the agent's visible dirty baseline must never be published
+    // under the clean HEAD identity. The normal overlay index below startup
+    // attaches its dirty files and restored proposal edits as private Delta.
+    let clean = TemporaryBaseWorktree::create(workspace.repo_root(), workspace.base_commit())?;
     prepare_base_store_paths(
         BaseSourcePaths {
             repo_root: workspace.repo_root(),
-            source_path: workspace.repository_path(),
-            worktree_path: workspace.worktree_path(),
+            source_path: clean.path(),
+            worktree_path: clean.path(),
             base_commit: workspace.base_commit(),
         },
         shared_data_root,
@@ -2452,7 +2467,17 @@ fn validate_workspace_inventory(source_path: &Path, worktree_path: &Path) -> Res
 
     let expected = inventory(source_path)?;
     let actual = inventory(worktree_path)?;
-    if expected == actual {
+    // Identical paths with different sizes are not an incomplete mount.
+    // Line-ending normalisation (core.autocrlf / attributes eol) leaves Git
+    // clean while the working tree disagrees with the Base checkout. Those
+    // paths are Store Delta: they are reindexed from the working tree instead
+    // of failing Base publication. Missing or extra paths still fail.
+    let paths_match = expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual.iter())
+            .all(|(left, right)| left.0 == right.0);
+    if paths_match {
         return Ok(expected.len());
     }
     let first_difference = expected
@@ -2901,8 +2926,95 @@ pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<Visib
         )));
     }
     dirty.extend(nul_fields(&untracked.stdout)?);
+    // Git's clean/smudge filters can report a tracked file as unmodified while
+    // its working-tree bytes differ from the checkout indexed into Base
+    // (core.autocrlf, `.gitattributes` eol). One stat per Base file — never a
+    // content read — promotes those paths into Delta. Paths Git already called
+    // dirty or deleted stay as they are.
+    add_size_mismatched_base_paths(root, base_commit, &mut dirty, &deleted)?;
+    // A Base path may be removed from Git's index (or renamed) and then
+    // recreated as an untracked working-tree file. Git reports both the old
+    // deletion and the current file. Current content replaces the Base at
+    // that path; it must not also retain a deletion tombstone.
+    let present = dirty.iter().collect::<std::collections::BTreeSet<_>>();
+    deleted.retain(|path| !present.contains(path));
     VisibilityIndex::new(dirty, deleted)
         .map_err(|error| Error::io("validate Store Delta visibility", error))
+}
+
+/// Promote tracked paths whose working-tree length disagrees with the indexed
+/// Base inventory. Only regular files are compared, and only by `stat`.
+fn add_size_mismatched_base_paths(
+    root: &Path,
+    base_commit: &str,
+    dirty: &mut Vec<String>,
+    deleted: &[String],
+) -> Result<()> {
+    // Recovery lookup: this runs while `greppy index` rebuilds a missing Base,
+    // and a missing Base simply has no sizes to compare.
+    let Some((base_path, bound_commit)) = overlay_environment_for_recovery(root)? else {
+        return Ok(());
+    };
+    if bound_commit != base_commit || !base_path.is_file() {
+        return Ok(());
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &base_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        Error::Store(format!(
+            "open Base inventory for Store Delta visibility: {error}"
+        ))
+    })?;
+    // A published Base is immutable, but a concurrent publish may briefly hold
+    // its lock; wait like every other Base reader instead of failing at once.
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| Error::Store(format!("configure Base inventory read: {error}")))?;
+    let mut statement = connection
+        .prepare("SELECT rel_path, size FROM file_state")
+        .map_err(|error| Error::Store(format!("read Base inventory sizes: {error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| Error::Store(format!("query Base inventory sizes: {error}")))?;
+    let already_dirty = dirty
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let already_deleted = deleted
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut extra = Vec::new();
+    for row in rows {
+        let (rel_path, size) =
+            row.map_err(|error| Error::Store(format!("read Base inventory size row: {error}")))?;
+        if size < 0
+            || already_dirty.contains(rel_path.as_str())
+            || already_deleted.contains(rel_path.as_str())
+        {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(root.join(&rel_path)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // An unreadable path cannot be proven equal to Base: index it from
+            // the working tree like any changed file instead of failing every
+            // overlay query.
+            Err(_) => {
+                extra.push(rel_path);
+                continue;
+            }
+        };
+        if metadata.is_file() && metadata.len() != size as u64 {
+            extra.push(rel_path);
+        }
+    }
+    dirty.extend(extra);
+    Ok(())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -5000,6 +5112,223 @@ mod tests {
     }
 
     #[test]
+    fn dirty_agent_baseline_reuses_clean_base_and_indexes_only_private_delta() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let _tmp = TmpdirRestore::set(scratch.path());
+        let _environment = EnvRestore::capture(&[
+            "GREPPY_PROJECT_IDENTITY",
+            "GREPPY_WORKSPACE_DIR",
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_TEST_FORBID_TEMP_BASE_CHECKOUT,
+        ]);
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        std::env::set_var(
+            "GREPPY_WORKSPACE_DIR",
+            scratch.path().join("agent-workspaces"),
+        );
+        for name in [
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_TEST_FORBID_TEMP_BASE_CHECKOUT,
+        ] {
+            std::env::remove_var(name);
+        }
+        let repo = fixture();
+        // The fixture writes its files directly with LF. Keep the clean Base
+        // checkout byte-identical to them on runners whose git defaults to
+        // core.autocrlf=true (Windows); this test is about Base reuse.
+        git(repo.path(), &["config", "core.autocrlf", "false"]);
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("src/a.rs"), "fn operator_dirty() {}\n").unwrap();
+        std::fs::write(
+            repo.path().join("src/untracked.rs"),
+            "fn operator_untracked() {}\n",
+        )
+        .unwrap();
+
+        // Materialize the same clean source used by a cold production Base build.
+        let clean = TemporaryBaseWorktree::create(repo.path(), &commit).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clean.path().join("src/a.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+        assert!(!clean.path().join("src/untracked.rs").exists());
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let staged_graph = scratch.path().join("staged-base.db");
+        {
+            let mut base = greppy_store::Store::open(&staged_graph).unwrap();
+            greppy_indexer::index(&mut base, clean.path(), "p").unwrap();
+            let fingerprint = greppy_core::GitFingerprint::capture(clean.path());
+            base.upsert_workspace_state(&greppy_store::WorkspaceState {
+                root_path: clean.path().to_string_lossy().into_owned(),
+                git_dir: fingerprint
+                    .git_dir
+                    .map(|path| path.to_string_lossy().into_owned()),
+                git_common_dir: fingerprint
+                    .git_common_dir
+                    .map(|path| path.to_string_lossy().into_owned()),
+                head_oid: fingerprint.head_oid,
+                index_signature: fingerprint.index_signature,
+                schema_version: base.schema_version().unwrap(),
+                indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
+                graph_generation: 1,
+                updated_at: "2026-10-06T00:00:00Z".into(),
+            })
+            .unwrap();
+        }
+        mark_base_embeddings_deferred(&staged_graph, "p", &identity).unwrap();
+        let summaries =
+            build_base_summary_cache(&staged_graph, &identity.summary_model_and_prompt_version)
+                .unwrap();
+        let shared = scratch.path().join("shared");
+        let layout = BaseStoreLayout::new(&shared, &identity).unwrap();
+        {
+            let _builder = layout.acquire_builder(true).unwrap().unwrap();
+            layout
+                .publish_graph_with_summary(identity, &staged_graph, &summaries)
+                .unwrap();
+        }
+        drop(clean);
+        let baseline =
+            greppy_agent::AgentWorkspace::create(repo.path(), "dirty-base-reuse").unwrap();
+        assert!(!baseline.baseline_is_clean().unwrap());
+        let base_before = std::fs::read(&layout.graph).unwrap();
+        std::env::set_var(ENV_TEST_FORBID_TEMP_BASE_CHECKOUT, "1");
+        let prepared = prepare_base_store(
+            &baseline,
+            &shared,
+            crate::EmbeddingCliArgs {
+                device: None,
+                no_gpu: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            prepared.reused,
+            "dirty baseline must reuse authenticated clean Base without rebuilding"
+        );
+        configure_overlay_environment(&prepared, baseline.base_commit());
+        let spec = overlay_spec(baseline.worktree_path()).unwrap().unwrap();
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut overlay = greppy_store::Store::open_overlay(
+                &prepared.graph_path,
+                &delta_path,
+                &spec.visibility,
+            )
+            .unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(
+                    ["src/a.rs".to_string(), "src/untracked.rs".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+            greppy_indexer::index_with_options(
+                &mut overlay,
+                baseline.worktree_path(),
+                "p",
+                &options,
+            )
+            .unwrap();
+            assert!(overlay
+                .get_node_by_qname("p", "src/a.rs::Function::operator_dirty")
+                .unwrap()
+                .is_some());
+            assert!(overlay
+                .get_node_by_qname("p", "src/untracked.rs::Function::operator_untracked")
+                .unwrap()
+                .is_some());
+            assert!(overlay
+                .get_node_by_qname("p", "src/b.rs::Function::b")
+                .unwrap()
+                .is_some());
+        }
+        {
+            let base = greppy_store::Store::open_with(
+                &layout.graph,
+                greppy_store::OpenOptions::read_only(),
+            )
+            .unwrap();
+            assert!(base
+                .get_node_by_qname("p", "src/a.rs::Function::a")
+                .unwrap()
+                .is_some());
+            assert!(base
+                .get_node_by_qname("p", "src/a.rs::Function::operator_dirty")
+                .unwrap()
+                .is_none());
+            assert!(base
+                .get_node_by_qname("p", "src/untracked.rs::Function::operator_untracked")
+                .unwrap()
+                .is_none());
+            let delta =
+                greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                    .unwrap();
+            assert!(
+                delta
+                    .get_node_by_qname("p", "src/b.rs::Function::b")
+                    .unwrap()
+                    .is_none(),
+                "unchanged code remains exclusively in shared Base"
+            );
+        }
+        // Restored proposal edits still use the same Base on the next startup.
+        std::fs::write(
+            baseline.worktree_path().join("src/a.rs"),
+            "fn restored_agent_edit() {}\n",
+        )
+        .unwrap();
+        let reused = try_reuse_base_store(&baseline, &shared).unwrap().unwrap();
+        assert!(reused.reused);
+        let refreshed = overlay_spec(baseline.worktree_path()).unwrap().unwrap();
+        {
+            let mut overlay = greppy_store::Store::open_overlay(
+                &reused.graph_path,
+                &delta_path,
+                &refreshed.visibility,
+            )
+            .unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(["src/a.rs".to_string()].into_iter().collect()),
+                ..Default::default()
+            };
+            greppy_indexer::index_with_options(
+                &mut overlay,
+                baseline.worktree_path(),
+                "p",
+                &options,
+            )
+            .unwrap();
+            assert!(overlay
+                .get_node_by_qname("p", "src/a.rs::Function::restored_agent_edit")
+                .unwrap()
+                .is_some());
+            assert!(overlay
+                .get_node_by_qname("p", "src/a.rs::Function::operator_dirty")
+                .unwrap()
+                .is_none());
+            assert!(overlay
+                .get_node_by_qname("p", "src/b.rs::Function::b")
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(std::fs::read(&layout.graph).unwrap(), base_before);
+        baseline.cleanup().unwrap();
+    }
+
+    #[test]
     fn temporary_base_checkout_uses_tmpdir_and_cleans_up() {
         let _env = crate::TEST_ENV_LOCK
             .lock()
@@ -5406,6 +5735,102 @@ mod tests {
     }
 
     #[test]
+    fn filtered_overlay_refresh_preserves_certified_unselected_base_relations() {
+        let repo = fixture();
+        let js_path = "src/clean.ts";
+        std::fs::write(
+            repo.path().join(js_path),
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let source_sha;
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            source_sha = base
+                .list_file_states("p")
+                .unwrap()
+                .into_iter()
+                .find(|state| state.rel_path == js_path)
+                .unwrap()
+                .sha256;
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        let visibility =
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap();
+        let delta_path = scratch.path().join("delta.db");
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        // A retained compatibility repair owns derived relations, not source.
+        // The next filtered structural refresh must not delete its contribution.
+        overlay.conn().execute_batch(
+            "INSERT INTO main.projects SELECT * FROM greppy_base.projects;
+             INSERT INTO main.file_state SELECT * FROM greppy_base.file_state WHERE rel_path='src/lib.rs';
+             INSERT INTO main.workspace_state SELECT * FROM greppy_base.workspace_state;
+             INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
+             SELECT project,file_path,source_qname,target_qname,edge_type,properties
+             FROM greppy_base.raw_edges WHERE file_path='src/clean.ts';
+             INSERT INTO main.js_ts_reference_override_files VALUES('p','src/clean.ts');
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v9.p','complete');"
+        ).unwrap();
+        overlay
+            .certify_js_ts_reference_repair("p", js_path, &source_sha)
+            .unwrap();
+        let retained = overlay.list_delta_raw_edges("p").unwrap();
+        assert!(!retained.is_empty());
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(["src/lib.rs".to_string()].into_iter().collect()),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+        let after = overlay
+            .list_delta_raw_edges("p")
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.file_path == js_path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, retained,
+            "filtered inventory must not delete unselected Base repairs"
+        );
+        assert!(
+            overlay
+                .js_ts_reference_repair_path_is_certified(js_path)
+                .unwrap(),
+            "filtered inventory must not delete unselected Base repairs: certificate lost"
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        // A deletion inside the requested scope still removes its own rows.
+        std::fs::remove_file(repo.path().join("src/lib.rs")).unwrap();
+        greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+        assert!(overlay
+            .list_file_states("p")
+            .unwrap()
+            .iter()
+            .all(|state| state.rel_path != "src/lib.rs"));
+        assert!(
+            overlay
+                .js_ts_reference_repair_path_is_certified(js_path)
+                .unwrap(),
+            "filtered inventory must not delete unselected Base repairs: certificate lost"
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        drop(overlay);
+        let reopened =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        validate_overlay_delta_visibility(&reopened, &visibility).unwrap();
+        assert!(reopened
+            .js_ts_reference_repair_path_is_certified(js_path)
+            .unwrap());
+    }
+
+    #[test]
     fn changed_clean_js_repair_and_legacy_migration_are_certified_without_ownership() {
         let repo = fixture();
         std::fs::write(
@@ -5510,7 +5935,7 @@ export function caller() { target(); }
             let mut base = greppy_store::Store::open(&base_path).unwrap();
             greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
             state = base
-                .get_workspace_state(repo.path().to_str().unwrap())
+                .get_workspace_state(repo.path().canonicalize().unwrap().to_str().unwrap())
                 .unwrap()
                 .unwrap();
             base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
@@ -5745,6 +6170,220 @@ export function caller() { target(); }
         let reverted = visibility_against(repo.path(), &base).unwrap();
         assert!(!reverted.hides_base_path("src/a.rs"));
         assert_eq!(reverted.changed_count(), 2);
+    }
+
+    #[test]
+    fn line_ending_size_mismatch_is_indexed_from_the_working_tree() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let _tmp = TmpdirRestore::set(scratch.path());
+        let _environment = EnvRestore::capture(&[
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_BASE_REUSED,
+            ENV_FALLBACK_REASON,
+        ]);
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        for name in [
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+            ENV_BASE_REUSED,
+            ENV_FALLBACK_REASON,
+        ] {
+            std::env::remove_var(name);
+        }
+
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "cow@test.invalid"]);
+        git(&repo, &["config", "user.name", "Store CoW"]);
+        git(&repo, &["config", "core.autocrlf", "true"]);
+        git(&repo, &["config", "core.safecrlf", "false"]);
+        // LF in the index, CRLF in a clean checkout. The LF working tree stays
+        // git-clean because the clean filter normalises both sides. The
+        // same-size file has no newline, so checkout does not change its bytes.
+        std::fs::write(
+            repo.join(".gitattributes"),
+            ".gitattributes text eol=lf\n*.rs text eol=crlf\n",
+        )
+        .unwrap();
+        let lf_eol = b"fn lf_worktree_symbol() {}\n".to_vec();
+        let same_bytes = b"fn same_size_symbol() {}".to_vec();
+        std::fs::write(repo.join("src/eol.rs"), &lf_eol).unwrap();
+        std::fs::write(repo.join("src/same.rs"), &same_bytes).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+
+        let clean = TemporaryBaseWorktree::create(&repo, &commit).unwrap();
+        let clean_eol = std::fs::read(clean.path().join("src/eol.rs")).unwrap();
+        let clean_same = std::fs::read(clean.path().join("src/same.rs")).unwrap();
+        assert!(
+            clean_eol.contains(&b'\r'),
+            "Base checkout must materialize CRLF, bytes={clean_eol:?}"
+        );
+        assert!(
+            !lf_eol.contains(&b'\r'),
+            "working tree fixture must stay LF"
+        );
+        assert_ne!(clean_eol.len(), lf_eol.len());
+        assert_eq!(
+            clean_same, same_bytes,
+            "same-size fixture must be unchanged by checkout"
+        );
+        let status = git(&repo, &["status", "--porcelain"]);
+        assert!(
+            status.is_empty(),
+            "line-ending rewrite must stay git-clean, status={status:?}"
+        );
+        assert!(
+            git(&repo, &["diff", "--name-status", commit.as_str()]).is_empty(),
+            "git diff must not report the LF rewrite"
+        );
+
+        let counted = validate_workspace_inventory(&repo, clean.path()).unwrap();
+        assert!(counted >= 2, "size-only differences must still validate");
+
+        let base_graph = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_graph).unwrap();
+            greppy_indexer::index(&mut base, clean.path(), "p").unwrap();
+        }
+        let base_same = {
+            let base =
+                greppy_store::Store::open_with(&base_graph, greppy_store::OpenOptions::read_only())
+                    .unwrap();
+            let eol_state = base.get_file_state("p", "src/eol.rs").unwrap().unwrap();
+            assert_eq!(eol_state.size as usize, clean_eol.len());
+            assert_eq!(
+                eol_state.sha256,
+                greppy_store::file_state::sha256_hex(&clean_eol)
+            );
+            base.get_file_state("p", "src/same.rs")
+                .unwrap()
+                .unwrap()
+                .size
+        };
+
+        std::env::set_var(ENV_MODE, MODE_OVERLAY);
+        std::env::set_var(ENV_BASE_PATH, &base_graph);
+        std::env::set_var(ENV_BASE_COMMIT, &commit);
+        let visibility = visibility_against(&repo, &commit).unwrap();
+        assert!(
+            visibility.is_dirty_path("src/eol.rs"),
+            "LF bytes that differ in size from Base must be Delta"
+        );
+        assert!(
+            !visibility.is_dirty_path("src/same.rs"),
+            "same-size clean file must stay Base, dirty={:?}",
+            visibility.dirty_paths().collect::<Vec<_>>()
+        );
+        assert!(!visibility.hides_base_path("src/same.rs"));
+        assert!(visibility.deleted_paths().next().is_none());
+
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut overlay =
+                greppy_store::Store::open_overlay(&base_graph, &delta_path, &visibility).unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(visibility.dirty_paths().map(str::to_owned).collect()),
+                ..greppy_indexer::IndexOptions::default()
+            };
+            greppy_indexer::index_with_options(&mut overlay, &repo, "p", &options).unwrap();
+            assert!(
+                overlay
+                    .get_node_by_qname("p", "src/eol.rs::Function::lf_worktree_symbol")
+                    .unwrap()
+                    .is_some(),
+                "overlay must find the symbol from the LF working tree"
+            );
+            assert!(overlay
+                .get_node_by_qname("p", "src/same.rs::Function::same_size_symbol")
+                .unwrap()
+                .is_some());
+        }
+        let delta =
+            greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        let indexed = delta.get_file_state("p", "src/eol.rs").unwrap().unwrap();
+        assert_eq!(indexed.size as usize, lf_eol.len());
+        assert_eq!(
+            indexed.sha256,
+            greppy_store::file_state::sha256_hex(&lf_eol),
+            "Delta must store the LF working-tree bytes, not the CRLF Base checkout"
+        );
+        assert!(delta
+            .get_node_by_qname("p", "src/eol.rs::Function::lf_worktree_symbol")
+            .unwrap()
+            .is_some());
+        assert!(
+            delta.get_file_state("p", "src/same.rs").unwrap().is_none(),
+            "same-size clean file must not be copied into Delta"
+        );
+        assert!(delta
+            .get_node_by_qname("p", "src/same.rs::Function::same_size_symbol")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::metadata(repo.join("src/same.rs")).unwrap().len() as i64,
+            base_same
+        );
+    }
+
+    #[test]
+    fn workspace_inventory_ignores_size_mismatch_but_rejects_missing_paths() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        let mount = scratch.path().join("mount");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(mount.join("src")).unwrap();
+        std::fs::write(source.join("src/eol.rs"), b"fn lf_worktree_symbol() {}\n").unwrap();
+        std::fs::write(mount.join("src/eol.rs"), b"fn lf_worktree_symbol() {}\r\n").unwrap();
+        let counted = validate_workspace_inventory(&source, &mount).unwrap();
+        assert_eq!(counted, 1);
+
+        std::fs::write(source.join("src/extra.rs"), b"fn extra() {}\n").unwrap();
+        let error = validate_workspace_inventory(&source, &mount)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inventory is incomplete"), "{error}");
+    }
+
+    #[test]
+    fn visibility_recreated_untracked_base_path_is_dirty_not_deleted() {
+        let repo = fixture();
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["rm", "--cached", "src/a.rs"]);
+        std::fs::write(repo.path().join("src/a.rs"), "fn replacement() {}\n").unwrap();
+        let visibility = visibility_against(repo.path(), &base).unwrap();
+        assert!(visibility.is_dirty_path("src/a.rs"));
+        assert!(!visibility.is_deleted_path("src/a.rs"));
+        assert!(!visibility.hides_base_path("src/b.rs"));
+        assert_eq!(visibility.changed_count(), 1);
+    }
+
+    #[test]
+    fn visibility_renamed_and_recreated_base_path_retains_both_current_files() {
+        let repo = fixture();
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["mv", "src/a.rs", "src/renamed.rs"]);
+        std::fs::write(repo.path().join("src/a.rs"), "fn replacement() {}\n").unwrap();
+        let visibility = visibility_against(repo.path(), &base).unwrap();
+        assert!(visibility.is_dirty_path("src/a.rs"));
+        assert!(visibility.is_dirty_path("src/renamed.rs"));
+        assert!(!visibility.is_deleted_path("src/a.rs"));
+        assert_eq!(visibility.changed_count(), 2);
+        std::fs::remove_file(repo.path().join("src/a.rs")).unwrap();
+        let removed_again = visibility_against(repo.path(), &base).unwrap();
+        assert!(removed_again.is_deleted_path("src/a.rs"));
+        assert!(!removed_again.is_dirty_path("src/a.rs"));
+        assert!(removed_again.is_dirty_path("src/renamed.rs"));
     }
 
     #[test]

@@ -120,9 +120,195 @@ pub fn publish_atomic(
     Ok(sha256_hex(content))
 }
 
+/// Resolve an absent target through its nearest existing ancestor without
+/// writing directories. Missing paths still have to remain inside the root.
+pub fn require_new_inside_workspace(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
+    let root = workspace_root.canonicalize().map_err(|source| Error::Io {
+        context: format!("canonicalize {}", workspace_root.display()),
+        source,
+    })?;
+    let mut ancestor = path
+        .parent()
+        .ok_or_else(|| Error::Invalid("not a file path".into()))?;
+    let mut tail = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| Error::Invalid("invalid creation parent".into()))?;
+        tail.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| Error::Invalid("invalid creation parent".into()))?;
+    }
+    let mut parent = ancestor.canonicalize().map_err(|source| Error::Io {
+        context: format!("canonicalize {}", ancestor.display()),
+        source,
+    })?;
+    for name in tail.into_iter().rev() {
+        parent.push(name);
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Invalid("not a file path".into()))?;
+    let resolved = parent.join(name);
+    if !resolved.starts_with(&root) {
+        return Err(Error::Workspace(format!(
+            "path {} escapes workspace {}",
+            resolved.display(),
+            root.display()
+        )));
+    }
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(_) => Err(Error::Workspace(format!(
+            "creation target {} already exists; nothing written",
+            resolved.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(source) => Err(Error::Io {
+            context: format!("stat {}", resolved.display()),
+            source,
+        }),
+    }
+}
+
+/// Publish a complete new file without replacing a racing creator. Temporary
+/// bytes are private until persist_noclobber atomically links the final name.
+pub fn publish_create_atomic(
+    workspace_root: &Path,
+    path: &Path,
+    content: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<String> {
+    let resolved = require_new_inside_workspace(workspace_root, path)?;
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| Error::Invalid("not a file path".into()))?;
+    std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+        context: format!("create {}", parent.display()),
+        source,
+    })?;
+    // Re-check after directory creation; an ancestor may have been replaced.
+    let checked = require_new_inside_workspace(workspace_root, path)?;
+    if checked != resolved {
+        return Err(Error::Workspace(
+            "creation parent changed since planning; nothing written".into(),
+        ));
+    }
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".greppy-edit.")
+        .tempfile_in(parent)
+        .map_err(|source| Error::Io {
+            context: "create temporary file".into(),
+            source,
+        })?;
+    tmp.write_all(content).map_err(|source| Error::Io {
+        context: "write tmp".into(),
+        source,
+    })?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(tmp.path(), permissions).map_err(|source| Error::Io {
+            context: "restore permissions".into(),
+            source,
+        })?;
+    }
+    tmp.as_file().sync_all().map_err(|source| Error::Io {
+        context: "fsync tmp".into(),
+        source,
+    })?;
+    tmp.persist_noclobber(&resolved)
+        .map_err(|error| Error::Io {
+            context: format!("create {} without replacement", resolved.display()),
+            source: error.error,
+        })?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(sha256_hex(content))
+}
+
+/// Delete only the planned file bytes, with the same path/link guards and
+/// compare-before-publication window as publish_atomic.
+pub fn publish_delete_atomic(
+    workspace_root: &Path,
+    path: &Path,
+    expected_live_sha256: &str,
+) -> Result<()> {
+    let resolved = require_inside_workspace(workspace_root, path)?;
+    let live = std::fs::read(&resolved).map_err(|source| Error::Io {
+        context: format!("read {}", resolved.display()),
+        source,
+    })?;
+    if sha256_hex(&live) != expected_live_sha256 {
+        return Err(Error::Workspace(format!(
+            "stale plan: {} changed since planning; nothing was written",
+            resolved.display()
+        )));
+    }
+    std::fs::remove_file(&resolved).map_err(|source| Error::Io {
+        context: format!("delete {}", resolved.display()),
+        source,
+    })?;
+    if let Some(parent) = resolved.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_is_complete_and_never_replaces_an_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/new.txt");
+        publish_create_atomic(dir.path(), &path, b"created", None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"created");
+        assert!(publish_create_atomic(dir.path(), &path, b"overwrite", None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"created");
+    }
+
+    #[test]
+    fn deletion_requires_the_planned_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.txt");
+        std::fs::write(&path, b"other writer").unwrap();
+        assert!(publish_delete_atomic(dir.path(), &path, &sha256_hex(b"old")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"other writer");
+        publish_delete_atomic(dir.path(), &path, &sha256_hex(b"other writer")).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn creation_and_deletion_refuse_symlinks_and_escaped_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("new.txt");
+        assert!(publish_create_atomic(dir.path(), &external, b"escape", None).is_err());
+        assert!(!external.exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+            assert!(publish_create_atomic(
+                dir.path(),
+                &dir.path().join("escape/new.txt"),
+                b"escape",
+                None
+            )
+            .is_err());
+            std::fs::write(&external, b"sentinel").unwrap();
+            std::os::unix::fs::symlink(&external, dir.path().join("link.txt")).unwrap();
+            assert!(publish_delete_atomic(
+                dir.path(),
+                &dir.path().join("link.txt"),
+                &sha256_hex(b"sentinel")
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&external).unwrap(), b"sentinel");
+        }
+    }
 
     #[test]
     fn cas_publishes_when_hash_matches() {

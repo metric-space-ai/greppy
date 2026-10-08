@@ -326,16 +326,15 @@ impl Certificate {
                         detail.map_or_else(
                             || {
                                 format!(
-                                    "`OLD` occurs {} times; text-cas requires the explicit expected cardinality.",
+                                    "`OLD` occurs {} times; pass --expect N to edit all of them.",
                                     operation.target_matches
                                 )
                             },
                             str::to_owned,
                         ),
                         vec![
-                            "greppy edit text-cas --help".into(),
-                            "greppy edit rename-symbol --help".into(),
-                            "greppy edit rename-call --help".into(),
+                            "greppy replace-text --help".into(),
+                            "greppy rename --help".into(),
                         ],
                     )
                 } else {
@@ -394,16 +393,26 @@ impl Certificate {
                     .unwrap_or_else(|| "the projected edit violated its declared scope".into());
                 let alternative = match operation.selector_engine {
                     SelectorEngine::Symbol | SelectorEngine::TreeSitter | SelectorEngine::Lsp => {
-                        "greppy edit patch-span --help"
+                        "greppy replace-lines --help"
                     }
-                    SelectorEngine::Text | SelectorEngine::Regex => "greppy edit text-cas --help",
-                    SelectorEngine::DataPath => "greppy edit data --help",
+                    SelectorEngine::Text | SelectorEngine::Regex => "greppy replace-text --help",
+                    SelectorEngine::DataPath => "greppy replace-lines --help",
                 };
                 (
-                    format!(
-                        "operation `{}` expected no new syntax or scope violation but found {violation}.",
-                        operation.id
-                    ),
+                    // A failed postcondition already says what was expected
+                    // and found; wrapping it in a second "expected … found"
+                    // produced a garbled sentence.
+                    if detail.is_some() {
+                        format!(
+                            "operation `{}` failed its postcondition: {violation}.",
+                            operation.id
+                        )
+                    } else {
+                        format!(
+                            "operation `{}` expected no new syntax or scope violation but found {violation}.",
+                            operation.id
+                        )
+                    },
                     vec![format!("greppy read {file} --json"), alternative.into()],
                 )
             }
@@ -433,7 +442,7 @@ impl Certificate {
                             .join(" ")
                     })
                     .filter(|command| !command.is_empty())
-                    .unwrap_or_else(|| "greppy edit apply --help".into());
+                    .unwrap_or_else(|| "greppy patch --help".into());
                 (
                     format!(
                         "operation `{}` expected every validator to exit 0 but found {found}.",
@@ -706,7 +715,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("first new syntax error"));
-        assert_eq!(compact["next_steps"][1], "greppy edit patch-span --help");
+        assert_eq!(compact["next_steps"][1], "greppy replace-lines --help");
     }
 
     #[test]

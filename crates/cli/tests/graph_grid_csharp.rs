@@ -161,8 +161,10 @@ fn index_existing(repo: &Path, store: &Path) -> String {
         code, 0,
         "C# fixture index must succeed; stderr={err}\nstdout={out}"
     );
+    // A reindex of unchanged sources may answer from the no-op fast path
+    // (`index already current (N files)`); a real index run reports support.
     assert!(
-        out.contains("0 unsupported"),
+        out.contains("0 unsupported") || out.starts_with("index already current (3 files)"),
         "all discovered .cs files must be accepted through Language::CSharp; got: {out:?}"
     );
     out

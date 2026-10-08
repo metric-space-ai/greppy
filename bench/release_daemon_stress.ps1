@@ -192,7 +192,7 @@ public static class GreppyPipeClient
         for (int index = 0; index < count; index++)
         {
             string requestId = prefix + "-" + index.ToString();
-            requests[index] = "{\"protocol\":2,\"request_id\":" +
+            requests[index] = "{\"protocol\":4,\"request_id\":" +
                 JsonString(requestId) + ",\"pv\":" + JsonString(promptVersion) +
                 ",\"mk\":" + JsonString(modelKey) + ",\"text\":" +
                 JsonString("capacity flood " + requestId) + "}";
@@ -208,7 +208,7 @@ public static class GreppyPipeClient
         for (int index = 0; index < count; index++)
         {
             string requestId = prefix + "-" + index.ToString();
-            requests[index] = "{\"protocol\":2,\"request_id\":" +
+            requests[index] = "{\"protocol\":4,\"request_id\":" +
                 JsonString(requestId) + ",\"pv\":" + JsonString(promptVersion) +
                 ",\"fv\":" + JsonString(filterVersion) +
                 ",\"mk\":" + JsonString(modelKey) +
@@ -273,7 +273,7 @@ function Invoke-PipeJson(
 }
 
 function Get-DaemonStatus([string]$Endpoint) {
-    $status = Invoke-PipeJson $Endpoint @{ protocol = 2; op = 'status' } 5
+    $status = Invoke-PipeJson $Endpoint @{ protocol = 4; op = 'status' } 5
     if ([int]$status.daemon_pid -gt 0) {
         [void]$DaemonPids.Add([int]$status.daemon_pid)
     }
@@ -685,7 +685,7 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
     if (-not (Test-ProcessAlive $EmbedPid)) { throw 'daemon_pid is not live' }
 
     $ping = Invoke-PipeJson $EmbedEndpoint @{
-        protocol = 2; op = 'ping'; request_id = 'windows-sanity-ping'
+        protocol = 4; op = 'ping'; request_id = 'windows-sanity-ping'
     }
     if (-not $ping.ok -or $ping.request_id -ne 'windows-sanity-ping') {
         throw 'ping response did not preserve the request identity'

@@ -37,19 +37,21 @@ impl StoreDiagnostics {
     pub fn is_healthy(&self) -> bool {
         self.schema_current
             && self.integrity_ok
-            && self
-                .projects
-                .iter()
-                .all(|p| p.incomplete_provider_count == 0)
+            && self.projects.iter().all(|project| {
+                project
+                    .provider_states
+                    .iter()
+                    .all(|provider| !provider.blocks_diagnostics_health())
+            })
     }
 }
 
 impl Store {
     /// Build a read-only diagnostic snapshot of the active store.
     ///
-    /// Provider incompleteness is deliberately part of health: a database can
-    /// be structurally valid while still being unsafe to market as full graph
-    /// parity because one or more language providers are partial.
+    /// Call-graph gaps and failed provider files are part of health. A provider
+    /// that is only partial because it omits non-call-graph classes (routes,
+    /// k8s, …) stays healthy; `incomplete_provider_count` still discloses it.
     pub fn diagnostics(&self) -> Result<StoreDiagnostics> {
         let schema_version = self.schema_version()?;
         let integrity_messages = self.integrity_check_messages()?;
@@ -152,6 +154,45 @@ mod tests {
         assert_eq!(diag.projects[0].incomplete_provider_count, 1);
         assert_eq!(diag.projects[0].index_skips.len(), 1);
         assert_eq!(diag.projects[0].skip_counts_by_reason[0].reason, "oversize");
-        assert!(!diag.is_healthy());
+        // "tests" is not a call-graph class, so the repo is healthy even though
+        // the provider is still disclosed as incomplete.
+        assert!(diag.is_healthy());
+    }
+
+    #[test]
+    fn call_graph_gap_fails_diagnostics_health() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let provider = |language: &str, unsupported: &str| ProviderState {
+            project: "p".into(),
+            language: language.into(),
+            provider_version: "v1".into(),
+            status: "partial".into(),
+            supported_edge_classes: vec!["definitions".into()],
+            unsupported_edge_classes: vec![unsupported.into()],
+            files_seen: 1,
+            files_indexed: 1,
+            files_failed: 0,
+            diagnostics: Vec::new(),
+            last_indexed_generation: 1,
+            updated_at: ws::now_iso8601(),
+        };
+        store
+            .upsert_provider_state(&provider("rust", "routes"))
+            .unwrap();
+        let routes_only = store.diagnostics().unwrap();
+        assert_eq!(routes_only.projects[0].incomplete_provider_count, 1);
+        assert!(routes_only.is_healthy());
+        store
+            .upsert_provider_state(&provider("python", "calls"))
+            .unwrap();
+        let with_call_gap = store.diagnostics().unwrap();
+        assert!(!with_call_gap.is_healthy());
     }
 }

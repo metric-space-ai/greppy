@@ -289,7 +289,7 @@ mod rust_repair_recovery_tests {
         let options = greppy_indexer::IndexOptions::default();
         validate_standalone_embedding_store(&store, &active, &root, "p", &options).unwrap();
         let generation = store
-            .get_workspace_state(root.to_str().unwrap())
+            .get_workspace_state(root.canonicalize().unwrap().to_str().unwrap())
             .unwrap()
             .unwrap()
             .graph_generation;
@@ -300,7 +300,7 @@ mod rust_repair_recovery_tests {
         );
         assert_eq!(
             store
-                .get_workspace_state(root.to_str().unwrap())
+                .get_workspace_state(root.canonicalize().unwrap().to_str().unwrap())
                 .unwrap()
                 .unwrap()
                 .graph_generation,
@@ -461,6 +461,17 @@ pub(crate) fn dispatch_index_health(
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
     dispatch_index_health_with_detail(command, json, root, embedding_args, true)
+}
+
+fn js_ts_usage_repair_skip_diagnostic(store: &greppy_store::Store) -> serde_json::Value {
+    match store.conn().query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        [greppy_indexer::JS_TS_USAGE_REPAIR_SKIPS_KEY],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
 }
 
 fn index_health_output(mut value: serde_json::Value, detailed: bool) -> serde_json::Value {
@@ -1101,7 +1112,9 @@ fn dispatch_index_health_with_detail(
     store_bytes_complete = size.is_some();
     store_bytes = serde_json::json!(size);
     status_diagnostic_phase("git_status");
-    let dirty_overlay = dirty_overlay(&effective_root)?;
+    // Doctor must not refresh `.git/index`. Index-status keeps the historical
+    // git-status behaviour.
+    let dirty_overlay = dirty_overlay_locking(&effective_root, command != "doctor")?;
     let inference = (command == "doctor")
         .then(inference_registry_status)
         .transpose()?;
@@ -1174,6 +1187,9 @@ fn dispatch_index_health_with_detail(
             }
             if let Some(daemons) = &inference_daemons {
                 print_inference_daemons(daemons);
+            }
+            if let Some(diagnostic) = dirty_overlay.diagnostic {
+                println!("dirty_overlay: {diagnostic}");
             }
             if dirty_overlay.git_available && !dirty_overlay.clean {
                 println!(
@@ -1261,7 +1277,16 @@ fn dispatch_index_health_with_detail(
     status_diagnostic_phase("graph_integrity");
     let diag = store.diagnostics()?;
     status_diagnostic_phase("source_freshness");
-    let freshness = nav_freshness_json(&store, root, &project);
+    let mut freshness = nav_freshness_json(&store, root, &project);
+    if command == "doctor" {
+        // Same metadata refresh the query path uses: a copied repo can carry an
+        // index signature that drifted with zero stale files. That is fresh.
+        if let Some(refreshed) =
+            super::freshness::try_refresh_metadata_only_fingerprint(root, &freshness)
+        {
+            freshness = refreshed;
+        }
+    }
     status_diagnostic_phase("embedding_completion");
     let fresh = freshness
         .get("fresh")
@@ -1359,9 +1384,13 @@ fn dispatch_index_health_with_detail(
             .vector_model_ids(&project)
             .map(|v| v.is_empty())
             .unwrap_or(false);
-    let inference_healthy = inference
-        .as_ref()
-        .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
+    // Debug/CI fixtures that explicitly bypass inference still validate the
+    // graph, freshness and provider state without requiring physical GPUs.
+    // Production builds make test_inference_skipped() unconditionally false.
+    let inference_healthy = test_inference_skipped()
+        || inference
+            .as_ref()
+            .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
     let embedding_healthy = embedding_complete || test_inference_skipped();
     let healthy = diag.schema_current
         && diag.integrity_ok
@@ -1377,6 +1406,7 @@ fn dispatch_index_health_with_detail(
         && inference_healthy
         && background_state != Some("refreshing");
     let status_label = if healthy { "ok" } else { "unhealthy" };
+    let js_ts_usage_repair_skips = js_ts_usage_repair_skip_diagnostic(&store);
 
     if json {
         let value = serde_json::json!({
@@ -1419,6 +1449,7 @@ fn dispatch_index_health_with_detail(
             "dirty_overlay": dirty_overlay.to_json(),
             "store_cow": store_cow,
             "inference": inference_diagnostics,
+            "js_ts_usage_repair_skips": js_ts_usage_repair_skips,
         });
         println!(
             "{}",
@@ -1427,6 +1458,13 @@ fn dispatch_index_health_with_detail(
         );
     } else {
         println!("status: {status_label}");
+        if let Some(count) = js_ts_usage_repair_skips
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|count| *count > 0)
+        {
+            println!("js_ts_usage_repair_skips: {count}");
+        }
         if let Some(w) = &coverage_warning {
             println!("coverage_warning: {w}");
         }
@@ -1501,6 +1539,9 @@ fn dispatch_index_health_with_detail(
             }
         } else {
             println!("project_present: false");
+        }
+        if let Some(diagnostic) = dirty_overlay.diagnostic {
+            println!("dirty_overlay: {diagnostic}");
         }
         if dirty_overlay.git_available && !dirty_overlay.clean {
             println!(
@@ -1640,6 +1681,89 @@ pub(crate) fn dispatch_index_agent_worktree(
         Err(error) => Err(error),
         Ok(code) => cleanup.map(|()| code),
     }
+}
+
+fn index_embeddings_settled(
+    store: &greppy_store::Store,
+    root: &std::path::Path,
+    project: &str,
+    embedding_config: Option<&EmbeddingModelConfig>,
+) -> bool {
+    // No embedding configuration means inference is skipped (CI) or this index
+    // is structural-only. The published graph is the complete result.
+    let Some(cfg) = embedding_config else {
+        return true;
+    };
+    let Ok(states) = store.list_workspace_states() else {
+        return false;
+    };
+    let Some(state) = states.into_iter().find(|state| {
+        let stored = std::path::Path::new(&state.root_path);
+        stored == root
+            || stored.canonicalize().ok().as_deref() == root.canonicalize().ok().as_deref()
+    }) else {
+        return false;
+    };
+    state.graph_generation > 0
+        && embedding_generation_complete(store, project, state.graph_generation, &cfg.model_id)
+}
+
+fn finish_index_already_current(background_job: &mut BackgroundJobGuard, files: usize) {
+    background_job.complete();
+    println!("index already current ({files} files)");
+}
+
+fn index_inventory_count(report: &greppy_freshness::FileFreshnessReport, fallback: usize) -> usize {
+    report.total_inventory.unwrap_or(fallback)
+}
+
+/// After the index lock, skip the snapshot when the active store is already
+/// fresh and its embeddings are complete. Metadata-only git fingerprint drift
+/// is refreshed in place. A read-only open keeps `graph.db` mtime unchanged.
+fn try_skip_current_plain_index(
+    store_path: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    index_options: &greppy_indexer::IndexOptions,
+    embedding_config: Option<&EmbeddingModelConfig>,
+    background_job: &mut BackgroundJobGuard,
+) -> Result<Option<i32>> {
+    if !store_path.is_file() {
+        return Ok(None);
+    }
+    let store =
+        match greppy_store::Store::open_with(store_path, greppy_store::OpenOptions::read_only()) {
+            Ok(store) => store,
+            Err(_) => return Ok(None),
+        };
+    let fallback = store
+        .file_count(project)
+        .ok()
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    // Any doubt (unreadable or corrupt store, failed check) takes the normal
+    // index path, which repairs what it finds.
+    let Ok(report) = greppy_freshness::check_files_report_with_overrides(
+        &store,
+        target,
+        project,
+        std::time::Duration::from_secs(30),
+        &index_options.discover_overrides,
+    ) else {
+        return Ok(None);
+    };
+    let files = index_inventory_count(&report, fallback);
+    let settled = index_embeddings_settled(&store, target, project, embedding_config);
+    if matches!(
+        report.state.outcome,
+        greppy_freshness::FreshnessOutcome::Fresh
+    ) && settled
+    {
+        drop(store);
+        finish_index_already_current(background_job, files);
+        return Ok(Some(0));
+    }
+    Ok(None)
 }
 
 pub(crate) fn dispatch_index(
@@ -1857,15 +1981,31 @@ pub(crate) fn dispatch_index(
             recovery.reason.as_deref().unwrap_or("validation failed")
         );
     }
+    // Freshness before any snapshot work, and before the foreground job is
+    // attached, so a current index does not announce a build it will not do.
+    // Only an explicit foreground `greppy index` may answer "already current":
+    // a background index was started by a query that needs a publication.
+    // An overlay error (e.g. a missing Base) must reach the rebuilding path
+    // below, never abort `greppy index` here.
+    if !background_job.is_background()
+        && matches!(
+            crate::store_cow::overlay_environment(&effective_root),
+            Ok(None)
+        )
+    {
+        if let Some(code) = try_skip_current_plain_index(
+            &store_path,
+            &target,
+            &project,
+            &index_options,
+            embedding_config.as_ref(),
+            &mut background_job,
+        )? {
+            return Ok(code);
+        }
+    }
     background_job.attach_foreground(background_job_path(&effective_root));
     background_job.write_state("preparing_base", None);
-    if background_job.is_foreground_owner() && !cli_json_output() {
-        eprintln!(
-            "greppy: index started for {} (phase=preparing_base, pid={}); progress: `greppy index status --json`",
-            effective_root.display(),
-            std::process::id()
-        );
-    }
     let _auto_linked_worktree_overlay = match crate::store_cow::prepare_auto_linked_worktree_overlay(
         &effective_root,
         &greppy_core::cache::data_root(),
@@ -1880,6 +2020,13 @@ pub(crate) fn dispatch_index(
     };
     background_job.write_state("indexing", None);
     if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {
+        if background_job.is_foreground_owner() && !cli_json_output() {
+            eprintln!(
+                "greppy: index started for {} (phase=preparing_base, pid={}); progress: `greppy index status --json`",
+                effective_root.display(),
+                std::process::id()
+            );
+        }
         let result = index_overlay_snapshot(
             &store_path,
             &target,
@@ -1902,6 +2049,13 @@ pub(crate) fn dispatch_index(
     // supports in-place incremental updates for library tests; the CLI path is
     // the production publication boundary, so it must never expose a half-built
     // graph.db to query commands.
+    if background_job.is_foreground_owner() && !cli_json_output() {
+        eprintln!(
+            "greppy: index started for {} (phase=preparing_base, pid={}); progress: `greppy index status --json`",
+            effective_root.display(),
+            std::process::id()
+        );
+    }
     let is_background = background_job.is_background();
     let snapshot = match index_atomic_snapshot(
         &store_path,
@@ -2258,9 +2412,6 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }
 
     let embedding_deferred = embedding_config.is_some_and(|cfg| {
-        if let Some(job) = background_job.as_deref_mut() {
-            job.finalization_phase("counting_embeddings");
-        }
         allow_deferred_embeddings
             && greppy_indexer::count_embedding_candidate_nodes(&temp_store, project)
                 .is_ok_and(|count| should_defer_embedding(cfg, count))
@@ -2584,7 +2735,6 @@ fn index_embeddings_into_temp_store_scoped(
             },
         ));
     }
-    let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
     let options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
     // A structural-only Base may have no meanings yet. A later global query
     // must catch up every visible node before writing a global stamp, while
@@ -2598,70 +2748,80 @@ fn index_embeddings_into_temp_store_scoped(
     } else {
         prefixes
     };
-    let mut embedding_report = if let Some(job) = background_job {
-        // Exact document counting tokenizes candidate spans. It does not load
-        // model weights and must remain observable instead of leaving status
-        // frozen at the misleading `loading_model` phase.
-        job.finalization_phase("counting_embeddings");
-        let total_documents = greppy_indexer::count_code_embedding_documents_for_scope(
-            store,
-            target,
-            project,
-            &provider,
-            options,
-            index_prefixes,
-        )?;
-        let (backend, device) = provider.backend_plan();
-        job.device = device;
-        job.embedding_started(&backend, total_documents);
-        let mut progress = |value| job.embedding_progress(value);
-        greppy_indexer::index_code_embeddings_for_scope_with_progress(
-            store,
-            target,
-            project,
-            &mut provider,
-            options,
-            greppy_indexer::EmbeddingIndexProgressContext {
-                total_documents,
-                callback: &mut progress,
-            },
-            index_prefixes,
-        )?
+    // The SQL candidate count is cheap. Zero candidates means there is no
+    // document walk to wait on, so the completeness stamp can advance now.
+    // A positive or unknown count must publish that fact before the walk,
+    // which otherwise leaves status at `counting_embeddings` 0/0.
+    let candidate_nodes = greppy_indexer::count_embedding_candidate_nodes(store, project).ok();
+    let mut embedding_report = if candidate_nodes == Some(0) {
+        greppy_indexer::EmbeddingIndexReport::default()
     } else {
-        greppy_indexer::index_code_embeddings_for_scope_with_progress(
-            store,
-            target,
-            project,
-            &mut provider,
-            options,
-            greppy_indexer::EmbeddingIndexProgressContext {
-                total_documents: 0,
-                callback: &mut |_| {},
-            },
-            index_prefixes,
-        )?
-    };
-    if !embedding_report.is_complete() {
-        // The completeness stamp is deliberately withheld: the next
-        // semantic query (or the spawned background job) re-runs the
-        // embedding pass, reusing every vector that DID embed by content
-        // hash and retrying only the failed documents.
-        let mut reason = format!(
-            "{} of {} embedding documents failed inference",
-            embedding_report.nodes_failed,
-            embedding_report
-                .nodes_failed
-                .saturating_add(embedding_report.nodes_embedded)
-        );
-        if let Some(cause) = provider.last_error() {
-            reason.push_str(": ");
-            reason.push_str(cause);
+        let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
+        let report = if let Some(job) = background_job {
+            let heartbeat_path = job.path.clone();
+            job.begin_counting_embeddings(candidate_nodes);
+            let _heartbeat = heartbeat_path.map(CountingEmbeddingsHeartbeat::start);
+            let (backend, device) = provider.backend_plan();
+            job.device = device;
+            let mut started = false;
+            let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
+                if !started {
+                    job.embedding_started(
+                        &backend,
+                        value.total_documents,
+                        value.reusable_documents,
+                    );
+                    started = true;
+                }
+                job.embedding_progress(value);
+            };
+            greppy_indexer::index_code_embeddings_for_scope_with_progress(
+                store,
+                target,
+                project,
+                &mut provider,
+                options,
+                greppy_indexer::EmbeddingIndexProgressContext {
+                    total_documents: 0,
+                    callback: &mut progress,
+                },
+                index_prefixes,
+            )?
+        } else {
+            greppy_indexer::index_code_embeddings_for_scope_with_progress(
+                store,
+                target,
+                project,
+                &mut provider,
+                options,
+                greppy_indexer::EmbeddingIndexProgressContext {
+                    total_documents: 0,
+                    callback: &mut |_| {},
+                },
+                index_prefixes,
+            )?
+        };
+        if !report.is_complete() {
+            // The completeness stamp is deliberately withheld: the next
+            // semantic query (or the spawned background job) re-runs the
+            // embedding pass, reusing every vector that DID embed by content
+            // hash and retrying only the failed documents.
+            let mut reason = format!(
+                "{} of {} embedding documents failed inference",
+                report.nodes_failed,
+                report.nodes_failed.saturating_add(report.nodes_embedded)
+            );
+            if let Some(cause) = provider.last_error() {
+                reason.push_str(": ");
+                reason.push_str(cause);
+            }
+            return Ok(EmbeddingBuildOutcome::Degraded {
+                report: Some(report),
+                reason,
+            });
         }
-        return Ok(EmbeddingBuildOutcome::Degraded {
-            report: Some(embedding_report),
-            reason,
-        });
-    }
+        report
+    };
     if include_incomplete_base {
         embedding_report.stale_rows_pruned =
             store.prune_vector_embeddings_before_generation(project, graph_generation)?;
@@ -2689,6 +2849,51 @@ mod progress_status_tests {
     #[test]
     fn index_warm_run_ids_are_unique_within_a_process() {
         assert_ne!(index_warm_run_id(), index_warm_run_id());
+    }
+
+    #[test]
+    fn zero_embedding_candidates_skip_the_document_walk() {
+        let forced = std::env::var_os("GREPPY_TEST_FORCE_EMBED_COMPLETION");
+        std::env::remove_var("GREPPY_TEST_FORCE_EMBED_COMPLETION");
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-08T00:00:00Z".into(),
+                root_path: "/repos/p".into(),
+            })
+            .unwrap();
+        let cfg = super::EmbeddingModelConfig {
+            model_id: "test-model".into(),
+            source: super::EmbeddingModelSource::Gguf {
+                gguf: std::path::PathBuf::from("/missing/model.gguf"),
+                tokenizer: std::path::PathBuf::from("/missing/tokenizer.json"),
+            },
+            max_length: None,
+            device: greppy_embed_native::DevicePreference::Cpu,
+        };
+        let outcome = super::index_embeddings_into_temp_store(
+            &mut store,
+            std::path::Path::new("/missing-root"),
+            "p",
+            &cfg,
+            1,
+            None,
+            None,
+        );
+        if let Some(forced) = forced {
+            std::env::set_var("GREPPY_TEST_FORCE_EMBED_COMPLETION", forced);
+        }
+        let outcome = outcome.expect("zero candidates must not open the embedding provider");
+        match outcome {
+            super::EmbeddingBuildOutcome::Complete(report) => {
+                assert!(report.is_complete());
+                assert_eq!(report.nodes_failed, 0);
+            }
+            super::EmbeddingBuildOutcome::Degraded { reason, .. } => {
+                panic!("empty graph degraded: {reason}")
+            }
+        }
     }
 
     #[test]

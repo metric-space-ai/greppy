@@ -591,7 +591,172 @@ fn outer_brace_offsets(content: &[u8]) -> Option<(usize, usize)> {
     (content[open] == b'{' && content[close] == b'}').then_some((open, close))
 }
 
+fn line_indent(line: &[u8]) -> &[u8] {
+    let end = line
+        .iter()
+        .take_while(|byte| **byte == b' ' || **byte == b'\t')
+        .count();
+    &line[..end]
+}
+
+fn indent_of_line_containing(content: &[u8], index: usize) -> &[u8] {
+    let line_start = content[..index]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|offset| offset + 1)
+        .unwrap_or(0);
+    line_indent(&content[line_start..index.max(line_start)])
+}
+
+/// Split on `\n`, dropping a final empty piece from a trailing newline and a
+/// carriage return that belongs to a CRLF ending. Matches `str::lines`.
+fn split_body_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let mut end = index;
+        if end > start && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+        lines.push(&bytes[start..end]);
+        start = index + 1;
+    }
+    if start < bytes.len() {
+        let mut end = bytes.len();
+        if end > start && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+        lines.push(&bytes[start..end]);
+    }
+    lines
+}
+
+fn blank_line(line: &[u8]) -> bool {
+    line.iter().all(|byte| *byte == b' ' || *byte == b'\t')
+}
+
+fn common_indent<'a>(lines: &[&'a [u8]]) -> &'a [u8] {
+    let mut common: Option<&[u8]> = None;
+    for line in lines {
+        if blank_line(line) {
+            continue;
+        }
+        let indent = line_indent(line);
+        common = Some(match common {
+            None => indent,
+            Some(previous) => {
+                let shared = previous
+                    .iter()
+                    .zip(indent.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                &previous[..shared]
+            }
+        });
+    }
+    common.unwrap_or(b"")
+}
+
+fn gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+/// One indent level inferred from `content`. Tabs win when the body is
+/// tab-indented; otherwise the greatest common space width, else four spaces.
+fn indent_unit(content: &[u8]) -> Vec<u8> {
+    let mut tab_lines = 0usize;
+    let mut space_widths = Vec::new();
+    for line in split_body_lines(content) {
+        if line.first() == Some(&b'\t') {
+            tab_lines += 1;
+            continue;
+        }
+        let spaces = line.iter().take_while(|byte| **byte == b' ').count();
+        if spaces > 0 && spaces < line.len() {
+            space_widths.push(spaces);
+        }
+    }
+    if tab_lines > 0 && space_widths.is_empty() {
+        return vec![b'\t'];
+    }
+    if let Some(unit) = space_widths.into_iter().reduce(gcd) {
+        if unit > 0 {
+            return vec![b' '; unit];
+        }
+    }
+    if tab_lines > 0 {
+        return vec![b'\t'];
+    }
+    vec![b' '; 4]
+}
+
+fn fallback_inner_indent(current_body: &[u8], open: usize) -> Vec<u8> {
+    let mut indent = indent_of_line_containing(current_body, open).to_vec();
+    indent.extend_from_slice(&indent_unit(current_body));
+    indent
+}
+
+/// Indent of the first non-empty line inside the braces, or the `{` line's
+/// indent plus one level when the body has no inner line of its own.
+fn inner_body_indent(current_body: &[u8], open: usize, close: usize) -> Vec<u8> {
+    let mut interior = &current_body[open + 1..close];
+    if interior.starts_with(b"\r\n") {
+        interior = &interior[2..];
+    } else if let Some(rest) = interior.strip_prefix(b"\n") {
+        interior = rest;
+    } else {
+        return fallback_inner_indent(current_body, open);
+    }
+    for line in split_body_lines(interior) {
+        if !blank_line(line) {
+            return line_indent(line).to_vec();
+        }
+    }
+    fallback_inner_indent(current_body, open)
+}
+
+fn reindent_lines(lines: &[&[u8]], target: &[u8]) -> Vec<u8> {
+    let common = common_indent(lines);
+    let mut out = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push(b'\n');
+        }
+        if blank_line(line) {
+            continue;
+        }
+        out.extend_from_slice(target);
+        out.extend_from_slice(line.strip_prefix(common).unwrap_or(line));
+    }
+    out
+}
+
+fn splice_inner(current_body: &[u8], open: usize, close: usize, inner: &[u8]) -> Vec<u8> {
+    let mut replacement = Vec::with_capacity(open + 1 + inner.len() + current_body.len() - close);
+    replacement.extend_from_slice(&current_body[..=open]);
+    replacement.extend_from_slice(inner);
+    replacement.extend_from_slice(&current_body[close..]);
+    replacement
+}
+
 /// Keep a selected body's outer braces when the replacement supplies only inner content.
+///
+/// A multi-line inner body (a heredoc) is dedented by the common indent of its
+/// non-empty lines and re-indented to the current body's inner indent. The
+/// result starts on the line after `{` and ends with a newline plus the
+/// original indentation of the closing-brace line, so the first statement is
+/// not glued to `{` and `}` does not land in column 0. A body that already
+/// uses that absolute indent is unchanged. A single-line inner replacement
+/// stays on the `{` line. Brace-less suites (Python) and replacements that
+/// already include their own braces are returned untouched.
 pub fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
     if outer_brace_offsets(requested).is_some() {
         return requested.to_vec();
@@ -599,12 +764,44 @@ pub fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[
     let Some((open, close)) = outer_brace_offsets(current_body) else {
         return requested.to_vec();
     };
-    let mut replacement =
-        Vec::with_capacity(open + 1 + requested.len() + current_body.len() - close);
-    replacement.extend_from_slice(&current_body[..=open]);
-    replacement.extend_from_slice(requested);
-    replacement.extend_from_slice(&current_body[close..]);
-    replacement
+    // No newline: the caller sent a one-line body (`return 2`), which stays
+    // beside `{`. A heredoc always contains a newline; that is the form that
+    // used to glue the first line to the brace.
+    if !requested.contains(&b'\n') {
+        return splice_inner(current_body, open, close, requested);
+    }
+    let close_indent = indent_of_line_containing(current_body, close);
+    let inner_indent = inner_body_indent(current_body, open, close);
+    let mut block = requested;
+    if block.starts_with(b"\r\n") {
+        block = &block[2..];
+    } else if let Some(rest) = block.strip_prefix(b"\n") {
+        block = rest;
+    }
+    let lines = split_body_lines(block);
+    let reindented = reindent_lines(&lines, &inner_indent);
+    let mut inner = Vec::with_capacity(1 + reindented.len() + 1 + close_indent.len());
+    inner.push(b'\n');
+    inner.extend_from_slice(&reindented);
+    inner.push(b'\n');
+    inner.extend_from_slice(close_indent);
+    // Keep the file's line endings: a CRLF body gets a CRLF block, never a
+    // mixed one.
+    if current_body.windows(2).any(|pair| pair == b"\r\n") {
+        inner = lf_to_crlf(&inner);
+    }
+    splice_inner(current_body, open, close, &inner)
+}
+
+fn lf_to_crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
+            out.push(b'\r');
+        }
+        out.push(*byte);
+    }
+    out
 }
 
 /// `greppy edit replace-body --symbol SYM`: replace only the BODY of the
@@ -1830,12 +2027,12 @@ fn plan_semantic_file(
     scope_matches: usize,
     options: &VerbOptions,
 ) -> Result<SemanticFilePlan> {
+    let applied = apply_in_memory(&snapshot, &ops)?;
     let language = if language == Language::C {
-        crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+        crate::txn::syntax_language_for_edit(&snapshot.path, &snapshot.content, &applied.content)
     } else {
         language
     };
-    let applied = apply_in_memory(&snapshot, &ops)?;
     let syntax_before = syntax_counts(language, &snapshot.content);
     let syntax_after = syntax_counts(language, &applied.content);
     let (syntax, applicable) = match (syntax_before, syntax_after) {
@@ -2441,14 +2638,6 @@ fn run_pipeline(
     {
         return Ok(certificate);
     }
-    let language = language.map(|language| {
-        if language == Language::C {
-            crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
-        } else {
-            language
-        }
-    });
-    let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
     let mut formatter_expanded = false;
     let ext = snapshot
@@ -2490,6 +2679,18 @@ fn run_pipeline(
             }
         }
     }
+    let language = language.map(|language| {
+        if language == Language::C {
+            crate::txn::syntax_language_for_edit(
+                &snapshot.path,
+                &snapshot.content,
+                &applied.content,
+            )
+        } else {
+            language
+        }
+    });
+    let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let syntax_after = language.and_then(|l| syntax_counts(l, &applied.content));
 
     let syntax = match (syntax_before, syntax_after) {
@@ -3229,6 +3430,163 @@ timeout = 30
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             "pub fn greet(name: &str) -> String {format!(\"hey {}\", name)}\n"
+        );
+    }
+
+    #[test]
+    fn heredoc_body_is_reindented_for_rust_and_is_idempotent() {
+        let current = b"{\n    let doubled = value * 2;\n    doubled + 1\n}";
+        let heredoc = b"        let doubled = value * 3;\n        doubled + 4\n";
+        let expected = b"{\n    let doubled = value * 3;\n    doubled + 4\n}";
+        assert_eq!(
+            replacement_body_preserving_delimiters(current, heredoc),
+            expected
+        );
+        let preindented = b"    let doubled = value * 3;\n    doubled + 4\n";
+        assert_eq!(
+            replacement_body_preserving_delimiters(current, preindented),
+            expected,
+            "absolute indent must not be indented again"
+        );
+        assert_eq!(
+            replacement_body_preserving_delimiters(
+                current,
+                b"\n    let doubled = value * 3;\n    doubled + 4\n"
+            ),
+            expected
+        );
+        assert_eq!(
+            replacement_body_preserving_delimiters(expected, preindented),
+            expected
+        );
+
+        let dir = ws();
+        let file = dir.path().join("m.rs");
+        let source =
+            b"fn score(value: i32) -> i32 {\n    let doubled = value * 2;\n    doubled + 1\n}\n";
+        std::fs::write(&file, source).unwrap();
+        let cert = replace_body(
+            dir.path(),
+            &file,
+            (0, source.len() - 1),
+            heredoc,
+            Language::Rust,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied, "{cert:?}");
+        let expected_file =
+            "fn score(value: i32) -> i32 {\n    let doubled = value * 3;\n    doubled + 4\n}\n";
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected_file);
+
+        std::fs::write(&file, source).unwrap();
+        let cert = replace_body(
+            dir.path(),
+            &file,
+            (0, source.len() - 1),
+            preindented,
+            Language::Rust,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied, "{cert:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected_file);
+
+        let again = replace_body(
+            dir.path(),
+            &file,
+            (0, std::fs::read(&file).unwrap().len() - 1),
+            preindented,
+            Language::Rust,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(again.status, Status::AlreadySatisfied, "{again:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected_file);
+    }
+
+    #[test]
+    fn heredoc_body_keeps_crlf_line_endings() {
+        let current = b"{\r\n    old();\r\n}";
+        let out = replacement_body_preserving_delimiters(current, b"let a = 1;\nnew_call(a);\n");
+        assert_eq!(
+            out,
+            b"{\r\n    let a = 1;\r\n    new_call(a);\r\n}".to_vec()
+        );
+        assert!(!out
+            .iter()
+            .enumerate()
+            .any(|(i, b)| *b == b'\n' && (i == 0 || out[i - 1] != b'\r')));
+    }
+
+    #[test]
+    fn heredoc_body_is_reindented_for_javascript() {
+        let dir = ws();
+        let file = dir.path().join("m.js");
+        let source =
+            b"function score(value) {\n    const doubled = value * 2;\n    return doubled + 1;\n}\n";
+        std::fs::write(&file, source).unwrap();
+        let heredoc = b"        const doubled = value * 3;\n        return doubled + 4;\n";
+        let cert = replace_body(
+            dir.path(),
+            &file,
+            (0, source.len() - 1),
+            heredoc,
+            Language::JavaScript,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied, "{cert:?}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "function score(value) {\n    const doubled = value * 3;\n    return doubled + 4;\n}\n"
+        );
+    }
+
+    #[test]
+    fn heredoc_body_keeps_relative_indent_and_closing_brace_column() {
+        let current = b"{\n    let x = 1;\n}";
+        let heredoc =
+            b"if value > 0 {\n    let doubled = value * 3;\n    doubled\n} else {\n    0\n}\n";
+        assert_eq!(
+            replacement_body_preserving_delimiters(current, heredoc),
+            b"{\n    if value > 0 {\n        let doubled = value * 3;\n        doubled\n    } else {\n        0\n    }\n}"
+        );
+        let method = b"{\n        self.n + 1\n    }";
+        assert_eq!(
+            replacement_body_preserving_delimiters(method, b"self.n + 2\n"),
+            b"{\n        self.n + 2\n    }"
+        );
+        assert_eq!(
+            replacement_body_preserving_delimiters(method, b"        self.n + 2\n"),
+            b"{\n        self.n + 2\n    }"
+        );
+        assert_eq!(
+            replacement_body_preserving_delimiters(
+                b"{\n\treturn a + b\n}",
+                b"return a - b\nreturn b\n"
+            ),
+            b"{\n\treturn a - b\n\treturn b\n}"
+        );
+    }
+
+    #[test]
+    fn brace_less_body_and_single_line_inner_replacement_stay_literal() {
+        let python = b"    return a + b";
+        let requested = b"return b + a\n    return 1\n";
+        assert_eq!(
+            replacement_body_preserving_delimiters(python, requested),
+            requested,
+            "Python suites have no braces to reindent"
+        );
+        assert_eq!(
+            replacement_body_preserving_delimiters(b"{\n    return 1;\n}", b"return 2;"),
+            b"{return 2;}"
+        );
+        let braced = b"{\n        kept\n    }";
+        assert_eq!(
+            replacement_body_preserving_delimiters(b"{\n    old\n}", braced),
+            braced
         );
     }
 

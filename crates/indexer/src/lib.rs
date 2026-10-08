@@ -129,11 +129,12 @@ use rayon::prelude::*;
 
 pub use embedding::{
     count_code_embedding_documents_for_project, count_code_embedding_documents_for_scope,
-    count_embedding_candidate_nodes, embedding_path_matches, index_code_embeddings_for_project,
-    index_code_embeddings_for_project_with_progress, index_code_embeddings_for_scope_with_progress,
-    CodeEmbeddingProvider, EmbeddingGemmaCodeProvider, EmbeddingIndexOptions,
-    EmbeddingIndexProgress, EmbeddingIndexProgressContext, EmbeddingIndexReport,
-    EmbeddingProviderCacheStats,
+    count_code_embedding_work_for_scope, count_embedding_candidate_nodes, embedding_path_matches,
+    index_code_embeddings_for_project, index_code_embeddings_for_project_with_progress,
+    index_code_embeddings_for_scope_with_progress, CodeEmbeddingProvider,
+    EmbeddingGemmaCodeProvider, EmbeddingIndexOptions, EmbeddingIndexProgress,
+    EmbeddingIndexProgressContext, EmbeddingIndexReport, EmbeddingProviderCacheStats,
+    EmbeddingWorkload,
 };
 
 /// Fraction of the process RAM budget the indexer initialises
@@ -472,6 +473,7 @@ pub fn index_with_options_and_progress(
             store,
             project_name,
             &entries,
+            only_paths.as_ref(),
             generation,
             worker_count,
             &mut report,
@@ -519,6 +521,7 @@ pub fn index_with_options_and_progress(
             store,
             project_name,
             &entries,
+            only_paths.as_ref(),
             generation,
             worker_count,
             &mut report,
@@ -902,6 +905,7 @@ fn run_incremental(
     store: &mut Store,
     project_name: &str,
     entries: &[InventoryEntry],
+    only_paths: Option<&std::collections::BTreeSet<String>>,
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
@@ -927,6 +931,12 @@ fn run_incremental(
                 report.files_skipped += 1;
             }
             greppy_freshness::FileDiff::Deleted(rel) => {
+                // A filtered inventory says nothing about unselected files.
+                // In an overlay these may own certified derived relations:
+                // treating them as deleted invalidates their retained proof.
+                if only_paths.is_some_and(|paths| !paths.contains(rel)) {
+                    continue;
+                }
                 // Remove the file's nodes (FK-cascades its edges), content,
                 // file_state, and its persisted raw edges.
                 let _ = store.delete_nodes_for_file(project_name, rel)?;
@@ -2822,7 +2832,25 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
-pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v3";
+pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v4";
+
+/// JSON `{"count":N,"paths":[...]}` for files skipped by
+/// [`recover_persisted_js_ts_usages`] because extraction still violated the
+/// provider contract after degradation. `paths` is sorted and capped at 20;
+/// `count` is the full skip count. Written in the same savepoint as the
+/// completion marker, including `{"count":0,"paths":[]}` so a later repair
+/// clears a stale diagnostic.
+pub const JS_TS_USAGE_REPAIR_SKIPS_KEY: &str = "greppy.js_ts_usage_repair_skips_v1";
+
+// Test-only stand-in for a residual contract failure. Real JS/TS extracts
+// rewrite file identity and confidence, and `validate_or_degrade` drops the
+// invalid spans and blank identities the grammar emits, so a source file
+// cannot currently force the post-degrade error. The repair test arms this
+// for `contract-invalid.js` only.
+#[cfg(test)]
+thread_local! {
+    static FORCE_JS_TS_CONTRACT_SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
     store
@@ -2833,6 +2861,56 @@ pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
             |row| row.get(0),
         )
         .map_err(sqlite_err)
+}
+
+fn js_ts_usage_repair_skip_json(paths: &[String]) -> String {
+    let mut ordered = paths.to_vec();
+    ordered.sort();
+    let count = ordered.len();
+    ordered.truncate(20);
+    serde_json::json!({
+        "count": count,
+        "paths": ordered,
+    })
+    .to_string()
+}
+
+fn warn_js_ts_usage_repair_skips(paths: &[String]) {
+    let mut ordered = paths.to_vec();
+    ordered.sort();
+    let count = ordered.len();
+    ordered.truncate(20);
+    tracing::warn!(
+        count,
+        paths = %ordered.join(", "),
+        "JS/TS usage repair skipped files that still violate the provider contract"
+    );
+}
+
+/// Fresh indexing and recovery must use the same validated extraction. Grammar
+/// recovery can emit an invalid anonymous record among valid definitions; the
+/// provider contract already filters that record at first use. Reject only an
+/// extraction that still violates the contract, not a successfully cured one.
+fn validated_js_ts_repair_extraction(
+    language: Language,
+    relative: &str,
+    extraction: greppy_parser::ExtractionResult,
+) -> Result<greppy_parser::ExtractionResult> {
+    #[cfg(test)]
+    if FORCE_JS_TS_CONTRACT_SKIP.with(|flag| flag.get())
+        && relative.rsplit(['/', '\\']).next() == Some("contract-invalid.js")
+    {
+        return Err(greppy_core::Error::Invalid(format!(
+            "JS/TS usage repair extraction incomplete for {relative}: synthetic residual contract violation (0 invalid records removed)"
+        )));
+    }
+    let (validated, dropped, error) = validate_or_degrade(language, relative, extraction);
+    if let Some(error) = error {
+        return Err(greppy_core::Error::Invalid(format!(
+            "JS/TS usage repair extraction incomplete for {relative}: {error} ({dropped} invalid records removed)"
+        )));
+    }
+    Ok(validated)
 }
 
 /// One-shot source-validated usage recovery, separately partitioned from Rust.
@@ -2871,6 +2949,7 @@ pub fn recover_persisted_js_ts_usages(
         indexed.iter().map(|node| node.file_path.as_str()).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
+    let mut skipped_contract_files = Vec::new();
     for state in states.iter().filter(|state| relevant(&state.rel_path)) {
         if current_discovery_filtered_recovery_identity(state, &discovery_filtered, &indexed_paths)
         {
@@ -2904,13 +2983,22 @@ pub fn recover_persisted_js_ts_usages(
         }
         let language = greppy_parser::language_for_path(relative);
         let extraction = parser_extract(language, &bytes, &state.rel_path)?;
-        let (extraction, dropped, error) =
-            validate_or_degrade(language, &state.rel_path, extraction);
-        if dropped != 0 || error.is_some() {
-            return Err(greppy_core::Error::Invalid(
-                "JS/TS usage repair extraction incomplete".into(),
-            ));
-        }
+        // One file that still violates the provider contract must not refuse
+        // the repository. Previously persisted edges for that file stay as
+        // they are; fingerprint and definition-identity failures still abort.
+        // Marking the repair complete despite the skip is safe: the bytes were
+        // just verified against their recorded sha256, so the same extractor
+        // fails the same way on every retry. A changed file is re-extracted by
+        // ordinary indexing, and an extractor change bumps INDEXER_VERSION_BASE,
+        // which forces a full re-extraction.
+        let extraction =
+            match validated_js_ts_repair_extraction(language, &state.rel_path, extraction) {
+                Ok(extraction) => extraction,
+                Err(_) => {
+                    skipped_contract_files.push(state.rel_path.clone());
+                    continue;
+                }
+            };
         // Persistence upserts in extraction order by (project, qualified_name).
         // Object-literal methods can share a qualified name: validate the final
         // stored definition, rather than rejecting the overwritten earlier span.
@@ -2996,7 +3084,10 @@ pub fn recover_persisted_js_ts_usages(
                 target,
                 edge.source_qualified_name.clone(),
                 index.qname_for_id(target).unwrap().to_owned(),
-                edge.properties.clone(),
+                // Extraction stores the reference address separately from
+                // properties. Recovery must publish it just as fresh indexing
+                // does, or navigation falls back to the owner's definition.
+                new_raw_edge_for(project, &edge.file_path, edge).properties,
                 edge.edge_type.clone(),
             ));
         }
@@ -3011,6 +3102,7 @@ pub fn recover_persisted_js_ts_usages(
         .filter(|edge| edge.edge_type == "USAGE")
         .map(|edge| new_raw_edge_for(project, &edge.file_path, edge))
         .collect::<Vec<_>>();
+    let skip_json = js_ts_usage_repair_skip_json(&skipped_contract_files);
     store
         .conn()
         .execute_batch("SAVEPOINT greppy_js_ts_usage_repair")
@@ -3040,6 +3132,7 @@ pub fn recover_persisted_js_ts_usages(
             }
         }
         store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [JS_TS_USAGE_REPAIR_KEY]).map_err(sqlite_err)?;
+        store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![JS_TS_USAGE_REPAIR_SKIPS_KEY, skip_json]).map_err(sqlite_err)?;
         Ok(())
     })();
     match result {
@@ -3048,6 +3141,9 @@ pub fn recover_persisted_js_ts_usages(
                 .conn()
                 .execute_batch("RELEASE greppy_js_ts_usage_repair")
                 .map_err(sqlite_err)?;
+            if !skipped_contract_files.is_empty() {
+                warn_js_ts_usage_repair_skips(&skipped_contract_files);
+            }
             Ok(true)
         }
         Err(error) => {
@@ -4299,6 +4395,9 @@ struct GraphIndex {
     /// the structural pass has created the File nodes.
     files_by_stem: std::collections::HashMap<String, Vec<i64>>,
     known_files: std::collections::HashSet<String>,
+    /// Rust defs that live in an inline `mod` (no `mod.rs` / `name.rs`).
+    /// Keyed by node id. Absent for file-module items.
+    rust_inline_scopes: std::collections::HashMap<i64, RustInlineScope>,
     /// `file::Trait::as_ref` → the method's self parameter text. Used only to
     /// reject a by-value adapter that can hide Option::as_ref.
     as_ref_receivers: std::collections::HashMap<String, String>,
@@ -4318,6 +4417,16 @@ impl UniqueResolution {
             Self::Unique(id) => Some(id),
             Self::Unresolved | Self::Ambiguous => None,
         }
+    }
+}
+
+/// Languages that share an import and call namespace. A same-named definition
+/// in any other language must not make an in-language match ambiguous.
+fn resolution_language_family(path: &str) -> &'static str {
+    match greppy_parser::language_for_path(Path::new(path)) {
+        Language::JavaScript | Language::TypeScript { .. } => "javascript",
+        Language::C | Language::Cpp => "c",
+        other => other.name(),
     }
 }
 
@@ -4385,6 +4494,426 @@ fn rust_module_files_for_module_path_with_crate_roots(
     vec![flat, nested, lib, main]
 }
 
+/// A Rust definition inside an inline `mod` item.
+///
+/// `module` is the `mod` chain (`trace`, `a::b`). `module_vis` is parallel to
+/// those segments; an empty string means the module is private. `visibility`
+/// is the item's own visibility text (`None` when the item is private).
+struct RustInlineScope {
+    module: String,
+    visibility: Option<String>,
+    module_vis: Vec<String>,
+}
+
+struct RustModuleSite {
+    dir: std::path::PathBuf,
+    file: String,
+    inline: String,
+}
+
+fn slash_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn rust_file_module_dir(
+    file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> std::path::PathBuf {
+    let path = std::path::Path::new(file);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if matches!(name, "lib.rs" | "main.rs" | "mod.rs")
+        || crate_roots.is_some_and(|roots| roots.contains(file))
+    {
+        path.parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .to_path_buf()
+    } else {
+        path.with_extension("")
+    }
+}
+
+fn rust_module_site_for_file(
+    file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> RustModuleSite {
+    RustModuleSite {
+        dir: rust_file_module_dir(file, crate_roots),
+        file: file.to_string(),
+        inline: String::new(),
+    }
+}
+
+fn rust_crate_directory(
+    referrer_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> std::path::PathBuf {
+    crate_roots
+        .and_then(|roots| rust_crate_root_for_file(referrer_file, roots))
+        .or_else(|| {
+            let root_end = referrer_file
+                .rfind("/src/")
+                .map(|offset| offset + "/src".len())
+                .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+            root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+        })
+        .unwrap_or_else(|| {
+            std::path::Path::new(referrer_file)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                .to_path_buf()
+        })
+}
+
+fn rust_crate_root_files(
+    dir: &std::path::Path,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for name in ["lib.rs", "main.rs", "mod.rs"] {
+        let candidate = slash_path(&dir.join(name));
+        if known_files.contains(&candidate) {
+            hits.push(candidate);
+        }
+    }
+    if let Some(roots) = crate_roots {
+        for root in roots {
+            if std::path::Path::new(root).parent() == Some(dir)
+                && known_files.contains(root)
+                && !hits.contains(root)
+            {
+                hits.push(root.clone());
+            }
+        }
+    }
+    hits
+}
+
+fn rust_child_module_site(
+    dir: &std::path::Path,
+    segment: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Option<RustModuleSite> {
+    let child_dir = dir.join(segment);
+    let candidates = [
+        slash_path(&dir.join(format!("{segment}.rs"))),
+        slash_path(&child_dir.join("mod.rs")),
+        slash_path(&child_dir.join("lib.rs")),
+        slash_path(&child_dir.join("main.rs")),
+    ];
+    let hits = candidates
+        .into_iter()
+        .filter(|candidate| known_files.contains(candidate))
+        .collect::<Vec<_>>();
+    match hits.as_slice() {
+        [file] => Some(rust_module_site_for_file(file, crate_roots)),
+        _ => None,
+    }
+}
+
+fn rust_parent_module_site(
+    file: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Option<RustModuleSite> {
+    let path = std::path::Path::new(file);
+    let parent_dir = path.parent()?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let container = if matches!(name, "lib.rs" | "main.rs" | "mod.rs")
+        || crate_roots.is_some_and(|roots| roots.contains(file))
+    {
+        parent_dir.parent()?.to_path_buf()
+    } else {
+        parent_dir.to_path_buf()
+    };
+    let stem = container
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if stem.is_empty() {
+        return None;
+    }
+    let parent_of_container = container
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let mut hits = Vec::new();
+    for candidate in [
+        slash_path(&container.join("mod.rs")),
+        slash_path(&parent_of_container.join(format!("{stem}.rs"))),
+        slash_path(&container.join("lib.rs")),
+        slash_path(&container.join("main.rs")),
+    ] {
+        if candidate != file && known_files.contains(&candidate) && !hits.contains(&candidate) {
+            hits.push(candidate);
+        }
+    }
+    match hits.as_slice() {
+        [one] => Some(rust_module_site_for_file(one, crate_roots)),
+        _ => None,
+    }
+}
+
+/// Where an inline module path lives when no file module covers the whole path.
+///
+/// `crate::trace` in a crate whose only root is `src/lib.rs` yields
+/// `("src/lib.rs", "trace")`. A path that lands entirely on files yields nothing.
+fn rust_inline_module_sites(
+    referrer_file: &str,
+    module_path: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, String)> {
+    let segments = module_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let mut index = 0;
+    let mut states = Vec::new();
+    match segments[0] {
+        "crate" => {
+            let dir = rust_crate_directory(referrer_file, crate_roots);
+            for file in rust_crate_root_files(&dir, known_files, crate_roots) {
+                states.push(rust_module_site_for_file(&file, crate_roots));
+            }
+            index = 1;
+        }
+        "self" => {
+            states.push(rust_module_site_for_file(referrer_file, crate_roots));
+            index = 1;
+        }
+        "super" => {
+            if let Some(parent) = rust_parent_module_site(referrer_file, known_files, crate_roots) {
+                states.push(parent);
+            }
+            index = 1;
+        }
+        _ => states.push(rust_module_site_for_file(referrer_file, crate_roots)),
+    }
+    while index < segments.len() {
+        let segment = segments[index];
+        index += 1;
+        if states.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for state in states {
+            if segment == "super" && state.inline.is_empty() {
+                if let Some(parent) = rust_parent_module_site(&state.file, known_files, crate_roots)
+                {
+                    next.push(parent);
+                }
+                continue;
+            }
+            if state.inline.is_empty() {
+                if let Some(child) =
+                    rust_child_module_site(&state.dir, segment, known_files, crate_roots)
+                {
+                    next.push(child);
+                    continue;
+                }
+            }
+            let inline = if state.inline.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{}::{segment}", state.inline)
+            };
+            next.push(RustModuleSite { inline, ..state });
+        }
+        states = next;
+    }
+    states
+        .into_iter()
+        .filter(|state| !state.inline.is_empty())
+        .map(|state| (state.file, state.inline))
+        .collect()
+}
+
+fn rust_inline_sites_below_alias(
+    alias_files: &[String],
+    ref_path: &str,
+    name: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, String)> {
+    let segments = ref_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if segments.last().copied() != Some(name) || segments.len() < 2 {
+        return Vec::new();
+    }
+    let mut states = alias_files
+        .iter()
+        .map(|file| rust_module_site_for_file(file, crate_roots))
+        .collect::<Vec<_>>();
+    for segment in &segments[1..segments.len() - 1] {
+        let mut next = Vec::new();
+        for state in states {
+            if state.inline.is_empty() {
+                if let Some(child) =
+                    rust_child_module_site(&state.dir, segment, known_files, crate_roots)
+                {
+                    next.push(child);
+                    continue;
+                }
+            }
+            let inline = if state.inline.is_empty() {
+                (*segment).to_string()
+            } else {
+                format!("{}::{segment}", state.inline)
+            };
+            next.push(RustModuleSite { inline, ..state });
+        }
+        states = next;
+    }
+    states
+        .into_iter()
+        .filter(|state| !state.inline.is_empty())
+        .map(|state| (state.file, state.inline))
+        .collect()
+}
+
+fn compact_visibility(visibility: &str) -> String {
+    visibility
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn caller_in_rust_module(
+    module: &str,
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    if module.is_empty() {
+        if caller_file == owner_file {
+            return true;
+        }
+        let dir = slash_path(&rust_file_module_dir(owner_file, crate_roots));
+        return !dir.is_empty() && caller_file.starts_with(&format!("{dir}/"));
+    }
+    if caller_file == owner_file {
+        return caller_module == module || caller_module.starts_with(&format!("{module}::"));
+    }
+    let mut dir = rust_file_module_dir(owner_file, crate_roots);
+    for segment in module.split("::") {
+        dir.push(segment);
+    }
+    let prefix = format!("{}/", slash_path(&dir));
+    caller_file.starts_with(&prefix)
+}
+
+fn rust_module_item_visible(
+    visibility: &str,
+    module_path: &str,
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let vis = compact_visibility(visibility);
+    if vis == "pub"
+        || vis == "pub(crate)"
+        || vis.starts_with("pub(crate::")
+        || vis.starts_with("pub(in crate")
+        || vis.starts_with("pub(incrate")
+    {
+        return true;
+    }
+    if vis.is_empty() || vis == "pub(self)" || vis == "pub(in self)" || vis == "pub(inself)" {
+        let parent = module_path
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        return caller_in_rust_module(parent, owner_file, caller_module, caller_file, crate_roots);
+    }
+    if vis == "pub(super)" || vis == "pub(in super)" || vis == "pub(insuper)" {
+        let Some((containing, _)) = module_path.rsplit_once("::") else {
+            return false;
+        };
+        let grandparent = containing
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        return caller_in_rust_module(
+            grandparent,
+            owner_file,
+            caller_module,
+            caller_file,
+            crate_roots,
+        );
+    }
+    false
+}
+
+fn rust_path_modules_visible(
+    module: &str,
+    module_vis: &[String],
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let segments = module.split("::").collect::<Vec<_>>();
+    for (index, _) in segments.iter().enumerate() {
+        let visibility = module_vis.get(index).map(String::as_str).unwrap_or("");
+        let module_path = segments[..=index].join("::");
+        if !rust_module_item_visible(
+            visibility,
+            &module_path,
+            owner_file,
+            caller_module,
+            caller_file,
+            crate_roots,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn rust_item_visible(
+    visibility: Option<&str>,
+    module: &str,
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let vis = compact_visibility(visibility.unwrap_or(""));
+    if vis == "pub"
+        || vis == "pub(crate)"
+        || vis.starts_with("pub(crate::")
+        || vis.starts_with("pub(in crate")
+        || vis.starts_with("pub(incrate")
+    {
+        return true;
+    }
+    if vis.is_empty() || vis == "pub(self)" || vis == "pub(in self)" || vis == "pub(inself)" {
+        return caller_in_rust_module(module, owner_file, caller_module, caller_file, crate_roots);
+    }
+    if vis == "pub(super)" || vis == "pub(in super)" || vis == "pub(insuper)" {
+        let parent = module
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        return caller_in_rust_module(parent, owner_file, caller_module, caller_file, crate_roots);
+    }
+    false
+}
+
 fn rust_crate_root_for_file(
     referrer_file: &str,
     crate_roots: &std::collections::HashSet<String>,
@@ -4403,12 +4932,17 @@ fn rust_crate_root_for_file(
     }
 }
 
-/// Only the owning package's library is an implicit extern crate. A matching
-/// name elsewhere in the workspace is not evidence of a dependency.
+/// The owning package's library is an implicit extern crate. Another workspace
+/// member is an extern crate only when this package's manifest names it with a
+/// path dependency or a `workspace = true` dependency whose workspace entry has
+/// a path. A matching name elsewhere, including a crates.io version requirement,
+/// is not evidence of a dependency.
 #[derive(Debug)]
 struct RustPackage {
     package_dir: String,
     library: Option<RustLibrary>,
+    /// `(extern crate name, that dependency's library root file)`.
+    extern_crates: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -4437,6 +4971,7 @@ fn rust_crate_roots_for_project(
     ) {
         return None;
     }
+    attach_rust_extern_crates(&root, &mut libraries);
     Some((roots, libraries))
 }
 
@@ -4555,6 +5090,7 @@ fn rust_crate_roots_from_manifest(
         libraries.push(RustPackage {
             package_dir,
             library,
+            extern_crates: Vec::new(),
         });
     }
 
@@ -4645,6 +5181,196 @@ fn workspace_member_manifests(
         })
         .map(|path| path.join(&suffix).join("Cargo.toml"))
         .collect()
+}
+
+fn relative_repo_dir(repository_root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let relative = canonical.strip_prefix(repository_root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn toml_dep_path(item: &toml_edit::Item) -> Option<&str> {
+    item.as_table_like()
+        .and_then(|table| table.get("path"))
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty())
+}
+
+fn toml_dep_is_optional(item: &toml_edit::Item) -> bool {
+    item.as_table_like()
+        .and_then(|table| table.get("optional"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+fn toml_dep_uses_workspace(item: &toml_edit::Item) -> bool {
+    item.as_table_like()
+        .and_then(|table| table.get("workspace"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+/// The Rust 2018 extern name. A `package = "..."` rename uses the dependency
+/// key; otherwise the dependency's library name already includes `[lib] name`.
+fn rust_extern_crate_name(key: &str, item: &toml_edit::Item, library_name: &str) -> String {
+    let key_name = key.replace('-', "_");
+    let renamed = item
+        .as_table_like()
+        .and_then(|table| table.get("package"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|package| package.replace('-', "_") != key_name);
+    if renamed {
+        key_name
+    } else {
+        library_name.to_string()
+    }
+}
+
+fn workspace_path_dep_dirs(
+    repository_root: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    let mut dirs = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(repository_root.join("Cargo.toml")) else {
+        return dirs;
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return dirs;
+    };
+    let Some(dependencies) = document
+        .get("workspace")
+        .and_then(|item| item.as_table())
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|item| item.as_table_like())
+    else {
+        return dirs;
+    };
+    for (key, item) in dependencies.iter() {
+        let Some(path) = toml_dep_path(item) else {
+            continue;
+        };
+        let Some(relative) = relative_repo_dir(repository_root, &repository_root.join(path)) else {
+            continue;
+        };
+        dirs.insert(key.to_string(), relative);
+    }
+    dirs
+}
+
+/// Link each package to library roots it actually depends on. Target-specific
+/// and optional dependencies are skipped: cfg and feature selection are not
+/// known here, and a wrong crate is worse than a missing edge.
+fn attach_rust_extern_crates(repository_root: &std::path::Path, libraries: &mut [RustPackage]) {
+    let workspace_deps = workspace_path_dep_dirs(repository_root);
+    let mut attached = Vec::with_capacity(libraries.len());
+    for package in libraries.iter() {
+        let mut extern_crates = Vec::new();
+        let manifest = repository_root
+            .join(&package.package_dir)
+            .join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            attached.push(extern_crates);
+            continue;
+        };
+        let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+            attached.push(extern_crates);
+            continue;
+        };
+        let manifest_dir = manifest.parent().unwrap_or(repository_root);
+        for table_name in ["dependencies", "dev-dependencies"] {
+            let Some(table) = document
+                .get(table_name)
+                .and_then(|item| item.as_table_like())
+            else {
+                continue;
+            };
+            for (key, item) in table.iter() {
+                if toml_dep_is_optional(item) {
+                    continue;
+                }
+                let dep_dir = if let Some(path) = toml_dep_path(item) {
+                    relative_repo_dir(repository_root, &manifest_dir.join(path))
+                } else if toml_dep_uses_workspace(item) {
+                    workspace_deps.get(key).cloned()
+                } else {
+                    None
+                };
+                let Some(dep_dir) = dep_dir else {
+                    continue;
+                };
+                if dep_dir == package.package_dir {
+                    continue;
+                }
+                let mut roots = libraries
+                    .iter()
+                    .filter(|candidate| candidate.package_dir == dep_dir)
+                    .filter_map(|candidate| candidate.library.as_ref())
+                    .collect::<Vec<_>>();
+                roots.sort_by_key(|library| library.root_file.as_str());
+                roots.dedup_by(|left, right| left.root_file == right.root_file);
+                let [library] = roots.as_slice() else {
+                    continue;
+                };
+                let extern_name = rust_extern_crate_name(key, item, &library.name);
+                if extern_name.is_empty() {
+                    continue;
+                }
+                extern_crates.push((extern_name, library.root_file.clone()));
+            }
+        }
+        attached.push(extern_crates);
+    }
+    for (package, extern_crates) in libraries.iter_mut().zip(attached) {
+        package.extern_crates = extern_crates;
+    }
+}
+
+enum ExternModuleFiles {
+    Miss,
+    Ambiguous,
+    Hit(Vec<String>),
+}
+
+fn rust_library_module_files(root_file: &str, rest: &[&str]) -> Vec<String> {
+    if rest.is_empty() {
+        return vec![root_file.to_string()];
+    }
+    let mut base = Path::new(root_file)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    for segment in rest {
+        base.push(segment);
+    }
+    vec![
+        base.with_extension("rs")
+            .to_string_lossy()
+            .replace('\\', "/"),
+        base.join("mod.rs").to_string_lossy().replace('\\', "/"),
+    ]
+}
+
+/// Exactly one declared extern crate may supply `first`. Zero falls through to
+/// lexical lookup; two different library roots are not guessed.
+fn rust_extern_module_files(
+    packages: &[&RustPackage],
+    first: &str,
+    rest: &[&str],
+) -> ExternModuleFiles {
+    let mut roots = Vec::new();
+    for package in packages {
+        for (name, root_file) in &package.extern_crates {
+            if name == first {
+                roots.push(root_file.clone());
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    match roots.as_slice() {
+        [] => ExternModuleFiles::Miss,
+        [root_file] => ExternModuleFiles::Hit(rust_library_module_files(root_file, rest)),
+        _ => ExternModuleFiles::Ambiguous,
+    }
 }
 
 fn rust_module_files_below_alias(
@@ -4825,6 +5551,7 @@ impl GraphIndex {
         let normalized = module.trim_start_matches("::");
         let mut segments = normalized.split("::");
         let first = segments.next().unwrap_or("");
+        let rest = segments.collect::<Vec<_>>();
         if !module.starts_with("::") && !matches!(first, "crate" | "self" | "super") {
             let lexical = rust_module_files_for_module_path_with_crate_roots(
                 file,
@@ -4844,30 +5571,27 @@ impl GraphIndex {
             .filter(|library| Path::new(file).starts_with(&library.package_dir))
             .collect::<Vec<_>>();
         let nearest = owning.iter().map(|library| library.package_dir.len()).max();
-        let libraries = owning
+        let nearest_packages = owning
             .into_iter()
             .filter(|package| Some(package.package_dir.len()) == nearest)
+            .collect::<Vec<_>>();
+        let libraries = nearest_packages
+            .iter()
             .filter_map(|package| package.library.as_ref())
             .filter(|library| library.name == first)
             .collect::<Vec<_>>();
         if let [library] = libraries.as_slice() {
-            let rest = segments.collect::<Vec<_>>();
-            if rest.is_empty() {
-                return vec![library.root_file.clone()];
+            return rust_library_module_files(&library.root_file, &rest);
+        }
+        if libraries.is_empty()
+            && !module.starts_with("::")
+            && !matches!(first, "" | "crate" | "self" | "super")
+        {
+            match rust_extern_module_files(&nearest_packages, first, &rest) {
+                ExternModuleFiles::Hit(files) => return files,
+                ExternModuleFiles::Ambiguous => return Vec::new(),
+                ExternModuleFiles::Miss => {}
             }
-            let mut base = Path::new(&library.root_file)
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_path_buf();
-            for segment in rest {
-                base.push(segment);
-            }
-            return vec![
-                base.with_extension("rs")
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-                base.join("mod.rs").to_string_lossy().replace('\\', "/"),
-            ];
         }
         if !libraries.is_empty() || module.starts_with("::") {
             return Vec::new();
@@ -4895,6 +5619,7 @@ impl GraphIndex {
         let mut files_by_stem: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
         let mut known_files = std::collections::HashSet::new();
+        let mut rust_inline_scopes = std::collections::HashMap::new();
         let mut as_ref_receivers = std::collections::HashMap::new();
         let mut open_traits = std::collections::HashSet::new();
         {
@@ -4911,7 +5636,13 @@ impl GraphIndex {
                             CASE WHEN label = 'Interface'
                                 THEN json_extract(properties, '$.has_bounds') END,
                             CASE WHEN label = 'Interface'
-                                THEN json_extract(properties, '$.as_ref_receiver') END
+                                THEN json_extract(properties, '$.as_ref_receiver') END,
+                            CASE WHEN file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.rust_inline_module') END,
+                            CASE WHEN file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.visibility') END,
+                            CASE WHEN file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.rust_inline_module_vis') END
                      FROM nodes WHERE project = ?1 ORDER BY qualified_name",
                 )
                 .map_err(sqlite_err)?;
@@ -4927,6 +5658,9 @@ impl GraphIndex {
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, Option<i64>>(7)?,
                         r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
                     ))
                 })
                 .map_err(sqlite_err)?;
@@ -4941,6 +5675,9 @@ impl GraphIndex {
                     as_ref_receiver,
                     trait_bounds,
                     trait_as_ref,
+                    rust_inline_module,
+                    visibility,
+                    rust_inline_module_vis,
                 ) = row.map_err(sqlite_err)?;
                 note_edge_resolution_work(1);
                 if label == "File" {
@@ -4965,6 +5702,21 @@ impl GraphIndex {
                 }
                 if trait_bounds == Some(1) {
                     open_traits.insert(id);
+                }
+                if let Some(module) = rust_inline_module.filter(|module| !module.is_empty()) {
+                    let module_vis = rust_inline_module_vis
+                        .unwrap_or_default()
+                        .split('\u{1f}')
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    rust_inline_scopes.insert(
+                        id,
+                        RustInlineScope {
+                            module,
+                            visibility,
+                            module_vis,
+                        },
+                    );
                 }
                 let node = NodeLite {
                     id,
@@ -5125,6 +5877,7 @@ impl GraphIndex {
             id_to_qname,
             files_by_stem,
             known_files,
+            rust_inline_scopes,
             as_ref_receivers,
             open_traits,
         })
@@ -5459,6 +6212,7 @@ impl GraphIndex {
         let Some(referrer_file) = self.file_of(referrer_id) else {
             return UniqueResolution::Unresolved;
         };
+        let referrer_family = resolution_language_family(referrer_file);
         if let Some(alias_targets) = self
             .import_aliases_by_file
             .get(referrer_file)
@@ -5479,7 +6233,11 @@ impl GraphIndex {
         }
         // A local Rust item shadows a glob import. Do not let Base export
         // hydration redirect a same-file reference to an imported namesake.
-        let candidates = self.defs_named(labels, name);
+        let candidates = self
+            .defs_named(labels, name)
+            .into_iter()
+            .filter(|node| resolution_language_family(&node.file_path) == referrer_family)
+            .collect::<Vec<_>>();
         let local = candidates
             .iter()
             .filter(|node| node.file_path == referrer_file)
@@ -5578,6 +6336,113 @@ impl GraphIndex {
         self.id_to_file.get(&id).map(|s| s.as_str())
     }
 
+    /// Resolve `crate::trace::name` when `trace` is an inline module in the crate
+    /// root file rather than `trace.rs` / `trace/mod.rs`. Exactly one visible
+    /// callable wins. A miss falls through to associated-item resolution.
+    fn resolve_rust_inline_module_call(
+        &self,
+        src_id: i64,
+        name: &str,
+        sites: &[(String, String)],
+    ) -> Option<i64> {
+        if sites.is_empty() {
+            return None;
+        }
+        let caller_file = self.file_of(src_id)?;
+        let caller_module = self
+            .rust_inline_scopes
+            .get(&src_id)
+            .map(|scope| scope.module.as_str())
+            .unwrap_or("");
+        let nodes = self.by_name.get(name)?;
+        let mut functions = Vec::new();
+        let mut other = Vec::new();
+        for (parent_file, inline_path) in sites {
+            for node in nodes {
+                if node.file_path != *parent_file || !CALLABLE_LABELS.contains(&node.label.as_str())
+                {
+                    continue;
+                }
+                let Some(scope) = self.rust_inline_scopes.get(&node.id) else {
+                    continue;
+                };
+                if scope.module != *inline_path {
+                    continue;
+                }
+                if !rust_path_modules_visible(
+                    &scope.module,
+                    &scope.module_vis,
+                    parent_file,
+                    caller_module,
+                    caller_file,
+                    self.rust_crate_roots.as_ref(),
+                ) || !rust_item_visible(
+                    scope.visibility.as_deref(),
+                    &scope.module,
+                    parent_file,
+                    caller_module,
+                    caller_file,
+                    self.rust_crate_roots.as_ref(),
+                ) {
+                    continue;
+                }
+                if node.label == "Function" {
+                    functions.push(node.id);
+                } else {
+                    other.push(node.id);
+                }
+            }
+        }
+        functions.sort_unstable();
+        functions.dedup();
+        other.sort_unstable();
+        other.dedup();
+        match functions.as_slice() {
+            [id] => Some(*id),
+            [] => match other.as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Resolve the initializer of a local alias (`let test = crate_b::f`) to one
+    /// callable. An unresolved or ambiguous path stays unresolved; it must not
+    /// fall through to a function that happens to share the local's name.
+    fn resolve_rust_local_alias_path(&self, src_id: i64, path: &str) -> Option<i64> {
+        let path = path.trim();
+        let name = path.rsplit("::").next().unwrap_or("");
+        if name.is_empty() || matches!(path, "Ok" | "Err" | "Some") {
+            return None;
+        }
+        if !path.contains("::") {
+            return self
+                .resolve_unique_status_with_imports(&CALLABLE_LABELS, name, src_id)
+                .unique_id();
+        }
+        let referrer_file = self.file_of(src_id)?;
+        let first_segment = path.split("::").next().unwrap_or("");
+        let module_files = self
+            .rust_namespaces_by_file
+            .get(referrer_file)
+            .and_then(|aliases| aliases.get(first_segment))
+            .map(|alias_files| {
+                rust_module_files_below_alias(
+                    alias_files,
+                    path,
+                    name,
+                    self.rust_crate_roots.as_ref(),
+                )
+            })
+            .unwrap_or_else(|| self.rust_module_files_for_path(referrer_file, path, name));
+        let targets = self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
+        match targets.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
     /// Resolve a CALLS edge. Receiver dispatch is deliberately method-only:
     /// resolving `value.as_bytes()` to an unrelated free `as_bytes` function
     /// is worse than leaving the edge unresolved. Other calls retain the
@@ -5620,7 +6485,8 @@ impl GraphIndex {
             == Some("receiver")
         {
             if let Some(fact) = edge.properties.get("receiver_provenance") {
-                if fact.get("kind").and_then(|value| value.as_str()) == Some("direct_self_field") {
+                let kind = fact.get("kind").and_then(|value| value.as_str());
+                if kind == Some("direct_self_field") || kind == Some("typed_field_chain") {
                     return self.resolve_direct_self_field_receiver(src_id, fact, name);
                 }
                 return self.resolve_option_field_receiver(src_id, edge, fact, name);
@@ -5692,6 +6558,33 @@ impl GraphIndex {
                 .iter()
                 .any(|module_file| self.known_files.contains(module_file));
             if !module_exists {
+                let sites = if let Some(alias_files) = self
+                    .rust_namespaces_by_file
+                    .get(referrer_file)
+                    .and_then(|aliases| aliases.get(first_segment))
+                {
+                    rust_inline_sites_below_alias(
+                        alias_files,
+                        ref_path,
+                        name,
+                        &self.known_files,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                } else {
+                    let module = ref_path
+                        .strip_suffix(name)
+                        .and_then(|path| path.strip_suffix("::"))
+                        .unwrap_or("");
+                    rust_inline_module_sites(
+                        referrer_file,
+                        module,
+                        &self.known_files,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                };
+                if let Some(id) = self.resolve_rust_inline_module_call(src_id, name, &sites) {
+                    return Some(id);
+                }
                 return self.resolve_associated_member(
                     src_id,
                     ref_path,
@@ -5707,6 +6600,34 @@ impl GraphIndex {
         }
         // Preserve the existing basename-based qualified-call behavior for
         // non-Rust extractors, whose path syntax is language-specific.
+        if edge.file_path.ends_with(".rs")
+            && edge
+                .properties
+                .get("ref_local_binding")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        {
+            // A `let test = real` / parameter named `test` is not a call to an
+            // unrelated `fn test`. Only a plain initializer path may retarget it.
+            return edge
+                .properties
+                .get("rust_local_callee_path")
+                .and_then(|value| value.as_str())
+                .and_then(|path| self.resolve_rust_local_alias_path(src_id, path));
+        }
+        // Unqualified prelude constructors are not user functions. A same-file
+        // `fn Err` is shadowed by the prelude in this position; `MyEnum::Err`
+        // stays on the qualified path above.
+        if edge.file_path.ends_with(".rs")
+            && matches!(name, "Ok" | "Err" | "Some")
+            && edge
+                .properties
+                .get("callee_path")
+                .and_then(|value| value.as_str())
+                .is_none()
+        {
+            return None;
+        }
         if rust_qualified_path.is_none() {
             if let Some(module) = edge
                 .properties
@@ -6359,6 +7280,7 @@ impl GraphIndex {
         }
 
         let suffix = format!("::{owner}::{name}");
+        let family = resolution_language_family(file_path);
         // The name index already bounds candidates to this method name.
         // Scanning every project node here made cross-file receiver calls
         // proportional to the whole graph for every individual edge.
@@ -6366,8 +7288,10 @@ impl GraphIndex {
         let mut matches = candidates
             .into_iter()
             .filter(|node| {
-                self.qname_for_id(node.id)
-                    .is_some_and(|qname| qname.ends_with(&suffix))
+                resolution_language_family(&node.file_path) == family
+                    && self
+                        .qname_for_id(node.id)
+                        .is_some_and(|qname| qname.ends_with(&suffix))
             })
             .map(|node| node.id);
         let target = matches.next()?;
@@ -7676,10 +8600,11 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         // Keep the file state unchanged so only the version upgrade can repair it.
         store.delete_node(method.id).unwrap();
         for mut state in store.list_workspace_states().unwrap() {
-            state.indexer_version =
-                state
-                    .indexer_version
-                    .replacen("greppy-indexer-v10", "greppy-indexer-v9", 1);
+            state.indexer_version = state.indexer_version.replacen(
+                greppy_core::INDEXER_VERSION_BASE,
+                "greppy-indexer-v9",
+                1,
+            );
             store.upsert_workspace_state(&state).unwrap();
         }
         let narrow = IndexOptions {
@@ -8587,7 +9512,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                     [JS_TS_USAGE_REPAIR_KEY],
                 )
                 .unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v3','complete');").unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
         let mut overlay = Store::open_overlay(
@@ -8596,7 +9521,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
             &greppy_store::VisibilityIndex::default(),
         )
         .unwrap();
-        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v3','complete');").unwrap();
         let private_path = scratch.path().join("private.db");
         let mut private = Store::open(&private_path).unwrap();
         index(&mut private, repo.path(), "test").unwrap();
@@ -8607,7 +9532,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                 [JS_TS_USAGE_REPAIR_KEY],
             )
             .unwrap();
-        private.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+        private.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v3','complete');").unwrap();
         for store in [&mut overlay, &mut private] {
             let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
             let states = format!("{:?}", store.list_file_states("test").unwrap());
@@ -8656,12 +9581,20 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                 .unwrap();
             let callers = store.incoming_edges(helper.id, Some("CALLS"), 100).unwrap();
             assert_eq!(callers.len(), 3, "{callers:?}");
-            for suffix in ["Variable::make", "Function::exposed", "__file__"] {
+            for (suffix, line) in [
+                ("Variable::make", 4),
+                ("Function::exposed", 5),
+                ("__file__", 7),
+            ] {
                 let owner = store
                     .get_node_by_qname("test", &format!("app.ts::{suffix}"))
                     .unwrap()
                     .unwrap();
-                assert!(callers.iter().any(|edge| edge.source_id == owner.id));
+                let caller = callers
+                    .iter()
+                    .find(|edge| edge.source_id == owner.id)
+                    .unwrap();
+                assert_eq!(caller.properties["line"], line, "{caller:?}");
                 assert!(store
                     .outgoing_edges(owner.id, Some("CALLS"), 100)
                     .unwrap()
@@ -8853,7 +9786,13 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
         {
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, repo.path(), "test").unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v3'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [JS_TS_USAGE_REPAIR_KEY],
+                )
+                .unwrap();
             mark_rust_caller_edges_repaired(&base).unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
@@ -8958,7 +9897,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
         assert_eq!(raw, store.list_raw_edges("test").unwrap());
         assert!(!js_ts_usages_repaired(&store).unwrap());
         fs::write(repo.path().join("view.tsx"), source).unwrap();
-        store.conn().execute_batch("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.js_ts_usage_repair_v3' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;").unwrap();
+        store.conn().execute_batch(&format!("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='{JS_TS_USAGE_REPAIR_KEY}' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;")).unwrap();
         assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
         assert_eq!(raw, store.list_raw_edges("test").unwrap());
         assert!(!js_ts_usages_repaired(&store).unwrap());
@@ -10232,6 +11171,105 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
     }
 
     #[test]
+    fn rust_inline_module_site_stops_at_the_missing_file_module() {
+        let known = std::collections::HashSet::from([
+            "src/lib.rs".to_string(),
+            "src/sync/mod.rs".to_string(),
+            "src/sync/barrier.rs".to_string(),
+        ]);
+        assert_eq!(
+            rust_inline_module_sites("src/sync/barrier.rs", "crate::trace", &known, None),
+            vec![("src/lib.rs".to_string(), "trace".to_string())]
+        );
+        assert_eq!(
+            rust_inline_module_sites("src/sync/barrier.rs", "crate::a::b", &known, None),
+            vec![("src/lib.rs".to_string(), "a::b".to_string())]
+        );
+        assert_eq!(
+            rust_inline_module_sites("src/sync/barrier.rs", "crate::sync::helper", &known, None),
+            vec![("src/sync/mod.rs".to_string(), "helper".to_string())]
+        );
+        assert!(
+            rust_inline_module_sites("src/lib.rs", "crate::sync::barrier", &known, None).is_empty(),
+            "a path that lands on a real file module is not inline"
+        );
+    }
+
+    #[test]
+    fn rust_inline_module_calls_resolve_without_a_module_file() {
+        let repo = setup_multifile_repo(
+            "rust-inline-module",
+            "mod trace {\n\
+                 pub(crate) async fn async_trace_leaf() {}\n\
+                 fn private_leaf() {}\n\
+                 pub(crate) fn calls_private() { crate::trace::private_leaf(); }\n\
+             }\n\
+             mod a {\n\
+                 pub mod b { pub fn nested() {} }\n\
+                 mod hidden { pub fn secret() {} }\n\
+             }\n\
+             mod sync;\n",
+            "// placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/sync")).unwrap();
+        fs::write(repo.join("src/sync/mod.rs"), "pub mod barrier;\n").unwrap();
+        fs::write(
+            repo.join("src/sync/barrier.rs"),
+            "pub fn changed_impl() {\n\
+                 crate::trace::async_trace_leaf();\n\
+                 crate::trace::private_leaf();\n\
+                 crate::a::b::nested();\n\
+                 crate::a::hidden::secret();\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let target = |qname: &str| {
+            store
+                .get_node_by_qname("test", qname)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {qname}"))
+        };
+        let leaf = target("src/lib.rs::Function::async_trace_leaf");
+        let private_leaf = target("src/lib.rs::Function::private_leaf");
+        let calls_private = target("src/lib.rs::Function::calls_private");
+        let nested = target("src/lib.rs::Function::nested");
+        let secret = target("src/lib.rs::Function::secret");
+        let caller = target("src/sync/barrier.rs::Function::changed_impl");
+        let calls_from = |id: i64, source: i64| {
+            store
+                .incoming_edges(id, Some("CALLS"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == source)
+        };
+
+        assert!(
+            calls_from(leaf.id, caller.id),
+            "pub(crate) fn in an inline module must resolve across files"
+        );
+        assert!(
+            calls_from(nested.id, caller.id),
+            "nested inline modules must resolve crate::a::b::nested"
+        );
+        assert!(
+            !calls_from(private_leaf.id, caller.id),
+            "a private inline fn must not be linked from another file"
+        );
+        assert!(
+            calls_from(private_leaf.id, calls_private.id),
+            "a private inline fn must still resolve from inside its module"
+        );
+        assert!(
+            !calls_from(secret.id, caller.id),
+            "a public fn inside a private nested inline module is not visible outside it"
+        );
+    }
+
+    #[test]
     fn rust_crate_root_uncovered_manifest_member_preserves_conventional_layout() {
         let roots = std::collections::HashSet::from(["other/src/lib.rs".to_string()]);
         let files = rust_module_files_for_module_path_with_crate_roots(
@@ -10248,6 +11286,381 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
                 "crates/widget/src/helpers/main.rs".to_string(),
             ]
         );
+    }
+
+    fn calls_between(store: &Store, target: &str, source: &str) -> bool {
+        let Some(target) = store.get_node_by_qname("test", target).unwrap() else {
+            panic!("missing target {target}");
+        };
+        let Some(source) = store.get_node_by_qname("test", source).unwrap() else {
+            panic!("missing source {source}");
+        };
+        store
+            .incoming_edges(target.id, Some("CALLS"), 30)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == source.id)
+    }
+
+    #[test]
+    fn rust_workspace_path_deps_resolve_qualified_and_imported_calls() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-workspace-extern-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("crates/crate_b/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/app/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/workspace_user/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/decoy/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/shadow/src")).unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/crate_b\", \"crates/app\", \"crates/workspace_user\", \"crates/decoy\", \"crates/shadow\"]\nresolver = \"2\"\n\n[workspace.dependencies]\ncrate_b = { path = \"crates/crate_b\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/crate_b/Cargo.toml"),
+            "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/crate_b/src/lib.rs"),
+            "pub fn f() {}\npub mod nested;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("crates/crate_b/src/nested.rs"), "pub fn g() {}\n").unwrap();
+        fs::write(
+            repo.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\ndecoy = \"1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/app/src/lib.rs"),
+            "use crate_b::f;\npub fn qualified() { crate_b::f(); crate_b::nested::g(); }\npub fn imported() { f(); }\npub fn not_a_dep() { decoy::f(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/shadow/Cargo.toml"),
+            "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/shadow/src/lib.rs"),
+            "pub fn shadowed() { crate_b::f(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("crates/shadow/src/crate_b.rs"), "pub fn f() {}\n").unwrap();
+        fs::write(
+            repo.join("crates/workspace_user/Cargo.toml"),
+            "[package]\nname = \"workspace_user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncrate_b = { workspace = true }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/workspace_user/src/lib.rs"),
+            "pub fn via_workspace() { crate_b::f(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/decoy/Cargo.toml"),
+            "[package]\nname = \"decoy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(repo.join("crates/decoy/src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/workspace_user/src/lib.rs::Function::via_workspace",
+            ),
+            "workspace = true path dependency must resolve crate_b::f"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/app/src/lib.rs::Function::qualified",
+            ),
+            "path dependency must resolve crate_b::f"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/nested.rs::Function::g",
+                "crates/app/src/lib.rs::Function::qualified",
+            ),
+            "path dependency must resolve crate_b::nested::g"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/shadow/src/crate_b.rs::Function::f",
+                "crates/shadow/src/lib.rs::Function::shadowed",
+            ),
+            "a lexical module file must keep shadowing the extern crate"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/shadow/src/lib.rs::Function::shadowed",
+            ),
+            "shadowed extern crate must not also receive the call"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/app/src/lib.rs::Function::imported",
+            ),
+            "use crate_b::f must resolve the imported call"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "crates/decoy/src/lib.rs::Function::f",
+                "crates/app/src/lib.rs::Function::not_a_dep",
+            ),
+            "a version-only dependency must not bind a same-named workspace member"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn mixed_language_same_name_does_not_suppress_in_language_call() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-lang-family-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/Pricing.java"),
+            "class Pricing { static int parsePrice(String raw) { return 1; } }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/Cart.java"),
+            "class Cart { int cartTotal() { return Pricing.parsePrice(\"1\"); } }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/price.ts"),
+            "export function parsePrice(raw: string): number { return 1; }\nexport function cartTotal(): number { return parsePrice(\"1\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/util.c"),
+            "int parsePrice(const char *raw) { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/app.cpp"),
+            "int run() { return parsePrice(\"1\"); }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            calls_between(
+                &store,
+                "src/Pricing.java::Pricing::parsePrice",
+                "src/Cart.java::Cart::cartTotal",
+            ),
+            "a TypeScript namesake must not suppress the Java call"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/price.ts::Function::parsePrice",
+                "src/Cart.java::Cart::cartTotal",
+            ),
+            "a Java call must not bind to a TypeScript function"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/price.ts::Function::parsePrice",
+                "src/price.ts::Function::cartTotal",
+            ),
+            "the TypeScript call still resolves in its own language"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/util.c::Function::parsePrice",
+                "src/app.cpp::Function::run",
+            ),
+            "C and C++ stay one family, so a Java namesake must not suppress them"
+        );
+
+        fs::write(
+            repo.join("src/Other.java"),
+            "class Other { static int parsePrice(String raw) { return 2; } }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            !calls_between(
+                &store,
+                "src/Pricing.java::Pricing::parsePrice",
+                "src/Cart.java::Cart::cartTotal",
+            ),
+            "two Java definitions stay ambiguous"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/price.ts::Function::parsePrice",
+                "src/price.ts::Function::cartTotal",
+            ),
+            "Java ambiguity must not suppress the unique TypeScript call"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rust_local_alias_calls_do_not_bind_unrelated_fn_test() {
+        let repo = setup_multifile_repo(
+            "rust-local-alias",
+            "pub fn real() {}\npub fn test() {}\npub fn assert_de() {}\n",
+            "use crate::real as test;\npub fn renamed() { test(); }\npub fn local_path() { let test = assert_de; test(); }\npub fn opaque() { let test = assert_de::<i8>; test(); }\npub fn param(test: fn()) { test(); }\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            calls_between(
+                &store,
+                "src/lib.rs::Function::real",
+                "src/helper.rs::Function::renamed",
+            ),
+            "use … as test must call the alias target"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::renamed",
+            ),
+            "a renamed import must not call an unrelated fn test"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/lib.rs::Function::assert_de",
+                "src/helper.rs::Function::local_path",
+            ),
+            "let test = assert_de must call assert_de"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::local_path",
+            ),
+            "a local let binding must not call fn test"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::opaque",
+            ),
+            "a turbofish local must not fall through to fn test"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::param",
+            ),
+            "a parameter named test must not call fn test"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rust_field_chain_and_ufcs_resolve_known_receiver_types() {
+        let repo = setup_multifile_repo(
+            "rust-field-chain",
+            "mod helper;\nmod other;\nuse helper::RenameRule;\nstruct RenameAllRules { serialize: RenameRule }\nimpl RenameAllRules {\n    fn apply(&self, value: &str) -> String { self.serialize.apply_to_field(value) }\n}\nfn apply_param(rules: &RenameAllRules, value: &str) -> String { rules.serialize.apply_to_field(value) }\nfn ufcs(rule: &RenameRule) { RenameRule::apply_to_field(rule, \"x\"); RenameRule::apply_to_variant(rule, \"x\"); }\nfn unknown(rules: RenameAllRules) { rules.missing.apply_to_field(\"x\"); }\nfn opaque() { let rules = opaque_rules(); rules.serialize.apply_to_field(\"x\"); }\nfn opaque_rules() -> RenameAllRules { unimplemented!() }\n",
+            "pub enum RenameRule { None, PascalCase }\nimpl RenameRule {\n    pub fn apply_to_field(&self, value: &str) -> String { value.to_string() }\n    pub fn apply_to_variant(&self, value: &str) -> String { value.to_string() }\n}\n",
+        );
+        fs::write(
+            repo.join("src/other.rs"),
+            "pub enum RenameRule { None }\nimpl RenameRule {\n    pub fn apply_to_field(&self, value: &str) -> String { value.to_string() }\n    pub fn apply_to_variant(&self, value: &str) -> String { value.to_string() }\n}\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let method = "src/helper.rs::RenameRule::apply_to_field";
+        let variant = "src/helper.rs::RenameRule::apply_to_variant";
+        let foreign = "src/other.rs::RenameRule::apply_to_field";
+        assert!(calls_between(
+            &store,
+            method,
+            "src/lib.rs::RenameAllRules::apply"
+        ));
+        assert!(calls_between(
+            &store,
+            method,
+            "src/lib.rs::Function::apply_param"
+        ));
+        assert!(calls_between(&store, method, "src/lib.rs::Function::ufcs"));
+        assert!(calls_between(&store, variant, "src/lib.rs::Function::ufcs"));
+        assert!(!calls_between(
+            &store,
+            foreign,
+            "src/lib.rs::RenameAllRules::apply"
+        ));
+        assert!(!calls_between(
+            &store,
+            foreign,
+            "src/lib.rs::Function::apply_param"
+        ));
+        assert!(!calls_between(
+            &store,
+            method,
+            "src/lib.rs::Function::unknown"
+        ));
+        assert!(!calls_between(
+            &store,
+            method,
+            "src/lib.rs::Function::opaque"
+        ));
+        assert!(!calls_between(
+            &store,
+            foreign,
+            "src/lib.rs::Function::ufcs"
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rust_prelude_enum_constructors_do_not_bind_user_functions() {
+        let repo = setup_repo(
+            "rust-prelude-ctors",
+            "pub fn Err() {}\npub fn Ok() {}\npub fn Some() {}\npub enum Outcome { Err(u8), Ok, Some }\npub fn expand_derive_deserialize() {\n    let _ = Err(\"no\");\n    let _ = Ok(1);\n    let _ = Some(1);\n    let _ = Outcome::Err(1);\n}\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let caller = "src/lib.rs::Function::expand_derive_deserialize";
+        assert!(!calls_between(&store, "src/lib.rs::Function::Err", caller));
+        assert!(!calls_between(&store, "src/lib.rs::Function::Ok", caller));
+        assert!(!calls_between(&store, "src/lib.rs::Function::Some", caller));
+        assert!(calls_between(&store, "src/lib.rs::Outcome::Err", caller));
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -14298,6 +15711,224 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             [],
         ).unwrap();
         assert!(!rust_caller_edges_repaired(&store).unwrap());
+    }
+
+    #[test]
+    fn js_ts_usage_recovery_accepts_validated_degraded_records() {
+        for (language, file) in [
+            (Language::JavaScript, "fixture.js"),
+            (Language::TypeScript { tsx: false }, "fixture.ts"),
+        ] {
+            let source =
+                b"function target() { return 1; }\nfunction valid() { return target(); }\n";
+            let original = parser_extract(language, source, file).unwrap();
+            let mut poisoned = original.clone();
+            poisoned.nodes.push(ExtractedNode {
+                label: "Function".into(),
+                name: String::new(),
+                qualified_name: String::new(),
+                file_path: file.into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::Value::Null,
+            });
+            let validated = validated_js_ts_repair_extraction(language, file, poisoned).unwrap();
+            assert_eq!(
+                format!("{:?}", validated.nodes),
+                format!("{:?}", original.nodes)
+            );
+            assert_eq!(
+                format!("{:?}", validated.edges),
+                format!("{:?}", original.edges)
+            );
+            assert!(validated.edges.iter().any(|e| e.edge_type == "CALLS"));
+        }
+    }
+
+    #[test]
+    fn js_ts_usage_recovery_indexes_malformed_fixture_without_losing_valid_calls() {
+        let repo = tempfile::tempdir().unwrap();
+        let file = "fixture.ts";
+        let language = Language::TypeScript { tsx: false };
+        let source = "class C { () {} }\nfunction target() { return 1; }\nfunction valid() { return target(); }\n";
+        let extraction = parser_extract(language, source.as_bytes(), file).unwrap();
+        let (_, dropped, error) = validate_or_degrade(language, file, extraction);
+        assert!(
+            dropped > 0,
+            "the malformed method must exercise grammar recovery"
+        );
+        assert!(error.is_none());
+        eprintln!("malformed_fixture_source={source:?}");
+        fs::write(repo.path().join(file), source).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        let target = store
+            .get_node_by_qname("test", "fixture.ts::Function::target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        store.conn().execute_batch("DELETE FROM main.raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM main.edges WHERE edge_type IN ('USAGE','CALLS');").unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert_eq!(
+            store
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+    }
+
+    #[test]
+    fn js_ts_usage_repair_skip_json_caps_paths_and_keeps_full_count() {
+        let paths: Vec<String> = (0..25).map(|i| format!("f{i:02}.js")).collect();
+        let value: serde_json::Value =
+            serde_json::from_str(&js_ts_usage_repair_skip_json(&paths)).unwrap();
+        assert_eq!(value["count"], 25);
+        assert_eq!(value["paths"].as_array().unwrap().len(), 20);
+        assert_eq!(value["paths"][0], "f00.js");
+        assert_eq!(value["paths"][19], "f19.js");
+    }
+
+    /// One residual contract failure is skipped. Other files are still repaired,
+    /// and edges already stored for the skipped file are left untouched.
+    ///
+    /// `contract-invalid.js` is the stand-in fixture (see
+    /// `tests/fixtures/contract-invalid.js`). The current provider filter cures
+    /// every real JS/TS extract, so the test arms the residual-contract path
+    /// for that filename only.
+    #[test]
+    fn js_ts_usage_repair_skips_contract_invalid_file_and_repairs_the_rest() {
+        let repo = tempfile::tempdir().unwrap();
+        let good = "function target() { return 1; }\nfunction valid() { return target(); }\n";
+        fs::write(repo.path().join("good.js"), good).unwrap();
+        fs::write(
+            repo.path().join("contract-invalid.js"),
+            include_str!("../tests/fixtures/contract-invalid.js"),
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        store
+            .conn()
+            .execute_batch(
+                "DELETE FROM main.raw_edges WHERE edge_type IN ('USAGE','CALLS'); \
+                 DELETE FROM main.edges WHERE edge_type IN ('USAGE','CALLS');",
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        let skipped = store
+            .get_node_by_qname("test", "contract-invalid.js::Function::skipped")
+            .unwrap()
+            .unwrap();
+        store
+            .insert_raw_edges(&[NewRawEdge {
+                project: "test".into(),
+                file_path: "contract-invalid.js".into(),
+                source_qname: skipped.qualified_name.clone(),
+                target_qname: "preserved-skip-edge".into(),
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"marker": "preserve"}),
+            }])
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO main.edges(project,source_id,target_id,edge_type,properties) \
+                 VALUES('test',?1,?1,'USAGE','{\"marker\":\"preserve\"}')",
+                [skipped.id],
+            )
+            .unwrap();
+        let _guard = ForceJsContractSkip::arm();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        let target = store
+            .get_node_by_qname("test", "good.js::Function::target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .len(),
+            1,
+            "the other file's usages are repaired"
+        );
+        let preserved_raw: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.raw_edges WHERE project='test' \
+                 AND file_path='contract-invalid.js' AND target_qname='preserved-skip-edge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_raw, 1, "skipped file raw edges stay");
+        let preserved_edge: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.edges WHERE source_id=?1 AND properties LIKE '%preserve%'",
+                [skipped.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_edge, 1, "skipped file resolved edges stay");
+        let raw: String = store
+            .conn()
+            .query_row(
+                "SELECT value FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_SKIPS_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let diagnostic: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(diagnostic["count"], 1);
+        assert_eq!(
+            diagnostic["paths"],
+            serde_json::json!(["contract-invalid.js"])
+        );
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+    }
+
+    struct ForceJsContractSkip;
+
+    impl ForceJsContractSkip {
+        fn arm() -> Self {
+            FORCE_JS_TS_CONTRACT_SKIP.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceJsContractSkip {
+        fn drop(&mut self) {
+            FORCE_JS_TS_CONTRACT_SKIP.with(|flag| flag.set(false));
+        }
     }
 
     /// ClickHouse regression: one anonymous node from grammar error-recovery
