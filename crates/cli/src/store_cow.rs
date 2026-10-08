@@ -2999,11 +2999,12 @@ fn add_size_mismatched_base_paths(
         let metadata = match std::fs::symlink_metadata(root.join(&rel_path)) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(Error::io(
-                    format!("stat working tree file {rel_path} against Base inventory"),
-                    error,
-                ));
+            // An unreadable path cannot be proven equal to Base: index it from
+            // the working tree like any changed file instead of failing every
+            // overlay query.
+            Err(_) => {
+                extra.push(rel_path);
+                continue;
             }
         };
         if metadata.is_file() && metadata.len() != size as u64 {

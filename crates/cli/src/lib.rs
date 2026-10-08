@@ -5322,18 +5322,15 @@ impl Drop for CountingEmbeddingsHeartbeat {
 
 /// Graph readers follow structural phases. Embedding progress must not keep
 /// `read` / `search-symbol` / `who-calls` parked on a published generation.
+/// Only a deferred embedding job (`kind = "embedding"`) runs after the graph is
+/// published. An index job in an embedding state is still embedding inline
+/// into its unpublished temp store, so a graph read must keep waiting for
+/// that publication or it would answer from the pre-drift graph.
 fn graph_read_follows_background_job(job: Option<&serde_json::Value>) -> bool {
     let Some(job) = job else {
         return true;
     };
-    if job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding") {
-        return false;
-    }
-    let state = job
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    !matches!(state, "counting_embeddings" | "embedding" | "loading_model")
+    job.get("kind").and_then(serde_json::Value::as_str) != Some("embedding")
 }
 
 #[cfg(not(windows))]

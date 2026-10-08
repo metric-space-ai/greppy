@@ -2986,6 +2986,11 @@ pub fn recover_persisted_js_ts_usages(
         // One file that still violates the provider contract must not refuse
         // the repository. Previously persisted edges for that file stay as
         // they are; fingerprint and definition-identity failures still abort.
+        // Marking the repair complete despite the skip is safe: the bytes were
+        // just verified against their recorded sha256, so the same extractor
+        // fails the same way on every retry. A changed file is re-extracted by
+        // ordinary indexing, and an extractor change bumps INDEXER_VERSION_BASE,
+        // which forces a full re-extraction.
         let extraction =
             match validated_js_ts_repair_extraction(language, &state.rel_path, extraction) {
                 Ok(extraction) => extraction,
@@ -8595,10 +8600,11 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         // Keep the file state unchanged so only the version upgrade can repair it.
         store.delete_node(method.id).unwrap();
         for mut state in store.list_workspace_states().unwrap() {
-            state.indexer_version =
-                state
-                    .indexer_version
-                    .replacen("greppy-indexer-v10", "greppy-indexer-v9", 1);
+            state.indexer_version = state.indexer_version.replacen(
+                greppy_core::INDEXER_VERSION_BASE,
+                "greppy-indexer-v9",
+                1,
+            );
             store.upsert_workspace_state(&state).unwrap();
         }
         let narrow = IndexOptions {

@@ -193,8 +193,10 @@ fn owned_workspaces(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn active_limits() -> RetainedLimits {
-    // Both knobs are required so a stray single variable cannot shrink the
-    // machine-wide namespace and evict unrelated captures.
+    // Test seam only: release builds always use the production limits, so a
+    // stray CI variable can never shrink the machine-wide namespace and evict
+    // users' captures. Both knobs are required.
+    #[cfg(debug_assertions)]
     if let (Ok(bytes), Ok(max_files)) = (
         std::env::var("GREPPY_TEST_RETAINED_QUOTA_BYTES"),
         std::env::var("GREPPY_TEST_RETAINED_MAX_FILES"),
@@ -293,21 +295,30 @@ fn evict_oldest_capture(root: &Path, protect: &[PathBuf; 2]) -> Result<bool> {
             .then_with(|| left.group.cmp(&right.group))
             .then_with(|| left.path.cmp(&right.path))
     });
-    let Some(oldest) = artifacts.first() else {
-        return Ok(false);
-    };
-    let deadline = oldest.deadline;
-    let group = oldest.group.clone();
-    let mut removed = false;
-    for artifact in artifacts
-        .into_iter()
-        .filter(|artifact| artifact.deadline == deadline && artifact.group == group)
-    {
-        std::fs::remove_file(&artifact.path)
-            .map_err(|e| Error::Store(format!("evict retained capture: {e}")))?;
-        removed = true;
+    // Oldest capture group first. A group whose files cannot be removed (for
+    // example owned by another user in a shared root) is skipped, so one stuck
+    // artifact never disables retention for the whole namespace.
+    let mut index = 0;
+    while index < artifacts.len() {
+        let deadline = artifacts[index].deadline;
+        let group = artifacts[index].group.clone();
+        let mut removed = false;
+        while index < artifacts.len()
+            && artifacts[index].deadline == deadline
+            && artifacts[index].group == group
+        {
+            match std::fs::remove_file(&artifacts[index].path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed = true,
+                Err(_) => {}
+            }
+            index += 1;
+        }
+        if removed {
+            return Ok(true);
+        }
     }
-    Ok(removed)
+    Ok(false)
 }
 
 fn namespace_usage(root: &Path) -> Result<(u64, usize)> {

@@ -276,9 +276,18 @@ fn plain_who_calls_limit_truncates_and_names_the_remainder() {
     );
     let omitted = full_rows.len() - 2;
     assert!(
-        limited.contains(&format!("… {omitted} more (use --all)")),
+        limited.contains(&format!("… {omitted} more (next page: --offset 2)")),
         "missing truncation footer\n{limited}"
     );
+
+    // --offset windows the text rows exactly like JSON: rows 2.. of the list.
+    let (code, paged, err) = run(
+        &["who-calls", "budgeted", "--limit", "1", "--offset", "1"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "paged who-calls failed\n{paged}\n{err}");
+    assert_eq!(row_lines(&paged), vec![shown[1].clone()], "{paged}");
 
     let (code, callees, err) = run(&["callees", "c1", "--limit", "1"], &repo, &store);
     assert_eq!(code, 0, "callees failed\n{callees}\n{err}");
@@ -289,7 +298,7 @@ fn plain_who_calls_limit_truncates_and_names_the_remainder() {
     );
     if row_lines(&run(&["callees", "c1"], &repo, &store).1).len() > 1 {
         assert!(
-            callees.contains("more (use --all)"),
+            callees.contains("more (next page: --offset 1)"),
             "callees text should name the omitted rows\n{callees}"
         );
     }

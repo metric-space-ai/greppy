@@ -3882,9 +3882,10 @@ fn graph_reads_do_not_follow_embedding_progress() {
     assert!(graph_read_follows_background_job(Some(
         &serde_json::json!({"kind": "index", "state": "writing_graph"})
     )));
+    // An index job embeds inline before it publishes: keep following it.
     for state in ["counting_embeddings", "embedding", "loading_model"] {
         assert!(
-            !graph_read_follows_background_job(Some(
+            graph_read_follows_background_job(Some(
                 &serde_json::json!({"kind": "index", "state": state})
             )),
             "{state}"

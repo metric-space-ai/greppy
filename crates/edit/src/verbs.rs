@@ -785,7 +785,23 @@ pub fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[
     inner.extend_from_slice(&reindented);
     inner.push(b'\n');
     inner.extend_from_slice(close_indent);
+    // Keep the file's line endings: a CRLF body gets a CRLF block, never a
+    // mixed one.
+    if current_body.windows(2).any(|pair| pair == b"\r\n") {
+        inner = lf_to_crlf(&inner);
+    }
     splice_inner(current_body, open, close, &inner)
+}
+
+fn lf_to_crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
+            out.push(b'\r');
+        }
+        out.push(*byte);
+    }
+    out
 }
 
 /// `greppy edit replace-body --symbol SYM`: replace only the BODY of the
@@ -3487,6 +3503,20 @@ timeout = 30
         .unwrap();
         assert_eq!(again.status, Status::AlreadySatisfied, "{again:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), expected_file);
+    }
+
+    #[test]
+    fn heredoc_body_keeps_crlf_line_endings() {
+        let current = b"{\r\n    old();\r\n}";
+        let out = replacement_body_preserving_delimiters(current, b"let a = 1;\nnew_call(a);\n");
+        assert_eq!(
+            out,
+            b"{\r\n    let a = 1;\r\n    new_call(a);\r\n}".to_vec()
+        );
+        assert!(!out
+            .iter()
+            .enumerate()
+            .any(|(i, b)| *b == b'\n' && (i == 0 || out[i - 1] != b'\r')));
     }
 
     #[test]

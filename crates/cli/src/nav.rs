@@ -3228,10 +3228,15 @@ pub(crate) fn print_nav_rows(
     });
 
     let total = rows.len();
-    // An explicit `--limit` is a row budget for text as well as JSON. It wins
-    // over the summary shape, and `--all` does not lift it.
-    let explicit_limit =
-        cli_result_limit_raw().map(|limit| limit.saturating_add(cli_result_offset()));
+    // An explicit `--limit` is a row budget for text as well as JSON: rows
+    // `--offset .. --offset + --limit`, like the JSON window. It wins over the
+    // summary shape, and `--all` does not lift it.
+    let explicit_limit = cli_result_limit_raw();
+    let offset = if explicit_limit.is_some() {
+        cli_result_offset().min(total)
+    } else {
+        0
+    };
     let summarize = explicit_limit.is_none() && !all && total > NAV_FULL_LIMIT;
     if summarize {
         let mut spread: Vec<(&String, &usize)> = per_file.iter().collect();
@@ -3245,14 +3250,14 @@ pub(crate) fn print_nav_rows(
         println!();
     }
     let shown = if let Some(limit) = explicit_limit {
-        limit.min(total)
+        limit.min(total - offset)
     } else if summarize {
         NAV_SUMMARY_ROWS.min(total)
     } else {
         total
     };
     let mut cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
-    for (index, row) in rows.iter().take(shown).enumerate() {
+    for (index, row) in rows.iter().skip(offset).take(shown).enumerate() {
         let marker = if row.test { "  test" } else { "" };
         if !code {
             println!("{}:{}  {}{}", row.file, row.line, row.name, marker);
@@ -3283,10 +3288,10 @@ pub(crate) fn print_nav_rows(
             }
         }
     }
-    if let Some(limit) = explicit_limit {
-        let omitted = total.saturating_sub(limit.min(total));
+    if explicit_limit.is_some() {
+        let omitted = total.saturating_sub(offset + shown);
         if omitted > 0 {
-            println!("… {omitted} more (use --all)");
+            println!("… {omitted} more (next page: --offset {})", offset + shown);
         }
     }
 }

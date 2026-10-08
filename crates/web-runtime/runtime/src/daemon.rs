@@ -425,12 +425,23 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             config.socket.display()
         );
     }
-    let mut daemon = Daemon::start(
+    // The socket is bound before the workers start. If they fail to start,
+    // remove it at once: otherwise the still-running accept thread keeps
+    // answering "starting" and the next runtime's stale-socket probe would
+    // mistake this dying process for a live one.
+    let socket_path = config.socket.clone();
+    let mut daemon = match Daemon::start(
         config,
         attach,
         Arc::clone(&early_control),
         Arc::clone(&startup),
-    )?;
+    ) {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            remove_runtime_socket_files(&socket_path);
+            return Err(error);
+        }
+    };
     startup.mark_ready();
     if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase request-ready elapsed_ms={}",
         started.elapsed().as_millis()

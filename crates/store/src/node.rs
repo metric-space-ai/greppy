@@ -785,12 +785,12 @@ impl Store {
     }
 
     /// Definitions whose name contains `fragment`, without loading the project.
-    /// `instr` stays case-sensitive, matching `str::contains`.
+    /// ASCII case-insensitive, matching the search-symbol name matcher.
     pub fn list_nodes_name_containing(&self, project: &str, fragment: &str) -> Result<Vec<Node>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, '{}'
              FROM nodes
-             WHERE project = ?1 AND instr(name, ?2) > 0",
+             WHERE project = ?1 AND instr(lower(name), lower(?2)) > 0",
         )?;
         let rows = stmt
             .query_map(params![project, fragment], row_to_node)?
