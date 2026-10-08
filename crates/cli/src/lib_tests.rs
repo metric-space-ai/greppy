@@ -1948,6 +1948,20 @@ fn inference_daemon_status_uses_cli_device_for_endpoint_identity() {
             .to_owned()
     };
 
+    // macOS has no CUDA backend: an explicit `--device cuda` is refused with a
+    // pointer to `--device auto` instead of probing a daemon it cannot start.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = endpoint(&auto);
+        assert_eq!(cuda["embedding"]["state"], "faulted", "{cuda}");
+        assert!(
+            cuda["embedding"]["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("CUDA is not available on macOS")),
+            "{cuda}"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     assert_ne!(
         endpoint(&auto),
         endpoint(&cuda),
