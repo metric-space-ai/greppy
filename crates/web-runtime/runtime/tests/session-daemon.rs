@@ -74,11 +74,45 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     wait_for_accepting(path, timeout, None);
 }
 
+fn startup_wait_budget(initial: Duration, saw_starting: bool) -> Duration {
+    if saw_starting {
+        initial.max(Duration::from_secs(180))
+    } else {
+        initial
+    }
+}
+
+fn response_is_starting(response: &greppy_web_client::Response) -> bool {
+    let error_is_starting = response
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == "starting");
+    let state_is_starting = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("state"))
+        .and_then(|state| state.as_str())
+        == Some("starting");
+    error_is_starting || state_is_starting
+}
+
 fn wait_for_accepting(path: &Path, timeout: Duration, mut child: Option<&mut Child>) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if UnixStream::connect(path).is_ok() {
-            return;
+    let started = Instant::now();
+    let mut saw_starting = false;
+    loop {
+        let budget = startup_wait_budget(timeout, saw_starting);
+        if started.elapsed() >= budget {
+            let pid = child.as_ref().map(|child| child.id());
+            panic!(
+                "supervisor socket {} was not ready within {budget:?} (pid {pid:?}, saw_starting={saw_starting}); blocked before workers finished starting",
+                path.display()
+            );
+        }
+        let probe = Request::new("startup-probe", "web.status", json!({}));
+        match unix_request(path, &probe, Duration::from_millis(500)) {
+            Ok(response) if response_is_starting(&response) => saw_starting = true,
+            Ok(_) => return,
+            Err(_) => {}
         }
         if let Some(child) = child.as_mut() {
             if let Ok(Some(status)) = child.try_wait() {
@@ -90,11 +124,40 @@ fn wait_for_accepting(path: &Path, timeout: Duration, mut child: Option<&mut Chi
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let pid = child.as_ref().map(|child| child.id());
-    panic!(
-        "supervisor socket {} was not accepting connections within {timeout:?} (pid {pid:?}); blocked before UnixListener::bind (Daemon::start controller/content spawn+handshake)",
-        path.display()
+}
+
+#[test]
+fn starting_status_extends_socket_wait_to_three_minutes() {
+    assert_eq!(
+        startup_wait_budget(Duration::from_secs(60), false),
+        Duration::from_secs(60)
     );
+    assert_eq!(
+        startup_wait_budget(Duration::from_secs(60), true),
+        Duration::from_secs(180)
+    );
+    assert_eq!(
+        startup_wait_budget(Duration::from_secs(300), true),
+        Duration::from_secs(300)
+    );
+    let mut starting = greppy_web_client::Response::ok(
+        &Request::new("run", "web.status", json!({})),
+        json!({ "state": "starting", "phase": "controller", "elapsed_ms": 4 }),
+    );
+    assert!(response_is_starting(&starting));
+    starting.result = None;
+    starting.status = "error".to_owned();
+    let mut error = greppy_web_client::ErrorObject::new(
+        "starting",
+        "web-runtime workers are still starting",
+        "req",
+        31,
+        "retry this request",
+    );
+    error.retryable = true;
+    starting.error = Some(error);
+    assert!(response_is_starting(&starting));
+    assert!(starting.error.as_ref().is_some_and(|error| error.retryable));
 }
 
 fn process_group_pids(pgid: u32) -> Vec<u32> {
