@@ -5165,8 +5165,6 @@ fn write_background_job_record(
     value: &serde_json::Value,
     new_owner: bool,
 ) -> Result<()> {
-    use std::io::Write;
-
     let parent = path
         .parent()
         .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
@@ -5212,6 +5210,17 @@ fn write_background_job_record(
             return Ok(());
         }
     }
+    publish_locked_background_job(path, value)
+}
+
+/// Caller holds `background-job-publication`. Do not call
+/// [`write_background_job`] from here: that lock is not reentrant.
+fn publish_locked_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
     let temp = parent.join(format!(
         ".background.job.{}.{}.tmp",
         std::process::id(),
@@ -5241,6 +5250,90 @@ fn write_background_job_record(
         .map_err(|error| Error::io(format!("publish {}", path.display()), error))?;
     sync_parent_dir(path)?;
     Ok(())
+}
+
+/// Bump `updated_at` while document validation is still inside the indexer.
+/// Status treats `counting_embeddings` as stalled after 120s with no write.
+fn refresh_counting_embeddings_liveness(path: &std::path::Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
+    let _publication = greppy_core::cache::acquire_named_lock_in(
+        parent,
+        "background-job-publication",
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .map_err(|error| Error::io("lock background job publication", error))?
+    .ok_or_else(|| Error::Invalid("background job publication lock unavailable".into()))?;
+    let Some(mut current) = read_background_job(path) else {
+        return Ok(());
+    };
+    if current.get("state").and_then(serde_json::Value::as_str) != Some("counting_embeddings") {
+        return Ok(());
+    }
+    let Some(object) = current.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert(
+        "updated_at_unix_secs".into(),
+        serde_json::json!(unix_now_secs_cli()),
+    );
+    publish_locked_background_job(path, &current)
+}
+
+struct CountingEmbeddingsHeartbeat {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CountingEmbeddingsHeartbeat {
+    fn start(path: std::path::PathBuf) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("greppy-embed-count".into())
+            .spawn(move || {
+                let mut last = std::time::Instant::now();
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if last.elapsed() >= std::time::Duration::from_secs(2) {
+                        let _ = refresh_counting_embeddings_liveness(&path);
+                        last = std::time::Instant::now();
+                    }
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for CountingEmbeddingsHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Graph readers follow structural phases. Embedding progress must not keep
+/// `read` / `search-symbol` / `who-calls` parked on a published generation.
+fn graph_read_follows_background_job(job: Option<&serde_json::Value>) -> bool {
+    let Some(job) = job else {
+        return true;
+    };
+    if job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding") {
+        return false;
+    }
+    let state = job
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    !matches!(state, "counting_embeddings" | "embedding" | "loading_model")
 }
 
 #[cfg(not(windows))]
@@ -5570,6 +5663,34 @@ impl BackgroundJobGuard {
         self.last_progress_write = Some(std::time::Instant::now());
     }
 
+    /// `finalization_phase` zeroes both counters, so status shows `0/0` with
+    /// a null ETA for the whole document walk. Candidate-node count is known
+    /// before that walk and is the concrete phase a status reader can show.
+    fn begin_counting_embeddings(&mut self, candidate_nodes: Option<usize>) {
+        self.progress_phase = Some("counting_embeddings");
+        self.completed_documents = 0;
+        self.total_documents = candidate_nodes.unwrap_or(0);
+        self.reusable_documents = 0;
+        self.local_store_reuse = 0;
+        self.global_cache_hits = 0;
+        self.global_cache_misses = 0;
+        self.backend = None;
+        self.device = None;
+        self.eta_seconds = None;
+        self.eta_basis = Some("pending_document_validation");
+        self.rate_milli_documents_per_second = None;
+        self.embedding_started = None;
+        self.index_phase_started = None;
+        self.current_detail = Some(match candidate_nodes {
+            Some(count) => format!(
+                "validating embedding documents for {count} candidate symbols; exact span total is pending"
+            ),
+            None => "counting embedding candidate symbols before document validation".into(),
+        });
+        self.write_state("counting_embeddings", None);
+        self.last_progress_write = Some(std::time::Instant::now());
+    }
+
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
         self.embedding_progress_at(progress, std::time::Instant::now());
     }
@@ -5885,6 +6006,77 @@ mod background_progress_tests {
             Some(now),
             now
         ));
+    }
+
+    fn counting_guard(path: std::path::PathBuf) -> super::BackgroundJobGuard {
+        super::BackgroundJobGuard {
+            path: Some(path),
+            detached: false,
+            delegated: false,
+            owner_pid: 42,
+            cause: "test".into(),
+            kind: "index".into(),
+            path_prefixes: Vec::new(),
+            started_at_unix_secs: 7,
+            target_generation: 3,
+            worker_count: None,
+            backend: None,
+            device: None,
+            completed_documents: 0,
+            total_documents: 0,
+            reusable_documents: 0,
+            local_store_reuse: 0,
+            global_cache_hits: 0,
+            global_cache_misses: 0,
+            eta_seconds: None,
+            eta_basis: None,
+            rate_milli_documents_per_second: None,
+            embedding_started: None,
+            index_phase_started: None,
+            index_phase_completed_base: 0,
+            last_progress_write: None,
+            progress_phase: None,
+            current_detail: None,
+            demand_terminal: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn counting_embeddings_publishes_candidate_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.json");
+        super::start_background_job_record(
+            &path,
+            &serde_json::json!({
+                "schema_version": super::BACKGROUND_JOB_SCHEMA_VERSION,
+                "kind": "index",
+                "pid": 42,
+                "started_at_unix_secs": 7,
+                "target_generation": 3,
+                "state": "writing_graph",
+            }),
+        )
+        .unwrap();
+        let mut guard = counting_guard(path.clone());
+        guard.begin_counting_embeddings(Some(12));
+        let job = super::read_background_job(&path).unwrap();
+        assert_eq!(job["state"], "counting_embeddings");
+        assert_eq!(job["total_spans"], 12);
+        assert_eq!(job["completed_spans"], 0);
+        assert!(job["eta_seconds"].is_null());
+        assert!(job["current_detail"]
+            .as_str()
+            .unwrap()
+            .contains("candidate"));
+        guard.begin_counting_embeddings(None);
+        let unknown = super::read_background_job(&path).unwrap();
+        assert_eq!(unknown["state"], "counting_embeddings");
+        assert!(unknown["current_detail"]
+            .as_str()
+            .unwrap()
+            .contains("candidate symbols"));
+        assert!(unknown["eta_seconds"].is_null());
     }
 }
 

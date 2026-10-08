@@ -2510,9 +2510,6 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }
 
     let embedding_deferred = embedding_config.is_some_and(|cfg| {
-        if let Some(job) = background_job.as_deref_mut() {
-            job.finalization_phase("counting_embeddings");
-        }
         allow_deferred_embeddings
             && greppy_indexer::count_embedding_candidate_nodes(&temp_store, project)
                 .is_ok_and(|count| should_defer_embedding(cfg, count))
@@ -2836,7 +2833,6 @@ fn index_embeddings_into_temp_store_scoped(
             },
         ));
     }
-    let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
     let options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
     // A structural-only Base may have no meanings yet. A later global query
     // must catch up every visible node before writing a global stamp, while
@@ -2850,68 +2846,83 @@ fn index_embeddings_into_temp_store_scoped(
     } else {
         prefixes
     };
-    let mut embedding_report = if let Some(job) = background_job {
-        // Exact document counting tokenizes candidate spans. It does not load
-        // model weights and must remain observable instead of leaving status
-        // frozen at the misleading `loading_model` phase.
-        job.finalization_phase("counting_embeddings");
-        let (backend, device) = provider.backend_plan();
-        job.device = device;
-        let mut started = false;
-        let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
-            if !started {
-                job.embedding_started(&backend, value.total_documents, value.reusable_documents);
-                started = true;
-            }
-            job.embedding_progress(value);
-        };
-        greppy_indexer::index_code_embeddings_for_scope_with_progress(
-            store,
-            target,
-            project,
-            &mut provider,
-            options,
-            greppy_indexer::EmbeddingIndexProgressContext {
-                total_documents: 0,
-                callback: &mut progress,
-            },
-            index_prefixes,
-        )?
-    } else {
-        greppy_indexer::index_code_embeddings_for_scope_with_progress(
-            store,
-            target,
-            project,
-            &mut provider,
-            options,
-            greppy_indexer::EmbeddingIndexProgressContext {
-                total_documents: 0,
-                callback: &mut |_| {},
-            },
-            index_prefixes,
-        )?
+    // The SQL candidate count is cheap. Zero candidates means there is no
+    // document walk to wait on, so the completeness stamp can advance now.
+    // A positive or unknown count must publish that fact before the walk,
+    // which otherwise leaves status at `counting_embeddings` 0/0.
+    let candidate_nodes = match greppy_indexer::count_embedding_candidate_nodes(store, project) {
+        Ok(count) => Some(count),
+        Err(_) => None,
     };
-    if !embedding_report.is_complete() {
-        // The completeness stamp is deliberately withheld: the next
-        // semantic query (or the spawned background job) re-runs the
-        // embedding pass, reusing every vector that DID embed by content
-        // hash and retrying only the failed documents.
-        let mut reason = format!(
-            "{} of {} embedding documents failed inference",
-            embedding_report.nodes_failed,
-            embedding_report
-                .nodes_failed
-                .saturating_add(embedding_report.nodes_embedded)
-        );
-        if let Some(cause) = provider.last_error() {
-            reason.push_str(": ");
-            reason.push_str(cause);
+    let mut embedding_report = if candidate_nodes == Some(0) {
+        greppy_indexer::EmbeddingIndexReport::default()
+    } else {
+        let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
+        let report = if let Some(job) = background_job {
+            let heartbeat_path = job.path.clone();
+            job.begin_counting_embeddings(candidate_nodes);
+            let _heartbeat = heartbeat_path.map(CountingEmbeddingsHeartbeat::start);
+            let (backend, device) = provider.backend_plan();
+            job.device = device;
+            let mut started = false;
+            let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
+                if !started {
+                    job.embedding_started(
+                        &backend,
+                        value.total_documents,
+                        value.reusable_documents,
+                    );
+                    started = true;
+                }
+                job.embedding_progress(value);
+            };
+            greppy_indexer::index_code_embeddings_for_scope_with_progress(
+                store,
+                target,
+                project,
+                &mut provider,
+                options,
+                greppy_indexer::EmbeddingIndexProgressContext {
+                    total_documents: 0,
+                    callback: &mut progress,
+                },
+                index_prefixes,
+            )?
+        } else {
+            greppy_indexer::index_code_embeddings_for_scope_with_progress(
+                store,
+                target,
+                project,
+                &mut provider,
+                options,
+                greppy_indexer::EmbeddingIndexProgressContext {
+                    total_documents: 0,
+                    callback: &mut |_| {},
+                },
+                index_prefixes,
+            )?
+        };
+        if !report.is_complete() {
+            // The completeness stamp is deliberately withheld: the next
+            // semantic query (or the spawned background job) re-runs the
+            // embedding pass, reusing every vector that DID embed by content
+            // hash and retrying only the failed documents.
+            let mut reason = format!(
+                "{} of {} embedding documents failed inference",
+                report.nodes_failed,
+                report.nodes_failed.saturating_add(report.nodes_embedded)
+            );
+            if let Some(cause) = provider.last_error() {
+                reason.push_str(": ");
+                reason.push_str(cause);
+            }
+            return Ok(EmbeddingBuildOutcome::Degraded {
+                report: Some(report),
+                reason,
+            });
         }
-        return Ok(EmbeddingBuildOutcome::Degraded {
-            report: Some(embedding_report),
-            reason,
-        });
-    }
+        report
+    };
     if include_incomplete_base {
         embedding_report.stale_rows_pruned =
             store.prune_vector_embeddings_before_generation(project, graph_generation)?;
@@ -2939,6 +2950,51 @@ mod progress_status_tests {
     #[test]
     fn index_warm_run_ids_are_unique_within_a_process() {
         assert_ne!(index_warm_run_id(), index_warm_run_id());
+    }
+
+    #[test]
+    fn zero_embedding_candidates_skip_the_document_walk() {
+        let forced = std::env::var_os("GREPPY_TEST_FORCE_EMBED_COMPLETION");
+        std::env::remove_var("GREPPY_TEST_FORCE_EMBED_COMPLETION");
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-08T00:00:00Z".into(),
+                root_path: "/repos/p".into(),
+            })
+            .unwrap();
+        let cfg = super::EmbeddingModelConfig {
+            model_id: "test-model".into(),
+            source: super::EmbeddingModelSource::Gguf {
+                gguf: std::path::PathBuf::from("/missing/model.gguf"),
+                tokenizer: std::path::PathBuf::from("/missing/tokenizer.json"),
+            },
+            max_length: None,
+            device: greppy_embed_native::DevicePreference::Cpu,
+        };
+        let outcome = super::index_embeddings_into_temp_store(
+            &mut store,
+            std::path::Path::new("/missing-root"),
+            "p",
+            &cfg,
+            1,
+            None,
+            None,
+        );
+        if let Some(forced) = forced {
+            std::env::set_var("GREPPY_TEST_FORCE_EMBED_COMPLETION", forced);
+        }
+        let outcome = outcome.expect("zero candidates must not open the embedding provider");
+        match outcome {
+            super::EmbeddingBuildOutcome::Complete(report) => {
+                assert!(report.is_complete());
+                assert_eq!(report.nodes_failed, 0);
+            }
+            super::EmbeddingBuildOutcome::Degraded { reason, .. } => {
+                panic!("empty graph degraded: {reason}")
+            }
+        }
     }
 
     #[test]

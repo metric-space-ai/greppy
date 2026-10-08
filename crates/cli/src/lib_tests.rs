@@ -3872,3 +3872,25 @@ fn multi_name_search_exit_keeps_a_retryable_refusal() {
     assert_eq!(combine_search_exit(75, 1), 75);
     assert_eq!(combine_search_exit(1, 75), 75);
 }
+
+#[test]
+fn graph_reads_do_not_follow_embedding_progress() {
+    assert!(graph_read_follows_background_job(None));
+    assert!(graph_read_follows_background_job(Some(
+        &serde_json::json!({"kind": "index", "state": "extracting_files"})
+    )));
+    assert!(graph_read_follows_background_job(Some(
+        &serde_json::json!({"kind": "index", "state": "writing_graph"})
+    )));
+    for state in ["counting_embeddings", "embedding", "loading_model"] {
+        assert!(
+            !graph_read_follows_background_job(Some(
+                &serde_json::json!({"kind": "index", "state": state})
+            )),
+            "{state}"
+        );
+    }
+    assert!(!graph_read_follows_background_job(Some(
+        &serde_json::json!({"kind": "embedding", "state": "writing_graph"})
+    )));
+}
