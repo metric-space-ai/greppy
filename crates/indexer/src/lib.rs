@@ -4415,6 +4415,16 @@ impl UniqueResolution {
     }
 }
 
+/// Languages that share an import and call namespace. A same-named definition
+/// in any other language must not make an in-language match ambiguous.
+fn resolution_language_family(path: &str) -> &'static str {
+    match greppy_parser::language_for_path(Path::new(path)) {
+        Language::JavaScript | Language::TypeScript { .. } => "javascript",
+        Language::C | Language::Cpp => "c",
+        other => other.name(),
+    }
+}
+
 fn rust_module_files_for_module_path_with_crate_roots(
     referrer_file: &str,
     module_path: &str,
@@ -4917,12 +4927,17 @@ fn rust_crate_root_for_file(
     }
 }
 
-/// Only the owning package's library is an implicit extern crate. A matching
-/// name elsewhere in the workspace is not evidence of a dependency.
+/// The owning package's library is an implicit extern crate. Another workspace
+/// member is an extern crate only when this package's manifest names it with a
+/// path dependency or a `workspace = true` dependency whose workspace entry has
+/// a path. A matching name elsewhere, including a crates.io version requirement,
+/// is not evidence of a dependency.
 #[derive(Debug)]
 struct RustPackage {
     package_dir: String,
     library: Option<RustLibrary>,
+    /// `(extern crate name, that dependency's library root file)`.
+    extern_crates: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -4951,6 +4966,7 @@ fn rust_crate_roots_for_project(
     ) {
         return None;
     }
+    attach_rust_extern_crates(&root, &mut libraries);
     Some((roots, libraries))
 }
 
@@ -5069,6 +5085,7 @@ fn rust_crate_roots_from_manifest(
         libraries.push(RustPackage {
             package_dir,
             library,
+            extern_crates: Vec::new(),
         });
     }
 
@@ -5159,6 +5176,196 @@ fn workspace_member_manifests(
         })
         .map(|path| path.join(&suffix).join("Cargo.toml"))
         .collect()
+}
+
+fn relative_repo_dir(repository_root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let relative = canonical.strip_prefix(repository_root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn toml_dep_path(item: &toml_edit::Item) -> Option<&str> {
+    item.as_table_like()
+        .and_then(|table| table.get("path"))
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty())
+}
+
+fn toml_dep_is_optional(item: &toml_edit::Item) -> bool {
+    item.as_table_like()
+        .and_then(|table| table.get("optional"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+fn toml_dep_uses_workspace(item: &toml_edit::Item) -> bool {
+    item.as_table_like()
+        .and_then(|table| table.get("workspace"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+/// The Rust 2018 extern name. A `package = "..."` rename uses the dependency
+/// key; otherwise the dependency's library name already includes `[lib] name`.
+fn rust_extern_crate_name(key: &str, item: &toml_edit::Item, library_name: &str) -> String {
+    let key_name = key.replace('-', "_");
+    let renamed = item
+        .as_table_like()
+        .and_then(|table| table.get("package"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|package| package.replace('-', "_") != key_name);
+    if renamed {
+        key_name
+    } else {
+        library_name.to_string()
+    }
+}
+
+fn workspace_path_dep_dirs(
+    repository_root: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    let mut dirs = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(repository_root.join("Cargo.toml")) else {
+        return dirs;
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return dirs;
+    };
+    let Some(dependencies) = document
+        .get("workspace")
+        .and_then(|item| item.as_table())
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|item| item.as_table_like())
+    else {
+        return dirs;
+    };
+    for (key, item) in dependencies.iter() {
+        let Some(path) = toml_dep_path(item) else {
+            continue;
+        };
+        let Some(relative) = relative_repo_dir(repository_root, &repository_root.join(path)) else {
+            continue;
+        };
+        dirs.insert(key.to_string(), relative);
+    }
+    dirs
+}
+
+/// Link each package to library roots it actually depends on. Target-specific
+/// and optional dependencies are skipped: cfg and feature selection are not
+/// known here, and a wrong crate is worse than a missing edge.
+fn attach_rust_extern_crates(repository_root: &std::path::Path, libraries: &mut [RustPackage]) {
+    let workspace_deps = workspace_path_dep_dirs(repository_root);
+    let mut attached = Vec::with_capacity(libraries.len());
+    for package in libraries.iter() {
+        let mut extern_crates = Vec::new();
+        let manifest = repository_root
+            .join(&package.package_dir)
+            .join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            attached.push(extern_crates);
+            continue;
+        };
+        let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+            attached.push(extern_crates);
+            continue;
+        };
+        let manifest_dir = manifest.parent().unwrap_or(repository_root);
+        for table_name in ["dependencies", "dev-dependencies"] {
+            let Some(table) = document
+                .get(table_name)
+                .and_then(|item| item.as_table_like())
+            else {
+                continue;
+            };
+            for (key, item) in table.iter() {
+                if toml_dep_is_optional(item) {
+                    continue;
+                }
+                let dep_dir = if let Some(path) = toml_dep_path(item) {
+                    relative_repo_dir(repository_root, &manifest_dir.join(path))
+                } else if toml_dep_uses_workspace(item) {
+                    workspace_deps.get(key).cloned()
+                } else {
+                    None
+                };
+                let Some(dep_dir) = dep_dir else {
+                    continue;
+                };
+                if dep_dir == package.package_dir {
+                    continue;
+                }
+                let mut roots = libraries
+                    .iter()
+                    .filter(|candidate| candidate.package_dir == dep_dir)
+                    .filter_map(|candidate| candidate.library.as_ref())
+                    .collect::<Vec<_>>();
+                roots.sort_by_key(|library| library.root_file.as_str());
+                roots.dedup_by(|left, right| left.root_file == right.root_file);
+                let [library] = roots.as_slice() else {
+                    continue;
+                };
+                let extern_name = rust_extern_crate_name(key, item, &library.name);
+                if extern_name.is_empty() {
+                    continue;
+                }
+                extern_crates.push((extern_name, library.root_file.clone()));
+            }
+        }
+        attached.push(extern_crates);
+    }
+    for (package, extern_crates) in libraries.iter_mut().zip(attached) {
+        package.extern_crates = extern_crates;
+    }
+}
+
+enum ExternModuleFiles {
+    Miss,
+    Ambiguous,
+    Hit(Vec<String>),
+}
+
+fn rust_library_module_files(root_file: &str, rest: &[&str]) -> Vec<String> {
+    if rest.is_empty() {
+        return vec![root_file.to_string()];
+    }
+    let mut base = Path::new(root_file)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    for segment in rest {
+        base.push(segment);
+    }
+    vec![
+        base.with_extension("rs")
+            .to_string_lossy()
+            .replace('\\', "/"),
+        base.join("mod.rs").to_string_lossy().replace('\\', "/"),
+    ]
+}
+
+/// Exactly one declared extern crate may supply `first`. Zero falls through to
+/// lexical lookup; two different library roots are not guessed.
+fn rust_extern_module_files(
+    packages: &[&RustPackage],
+    first: &str,
+    rest: &[&str],
+) -> ExternModuleFiles {
+    let mut roots = Vec::new();
+    for package in packages {
+        for (name, root_file) in &package.extern_crates {
+            if name == first {
+                roots.push(root_file.clone());
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    match roots.as_slice() {
+        [] => ExternModuleFiles::Miss,
+        [root_file] => ExternModuleFiles::Hit(rust_library_module_files(root_file, rest)),
+        _ => ExternModuleFiles::Ambiguous,
+    }
 }
 
 fn rust_module_files_below_alias(
@@ -5339,6 +5546,7 @@ impl GraphIndex {
         let normalized = module.trim_start_matches("::");
         let mut segments = normalized.split("::");
         let first = segments.next().unwrap_or("");
+        let rest = segments.collect::<Vec<_>>();
         if !module.starts_with("::") && !matches!(first, "crate" | "self" | "super") {
             let lexical = rust_module_files_for_module_path_with_crate_roots(
                 file,
@@ -5358,30 +5566,27 @@ impl GraphIndex {
             .filter(|library| Path::new(file).starts_with(&library.package_dir))
             .collect::<Vec<_>>();
         let nearest = owning.iter().map(|library| library.package_dir.len()).max();
-        let libraries = owning
+        let nearest_packages = owning
             .into_iter()
             .filter(|package| Some(package.package_dir.len()) == nearest)
+            .collect::<Vec<_>>();
+        let libraries = nearest_packages
+            .iter()
             .filter_map(|package| package.library.as_ref())
             .filter(|library| library.name == first)
             .collect::<Vec<_>>();
         if let [library] = libraries.as_slice() {
-            let rest = segments.collect::<Vec<_>>();
-            if rest.is_empty() {
-                return vec![library.root_file.clone()];
+            return rust_library_module_files(&library.root_file, &rest);
+        }
+        if libraries.is_empty()
+            && !module.starts_with("::")
+            && !matches!(first, "" | "crate" | "self" | "super")
+        {
+            match rust_extern_module_files(&nearest_packages, first, &rest) {
+                ExternModuleFiles::Hit(files) => return files,
+                ExternModuleFiles::Ambiguous => return Vec::new(),
+                ExternModuleFiles::Miss => {}
             }
-            let mut base = Path::new(&library.root_file)
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_path_buf();
-            for segment in rest {
-                base.push(segment);
-            }
-            return vec![
-                base.with_extension("rs")
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-                base.join("mod.rs").to_string_lossy().replace('\\', "/"),
-            ];
         }
         if !libraries.is_empty() || module.starts_with("::") {
             return Vec::new();
@@ -6002,6 +6207,7 @@ impl GraphIndex {
         let Some(referrer_file) = self.file_of(referrer_id) else {
             return UniqueResolution::Unresolved;
         };
+        let referrer_family = resolution_language_family(referrer_file);
         if let Some(alias_targets) = self
             .import_aliases_by_file
             .get(referrer_file)
@@ -6022,7 +6228,11 @@ impl GraphIndex {
         }
         // A local Rust item shadows a glob import. Do not let Base export
         // hydration redirect a same-file reference to an imported namesake.
-        let candidates = self.defs_named(labels, name);
+        let candidates = self
+            .defs_named(labels, name)
+            .into_iter()
+            .filter(|node| resolution_language_family(&node.file_path) == referrer_family)
+            .collect::<Vec<_>>();
         let local = candidates
             .iter()
             .filter(|node| node.file_path == referrer_file)
@@ -6192,6 +6402,42 @@ impl GraphIndex {
         }
     }
 
+    /// Resolve the initializer of a local alias (`let test = crate_b::f`) to one
+    /// callable. An unresolved or ambiguous path stays unresolved; it must not
+    /// fall through to a function that happens to share the local's name.
+    fn resolve_rust_local_alias_path(&self, src_id: i64, path: &str) -> Option<i64> {
+        let path = path.trim();
+        let name = path.rsplit("::").next().unwrap_or("");
+        if name.is_empty() || matches!(path, "Ok" | "Err" | "Some") {
+            return None;
+        }
+        if !path.contains("::") {
+            return self
+                .resolve_unique_status_with_imports(&CALLABLE_LABELS, name, src_id)
+                .unique_id();
+        }
+        let referrer_file = self.file_of(src_id)?;
+        let first_segment = path.split("::").next().unwrap_or("");
+        let module_files = self
+            .rust_namespaces_by_file
+            .get(referrer_file)
+            .and_then(|aliases| aliases.get(first_segment))
+            .map(|alias_files| {
+                rust_module_files_below_alias(
+                    alias_files,
+                    path,
+                    name,
+                    self.rust_crate_roots.as_ref(),
+                )
+            })
+            .unwrap_or_else(|| self.rust_module_files_for_path(referrer_file, path, name));
+        let targets = self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
+        match targets.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
     /// Resolve a CALLS edge. Receiver dispatch is deliberately method-only:
     /// resolving `value.as_bytes()` to an unrelated free `as_bytes` function
     /// is worse than leaving the edge unresolved. Other calls retain the
@@ -6234,7 +6480,8 @@ impl GraphIndex {
             == Some("receiver")
         {
             if let Some(fact) = edge.properties.get("receiver_provenance") {
-                if fact.get("kind").and_then(|value| value.as_str()) == Some("direct_self_field") {
+                let kind = fact.get("kind").and_then(|value| value.as_str());
+                if kind == Some("direct_self_field") || kind == Some("typed_field_chain") {
                     return self.resolve_direct_self_field_receiver(src_id, fact, name);
                 }
                 return self.resolve_option_field_receiver(src_id, edge, fact, name);
@@ -6348,6 +6595,34 @@ impl GraphIndex {
         }
         // Preserve the existing basename-based qualified-call behavior for
         // non-Rust extractors, whose path syntax is language-specific.
+        if edge.file_path.ends_with(".rs")
+            && edge
+                .properties
+                .get("ref_local_binding")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        {
+            // A `let test = real` / parameter named `test` is not a call to an
+            // unrelated `fn test`. Only a plain initializer path may retarget it.
+            return edge
+                .properties
+                .get("rust_local_callee_path")
+                .and_then(|value| value.as_str())
+                .and_then(|path| self.resolve_rust_local_alias_path(src_id, path));
+        }
+        // Unqualified prelude constructors are not user functions. A same-file
+        // `fn Err` is shadowed by the prelude in this position; `MyEnum::Err`
+        // stays on the qualified path above.
+        if edge.file_path.ends_with(".rs")
+            && matches!(name, "Ok" | "Err" | "Some")
+            && edge
+                .properties
+                .get("callee_path")
+                .and_then(|value| value.as_str())
+                .is_none()
+        {
+            return None;
+        }
         if rust_qualified_path.is_none() {
             if let Some(module) = edge
                 .properties
@@ -7000,6 +7275,7 @@ impl GraphIndex {
         }
 
         let suffix = format!("::{owner}::{name}");
+        let family = resolution_language_family(file_path);
         // The name index already bounds candidates to this method name.
         // Scanning every project node here made cross-file receiver calls
         // proportional to the whole graph for every individual edge.
@@ -7007,8 +7283,10 @@ impl GraphIndex {
         let mut matches = candidates
             .into_iter()
             .filter(|node| {
-                self.qname_for_id(node.id)
-                    .is_some_and(|qname| qname.ends_with(&suffix))
+                resolution_language_family(&node.file_path) == family
+                    && self
+                        .qname_for_id(node.id)
+                        .is_some_and(|qname| qname.ends_with(&suffix))
             })
             .map(|node| node.id);
         let target = matches.next()?;
@@ -11002,6 +11280,381 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
                 "crates/widget/src/helpers/main.rs".to_string(),
             ]
         );
+    }
+
+    fn calls_between(store: &Store, target: &str, source: &str) -> bool {
+        let Some(target) = store.get_node_by_qname("test", target).unwrap() else {
+            panic!("missing target {target}");
+        };
+        let Some(source) = store.get_node_by_qname("test", source).unwrap() else {
+            panic!("missing source {source}");
+        };
+        store
+            .incoming_edges(target.id, Some("CALLS"), 30)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == source.id)
+    }
+
+    #[test]
+    fn rust_workspace_path_deps_resolve_qualified_and_imported_calls() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-workspace-extern-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("crates/crate_b/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/app/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/workspace_user/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/decoy/src")).unwrap();
+        fs::create_dir_all(repo.join("crates/shadow/src")).unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/crate_b\", \"crates/app\", \"crates/workspace_user\", \"crates/decoy\", \"crates/shadow\"]\nresolver = \"2\"\n\n[workspace.dependencies]\ncrate_b = { path = \"crates/crate_b\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/crate_b/Cargo.toml"),
+            "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/crate_b/src/lib.rs"),
+            "pub fn f() {}\npub mod nested;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("crates/crate_b/src/nested.rs"), "pub fn g() {}\n").unwrap();
+        fs::write(
+            repo.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\ndecoy = \"1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/app/src/lib.rs"),
+            "use crate_b::f;\npub fn qualified() { crate_b::f(); crate_b::nested::g(); }\npub fn imported() { f(); }\npub fn not_a_dep() { decoy::f(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/shadow/Cargo.toml"),
+            "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/shadow/src/lib.rs"),
+            "pub fn shadowed() { crate_b::f(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("crates/shadow/src/crate_b.rs"), "pub fn f() {}\n").unwrap();
+        fs::write(
+            repo.join("crates/workspace_user/Cargo.toml"),
+            "[package]\nname = \"workspace_user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncrate_b = { workspace = true }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/workspace_user/src/lib.rs"),
+            "pub fn via_workspace() { crate_b::f(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("crates/decoy/Cargo.toml"),
+            "[package]\nname = \"decoy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(repo.join("crates/decoy/src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/workspace_user/src/lib.rs::Function::via_workspace",
+            ),
+            "workspace = true path dependency must resolve crate_b::f"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/app/src/lib.rs::Function::qualified",
+            ),
+            "path dependency must resolve crate_b::f"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/nested.rs::Function::g",
+                "crates/app/src/lib.rs::Function::qualified",
+            ),
+            "path dependency must resolve crate_b::nested::g"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/shadow/src/crate_b.rs::Function::f",
+                "crates/shadow/src/lib.rs::Function::shadowed",
+            ),
+            "a lexical module file must keep shadowing the extern crate"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/shadow/src/lib.rs::Function::shadowed",
+            ),
+            "shadowed extern crate must not also receive the call"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "crates/crate_b/src/lib.rs::Function::f",
+                "crates/app/src/lib.rs::Function::imported",
+            ),
+            "use crate_b::f must resolve the imported call"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "crates/decoy/src/lib.rs::Function::f",
+                "crates/app/src/lib.rs::Function::not_a_dep",
+            ),
+            "a version-only dependency must not bind a same-named workspace member"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn mixed_language_same_name_does_not_suppress_in_language_call() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-lang-family-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/Pricing.java"),
+            "class Pricing { static int parsePrice(String raw) { return 1; } }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/Cart.java"),
+            "class Cart { int cartTotal() { return Pricing.parsePrice(\"1\"); } }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/price.ts"),
+            "export function parsePrice(raw: string): number { return 1; }\nexport function cartTotal(): number { return parsePrice(\"1\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/util.c"),
+            "int parsePrice(const char *raw) { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/app.cpp"),
+            "int run() { return parsePrice(\"1\"); }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            calls_between(
+                &store,
+                "src/Pricing.java::Pricing::parsePrice",
+                "src/Cart.java::Cart::cartTotal",
+            ),
+            "a TypeScript namesake must not suppress the Java call"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/price.ts::Function::parsePrice",
+                "src/Cart.java::Cart::cartTotal",
+            ),
+            "a Java call must not bind to a TypeScript function"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/price.ts::Function::parsePrice",
+                "src/price.ts::Function::cartTotal",
+            ),
+            "the TypeScript call still resolves in its own language"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/util.c::Function::parsePrice",
+                "src/app.cpp::Function::run",
+            ),
+            "C and C++ stay one family, so a Java namesake must not suppress them"
+        );
+
+        fs::write(
+            repo.join("src/Other.java"),
+            "class Other { static int parsePrice(String raw) { return 2; } }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            !calls_between(
+                &store,
+                "src/Pricing.java::Pricing::parsePrice",
+                "src/Cart.java::Cart::cartTotal",
+            ),
+            "two Java definitions stay ambiguous"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/price.ts::Function::parsePrice",
+                "src/price.ts::Function::cartTotal",
+            ),
+            "Java ambiguity must not suppress the unique TypeScript call"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rust_local_alias_calls_do_not_bind_unrelated_fn_test() {
+        let repo = setup_multifile_repo(
+            "rust-local-alias",
+            "pub fn real() {}\npub fn test() {}\npub fn assert_de() {}\n",
+            "use crate::real as test;\npub fn renamed() { test(); }\npub fn local_path() { let test = assert_de; test(); }\npub fn opaque() { let test = assert_de::<i8>; test(); }\npub fn param(test: fn()) { test(); }\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            calls_between(
+                &store,
+                "src/lib.rs::Function::real",
+                "src/helper.rs::Function::renamed",
+            ),
+            "use … as test must call the alias target"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::renamed",
+            ),
+            "a renamed import must not call an unrelated fn test"
+        );
+        assert!(
+            calls_between(
+                &store,
+                "src/lib.rs::Function::assert_de",
+                "src/helper.rs::Function::local_path",
+            ),
+            "let test = assert_de must call assert_de"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::local_path",
+            ),
+            "a local let binding must not call fn test"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::opaque",
+            ),
+            "a turbofish local must not fall through to fn test"
+        );
+        assert!(
+            !calls_between(
+                &store,
+                "src/lib.rs::Function::test",
+                "src/helper.rs::Function::param",
+            ),
+            "a parameter named test must not call fn test"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rust_field_chain_and_ufcs_resolve_known_receiver_types() {
+        let repo = setup_multifile_repo(
+            "rust-field-chain",
+            "mod helper;\nmod other;\nuse helper::RenameRule;\nstruct RenameAllRules { serialize: RenameRule }\nimpl RenameAllRules {\n    fn apply(&self, value: &str) -> String { self.serialize.apply_to_field(value) }\n}\nfn apply_param(rules: &RenameAllRules, value: &str) -> String { rules.serialize.apply_to_field(value) }\nfn ufcs(rule: &RenameRule) { RenameRule::apply_to_field(rule, \"x\"); RenameRule::apply_to_variant(rule, \"x\"); }\nfn unknown(rules: RenameAllRules) { rules.missing.apply_to_field(\"x\"); }\nfn opaque() { let rules = opaque_rules(); rules.serialize.apply_to_field(\"x\"); }\nfn opaque_rules() -> RenameAllRules { unimplemented!() }\n",
+            "pub enum RenameRule { None, PascalCase }\nimpl RenameRule {\n    pub fn apply_to_field(&self, value: &str) -> String { value.to_string() }\n    pub fn apply_to_variant(&self, value: &str) -> String { value.to_string() }\n}\n",
+        );
+        fs::write(
+            repo.join("src/other.rs"),
+            "pub enum RenameRule { None }\nimpl RenameRule {\n    pub fn apply_to_field(&self, value: &str) -> String { value.to_string() }\n    pub fn apply_to_variant(&self, value: &str) -> String { value.to_string() }\n}\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let method = "src/helper.rs::RenameRule::apply_to_field";
+        let variant = "src/helper.rs::RenameRule::apply_to_variant";
+        let foreign = "src/other.rs::RenameRule::apply_to_field";
+        assert!(calls_between(
+            &store,
+            method,
+            "src/lib.rs::RenameAllRules::apply"
+        ));
+        assert!(calls_between(
+            &store,
+            method,
+            "src/lib.rs::Function::apply_param"
+        ));
+        assert!(calls_between(&store, method, "src/lib.rs::Function::ufcs"));
+        assert!(calls_between(&store, variant, "src/lib.rs::Function::ufcs"));
+        assert!(!calls_between(
+            &store,
+            foreign,
+            "src/lib.rs::RenameAllRules::apply"
+        ));
+        assert!(!calls_between(
+            &store,
+            foreign,
+            "src/lib.rs::Function::apply_param"
+        ));
+        assert!(!calls_between(
+            &store,
+            method,
+            "src/lib.rs::Function::unknown"
+        ));
+        assert!(!calls_between(
+            &store,
+            method,
+            "src/lib.rs::Function::opaque"
+        ));
+        assert!(!calls_between(
+            &store,
+            foreign,
+            "src/lib.rs::Function::ufcs"
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rust_prelude_enum_constructors_do_not_bind_user_functions() {
+        let repo = setup_repo(
+            "rust-prelude-ctors",
+            "pub fn Err() {}\npub fn Ok() {}\npub fn Some() {}\npub enum Outcome { Err(u8), Ok, Some }\npub fn expand_derive_deserialize() {\n    let _ = Err(\"no\");\n    let _ = Ok(1);\n    let _ = Some(1);\n    let _ = Outcome::Err(1);\n}\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let caller = "src/lib.rs::Function::expand_derive_deserialize";
+        assert!(!calls_between(&store, "src/lib.rs::Function::Err", caller));
+        assert!(!calls_between(&store, "src/lib.rs::Function::Ok", caller));
+        assert!(!calls_between(&store, "src/lib.rs::Function::Some", caller));
+        assert!(calls_between(&store, "src/lib.rs::Outcome::Err", caller));
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

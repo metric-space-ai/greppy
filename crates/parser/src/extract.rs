@@ -1448,6 +1448,57 @@ fn rust_direct_self_field_receiver(source: &[u8], callee: Node<'_>) -> Option<se
     None
 }
 
+/// `rules.serialize.apply_to_field` when `rules`'s type is a plain path in a
+/// parameter or local annotation. One field access only; generics, calls, and
+/// `self.field` (handled separately) stay unresolved.
+fn rust_typed_field_chain_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
+    let method = callee.parent()?;
+    if method.kind() != "field_expression" {
+        return None;
+    }
+    let access = method.child_by_field_name("value")?;
+    if access.kind() != "field_expression" {
+        return None;
+    }
+    let base = access.child_by_field_name("value")?;
+    let field = access.child_by_field_name("field")?;
+    if base.kind() != "identifier" || field.kind() != "field_identifier" {
+        return None;
+    }
+    let base_name = node_text(source, base);
+    if base_name == "self" || base_name.is_empty() {
+        return None;
+    }
+    let ty = rust_visible_binding_type(source, callee, base_name)?;
+    let base_type = rust_plain_type_path(source, ty)?;
+    Some(serde_json::json!({
+        "kind": "typed_field_chain",
+        "base_type": base_type,
+        "field": node_text(source, field),
+    }))
+}
+
+/// Strip `&` / `&mut` and keep a single path. Generic, pointer, and tuple
+/// types are not concrete field owners.
+fn rust_plain_type_path<'a>(source: &'a [u8], ty: Node<'_>) -> Option<&'a str> {
+    let mut node = ty;
+    loop {
+        if node.kind() == "reference_type" {
+            node = node.child_by_field_name("type")?;
+            continue;
+        }
+        if !matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
+            return None;
+        }
+        let text = node_text(source, node).trim();
+        let plain = !text.is_empty()
+            && text.split("::").all(|segment| {
+                !segment.is_empty() && segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            });
+        return plain.then_some(text);
+    }
+}
+
 fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
     fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
         (pattern.kind() == "identifier" && node_text(source, pattern) == name)
@@ -2268,6 +2319,134 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
         ancestor = scope.parent();
     }
     false
+}
+
+/// `Some(None)` is a local value with no safe target (`let test = foo()` or a
+/// parameter). `Some(Some(path))` is `let test = real` or `let test = crate::real`
+/// when that initializer is not itself a local.
+fn rust_local_call_initializer<'a>(
+    source: &'a [u8],
+    reference: Node<'_>,
+    name: &str,
+) -> Option<Option<&'a str>> {
+    fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+        if matches!(pattern.kind(), "identifier" | "shorthand_field_identifier") {
+            return node_text(source, pattern) == name;
+        }
+        let constructor = pattern.child_by_field_name("type");
+        let field_label = (pattern.kind() == "field_pattern")
+            .then(|| pattern.child_by_field_name("name"))
+            .flatten();
+        (0..pattern.named_child_count())
+            .filter_map(|index| pattern.named_child(index))
+            .filter(|child| Some(*child) != constructor && Some(*child) != field_label)
+            .any(|child| binds(source, child, name))
+    }
+    fn plain_path<'a>(source: &'a [u8], value: Node<'_>) -> Option<&'a str> {
+        let node = if value.kind() == "parenthesized_expression" {
+            value.named_child(0)?
+        } else {
+            value
+        };
+        if !matches!(node.kind(), "identifier" | "scoped_identifier") {
+            return None;
+        }
+        let text = node_text(source, node).trim();
+        let plain = !text.is_empty()
+            && text.split("::").all(|segment| {
+                !segment.is_empty() && segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            });
+        plain.then_some(text)
+    }
+    if !rust_usage_has_local_value_binding(source, reference, name) {
+        return None;
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if scope.kind() == "match_arm"
+            && scope.child_by_field_name("pattern").is_some_and(|pattern| {
+                !node_contains(pattern, reference) && binds(source, pattern, name)
+            })
+        {
+            return Some(None);
+        }
+        if scope.kind() == "for_expression"
+            && scope
+                .child_by_field_name("body")
+                .is_some_and(|body| node_contains(body, reference))
+            && scope
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return Some(None);
+        }
+        if matches!(scope.kind(), "if_expression" | "while_expression")
+            && scope
+                .child_by_field_name("consequence")
+                .or_else(|| scope.child_by_field_name("body"))
+                .is_some_and(|body| node_contains(body, reference))
+            && scope
+                .child_by_field_name("condition")
+                .filter(|condition| condition.kind() == "let_condition")
+                .and_then(|condition| condition.child_by_field_name("pattern"))
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return Some(None);
+        }
+        if matches!(scope.kind(), "function_item" | "closure_expression")
+            && scope
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| {
+                    (0..parameters.named_child_count())
+                        .filter_map(|index| parameters.named_child(index))
+                        .any(|parameter| {
+                            parameter
+                                .child_by_field_name("pattern")
+                                .or_else(|| (parameter.kind() == "identifier").then_some(parameter))
+                                .is_some_and(|pattern| binds(source, pattern, name))
+                        })
+                })
+        {
+            return Some(None);
+        }
+        if scope.kind() == "block" {
+            for index in (0..scope.named_child_count()).rev() {
+                let Some(declaration) = scope.named_child(index) else {
+                    continue;
+                };
+                if declaration.kind() != "let_declaration"
+                    || declaration.end_byte() > reference.start_byte()
+                {
+                    continue;
+                }
+                let Some(pattern) = declaration.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if !binds(source, pattern, name) {
+                    continue;
+                }
+                if node_text(source, pattern).trim() != name {
+                    return Some(None);
+                }
+                let Some(value) = declaration.child_by_field_name("value") else {
+                    return Some(None);
+                };
+                let Some(path) = plain_path(source, value) else {
+                    return Some(None);
+                };
+                let leaf = path.rsplit("::").next().unwrap_or(path);
+                if !path.contains("::") && rust_usage_has_local_value_binding(source, value, leaf) {
+                    return Some(None);
+                }
+                return Some(Some(path));
+            }
+        }
+        if scope.kind() == "function_item" {
+            break;
+        }
+        ancestor = scope.parent();
+    }
+    Some(None)
 }
 
 // Tree-sitter also uses type_identifier for the owner/name of struct-style
@@ -5250,6 +5429,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     .then(|| {
                         rust_direct_self_field_receiver(source, node)
                             .or_else(|| rust_option_field_receiver(source, node))
+                            .or_else(|| rust_typed_field_chain_receiver(source, node))
                     })
                     .flatten();
                 // The scoped path a direct call names (`store::f` for
@@ -5332,6 +5512,27 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                                     "callee_path".into(),
                                     serde_json::Value::String(path.to_string()),
                                 );
+                            }
+                            if callee_form == "direct"
+                                && callee_path.is_none()
+                                && node.kind() == "identifier"
+                            {
+                                if let Some(initializer) =
+                                    rust_local_call_initializer(source, node, text)
+                                {
+                                    if let Some(object) = properties.as_object_mut() {
+                                        object.insert(
+                                            "ref_local_binding".into(),
+                                            serde_json::json!(true),
+                                        );
+                                        if let Some(path) = initializer {
+                                            object.insert(
+                                                "rust_local_callee_path".into(),
+                                                serde_json::Value::String(path.to_string()),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             properties
                         },
