@@ -1779,7 +1779,7 @@ fn try_skip_current_plain_index(
     if file_report_is_metadata_only(&report) && settled {
         drop(store);
         let mut writer = greppy_store::Store::open(store_path)?;
-        let fingerprint = greppy_freshness::capture_fingerprint(target);
+        let fingerprint = greppy_freshness::capture(target);
         let refreshed = greppy_freshness::refresh_fingerprint_metadata(
             &mut writer,
             &fingerprint,

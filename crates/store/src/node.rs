@@ -774,7 +774,7 @@ impl Store {
             .query_map(params![project, lower, upper], row_to_node)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         nodes.extend(descendants);
-        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        nodes.sort_by_key(|node| node.id);
         nodes.dedup_by(|left, right| left.id == right.id);
         nodes.sort_by(|left, right| {
             left.qualified_name
