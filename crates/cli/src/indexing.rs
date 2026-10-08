@@ -1708,23 +1708,6 @@ fn index_embeddings_settled(
         && embedding_generation_complete(store, project, state.graph_generation, &cfg.model_id)
 }
 
-fn file_report_is_metadata_only(report: &greppy_freshness::FileFreshnessReport) -> bool {
-    let greppy_freshness::FreshnessOutcome::Stale { reasons } = &report.state.outcome else {
-        return false;
-    };
-    report
-        .changed_paths
-        .as_ref()
-        .is_some_and(|paths| paths.is_empty())
-        && !reasons.is_empty()
-        && reasons.iter().all(|reason| {
-            reason.starts_with("git_dir changed")
-                || reason.starts_with("git_common_dir changed")
-                || reason.starts_with("head_oid changed")
-                || reason.starts_with("index signature changed")
-        })
-}
-
 fn finish_index_already_current(background_job: &mut BackgroundJobGuard, files: usize) {
     background_job.complete();
     println!("index already current ({files} files)");
@@ -1758,13 +1741,17 @@ fn try_skip_current_plain_index(
         .ok()
         .and_then(|count| usize::try_from(count).ok())
         .unwrap_or(0);
-    let report = greppy_freshness::check_files_report_with_overrides(
+    // Any doubt (unreadable or corrupt store, failed check) takes the normal
+    // index path, which repairs what it finds.
+    let Ok(report) = greppy_freshness::check_files_report_with_overrides(
         &store,
         target,
         project,
         std::time::Duration::from_secs(30),
         &index_options.discover_overrides,
-    )?;
+    ) else {
+        return Ok(None);
+    };
     let files = index_inventory_count(&report, fallback);
     let settled = index_embeddings_settled(&store, target, project, embedding_config);
     if matches!(
@@ -1776,89 +1763,7 @@ fn try_skip_current_plain_index(
         finish_index_already_current(background_job, files);
         return Ok(Some(0));
     }
-    if file_report_is_metadata_only(&report) && settled {
-        drop(store);
-        let mut writer = greppy_store::Store::open(store_path)?;
-        let fingerprint = greppy_freshness::capture(target);
-        let refreshed = greppy_freshness::refresh_fingerprint_metadata(
-            &mut writer,
-            &fingerprint,
-            std::time::Duration::from_secs(30),
-            &index_options.discover_overrides,
-        )?;
-        drop(writer);
-        if refreshed {
-            finish_index_already_current(background_job, files);
-            return Ok(Some(0));
-        }
-        return Ok(None);
-    }
     Ok(None)
-}
-
-fn try_skip_current_overlay_index(
-    store_path: &std::path::Path,
-    target: &std::path::Path,
-    effective_root: &std::path::Path,
-    project: &str,
-    index_options: &greppy_indexer::IndexOptions,
-    overlay: &crate::store_cow::OverlaySpec,
-    embedding_config: Option<&EmbeddingModelConfig>,
-    background_job: &mut BackgroundJobGuard,
-) -> Result<Option<i32>> {
-    if !store_path.is_file() {
-        return Ok(None);
-    }
-    let store = match greppy_store::Store::open_overlay_read_only(
-        &overlay.base_path,
-        store_path,
-        &overlay.visibility,
-    ) {
-        Ok(store) => store,
-        Err(_) => return Ok(None),
-    };
-    match crate::store_cow::overlay_freshness_proof(effective_root, &store, project)? {
-        Some(crate::store_cow::OverlayFreshnessProof::Fresh { total_inventory }) => {
-            if index_embeddings_settled(&store, effective_root, project, embedding_config)
-                || index_embeddings_settled(&store, target, project, embedding_config)
-            {
-                finish_index_already_current(background_job, total_inventory);
-                return Ok(Some(0));
-            }
-            Ok(None)
-        }
-        Some(crate::store_cow::OverlayFreshnessProof::Stale { .. }) => Ok(None),
-        // Shapes the overlay proof does not understand fall back to the
-        // ordinary inventory check. Metadata refresh stays on the plain path:
-        // a writer opened without the Base attached would not be the overlay.
-        None => {
-            let fallback = store
-                .file_count(project)
-                .ok()
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(0);
-            let report = greppy_freshness::check_files_report_with_overrides(
-                &store,
-                target,
-                project,
-                std::time::Duration::from_secs(30),
-                &index_options.discover_overrides,
-            )?;
-            if matches!(
-                report.state.outcome,
-                greppy_freshness::FreshnessOutcome::Fresh
-            ) && (index_embeddings_settled(&store, target, project, embedding_config)
-                || index_embeddings_settled(&store, effective_root, project, embedding_config))
-            {
-                finish_index_already_current(
-                    background_job,
-                    index_inventory_count(&report, fallback),
-                );
-                return Ok(Some(0));
-            }
-            Ok(None)
-        }
-    }
 }
 
 pub(crate) fn dispatch_index(
@@ -2078,7 +1983,11 @@ pub(crate) fn dispatch_index(
     }
     // Freshness before any snapshot work, and before the foreground job is
     // attached, so a current index does not announce a build it will not do.
-    if crate::store_cow::overlay_environment(&effective_root)?.is_none() {
+    // Only an explicit foreground `greppy index` may answer "already current":
+    // a background index was started by a query that needs a publication.
+    if !background_job.is_background()
+        && crate::store_cow::overlay_environment(&effective_root)?.is_none()
+    {
         if let Some(code) = try_skip_current_plain_index(
             &store_path,
             &target,
@@ -2106,18 +2015,6 @@ pub(crate) fn dispatch_index(
     };
     background_job.write_state("indexing", None);
     if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {
-        if let Some(code) = try_skip_current_overlay_index(
-            &store_path,
-            &target,
-            &effective_root,
-            &project,
-            &index_options,
-            &overlay,
-            embedding_config.as_ref(),
-            &mut background_job,
-        )? {
-            return Ok(code);
-        }
         if background_job.is_foreground_owner() && !cli_json_output() {
             eprintln!(
                 "greppy: index started for {} (phase=preparing_base, pid={}); progress: `greppy index status --json`",
@@ -2850,10 +2747,7 @@ fn index_embeddings_into_temp_store_scoped(
     // document walk to wait on, so the completeness stamp can advance now.
     // A positive or unknown count must publish that fact before the walk,
     // which otherwise leaves status at `counting_embeddings` 0/0.
-    let candidate_nodes = match greppy_indexer::count_embedding_candidate_nodes(store, project) {
-        Ok(count) => Some(count),
-        Err(_) => None,
-    };
+    let candidate_nodes = greppy_indexer::count_embedding_candidate_nodes(store, project).ok();
     let mut embedding_report = if candidate_nodes == Some(0) {
         greppy_indexer::EmbeddingIndexReport::default()
     } else {
