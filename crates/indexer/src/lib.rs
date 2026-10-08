@@ -4390,6 +4390,9 @@ struct GraphIndex {
     /// the structural pass has created the File nodes.
     files_by_stem: std::collections::HashMap<String, Vec<i64>>,
     known_files: std::collections::HashSet<String>,
+    /// Rust defs that live in an inline `mod` (no `mod.rs` / `name.rs`).
+    /// Keyed by node id. Absent for file-module items.
+    rust_inline_scopes: std::collections::HashMap<i64, RustInlineScope>,
     /// `file::Trait::as_ref` → the method's self parameter text. Used only to
     /// reject a by-value adapter that can hide Option::as_ref.
     as_ref_receivers: std::collections::HashMap<String, String>,
@@ -4474,6 +4477,426 @@ fn rust_module_files_for_module_path_with_crate_roots(
     let lib = base.join("lib.rs").to_string_lossy().replace('\\', "/");
     let main = base.join("main.rs").to_string_lossy().replace('\\', "/");
     vec![flat, nested, lib, main]
+}
+
+/// A Rust definition inside an inline `mod` item.
+///
+/// `module` is the `mod` chain (`trace`, `a::b`). `module_vis` is parallel to
+/// those segments; an empty string means the module is private. `visibility`
+/// is the item's own visibility text (`None` when the item is private).
+struct RustInlineScope {
+    module: String,
+    visibility: Option<String>,
+    module_vis: Vec<String>,
+}
+
+struct RustModuleSite {
+    dir: std::path::PathBuf,
+    file: String,
+    inline: String,
+}
+
+fn slash_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn rust_file_module_dir(
+    file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> std::path::PathBuf {
+    let path = std::path::Path::new(file);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if matches!(name, "lib.rs" | "main.rs" | "mod.rs")
+        || crate_roots.is_some_and(|roots| roots.contains(file))
+    {
+        path.parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .to_path_buf()
+    } else {
+        path.with_extension("")
+    }
+}
+
+fn rust_module_site_for_file(
+    file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> RustModuleSite {
+    RustModuleSite {
+        dir: rust_file_module_dir(file, crate_roots),
+        file: file.to_string(),
+        inline: String::new(),
+    }
+}
+
+fn rust_crate_directory(
+    referrer_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> std::path::PathBuf {
+    crate_roots
+        .and_then(|roots| rust_crate_root_for_file(referrer_file, roots))
+        .or_else(|| {
+            let root_end = referrer_file
+                .rfind("/src/")
+                .map(|offset| offset + "/src".len())
+                .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+            root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+        })
+        .unwrap_or_else(|| {
+            std::path::Path::new(referrer_file)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                .to_path_buf()
+        })
+}
+
+fn rust_crate_root_files(
+    dir: &std::path::Path,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for name in ["lib.rs", "main.rs", "mod.rs"] {
+        let candidate = slash_path(&dir.join(name));
+        if known_files.contains(&candidate) {
+            hits.push(candidate);
+        }
+    }
+    if let Some(roots) = crate_roots {
+        for root in roots {
+            if std::path::Path::new(root).parent() == Some(dir)
+                && known_files.contains(root)
+                && !hits.contains(root)
+            {
+                hits.push(root.clone());
+            }
+        }
+    }
+    hits
+}
+
+fn rust_child_module_site(
+    dir: &std::path::Path,
+    segment: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Option<RustModuleSite> {
+    let child_dir = dir.join(segment);
+    let candidates = [
+        slash_path(&dir.join(format!("{segment}.rs"))),
+        slash_path(&child_dir.join("mod.rs")),
+        slash_path(&child_dir.join("lib.rs")),
+        slash_path(&child_dir.join("main.rs")),
+    ];
+    let hits = candidates
+        .into_iter()
+        .filter(|candidate| known_files.contains(candidate))
+        .collect::<Vec<_>>();
+    match hits.as_slice() {
+        [file] => Some(rust_module_site_for_file(file, crate_roots)),
+        _ => None,
+    }
+}
+
+fn rust_parent_module_site(
+    file: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Option<RustModuleSite> {
+    let path = std::path::Path::new(file);
+    let parent_dir = path.parent()?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let container = if matches!(name, "lib.rs" | "main.rs" | "mod.rs")
+        || crate_roots.is_some_and(|roots| roots.contains(file))
+    {
+        parent_dir.parent()?.to_path_buf()
+    } else {
+        parent_dir.to_path_buf()
+    };
+    let stem = container
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if stem.is_empty() {
+        return None;
+    }
+    let parent_of_container = container
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let mut hits = Vec::new();
+    for candidate in [
+        slash_path(&container.join("mod.rs")),
+        slash_path(&parent_of_container.join(format!("{stem}.rs"))),
+        slash_path(&container.join("lib.rs")),
+        slash_path(&container.join("main.rs")),
+    ] {
+        if candidate != file && known_files.contains(&candidate) && !hits.contains(&candidate) {
+            hits.push(candidate);
+        }
+    }
+    match hits.as_slice() {
+        [one] => Some(rust_module_site_for_file(one, crate_roots)),
+        _ => None,
+    }
+}
+
+/// Where an inline module path lives when no file module covers the whole path.
+///
+/// `crate::trace` in a crate whose only root is `src/lib.rs` yields
+/// `("src/lib.rs", "trace")`. A path that lands entirely on files yields nothing.
+fn rust_inline_module_sites(
+    referrer_file: &str,
+    module_path: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, String)> {
+    let segments = module_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let mut index = 0;
+    let mut states = Vec::new();
+    match segments[0] {
+        "crate" => {
+            let dir = rust_crate_directory(referrer_file, crate_roots);
+            for file in rust_crate_root_files(&dir, known_files, crate_roots) {
+                states.push(rust_module_site_for_file(&file, crate_roots));
+            }
+            index = 1;
+        }
+        "self" => {
+            states.push(rust_module_site_for_file(referrer_file, crate_roots));
+            index = 1;
+        }
+        "super" => {
+            if let Some(parent) = rust_parent_module_site(referrer_file, known_files, crate_roots) {
+                states.push(parent);
+            }
+            index = 1;
+        }
+        _ => states.push(rust_module_site_for_file(referrer_file, crate_roots)),
+    }
+    while index < segments.len() {
+        let segment = segments[index];
+        index += 1;
+        if states.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for state in states {
+            if segment == "super" && state.inline.is_empty() {
+                if let Some(parent) = rust_parent_module_site(&state.file, known_files, crate_roots)
+                {
+                    next.push(parent);
+                }
+                continue;
+            }
+            if state.inline.is_empty() {
+                if let Some(child) =
+                    rust_child_module_site(&state.dir, segment, known_files, crate_roots)
+                {
+                    next.push(child);
+                    continue;
+                }
+            }
+            let inline = if state.inline.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{}::{segment}", state.inline)
+            };
+            next.push(RustModuleSite { inline, ..state });
+        }
+        states = next;
+    }
+    states
+        .into_iter()
+        .filter(|state| !state.inline.is_empty())
+        .map(|state| (state.file, state.inline))
+        .collect()
+}
+
+fn rust_inline_sites_below_alias(
+    alias_files: &[String],
+    ref_path: &str,
+    name: &str,
+    known_files: &std::collections::HashSet<String>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, String)> {
+    let segments = ref_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if segments.last().copied() != Some(name) || segments.len() < 2 {
+        return Vec::new();
+    }
+    let mut states = alias_files
+        .iter()
+        .map(|file| rust_module_site_for_file(file, crate_roots))
+        .collect::<Vec<_>>();
+    for segment in &segments[1..segments.len() - 1] {
+        let mut next = Vec::new();
+        for state in states {
+            if state.inline.is_empty() {
+                if let Some(child) =
+                    rust_child_module_site(&state.dir, segment, known_files, crate_roots)
+                {
+                    next.push(child);
+                    continue;
+                }
+            }
+            let inline = if state.inline.is_empty() {
+                (*segment).to_string()
+            } else {
+                format!("{}::{segment}", state.inline)
+            };
+            next.push(RustModuleSite { inline, ..state });
+        }
+        states = next;
+    }
+    states
+        .into_iter()
+        .filter(|state| !state.inline.is_empty())
+        .map(|state| (state.file, state.inline))
+        .collect()
+}
+
+fn compact_visibility(visibility: &str) -> String {
+    visibility
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn caller_in_rust_module(
+    module: &str,
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    if module.is_empty() {
+        if caller_file == owner_file {
+            return true;
+        }
+        let dir = slash_path(&rust_file_module_dir(owner_file, crate_roots));
+        return !dir.is_empty() && caller_file.starts_with(&format!("{dir}/"));
+    }
+    if caller_file == owner_file {
+        return caller_module == module || caller_module.starts_with(&format!("{module}::"));
+    }
+    let mut dir = rust_file_module_dir(owner_file, crate_roots);
+    for segment in module.split("::") {
+        dir.push(segment);
+    }
+    let prefix = format!("{}/", slash_path(&dir));
+    caller_file.starts_with(&prefix)
+}
+
+fn rust_module_item_visible(
+    visibility: &str,
+    module_path: &str,
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let vis = compact_visibility(visibility);
+    if vis == "pub"
+        || vis == "pub(crate)"
+        || vis.starts_with("pub(crate::")
+        || vis.starts_with("pub(in crate")
+        || vis.starts_with("pub(incrate")
+    {
+        return true;
+    }
+    if vis.is_empty() || vis == "pub(self)" || vis == "pub(in self)" || vis == "pub(inself)" {
+        let parent = module_path
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        return caller_in_rust_module(parent, owner_file, caller_module, caller_file, crate_roots);
+    }
+    if vis == "pub(super)" || vis == "pub(in super)" || vis == "pub(insuper)" {
+        let Some((containing, _)) = module_path.rsplit_once("::") else {
+            return false;
+        };
+        let grandparent = containing
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        return caller_in_rust_module(
+            grandparent,
+            owner_file,
+            caller_module,
+            caller_file,
+            crate_roots,
+        );
+    }
+    false
+}
+
+fn rust_path_modules_visible(
+    module: &str,
+    module_vis: &[String],
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let segments = module.split("::").collect::<Vec<_>>();
+    for (index, _) in segments.iter().enumerate() {
+        let visibility = module_vis.get(index).map(String::as_str).unwrap_or("");
+        let module_path = segments[..=index].join("::");
+        if !rust_module_item_visible(
+            visibility,
+            &module_path,
+            owner_file,
+            caller_module,
+            caller_file,
+            crate_roots,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn rust_item_visible(
+    visibility: Option<&str>,
+    module: &str,
+    owner_file: &str,
+    caller_module: &str,
+    caller_file: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let vis = compact_visibility(visibility.unwrap_or(""));
+    if vis == "pub"
+        || vis == "pub(crate)"
+        || vis.starts_with("pub(crate::")
+        || vis.starts_with("pub(in crate")
+        || vis.starts_with("pub(incrate")
+    {
+        return true;
+    }
+    if vis.is_empty() || vis == "pub(self)" || vis == "pub(in self)" || vis == "pub(inself)" {
+        return caller_in_rust_module(module, owner_file, caller_module, caller_file, crate_roots);
+    }
+    if vis == "pub(super)" || vis == "pub(in super)" || vis == "pub(insuper)" {
+        let parent = module
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        return caller_in_rust_module(parent, owner_file, caller_module, caller_file, crate_roots);
+    }
+    false
 }
 
 fn rust_crate_root_for_file(
@@ -4986,6 +5409,7 @@ impl GraphIndex {
         let mut files_by_stem: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
         let mut known_files = std::collections::HashSet::new();
+        let mut rust_inline_scopes = std::collections::HashMap::new();
         let mut as_ref_receivers = std::collections::HashMap::new();
         let mut open_traits = std::collections::HashSet::new();
         {
@@ -5002,7 +5426,13 @@ impl GraphIndex {
                             CASE WHEN label = 'Interface'
                                 THEN json_extract(properties, '$.has_bounds') END,
                             CASE WHEN label = 'Interface'
-                                THEN json_extract(properties, '$.as_ref_receiver') END
+                                THEN json_extract(properties, '$.as_ref_receiver') END,
+                            CASE WHEN file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.rust_inline_module') END,
+                            CASE WHEN file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.visibility') END,
+                            CASE WHEN file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.rust_inline_module_vis') END
                      FROM nodes WHERE project = ?1 ORDER BY qualified_name",
                 )
                 .map_err(sqlite_err)?;
@@ -5018,6 +5448,9 @@ impl GraphIndex {
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, Option<i64>>(7)?,
                         r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
                     ))
                 })
                 .map_err(sqlite_err)?;
@@ -5032,6 +5465,9 @@ impl GraphIndex {
                     as_ref_receiver,
                     trait_bounds,
                     trait_as_ref,
+                    rust_inline_module,
+                    visibility,
+                    rust_inline_module_vis,
                 ) = row.map_err(sqlite_err)?;
                 note_edge_resolution_work(1);
                 if label == "File" {
@@ -5056,6 +5492,21 @@ impl GraphIndex {
                 }
                 if trait_bounds == Some(1) {
                     open_traits.insert(id);
+                }
+                if let Some(module) = rust_inline_module.filter(|module| !module.is_empty()) {
+                    let module_vis = rust_inline_module_vis
+                        .unwrap_or_default()
+                        .split('\u{1f}')
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    rust_inline_scopes.insert(
+                        id,
+                        RustInlineScope {
+                            module,
+                            visibility,
+                            module_vis,
+                        },
+                    );
                 }
                 let node = NodeLite {
                     id,
@@ -5216,6 +5667,7 @@ impl GraphIndex {
             id_to_qname,
             files_by_stem,
             known_files,
+            rust_inline_scopes,
             as_ref_receivers,
             open_traits,
         })
@@ -5669,6 +6121,77 @@ impl GraphIndex {
         self.id_to_file.get(&id).map(|s| s.as_str())
     }
 
+    /// Resolve `crate::trace::name` when `trace` is an inline module in the crate
+    /// root file rather than `trace.rs` / `trace/mod.rs`. Exactly one visible
+    /// callable wins. A miss falls through to associated-item resolution.
+    fn resolve_rust_inline_module_call(
+        &self,
+        src_id: i64,
+        name: &str,
+        sites: &[(String, String)],
+    ) -> Option<i64> {
+        if sites.is_empty() {
+            return None;
+        }
+        let caller_file = self.file_of(src_id)?;
+        let caller_module = self
+            .rust_inline_scopes
+            .get(&src_id)
+            .map(|scope| scope.module.as_str())
+            .unwrap_or("");
+        let nodes = self.by_name.get(name)?;
+        let mut functions = Vec::new();
+        let mut other = Vec::new();
+        for (parent_file, inline_path) in sites {
+            for node in nodes {
+                if node.file_path != *parent_file || !CALLABLE_LABELS.contains(&node.label.as_str())
+                {
+                    continue;
+                }
+                let Some(scope) = self.rust_inline_scopes.get(&node.id) else {
+                    continue;
+                };
+                if scope.module != *inline_path {
+                    continue;
+                }
+                if !rust_path_modules_visible(
+                    &scope.module,
+                    &scope.module_vis,
+                    parent_file,
+                    caller_module,
+                    caller_file,
+                    self.rust_crate_roots.as_ref(),
+                ) || !rust_item_visible(
+                    scope.visibility.as_deref(),
+                    &scope.module,
+                    parent_file,
+                    caller_module,
+                    caller_file,
+                    self.rust_crate_roots.as_ref(),
+                ) {
+                    continue;
+                }
+                if node.label == "Function" {
+                    functions.push(node.id);
+                } else {
+                    other.push(node.id);
+                }
+            }
+        }
+        functions.sort_unstable();
+        functions.dedup();
+        other.sort_unstable();
+        other.dedup();
+        match functions.as_slice() {
+            [id] => Some(*id),
+            [] => match other.as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Resolve a CALLS edge. Receiver dispatch is deliberately method-only:
     /// resolving `value.as_bytes()` to an unrelated free `as_bytes` function
     /// is worse than leaving the edge unresolved. Other calls retain the
@@ -5783,6 +6306,33 @@ impl GraphIndex {
                 .iter()
                 .any(|module_file| self.known_files.contains(module_file));
             if !module_exists {
+                let sites = if let Some(alias_files) = self
+                    .rust_namespaces_by_file
+                    .get(referrer_file)
+                    .and_then(|aliases| aliases.get(first_segment))
+                {
+                    rust_inline_sites_below_alias(
+                        alias_files,
+                        ref_path,
+                        name,
+                        &self.known_files,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                } else {
+                    let module = ref_path
+                        .strip_suffix(name)
+                        .and_then(|path| path.strip_suffix("::"))
+                        .unwrap_or("");
+                    rust_inline_module_sites(
+                        referrer_file,
+                        module,
+                        &self.known_files,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                };
+                if let Some(id) = self.resolve_rust_inline_module_call(src_id, name, &sites) {
+                    return Some(id);
+                }
                 return self.resolve_associated_member(
                     src_id,
                     ref_path,
@@ -10334,6 +10884,105 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
                 target.qualified_name
             );
         }
+    }
+
+    #[test]
+    fn rust_inline_module_site_stops_at_the_missing_file_module() {
+        let known = std::collections::HashSet::from([
+            "src/lib.rs".to_string(),
+            "src/sync/mod.rs".to_string(),
+            "src/sync/barrier.rs".to_string(),
+        ]);
+        assert_eq!(
+            rust_inline_module_sites("src/sync/barrier.rs", "crate::trace", &known, None),
+            vec![("src/lib.rs".to_string(), "trace".to_string())]
+        );
+        assert_eq!(
+            rust_inline_module_sites("src/sync/barrier.rs", "crate::a::b", &known, None),
+            vec![("src/lib.rs".to_string(), "a::b".to_string())]
+        );
+        assert_eq!(
+            rust_inline_module_sites("src/sync/barrier.rs", "crate::sync::helper", &known, None),
+            vec![("src/sync/mod.rs".to_string(), "helper".to_string())]
+        );
+        assert!(
+            rust_inline_module_sites("src/lib.rs", "crate::sync::barrier", &known, None).is_empty(),
+            "a path that lands on a real file module is not inline"
+        );
+    }
+
+    #[test]
+    fn rust_inline_module_calls_resolve_without_a_module_file() {
+        let repo = setup_multifile_repo(
+            "rust-inline-module",
+            "mod trace {\n\
+                 pub(crate) async fn async_trace_leaf() {}\n\
+                 fn private_leaf() {}\n\
+                 pub(crate) fn calls_private() { crate::trace::private_leaf(); }\n\
+             }\n\
+             mod a {\n\
+                 pub mod b { pub fn nested() {} }\n\
+                 mod hidden { pub fn secret() {} }\n\
+             }\n\
+             mod sync;\n",
+            "// placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/sync")).unwrap();
+        fs::write(repo.join("src/sync/mod.rs"), "pub mod barrier;\n").unwrap();
+        fs::write(
+            repo.join("src/sync/barrier.rs"),
+            "pub fn changed_impl() {\n\
+                 crate::trace::async_trace_leaf();\n\
+                 crate::trace::private_leaf();\n\
+                 crate::a::b::nested();\n\
+                 crate::a::hidden::secret();\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let target = |qname: &str| {
+            store
+                .get_node_by_qname("test", qname)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {qname}"))
+        };
+        let leaf = target("src/lib.rs::Function::async_trace_leaf");
+        let private_leaf = target("src/lib.rs::Function::private_leaf");
+        let calls_private = target("src/lib.rs::Function::calls_private");
+        let nested = target("src/lib.rs::Function::nested");
+        let secret = target("src/lib.rs::Function::secret");
+        let caller = target("src/sync/barrier.rs::Function::changed_impl");
+        let calls_from = |id: i64, source: i64| {
+            store
+                .incoming_edges(id, Some("CALLS"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == source)
+        };
+
+        assert!(
+            calls_from(leaf.id, caller.id),
+            "pub(crate) fn in an inline module must resolve across files"
+        );
+        assert!(
+            calls_from(nested.id, caller.id),
+            "nested inline modules must resolve crate::a::b::nested"
+        );
+        assert!(
+            !calls_from(private_leaf.id, caller.id),
+            "a private inline fn must not be linked from another file"
+        );
+        assert!(
+            calls_from(private_leaf.id, calls_private.id),
+            "a private inline fn must still resolve from inside its module"
+        );
+        assert!(
+            !calls_from(secret.id, caller.id),
+            "a public fn inside a private nested inline module is not visible outside it"
+        );
     }
 
     #[test]

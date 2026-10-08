@@ -2786,6 +2786,36 @@ fn modifier_info(source: &[u8], item: Node<'_>) -> ModifierInfo {
     info
 }
 
+/// Enclosing inline `mod` items, outermost first. File modules (`fn` in
+/// `trace.rs`) have no enclosing `mod_item`, so this stays `None`.
+///
+/// The visibility list is parallel to the module path and uses U+001F as a
+/// separator because visibility text itself can contain `::` (`pub(in crate::a)`).
+/// An empty segment means the module is private.
+fn rust_enclosing_inline_modules(source: &[u8], def_node: Node<'_>) -> Option<(String, String)> {
+    let mut names = Vec::new();
+    let mut visibilities = Vec::new();
+    let mut current = def_node.parent();
+    while let Some(node) = current {
+        if node.kind() == "mod_item" {
+            if let Some(name) = node.child_by_field_name("name") {
+                let text = node_text(source, name);
+                if !text.is_empty() {
+                    names.push(text.to_string());
+                    visibilities.push(modifier_info(source, node).visibility.unwrap_or_default());
+                }
+            }
+        }
+        current = node.parent();
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.reverse();
+    visibilities.reverse();
+    Some((names.join("::"), visibilities.join("\u{1f}")))
+}
+
 /// One generic bound: a type parameter constrained by a trait, captured so the
 /// resolver can link `fn f<T: Trait>`
 /// (or a `where T: Trait`) to the bound trait.
@@ -4977,6 +5007,17 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 }
                 if mods.is_const {
                     properties.insert("is_const".into(), serde_json::Value::Bool(true));
+                }
+                if let Some((module, module_vis)) = rust_enclosing_inline_modules(source, def_node)
+                {
+                    properties.insert(
+                        "rust_inline_module".into(),
+                        serde_json::Value::String(module),
+                    );
+                    properties.insert(
+                        "rust_inline_module_vis".into(),
+                        serde_json::Value::String(module_vis),
+                    );
                 }
 
                 // Signature + params + return type for functions/methods, plus
@@ -19732,6 +19773,41 @@ fn plain() {}
         assert!(
             node_props(SRC, "Private").get("visibility").is_none(),
             "private struct has no visibility property"
+        );
+    }
+
+    #[test]
+    fn rust_inline_module_property_records_enclosing_mod_items() {
+        const SRC: &str = r#"
+            fn file_level() {}
+            mod trace {
+                pub(crate) async fn async_trace_leaf() {}
+                pub mod b {
+                    pub fn nested() {}
+                }
+            }
+        "#;
+        let leaf = node_props(SRC, "async_trace_leaf");
+        assert_eq!(
+            leaf.get("rust_inline_module").and_then(|v| v.as_str()),
+            Some("trace")
+        );
+        assert!(node_props(SRC, "file_level")
+            .get("rust_inline_module")
+            .is_none());
+        let nested = node_props(SRC, "nested");
+        assert_eq!(
+            nested.get("rust_inline_module").and_then(|v| v.as_str()),
+            Some("trace::b")
+        );
+        assert_eq!(
+            nested
+                .get("rust_inline_module_vis")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .split('\u{1f}')
+                .collect::<Vec<_>>(),
+            vec!["", "pub"]
         );
     }
 
