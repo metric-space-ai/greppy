@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+/// How long an unreferenced, unused tracker keeps its watcher before release.
+pub const TRACKER_IDLE_RELEASE_MS: u64 = 300_000;
 pub const HEARTBEAT_STALE_AFTER_MS: u64 = 5 * HEARTBEAT_INTERVAL_MS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +61,15 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
              repository TEXT PRIMARY KEY,
              epoch INTEGER NOT NULL CHECK(epoch >= 0)
          );
+         -- When a tracker was last requested or its last workspace removed.
+         -- The supervisor releases a tracker only after it has been unused and
+         -- unreferenced for TRACKER_IDLE_RELEASE_MS, so back-to-back workspaces
+         -- reuse a warm watcher and snapshot (a separate table keeps older
+         -- releases, which never read it, compatible).
+         CREATE TABLE IF NOT EXISTS cow_repository_tracker_use (
+             repository TEXT PRIMARY KEY,
+             used_unix_ms INTEGER NOT NULL CHECK(used_unix_ms >= 0)
+         );
          CREATE TABLE IF NOT EXISTS cow_repository_events (
              repository TEXT NOT NULL REFERENCES cow_repository_trackers(repository)
                  ON DELETE CASCADE,
@@ -113,6 +124,7 @@ pub(crate) fn request(
 ) -> Result<()> {
     let repository = path_text(repository)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    touch(&transaction, repository, now_unix_ms)?;
     let existing: Option<(String, i64, i64)> = transaction
         .query_row(
             "SELECT state, owner_pid, heartbeat_unix_ms
@@ -394,6 +406,53 @@ pub(crate) fn heartbeat(
         return Err(Error::ConcurrentRepositoryMutation);
     }
     Ok(())
+}
+
+/// Records that `repository`'s tracker was just used (requested, or its last
+/// workspace removed); idle release counts from here.
+pub(crate) fn touch(connection: &Connection, repository: &str, now_unix_ms: u64) -> Result<()> {
+    connection.execute(
+        "INSERT INTO cow_repository_tracker_use(repository, used_unix_ms) VALUES(?1, ?2)
+         ON CONFLICT(repository) DO UPDATE
+         SET used_unix_ms = MAX(used_unix_ms, excluded.used_unix_ms)",
+        params![repository, now_unix_ms as i64],
+    )?;
+    Ok(())
+}
+
+/// Releases `repository`'s tracker when no workspace references it and it has
+/// been unused for `idle_ms`. Returns whether it was released.
+pub(crate) fn release_if_idle(
+    connection: &mut Connection,
+    repository: &Path,
+    now_unix_ms: u64,
+    idle_ms: u64,
+) -> Result<bool> {
+    let text = path_text(repository)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let referenced: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE repository = ?1)",
+        params![text],
+        |row| row.get(0),
+    )?;
+    let used: i64 = transaction
+        .query_row(
+            "SELECT used_unix_ms FROM cow_repository_tracker_use WHERE repository = ?1",
+            params![text],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if referenced || now_unix_ms.saturating_sub(used.max(0) as u64) < idle_ms {
+        return Ok(false);
+    }
+    release(&transaction, repository)?;
+    transaction.execute(
+        "DELETE FROM cow_repository_tracker_use WHERE repository = ?1",
+        params![text],
+    )?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 /// Releases the tracker of a repository no workspace references any more.

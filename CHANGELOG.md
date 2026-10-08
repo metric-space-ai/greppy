@@ -60,8 +60,9 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   as one error, and prints no partial-output line for empty output.
 - Inference daemons are bound to the build that started them; a newer greppy
   never reuses an older build's daemon.
-- The workspace provider releases a repository's watcher when its last
-  workspace is removed (inotify leak).
+- The workspace provider releases a repository's watcher five minutes after
+  its last workspace is removed (inotify leak). A workspace created sooner
+  reuses the warm watcher and snapshot.
 - Files that git calls clean but whose bytes differ from the Base checkout
   (line endings) are indexed from the working tree.
 - Graph reads no longer wait for a deferred embedding job.

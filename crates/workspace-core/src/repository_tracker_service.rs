@@ -86,13 +86,19 @@ pub fn spawn_repository_tracker_for(
 }
 
 fn supervise(core: Arc<WorkspaceCore>, repository_scope: Option<PathBuf>) {
-    supervise_with_watcher_count(core, repository_scope, None);
+    supervise_with_watcher_count(
+        core,
+        repository_scope,
+        None,
+        crate::repository_tracker::TRACKER_IDLE_RELEASE_MS,
+    );
 }
 
 fn supervise_with_watcher_count(
     core: Arc<WorkspaceCore>,
     repository_scope: Option<PathBuf>,
     live_watchers: Option<Arc<AtomicUsize>>,
+    idle_release_ms: u64,
 ) {
     let mut watchers = HashMap::<PathBuf, LiveWatcher>::new();
     let mut last_heartbeat = Instant::now();
@@ -172,6 +178,12 @@ fn supervise_with_watcher_count(
         {
             let heartbeat = now_ms();
             watchers.retain(|repository, _| {
+                // An unreferenced tracker keeps its watcher until it has been
+                // idle long enough; then it is released and dropped here.
+                if let Ok(true) = core.release_idle_repository_tracker(repository, idle_release_ms)
+                {
+                    return false;
+                }
                 match core.heartbeat_repository_tracker(repository, heartbeat) {
                     Ok(()) => true,
                     Err(crate::Error::ConcurrentRepositoryMutation) => false,
@@ -1415,10 +1427,25 @@ mod tests {
         data_root: PathBuf,
         live_watchers: Arc<AtomicUsize>,
     ) -> thread::JoinHandle<()> {
+        spawn_observing_tracker_with_idle(data_root, live_watchers, 0)
+    }
+
+    fn spawn_observing_tracker_with_idle(
+        data_root: PathBuf,
+        live_watchers: Arc<AtomicUsize>,
+        idle_release_ms: u64,
+    ) -> thread::JoinHandle<()> {
         let core = Arc::new(WorkspaceCore::open(data_root.join("core")).unwrap());
         thread::Builder::new()
             .name("greppy-repository-tracker".into())
-            .spawn(move || super::supervise_with_watcher_count(core, None, Some(live_watchers)))
+            .spawn(move || {
+                super::supervise_with_watcher_count(
+                    core,
+                    None,
+                    Some(live_watchers),
+                    idle_release_ms,
+                )
+            })
             .unwrap()
     }
 
@@ -1508,6 +1535,38 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_created_within_the_idle_window_reuses_the_warm_tracker() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository_path = temp.path().join("repo");
+        std::fs::create_dir(&repository_path).unwrap();
+        std::fs::create_dir(repository_path.join(".git")).unwrap();
+        let repository = std::fs::canonicalize(&repository_path).unwrap();
+        let data_root = temp.path().join("data");
+        let core = WorkspaceCore::open(data_root.join("core")).unwrap();
+        let baseline = overlay_baseline(&repository, "tracker-idle");
+        let first = core
+            .create_overlay_workspace("ws-a", baseline.clone())
+            .unwrap();
+        let live_watchers = Arc::new(AtomicUsize::new(0));
+        let _tracker =
+            spawn_observing_tracker_with_idle(data_root, Arc::clone(&live_watchers), 600_000);
+        core.request_repository_tracker(&repository).unwrap();
+        let active = wait_for_live_watcher(&core, &repository, &live_watchers, "initial");
+
+        // The last workspace goes away; within the idle window the watcher
+        // and its epoch stay, so the next workspace starts warm.
+        core.remove_workspace(first).unwrap();
+        assert_watcher_survives_a_heartbeat(&core, &repository, &live_watchers);
+        let second = core
+            .create_overlay_workspace_from_shared_baseline("ws-b", &baseline)
+            .unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+        let reused = wait_for_live_watcher(&core, &repository, &live_watchers, "reuse");
+        assert_eq!(reused.epoch, active.epoch, "a warm tracker must be reused");
+        core.remove_workspace(second).unwrap();
+    }
+
+    #[test]
     fn removing_the_last_workspace_releases_the_tracker_and_its_watcher() {
         let temp = tempfile::tempdir().unwrap();
         let repository_path = temp.path().join("repo");
@@ -1539,10 +1598,6 @@ mod tests {
         );
 
         core.remove_workspace(second).unwrap();
-        assert!(core
-            .repository_tracker_status(&repository)
-            .unwrap()
-            .is_none());
         wait_until_watcher_released(&core, &repository, &live_watchers, "last workspace");
 
         let again = core

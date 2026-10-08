@@ -3230,7 +3230,9 @@ pub(crate) fn print_nav_rows(
     let total = rows.len();
     // An explicit `--limit` is a row budget for text as well as JSON: rows
     // `--offset .. --offset + --limit`, like the JSON window. It wins over the
-    // summary shape, and `--all` does not lift it.
+    // summary shape, and `--all` does not lift it. The first `--offset` rows
+    // are printed too: the output budget layer drops exactly that many lines
+    // (and adds its offset/total lines), so skipping here would page twice.
     let explicit_limit = cli_result_limit_raw();
     let offset = if explicit_limit.is_some() {
         cli_result_offset().min(total)
@@ -3257,7 +3259,7 @@ pub(crate) fn print_nav_rows(
         total
     };
     let mut cache: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
-    for (index, row) in rows.iter().skip(offset).take(shown).enumerate() {
+    for (index, row) in rows.iter().take(offset + shown).enumerate() {
         let marker = if row.test { "  test" } else { "" };
         if !code {
             println!("{}:{}  {}{}", row.file, row.line, row.name, marker);

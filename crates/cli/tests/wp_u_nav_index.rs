@@ -73,7 +73,9 @@ fn row_lines(stdout: &str) -> Vec<&str> {
             let Some((file, rest)) = line.split_once(':') else {
                 return false;
             };
-            !file.is_empty()
+            // A row names a file (`src/lib.rs:4`); paging metadata such as
+            // `total: 3` / `offset: 1` does not.
+            file.contains('.')
                 && !file.contains(' ')
                 && rest
                     .split_whitespace()

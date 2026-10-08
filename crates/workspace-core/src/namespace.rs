@@ -704,7 +704,7 @@ impl WorkspaceCore {
             "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
             params![content_id, git_id],
         )?;
-        release_unreferenced_repository_trackers(&transaction, &repositories)?;
+        touch_unreferenced_repository_trackers(&transaction, &repositories)?;
         transaction.commit()?;
         for chunk in chunks {
             self.chunks.unpin(chunk)?;
@@ -893,6 +893,19 @@ impl WorkspaceCore {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         repository_tracker::request(&mut connection, repository, repository_tracker_now_ms())
+    }
+
+    /// Releases `repository`'s tracker when no workspace references it and it
+    /// has been unused for `idle_ms`. Returns whether it was released.
+    pub fn release_idle_repository_tracker(&self, repository: &Path, idle_ms: u64) -> Result<bool> {
+        let _writer = self.lock_metadata_writer()?;
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::release_if_idle(
+            &mut connection,
+            repository,
+            repository_tracker_now_ms(),
+            idle_ms,
+        )
     }
 
     pub fn pending_repository_trackers(&self) -> Result<Vec<PathBuf>> {
@@ -2014,7 +2027,7 @@ impl WorkspaceCore {
             "DELETE FROM cow_workspaces WHERE id = ?1",
             params![workspace.id],
         )?;
-        release_unreferenced_repository_trackers(&transaction, &repositories)?;
+        touch_unreferenced_repository_trackers(&transaction, &repositories)?;
         transaction.commit()?;
         self.promoted_origins
             .lock()
@@ -2066,7 +2079,7 @@ impl WorkspaceCore {
                     "DELETE FROM cow_workspace_pairs WHERE content_id = ?1 AND git_id = ?2",
                     params![content_id, git_id],
                 )?;
-                release_unreferenced_repository_trackers(&transaction, &repositories)?;
+                touch_unreferenced_repository_trackers(&transaction, &repositories)?;
             }
             transaction.commit()?;
         }
@@ -2964,10 +2977,15 @@ fn tracked_repositories(connection: &Connection, ids: &[&str]) -> Result<Vec<Str
     Ok(repositories)
 }
 
-fn release_unreferenced_repository_trackers(
+/// Starts the idle clock of every tracker whose last workspace was just
+/// removed. The tracker keeps its watcher (a workspace created right after
+/// reuses it); the supervisor releases it once idle (see
+/// `repository_tracker::release_if_idle`).
+fn touch_unreferenced_repository_trackers(
     connection: &Connection,
     repositories: &[String],
 ) -> Result<()> {
+    let now = repository_tracker_now_ms();
     for repository in repositories {
         let still_referenced: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM cow_workspaces WHERE repository = ?1)",
@@ -2975,7 +2993,7 @@ fn release_unreferenced_repository_trackers(
             |row| row.get(0),
         )?;
         if !still_referenced {
-            repository_tracker::release(connection, Path::new(repository))?;
+            repository_tracker::touch(connection, repository, now)?;
         }
     }
     Ok(())

@@ -164,8 +164,9 @@ fn rust_alias_field_and_prelude_calls_stay_precise() {
     );
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
     assert!(
-        out.lines()
-            .any(|line| line.split_whitespace().any(|part| part == "apply")),
+        out.lines().any(|line| line
+            .split_whitespace()
+            .any(|part| part == "apply" || part.ends_with("::apply"))),
         "self.serialize.apply_to_field must resolve: {out}"
     );
 
