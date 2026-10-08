@@ -239,6 +239,39 @@ pub(crate) fn edit_unified_diff(path: &str, before: &[u8], after: &[u8]) -> Stri
     diff
 }
 
+/// 1-based inclusive line span in `after` that differs from `before`.
+/// The prefix/suffix scan is the one `edit_unified_diff` uses. `None` when
+/// no line differs (including a trailing-newline-only change `lines()` ignores).
+pub(crate) fn edit_changed_line_span(before: &[u8], after: &[u8]) -> Option<(usize, usize)> {
+    let before_text = String::from_utf8_lossy(before);
+    let after_text = String::from_utf8_lossy(after);
+    let old_lines: Vec<&str> = before_text.lines().collect();
+    let new_lines: Vec<&str> = after_text.lines().collect();
+    let mut head = 0usize;
+    while head < old_lines.len() && head < new_lines.len() && old_lines[head] == new_lines[head] {
+        head += 1;
+    }
+    let mut tail = 0usize;
+    while tail < old_lines.len().saturating_sub(head)
+        && tail < new_lines.len().saturating_sub(head)
+        && old_lines[old_lines.len() - 1 - tail] == new_lines[new_lines.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let new_last = new_lines.len().saturating_sub(tail);
+    if head >= new_last {
+        let old_last = old_lines.len().saturating_sub(tail);
+        if head >= old_last {
+            return None;
+        }
+        // Pure deletion: the new file has no changed line of its own. Point at
+        // the boundary where the lines were removed so the receipt still names one.
+        let line = (head + 1).min(new_lines.len().max(1));
+        return Some((line, line));
+    }
+    Some((head + 1, new_last))
+}
+
 pub(crate) fn edit_line_count(content: &[u8]) -> usize {
     if content.is_empty() {
         return 0;
@@ -1167,6 +1200,28 @@ fn edit_validate_syntax(
     .with("next", serde_json::json!(SYNTAX_ALLOW_NEXT)))
 }
 
+/// The text receipt's first line. Names the symbol body that was replaced and
+/// the lines that actually differ, so a model cannot read the whole-span echo
+/// as "the body was swallowed".
+fn edit_note_replaced_body(record: &mut EditRecord, symbol: &str) {
+    if record.already_as_sent {
+        return;
+    }
+    let (Some((full_first, full_last)), Some((changed_first, changed_last))) =
+        (record.span, record.changed_span)
+    else {
+        return;
+    };
+    let verb = if record.published {
+        "replaced"
+    } else {
+        "would replace"
+    };
+    record.summary = Some(format!(
+        "{verb} body of {symbol} (lines {full_first}-{full_last}), changed lines {changed_first}-{changed_last}"
+    ));
+}
+
 /// Publish one file and answer with the record the contract promises: the
 /// file, every span it wrote, the resulting text, and a handle for the new
 /// span so the next edit needs no `read` in between.
@@ -1183,6 +1238,7 @@ pub(crate) fn edit_publish(
     let first_end = first_end.min(new_content.len());
     let text = String::from_utf8_lossy(&new_content[first_start..first_end]).into_owned();
     let span = edit_span_lines(&new_content, first_start, first_end - first_start);
+    let changed_span = edit_changed_line_span(&located.content, &new_content);
     let exact_required = changed.len() > 1;
     let exact_address = edit_exact_address(&located.rel, &new_content, &changed);
     let mut operation = EditOperation {
@@ -1201,6 +1257,7 @@ pub(crate) fn edit_publish(
     let mut record = EditRecord {
         files: vec![located.rel.clone()],
         span: Some(span),
+        changed_span,
         text: Some(text),
         published: !dry_run,
         ..EditRecord::default()
@@ -2434,6 +2491,12 @@ pub(crate) fn edit_record_json(
     }
     if let Some((first, last)) = record.span {
         value.insert("span".into(), serde_json::json!(format!("{first}:{last}")));
+    }
+    if let Some((first, last)) = record.changed_span {
+        value.insert(
+            "changed_span".into(),
+            serde_json::json!(format!("{first}:{last}")),
+        );
     }
     if let Some(text) = &record.text {
         value.insert("text".into(), serde_json::json!(text));
@@ -4567,6 +4630,7 @@ pub(crate) fn dispatch_edit_grammar(
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
                 let mut new_bytes = edit_positional_payload(new, "NEW")?;
+                let symbol_label = symbol.clone();
                 let spec = WhereSpec {
                     file: None,
                     old: None,
@@ -4600,7 +4664,7 @@ pub(crate) fn dispatch_edit_grammar(
                     );
                 }
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
-                edit_publish(
+                let mut record = edit_publish(
                     root_path,
                     &located,
                     new_content,
@@ -4608,7 +4672,11 @@ pub(crate) fn dispatch_edit_grammar(
                     dry_run,
                     verify,
                     false,
-                )
+                )?;
+                if body {
+                    edit_note_replaced_body(&mut record, &symbol_label);
+                }
+                Ok(record)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
         }

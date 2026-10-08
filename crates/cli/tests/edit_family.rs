@@ -2545,3 +2545,116 @@ fn regex_with_no_matches_names_search_pattern() {
         "{next}"
     );
 }
+
+fn receipt_source_lines(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .filter(|line| {
+            let Some(rest) = line.strip_prefix('│') else {
+                return false;
+            };
+            rest.starts_with('>') || rest.starts_with(' ')
+        })
+        .count()
+}
+
+#[test]
+fn heredoc_body_reindents_rust_and_javascript_from_stdin() {
+    let rust_before =
+        "fn score(value: i32) -> i32 {\n    let doubled = value * 2;\n    doubled + 1\n}\n";
+    let rust_after =
+        "fn score(value: i32) -> i32 {\n    let doubled = value * 3;\n    doubled + 4\n}\n";
+    let heredoc = b"        let doubled = value * 3;\n        doubled + 4\n";
+    let preindented = b"    let doubled = value * 3;\n    doubled + 4\n";
+    for (label, bytes) in [
+        ("heredoc", heredoc.as_slice()),
+        ("preindented", preindented.as_slice()),
+    ] {
+        let fixture = Fixture::new(&format!("heredoc-rust-{label}"));
+        let file = fixture.repo.join("score.rs");
+        std::fs::write(&file, rust_before).unwrap();
+        let applied =
+            fixture.run_with_stdin(&["replace", "score.rs::Function::score", "--body"], bytes);
+        assert!(applied.status.success(), "{label}: {}", combined(&applied));
+        assert_file(&file, rust_after);
+    }
+
+    let js_before =
+        "function score(value) {\n    const doubled = value * 2;\n    return doubled + 1;\n}\n";
+    let js_after =
+        "function score(value) {\n    const doubled = value * 3;\n    return doubled + 4;\n}\n";
+    let js_heredoc = b"        const doubled = value * 3;\n        return doubled + 4;\n";
+    let js_pre = b"    const doubled = value * 3;\n    return doubled + 4;\n";
+    for (label, bytes) in [
+        ("heredoc", js_heredoc.as_slice()),
+        ("preindented", js_pre.as_slice()),
+    ] {
+        let fixture = Fixture::new(&format!("heredoc-js-{label}"));
+        let file = fixture.repo.join("score.js");
+        std::fs::write(&file, js_before).unwrap();
+        let applied =
+            fixture.run_with_stdin(&["replace", "score.js::Function::score", "--body"], bytes);
+        assert!(applied.status.success(), "{label}: {}", combined(&applied));
+        assert_file(&file, js_after);
+    }
+}
+
+#[test]
+fn body_replace_receipt_shows_only_changed_lines() {
+    let mut inner = Vec::new();
+    for i in 0..38 {
+        inner.push(format!("    let kept_{i} = {i};"));
+    }
+    let original = format!("fn probe() {{\n{}\n}}\n", inner.join("\n"));
+    inner[18] = "    let after_change = 1;".to_string();
+    inner[19] = "    let after_next = 2;".to_string();
+    let replacement = format!("{{\n{}\n}}", inner.join("\n"));
+    let expected = format!("fn probe() {replacement}\n");
+
+    let fixture = Fixture::new("body-receipt-lines");
+    let file = fixture.repo.join("probe.rs");
+    std::fs::write(&file, &original).unwrap();
+    let applied = fixture.run(&[
+        "replace",
+        "probe.rs::Function::probe",
+        &replacement,
+        "--body",
+    ]);
+    let stdout = String::from_utf8_lossy(&applied.stdout);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let first = stdout.lines().next().unwrap_or("");
+    assert!(
+        first.starts_with("replaced body of probe.rs::Function::probe (lines "),
+        "{stdout}"
+    );
+    assert!(first.contains("changed lines "), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("applied probe.rs:1-40")),
+        "address line must keep the full span\n{stdout}"
+    );
+    assert!(
+        receipt_source_lines(&stdout) <= 6,
+        "changed-line echo too long ({} lines)\n{stdout}",
+        receipt_source_lines(&stdout)
+    );
+    assert!(stdout.contains("after_change"), "{stdout}");
+    assert!(!stdout.contains("kept_0"), "{stdout}");
+    assert!(!stdout.contains("kept_37"), "{stdout}");
+    assert_file(&file, &expected);
+
+    std::fs::write(&file, &original).unwrap();
+    let json_run = fixture.run(&[
+        "replace",
+        "probe.rs::Function::probe",
+        &replacement,
+        "--body",
+        "--json",
+    ]);
+    assert!(json_run.status.success(), "{}", combined(&json_run));
+    let value: serde_json::Value = serde_json::from_slice(&json_run.stdout).unwrap();
+    assert_eq!(value["span"], "1:40", "{value}");
+    assert_eq!(value["changed_span"], "20:21", "{value}");
+    assert_file(&file, &expected);
+}

@@ -342,6 +342,9 @@ pub(crate) fn emit_edit_outcome(
                 // where the spec orders them. A dry run must not say "applied"
                 // — it wrote nothing, and a receipt that overstates is the
                 // worst output this tool can produce.
+                if let Some(summary) = &record.summary {
+                    println!("{summary}");
+                }
                 let word = if record.published {
                     "applied"
                 } else {
@@ -373,13 +376,13 @@ pub(crate) fn emit_edit_outcome(
                         }
                     }
                 }
-                // Echo the landed span with context, read back from disk.
+                // Echo the landed change with context, read back from disk.
                 // The bare receipt is a claim; agents measurably re-read the
                 // whole file to verify it (three full re-reads of one 7.8K
-                // file in a single bench run). ~300 characters of read-back
-                // evidence retire that pattern — the harness Edit tool proved
-                // it. Disk is the source: this shows what IS there now, not
-                // what was sent.
+                // file in a single bench run). A short read-back of the lines
+                // that actually differ retires that pattern without reprinting
+                // a whole function the caller just wrote. Disk is the source:
+                // this shows what IS there now, not what was sent.
                 // Multi-site receipts (headline set) keep their per-site
                 // address lines: a min-max span would mark untouched lines
                 // between the sites as changed, which is worse than no echo.
@@ -421,14 +424,22 @@ pub(crate) fn emit_edit_outcome(
     }
 }
 
-/// Read the edited span back from disk and print it with ±3 lines of context,
-/// numbered read-file style. Only the single-file, known-span case — multi-site
-/// edits keep their per-site address lines. Long spans are elided in the
-/// middle: the evidence a verifier needs is the seams, not the body it wrote.
+/// Read the edited lines back from disk and print them numbered, read-file
+/// style. When `changed_span` is set, only those lines are shown, with ±2 of
+/// context; otherwise the whole written span is shown with ±3. Only the
+/// single-file case — multi-site edits keep their per-site address lines.
+/// Regions longer than 12 lines are cut to the first 6 and last 6: the
+/// evidence a verifier needs is the seams, not the body it wrote.
 fn print_landed_span(record: &super::EditRecord, root_path: &std::path::Path) {
-    const CONTEXT: usize = 3;
     const HEAD_TAIL: usize = 6;
-    let (Some((first, last)), [file]) = (record.span, record.files.as_slice()) else {
+    let (first, last, context) = match record.changed_span {
+        Some((first, last)) => (first, last, 2usize),
+        None => match record.span {
+            Some((first, last)) => (first, last, 3usize),
+            None => return,
+        },
+    };
+    let [file] = record.files.as_slice() else {
         return;
     };
     let Ok(content) = std::fs::read_to_string(root_path.join(file)) else {
@@ -438,8 +449,8 @@ fn print_landed_span(record: &super::EditRecord, root_path: &std::path::Path) {
     if first == 0 || first > last {
         return;
     }
-    let start = first.saturating_sub(CONTEXT + 1);
-    let end = (last + CONTEXT).min(lines.len());
+    let start = first.saturating_sub(context + 1);
+    let end = (last + context).min(lines.len());
     if start >= end {
         return;
     }

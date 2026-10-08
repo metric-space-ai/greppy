@@ -583,28 +583,9 @@ fn plan_body_range_within(
 }
 
 fn plan_replacement_body(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
-    fn outer_braces(content: &[u8]) -> Option<(usize, usize)> {
-        let open = content
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())?;
-        let close = content
-            .iter()
-            .rposition(|byte| !byte.is_ascii_whitespace())?;
-        (content[open] == b'{' && content[close] == b'}').then_some((open, close))
-    }
-
-    if outer_braces(requested).is_some() {
-        return requested.to_vec();
-    }
-    let Some((open, close)) = outer_braces(current_body) else {
-        return requested.to_vec();
-    };
-    let mut replacement =
-        Vec::with_capacity(open + 1 + requested.len() + current_body.len() - close);
-    replacement.extend_from_slice(&current_body[..=open]);
-    replacement.extend_from_slice(requested);
-    replacement.extend_from_slice(&current_body[close..]);
-    replacement
+    // The CLI verb owns the brace-preserving indent rules. The plan shorthand
+    // must apply the same ones, or a heredoc body is glued here and correct there.
+    crate::verbs::replacement_body_preserving_delimiters(current_body, requested)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

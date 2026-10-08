@@ -6843,6 +6843,12 @@ struct EditRecord {
     headline: Option<String>,
     files: Vec<String>,
     span: Option<(usize, usize)>,
+    /// 1-based inclusive lines of the resulting file that differ from the file
+    /// before this edit. Narrower than `span` when a large range is rewritten
+    /// but only a few lines change. Absent when no line differs.
+    changed_span: Option<(usize, usize)>,
+    /// Text-receipt first line, printed ahead of `applied file:span`.
+    summary: Option<String>,
     text: Option<String>,
     handle: Option<String>,
     diagnostics: Option<Vec<String>>,
