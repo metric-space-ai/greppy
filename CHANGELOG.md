@@ -4,6 +4,8 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-10-08
+
 ### Navigation and call graph
 
 - Rust calls into inline `mod` blocks resolve again (a 0.4.0 regression:
