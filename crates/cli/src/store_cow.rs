@@ -2965,6 +2965,11 @@ fn add_size_mismatched_base_paths(
             "open Base inventory for Store Delta visibility: {error}"
         ))
     })?;
+    // A published Base is immutable, but a concurrent publish may briefly hold
+    // its lock; wait like every other Base reader instead of failing at once.
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| Error::Store(format!("configure Base inventory read: {error}")))?;
     let mut statement = connection
         .prepare("SELECT rel_path, size FROM file_state")
         .map_err(|error| Error::Store(format!("read Base inventory sizes: {error}")))?;
