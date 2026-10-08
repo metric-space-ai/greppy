@@ -370,7 +370,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     if let Some(parent) = config.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    #[allow(fn_to_numeric_cast)]
+    #[allow(clippy::fn_to_numeric_cast)]
     unsafe {
         libc::signal(
             libc::SIGTERM,

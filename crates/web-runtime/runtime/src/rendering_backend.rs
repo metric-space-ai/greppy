@@ -203,7 +203,8 @@ mod tests {
     #[test]
     fn renderer_errors_keep_their_detail() {
         let error =
-            open_rendering_backend(true, false, || Err("ConnectionFailed".to_owned())).unwrap_err();
+            open_rendering_backend::<(), _>(true, false, || Err("ConnectionFailed".to_owned()))
+                .unwrap_err();
         assert_eq!(
             error.to_string(),
             "software renderer failed: ConnectionFailed"
