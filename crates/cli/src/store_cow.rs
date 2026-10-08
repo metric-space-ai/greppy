@@ -2950,7 +2950,9 @@ fn add_size_mismatched_base_paths(
     dirty: &mut Vec<String>,
     deleted: &[String],
 ) -> Result<()> {
-    let Some((base_path, bound_commit)) = overlay_environment(root)? else {
+    // Recovery lookup: this runs while `greppy index` rebuilds a missing Base,
+    // and a missing Base simply has no sizes to compare.
+    let Some((base_path, bound_commit)) = overlay_environment_for_recovery(root)? else {
         return Ok(());
     };
     if bound_commit != base_commit || !base_path.is_file() {

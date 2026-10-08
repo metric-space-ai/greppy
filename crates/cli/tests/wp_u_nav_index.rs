@@ -287,7 +287,7 @@ fn plain_who_calls_limit_truncates_and_names_the_remainder() {
         &store,
     );
     assert_eq!(code, 0, "paged who-calls failed\n{paged}\n{err}");
-    assert_eq!(row_lines(&paged), vec![shown[1].clone()], "{paged}");
+    assert_eq!(row_lines(&paged), vec![shown[1]], "{paged}");
 
     let (code, callees, err) = run(&["callees", "c1", "--limit", "1"], &repo, &store);
     assert_eq!(code, 0, "callees failed\n{callees}\n{err}");

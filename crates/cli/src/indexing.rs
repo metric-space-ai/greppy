@@ -1985,8 +1985,13 @@ pub(crate) fn dispatch_index(
     // attached, so a current index does not announce a build it will not do.
     // Only an explicit foreground `greppy index` may answer "already current":
     // a background index was started by a query that needs a publication.
+    // An overlay error (e.g. a missing Base) must reach the rebuilding path
+    // below, never abort `greppy index` here.
     if !background_job.is_background()
-        && crate::store_cow::overlay_environment(&effective_root)?.is_none()
+        && matches!(
+            crate::store_cow::overlay_environment(&effective_root),
+            Ok(None)
+        )
     {
         if let Some(code) = try_skip_current_plain_index(
             &store_path,
