@@ -639,7 +639,22 @@ fn remaining_wall_below_fifth(deadline: Instant, total: Duration, now: Instant) 
         .unwrap_or(true)
 }
 
-/// Stream a turn; on a retryable failure, retry exactly once.
+/// Backoff before each retry of a retryable model failure (about one minute in
+/// total). A gateway blip (EOF, reset, 5xx, 529) often outlasts a single 2 s
+/// retry: the 0.4.1 bench lost whole `greppy -p` runs to one, while Claude
+/// Code, Codex and OpenCode retried through the same blips.
+#[cfg(not(test))]
+const MODEL_RETRY_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+    std::time::Duration::from_secs(30),
+];
+#[cfg(test)]
+const MODEL_RETRY_DELAYS: [std::time::Duration; 5] = [std::time::Duration::from_millis(1); 5];
+
+/// Stream a turn; on a retryable failure, retry with [`MODEL_RETRY_DELAYS`].
 ///
 /// Retryable: pure transport/connect errors, and gateway-side transient
 /// HTTP statuses (429 and the 5xx family, incl. Anthropic's 529). Client
@@ -650,17 +665,15 @@ fn stream_turn_with_retry(
     req: &ModelRequest,
     on_event: &mut dyn FnMut(LoopEvent),
 ) -> Result<TurnResult, ClientError> {
-    match call_model(model, req, on_event) {
-        Ok(t) => Ok(t),
-        Err(first) if is_retryable(&first) => {
-            // One immediate retry at the loop boundary.
-            // Deviation from pi: pi's session-level auto-retry is configurable
-            // and delayed; we do a single immediate retry.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            call_model(model, req, on_event)
+    let mut result = call_model(model, req, on_event);
+    for delay in MODEL_RETRY_DELAYS {
+        match &result {
+            Err(error) if is_retryable(error) => std::thread::sleep(delay),
+            _ => return result,
         }
-        Err(other) => Err(other),
+        result = call_model(model, req, on_event);
     }
+    result
 }
 
 fn is_retryable(err: &ClientError) -> bool {
@@ -1325,25 +1338,48 @@ mod tests {
     }
 
     #[test]
-    fn transport_error_retries_once_then_fails() {
-        let mut model = FakeModel::new(vec![
-            ScriptedTurn {
+    fn transport_error_retries_through_the_backoff_then_fails() {
+        let mut turns: Vec<ScriptedTurn> = (0..MODEL_RETRY_DELAYS.len())
+            .map(|_| ScriptedTurn {
                 events: vec![],
                 result: Err(ClientError::Transport("connection reset".into())),
-            },
-            ScriptedTurn {
-                events: vec![],
-                result: Err(ClientError::Transport("still down".into())),
-            },
-        ]);
+            })
+            .collect();
+        turns.push(ScriptedTurn {
+            events: vec![],
+            result: Err(ClientError::Transport("still down".into())),
+        });
+        let mut model = FakeModel::new(turns);
         let mut env = FakeEnv::new(vec![]);
         let config = AgentConfig::default().with_model("mock");
 
         let err = run(&mut model, &mut env, &config, "hi").expect_err("must fail");
         assert!(matches!(err, LoopError::Transport(_)));
         assert!(err.to_string().contains("still down"));
-        // Initial attempt + one retry.
-        assert_eq!(model.calls, 2);
+        // Initial attempt + one retry per backoff step.
+        assert_eq!(model.calls, 1 + MODEL_RETRY_DELAYS.len());
+    }
+
+    #[test]
+    fn transport_blip_longer_than_one_retry_recovers() {
+        // An EOF burst that outlasts the first two retries (the 0.4.1 bench
+        // failure) must not end the run.
+        let blip = || ScriptedTurn {
+            events: vec![],
+            result: Err(ClientError::Transport("Unexpected EOF".into())),
+        };
+        let mut model = FakeModel::new(vec![
+            blip(),
+            blip(),
+            blip(),
+            text_turn("recovered", usage(1, 1)),
+        ]);
+        let mut env = FakeEnv::new(vec![]);
+        let config = AgentConfig::default().with_model("mock");
+
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("recovers");
+        assert_eq!(result.final_text, "recovered");
+        assert_eq!(model.calls, 4);
     }
 
     #[test]
@@ -1382,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn http_5xx_retries_once_then_fails() {
+    fn http_5xx_retries_through_the_backoff_then_fails() {
         let scripted = || ScriptedTurn {
             events: vec![],
             result: Err(ClientError::Http {
@@ -1390,17 +1426,18 @@ mod tests {
                 body: "overloaded".into(),
             }),
         };
-        let mut model = FakeModel::new(vec![scripted(), scripted()]);
+        let mut model =
+            FakeModel::new((0..=MODEL_RETRY_DELAYS.len()).map(|_| scripted()).collect());
         let mut env = FakeEnv::new(vec![]);
         let config = AgentConfig::default().with_model("mock");
 
         let err = run(&mut model, &mut env, &config, "hi").expect_err("http fatal");
         assert!(matches!(err, LoopError::Http { status: 503, .. }));
-        assert_eq!(model.calls, 2);
+        assert_eq!(model.calls, 1 + MODEL_RETRY_DELAYS.len());
     }
 
     #[test]
-    fn stream_error_retries_once_and_recovers() {
+    fn stream_error_retries_and_recovers() {
         let mut model = FakeModel::new(vec![
             ScriptedTurn {
                 events: vec![],

@@ -148,9 +148,12 @@ fn spawn_gateway(
                         } else if first.starts_with("POST /v1/messages") {
                             thread::sleep(delay);
                             if fail_messages {
+                                // A non-retryable 400: the model client retries
+                                // 429/5xx/transport errors with about a minute of
+                                // backoff, which this test does not exercise.
                                 let body = r#"{"error":{"message":"serve stub failure"}}"#;
                                 let response = format!(
-                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                     body.len()
                                 );
                                 stream.write_all(response.as_bytes()).ok();
