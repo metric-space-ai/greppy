@@ -647,17 +647,20 @@ mod tests {
         std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let nested = parent.path().join("inference-cache").join("v1");
         let cache = EmbeddingContentCache::open(&nested).unwrap();
-        drop(cache);
         let mode =
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(parent.path()), 0o755);
         assert_eq!(mode(&parent.path().join("inference-cache")), 0o700);
         assert_eq!(mode(&nested), 0o700);
         assert_eq!(mode(&nested.join("document-embeddings.db")), 0o600);
+        // SQLite creates the WAL sidecars lazily and removes them when the last
+        // connection closes, so check them while the cache is still open.
         for suffix in ["-wal", "-shm"] {
             let sidecar = nested.join(format!("document-embeddings.db{suffix}"));
-            assert!(sidecar.exists(), "WAL open should create {suffix}");
-            assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+            }
         }
+        drop(cache);
     }
 }

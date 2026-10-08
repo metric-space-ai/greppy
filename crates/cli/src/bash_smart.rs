@@ -1939,9 +1939,7 @@ fn retain_stream(
     line_ranges: &[(usize, usize)],
     retention_error: &mut Option<greppy_store::Error>,
 ) -> Option<String> {
-    let Some(store) = store else {
-        return None;
-    };
+    let store = store?;
     match insert_pack(store, project, query, raw, stream, line_ranges) {
         Ok(id) => Some(id),
         Err(error) => {
@@ -3866,8 +3864,8 @@ mod tests {
 FAIL: test_one (test_mod.Example)\n\
 ----------------------------------------------------------------------\n\
 Traceback (most recent call last):\n\
-  File \"test_mod.py\", line 4, in test_one\n\
-    self.assertEqual(1, 2)\n\
+\x20\x20File \"test_mod.py\", line 4, in test_one\n\
+\x20\x20\x20\x20self.assertEqual(1, 2)\n\
 AssertionError: 1 != 2\n\
 \n\
 ----------------------------------------------------------------------\n\
@@ -3906,8 +3904,8 @@ FAILED (failures=1)\n\
 ERROR: test_boom (test_mod.Example)\n\
 ----------------------------------------------------------------------\n\
 Traceback (most recent call last):\n\
-  File \"test_mod.py\", line 8, in test_boom\n\
-    raise ValueError('bad')\n\
+\x20\x20File \"test_mod.py\", line 8, in test_boom\n\
+\x20\x20\x20\x20raise ValueError('bad')\n\
 ValueError: bad\n\
 \n\
 FAILED (errors=1)\n\
@@ -3927,14 +3925,14 @@ FAILED (errors=1)\n\
 FAIL: test_one (test_mod.Example)\n\
 ----------------------------------------------------------------------\n\
 Traceback (most recent call last):\n\
-  File \"test_mod.py\", line 4, in test_one\n\
-    self.assertEqual(1, 2)\n\
+\x20\x20File \"test_mod.py\", line 4, in test_one\n\
+\x20\x20\x20\x20self.assertEqual(1, 2)\n\
 AssertionError: 1 != 2\n\
 ERROR: test_two (test_mod.Example)\n\
 ----------------------------------------------------------------------\n\
 Traceback (most recent call last):\n\
-  File \"test_mod.py\", line 9, in test_two\n\
-    raise RuntimeError('nope')\n\
+\x20\x20File \"test_mod.py\", line 9, in test_two\n\
+\x20\x20\x20\x20raise RuntimeError('nope')\n\
 RuntimeError: nope\n\
 FAILED (failures=1, errors=1)\n\
 ";

@@ -7394,10 +7394,6 @@ impl DirtyOverlay {
     }
 }
 
-fn dirty_overlay(root_path: &std::path::Path) -> Result<DirtyOverlay> {
-    dirty_overlay_locking(root_path, true)
-}
-
 /// `allow_optional_locks` is false for `doctor`. `git status` otherwise takes
 /// an optional index lock and rewrites `.git/index` when stat cache entries
 /// are racy (typical after `cp -R`). That rewrite changes the index signature
