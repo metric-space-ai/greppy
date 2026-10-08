@@ -24,34 +24,29 @@
 //!     `unquoted_argument`; its parent is the `argument`, so the def node is
 //!     `argument` → `Command`.
 //!
-//! IMPRECISION (honest): because a function/macro's def node is its *name*
-//! `argument_list` (not the enclosing `function_def` that contains the `body`),
-//! the body's call sites are NOT descendants of the def node. The engine's
-//! enclosing-callable walk therefore never attributes a CALLS edge to a CMake
-//! function (same limitation the module notes for Julia), so callee identifiers
-//! are recognised by the CALLS query but **0 CALLS edges are emitted**. The
-//! grammar exposes no distinct name node under `function_def`/`macro_def` that
-//! would let `Capture` pick the body-containing node as the def, so this is a
-//! deliberate trade to keep names + node kinds correct. Definition spans are
-//! the name line only. Not claimed as `supported` (no verification corpus).
+//! A function/macro definition is the body-containing `function_def` /
+//! `macro_def` (tagged `@def`). The name is still the first `argument` of the
+//! header; that argument's parent (`argument_list`) is not itself a DefRule, so
+//! the engine keeps the `@def` ancestor. Calls inside the body source from that
+//! function. Command definitions (`set`, `option`, …) stay on the `argument`
+//! node and are not callables. Not claimed as `supported` (no verification
+//! corpus). Signature-only `function()` declarations without a body are not
+//! emitted.
 
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};
 
 /// Definitions:
-///  * `argument_list` — the def node of a `function`/`macro` header (the parent
-///    of the captured first `argument`) → `Function`.
+///  * `function_def` / `macro_def` — the body-containing command wrapper → `Function`.
 ///  * `argument` — the def node of a whitelisted command definition (the parent
 ///    of the captured first `unquoted_argument`) → `Command`.
 ///
-/// No ownership is modelled (CMake has no class/method semantics). The
-/// `Function` rule is `func` (callable) so callee resolution *would* attribute
-/// to it if a call were a descendant of its def node — it is not (see the
-/// module note), so no CALLS edges result, but keeping it callable is correct.
+/// No ownership is modelled (CMake has no class/method semantics).
 static CMAKE_SPEC: LangSpec = LangSpec {
     name: NameStrategy::Capture,
     defs: &[
-        DefRule::func("argument_list"),
+        DefRule::func("function_def"),
+        DefRule::func("macro_def"),
         DefRule::ty("argument", "Command"),
     ],
     owner_kinds: &[],
@@ -66,8 +61,9 @@ static CMAKE_SPEC: LangSpec = LangSpec {
 
 /// `function(greet name)` parses as
 /// `(function_def (function_command (argument_list (argument (unquoted_argument "greet")) …)))`.
-/// Capture the *first* `argument` (anchored with `.`) as `@name`; its parent is
-/// the `argument_list`, which is the `DefRule::func("argument_list")` node.
+/// Capture the *first* `argument` (anchored with `.`) as `@name` and the
+/// enclosing `function_def` / `macro_def` as `@def`. The name's parent
+/// (`argument_list`) has no DefRule, so the engine keeps the body container.
 ///
 /// A command definition (`set(SOURCES …)`) parses as
 /// `(normal_command (identifier "set") (argument_list (argument (unquoted_argument "SOURCES")) …))`.
@@ -77,10 +73,10 @@ static CMAKE_SPEC: LangSpec = LangSpec {
 const DEFINITIONS: &str = r#"
     (function_def
       (function_command
-        (argument_list . (argument) @name)))
+        (argument_list . (argument) @name))) @def
     (macro_def
       (macro_command
-        (argument_list . (argument) @name)))
+        (argument_list . (argument) @name))) @def
     ((normal_command
        (identifier) @_cmd
        (argument_list . (argument (unquoted_argument) @name)))
@@ -93,8 +89,8 @@ const DEFINITIONS: &str = r#"
 /// callee is that leading identifier. This captures `message(…)`, a call to a
 /// user `function`/`macro`, and the built-in commands alike (best-effort). The
 /// def-introducing commands are NOT excluded here, so e.g. `set` appears both as
-/// a `Command` def and a callee — harmless, and the enclosing-callable walk
-/// never resolves a CMake call to a source function anyway (see module note).
+/// a `Command` def and a callee — harmless. `function()` / `macro()` themselves
+/// are not `normal_command`s, so the definition name is not a self-call.
 const CALLS: &str = r#"
     (normal_command
       (identifier) @callee)

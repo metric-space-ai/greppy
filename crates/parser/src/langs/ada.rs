@@ -10,11 +10,11 @@
 //! `subprogram_body` wrapping a `function_specification` or
 //! `procedure_specification`. The subprogram's name is a `name:` field (an
 //! `identifier`) on that *specification*, NOT on the enclosing
-//! `subprogram_body`. With the `Capture` name strategy the definition node is
-//! therefore the captured identifier's parent — i.e. the
-//! `function_specification` / `procedure_specification` — so keying the
-//! `DefRule::func` on those spec kinds yields one Function per subprogram with
-//! the correct name.
+//! `subprogram_body`. The definition query tags that body as `@def` and reads
+//! the name from the nested specification. The specification kinds are not
+//! DefRules, so the Function span is the whole `subprogram_body` (including
+//! `begin` … `end`), which is what `read` returns. Spec-only declarations
+//! without a body are not emitted.
 //!
 //! Package units carry their name directly: `package_declaration` (a package
 //! spec) and `package_body` both expose a `name:` `identifier`, so capturing it
@@ -26,37 +26,33 @@
 //!
 //! Calls parse as `function_call` (in an expression) or
 //! `procedure_call_statement`, each with a `name:` field naming the callee.
-//! Imprecision: (1) the callee `name:` can itself be a dotted `selected_component`
-//! for a qualified call (`Pkg.Op(…)`); this query captures only the plain
-//! `identifier` callee form (best-effort). (2) Because a subprogram's *body*
-//! (`handled_sequence_of_statements`) is a sibling of its *specification* under
-//! `subprogram_body` — not a descendant of the spec that owns the name — the
-//! generic engine's enclosing-callable walk cannot climb from a call back to
-//! the owning spec, so CALLS edges are emitted only when an enclosing callable
-//! is resolvable; in practice most Ada CALLS edges are dropped (same structural
-//! limitation as Elixir/Julia). Ada `with` clauses (imports) are not extracted
-//! (no Ada import strategy exists; import_query is empty). Not claimed as
-//! `supported` (no verification corpus).
+//! The body is inside `subprogram_body`, which has no `name:` field (`endname`
+//! is not `name`), so the calls pass reuses the qname recorded for that
+//! definition. Imprecision: the callee `name:` can itself be a dotted
+//! `selected_component` for a qualified call (`Pkg.Op(…)`); this query captures
+//! only the plain `identifier` callee form (best-effort). Ada `with` clauses
+//! (imports) are not extracted (no Ada import strategy exists; import_query is
+//! empty). Not claimed as `supported` (no verification corpus).
 
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};
 
 /// Definitions:
-///  * `function_specification` / `procedure_specification` — the parent of a
-///    subprogram's `name:` identifier → Function.
+///  * `subprogram_body` — a function or procedure body → Function. The name is
+///    the nested specification's `name:` identifier.
 ///  * `package_declaration` / `package_body` — the parent of a package's
 ///    `name:` identifier → Package.
 ///  * `full_type_declaration` — the parent of a type's plain `identifier` child
 ///    → Type.
 ///
-/// Every rule uses the `Capture` strategy (def node = the captured name's
-/// parent). No ownership is modelled (Ada nested subprograms/methods are not
-/// distinguished), so subprograms are always free Functions.
+/// Packages and types use the `Capture` strategy (def node = the captured
+/// name's parent). Subprograms use the `@def` body container. No ownership is
+/// modelled (Ada nested subprograms/methods are not distinguished), so
+/// subprograms are always free Functions.
 static ADA_SPEC: LangSpec = LangSpec {
     name: NameStrategy::Capture,
     defs: &[
-        DefRule::func("function_specification"),
-        DefRule::func("procedure_specification"),
+        DefRule::func("subprogram_body"),
         DefRule::ty("package_declaration", "Package"),
         DefRule::ty("package_body", "Package"),
         DefRule::ty("full_type_declaration", "Type"),
@@ -79,8 +75,10 @@ static ADA_SPEC: LangSpec = LangSpec {
 ///    `identifier` child (anchored so the query matches only that direct child,
 ///    not the enum-member identifiers nested inside the type definition).
 const DEFINITIONS: &str = r#"
-    (function_specification  name: (identifier) @name)
-    (procedure_specification name: (identifier) @name)
+    (subprogram_body
+      (function_specification name: (identifier) @name)) @def
+    (subprogram_body
+      (procedure_specification name: (identifier) @name)) @def
     (package_declaration     name: (identifier) @name)
     (package_body            name: (identifier) @name)
     (full_type_declaration . (identifier) @name)

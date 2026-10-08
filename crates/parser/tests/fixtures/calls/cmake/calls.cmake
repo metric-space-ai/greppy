@@ -1,0 +1,6 @@
+function(helper x)
+  message(STATUS "${x}")
+endfunction()
+function(caller x)
+  helper(${x})
+endfunction()

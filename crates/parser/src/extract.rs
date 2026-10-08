@@ -11906,14 +11906,18 @@ fn erlang_calls_pass(
 /// is the `expr:` atom (`log`, `system_time`, ...). Returns `None` when the call
 /// has no children or the first child is not an atom-like name.
 fn erlang_callee_name<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> {
-    let first = node.child(0)?;
-    // The `expr:` position of a `call` is an `atom` for a resolvable local
-    // callee. (For a remote `mod:fun` the inner `call`'s first child is still
-    // the `fun` atom.) Non-atom heads (rare) yield no resolvable callee.
-    if first.kind() == "atom" {
-        Some(node_text(source, first))
-    } else {
+    // The `expr:` field of a `call` is an `atom` for a resolvable local callee
+    // (`helper(X)`). A remote `mod:fun(X)` has `expr: (remote …)` and is left
+    // unresolved here so it cannot false-link a same-named local.
+    let expr = node.child_by_field_name("expr")?;
+    if expr.kind() != "atom" {
+        return None;
+    }
+    let text = node_text(source, expr);
+    if text.is_empty() {
         None
+    } else {
+        Some(text)
     }
 }
 
@@ -13175,20 +13179,17 @@ fn is_scala_usage_keyword(name: &str) -> bool {
 //     list, so it is deliberately NOT emitted.
 //   * an IMPORTS pass over explicit import lists, keyed by each imported name;
 //   * the `pass_usages` USAGE walk: every
-//     `variable` / `constructor` reference that is not inside a runtime call
-//     (`apply` / `infix`) or import (`import` / `instance`), is not a
-//     definition name, and is not a keyword. Constructor applies in a function
-//     LHS pattern are usages, not calls.
+//     `variable` / `constructor` reference that is not itself the callee of an
+//     `apply` / the operator of an `infix`, is not inside an import
+//     (`import` / `instance`), is not a definition name, and is not a keyword.
+//     Arguments (`map f`) and infix operands are usages. Constructor applies in
+//     a function LHS pattern are usages, not calls.
 // ---------------------------------------------------------------------------
 
 /// The Haskell type-declaration kinds routed through the class path.
 /// All three are labelled "Class"
 /// (Haskell has no Interface/Enum/Type kind).
 const HASKELL_TYPE_KINDS: [&str; 3] = ["class", "data_type", "newtype"];
-
-/// The Haskell call kinds — a reference inside one of these is a CALLS
-/// candidate, so the usage pass skips it.
-const HASKELL_CALL_KINDS: [&str; 2] = ["apply", "infix"];
 
 /// The Haskell import kinds — a reference inside one of these is skipped by the
 /// usage walk. Note `instance` is treated as an import
@@ -13501,12 +13502,15 @@ fn haskell_imports_pass(
 
 /// USAGE pass for Haskell over reference nodes
 /// (`variable` / `constructor`). Every such
-/// reference emits a USAGE edge unless it sits inside a call node
-/// (`apply` / `infix`), inside an import (`import` / `instance`), is a
-/// definition *name*, or is a keyword. The `ref_name` is resolved project-wide
-/// by the indexer, so the target qname is a placeholder. The source is the
-/// nearest enclosing callable qname (a `function` / `bind`, resolved free as
-/// `{file}::Function::{name}`) falling back to the per-file module qname.
+/// reference emits a USAGE edge unless it IS the callee of an `apply` / the
+/// operator of an `infix` (those stay CALLS-only), sits inside an import
+/// (`import` / `instance`), is a definition *name*, or is a keyword. Arguments
+/// passed to a call — `map f`, the operands of `pi * r` — are usages.
+/// Left-hand-side constructor patterns stay usages even though they parse as
+/// `apply`. The `ref_name` is resolved project-wide by the indexer, so the
+/// target qname is a placeholder. The source is the nearest enclosing callable
+/// qname (a `function` / `bind`, resolved free as `{file}::Function::{name}`)
+/// falling back to the per-file module qname.
 fn haskell_emit_usages(
     source: &[u8],
     node: Node<'_>,
@@ -13516,7 +13520,7 @@ fn haskell_emit_usages(
 ) {
     let kind = node.kind();
     if matches!(kind, "variable" | "constructor")
-        && (!haskell_is_inside(node, &HASKELL_CALL_KINDS) || haskell_is_function_lhs_pattern(node))
+        && (!haskell_is_direct_callee(node) || haskell_is_function_lhs_pattern(node))
         && !haskell_is_inside(node, &HASKELL_IMPORT_KINDS)
         && !is_definition_name(node)
     {
@@ -13540,6 +13544,35 @@ fn haskell_emit_usages(
     for child in node.named_children(&mut c) {
         haskell_emit_usages(source, child, file_path, file_module_qname, result);
     }
+}
+
+/// True when `node` is the callee of an `apply` or sits in the `operator`
+/// field of an `infix`. Arguments and infix operands are not callees, so
+/// `map f` records `f` as a usage while `map` stays CALLS-only.
+fn haskell_is_direct_callee(node: Node<'_>) -> bool {
+    let mut current = node;
+    for _ in 0..8 {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "apply" => {
+                let Some(func) = parent.child(0) else {
+                    return false;
+                };
+                return func.start_byte() <= node.start_byte()
+                    && node.end_byte() <= func.end_byte();
+            }
+            "infix" => {
+                let Some(op) = parent.child_by_field_name("operator") else {
+                    return false;
+                };
+                return op.start_byte() <= node.start_byte() && node.end_byte() <= op.end_byte();
+            }
+            _ => current = parent,
+        }
+    }
+    false
 }
 
 /// True if `node` has an ancestor whose kind is in `kinds`, within a
@@ -16121,17 +16154,16 @@ fn racket_def_label(head: &str) -> &'static str {
 ///     Enum is emitted for derived types at all.
 /// So we KEEP the spec's Function nodes and DROP every Module/Type node.
 ///
-/// Edges: the spec CALLS pass emits nothing (a `call_expression` is a sibling of
-/// the header `function_statement`, so the callable-ancestor walk fails). The
-/// CALLS / USAGE passes instead source both from the per-file Module:
+/// Edges: the spec CALLS pass is discarded (`result.edges.clear()`). The CALLS /
+/// USAGE passes attribute a call to the enclosing `function` / `subroutine` /
+/// `module_procedure` when one exists, and otherwise to the per-file Module:
 ///   * every `call_expression` (a `foo(...)` function reference — NOT a `call`
-///     statement, which is a distinct grammar node) → a `CALLS` edge from the
-///     file Module to the callee `Function`, resolved by short name.
-///   * every `subroutine_call` (`call sub(...)`) → a `USAGE` edge from the file
-///     Module to the referenced `Function` (the call kinds exclude
-///     `subroutine_call`, so it surfaces as a generic reference/usage, not a
-///     call). Both dedup by (source, target) via the indexer's ON CONFLICT
-///     upsert.
+///     statement, which is a distinct grammar node) → a `CALLS` edge to the
+///     callee `Function`, resolved by short name.
+///   * every `subroutine_call` (`call sub(...)`) → a `USAGE` edge to the
+///     referenced `Function` (the call kinds exclude `subroutine_call`, so it
+///     surfaces as a generic reference/usage, not a call). Both dedup by
+///     (source, target) via the indexer's ON CONFLICT upsert.
 fn extract_fortran(
     d: &'static crate::registry::LangDef,
     source: &[u8],
@@ -16145,8 +16177,8 @@ fn extract_fortran(
 
     // Keep only the spec's `Function` nodes (the 19 module procedures). Drop the
     // `module_statement` Modules and the `derived_type_statement` Types — we emit
-    // neither (see doc comment above). Drop all spec edges: the spec CALLS pass
-    // produces none for Fortran, and we emit the CALLS/USAGE edges below.
+    // neither (see doc comment above). Drop all spec edges. Procedure calls are
+    // emitted below from the enclosing function / subroutine.
     result.nodes.retain(|n| n.label == "Function");
     result.edges.clear();
 
@@ -16176,14 +16208,12 @@ fn fortran_call_callee<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str> 
 /// {call_expression, keyword_argument, call} — the resolvable head being the
 /// `call_expression`'s leading `identifier`). Every `call_expression` is a
 /// function reference `foo(...)`; the callee is its leading `identifier`. The
-/// source is ALWAYS the per-file Module node (`{file}::__file__`): a call's
-/// nearest enclosing captured def is the header `function_statement`, but the
-/// call lives in the sibling body, so the enclosing-func walk falls back to the
-/// file Module. The target is a
-/// same-file `{file}::Function::{callee}` direct qname; the `callee_name`
-/// property lets the shared resolver pick up a project-wide unique cross-file
-/// callee (Fortran procedure names are global, so a `use`d procedure resolves by
-/// bare name). Builtins with no Function def
+/// source is the enclosing procedure when the call sits inside a `function` /
+/// `subroutine` / `module_procedure`, otherwise the per-file Module node
+/// (`{file}::__file__`). The target is a same-file `{file}::Function::{callee}`
+/// direct qname; the `callee_name` property lets the shared resolver pick up a
+/// project-wide unique cross-file callee (Fortran procedure names are global, so
+/// a `use`d procedure resolves by bare name). Builtins with no Function def
 /// (`sqrt`, …) resolve to nothing and drop out.
 fn fortran_calls_pass(
     source: &[u8],
@@ -16196,9 +16226,11 @@ fn fortran_calls_pass(
     while let Some(node) = stack.pop() {
         if node.kind() == "call_expression" {
             if let Some(callee) = fortran_call_callee(source, node) {
+                let source_qname = fortran_enclosing_proc_qname(source, node, file_path)
+                    .unwrap_or_else(|| file_module_qname.to_string());
                 result.edges.push(ExtractedEdge {
                     edge_type: "CALLS".into(),
-                    source_qualified_name: file_module_qname.to_string(),
+                    source_qualified_name: source_qname,
                     target_qualified_name: format!("{file_path}::Function::{callee}"),
                     file_path: file_path.to_string(),
                     line: node.start_position().row as u32 + 1,
@@ -16221,10 +16253,11 @@ fn fortran_calls_pass(
 /// (`{call_expression, keyword_argument, call}`), so it is never a CALLS site.
 /// Its callee `identifier` is instead a generic reference, resolved
 /// against every registered def (Function/Method/… — Fortran
-/// procedures are Functions). Emit one `USAGE` edge per `subroutine_call` from
-/// the per-file Module to the referenced name; the shared resolver keys on
-/// `ref_name` and links same-file first, then project-wide unique. Dedup by
-/// (source, target) is the indexer's ON CONFLICT upsert.
+/// procedures are Functions). Emit one `USAGE` edge per `subroutine_call`
+/// from the enclosing procedure (or the per-file Module when there is none)
+/// to the referenced name; the shared resolver keys on `ref_name` and links
+/// same-file first, then project-wide unique. Dedup by (source, target) is
+/// the indexer's ON CONFLICT upsert.
 fn fortran_usages_pass(
     source: &[u8],
     root: Node<'_>,
@@ -16236,9 +16269,11 @@ fn fortran_usages_pass(
     while let Some(node) = stack.pop() {
         if node.kind() == "subroutine_call" {
             if let Some(name) = fortran_call_callee(source, node) {
+                let source_qname = fortran_enclosing_proc_qname(source, node, file_path)
+                    .unwrap_or_else(|| file_module_qname.to_string());
                 result.edges.push(ExtractedEdge {
                     edge_type: "USAGE".into(),
-                    source_qualified_name: file_module_qname.to_string(),
+                    source_qualified_name: source_qname,
                     target_qualified_name: format!("{file_path}::__ref__::{name}"),
                     file_path: file_path.to_string(),
                     line: node.start_position().row as u32 + 1,
@@ -16253,6 +16288,38 @@ fn fortran_usages_pass(
             stack.push(child);
         }
     }
+}
+
+/// Qname of the innermost `function` / `subroutine` / `module_procedure`
+/// containing `node`, or `None` at file / module scope. The procedure's name
+/// lives on its header statement, not on a `name:` field of the container.
+fn fortran_enclosing_proc_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+    let mut p = node.parent();
+    while let Some(cur) = p {
+        if matches!(cur.kind(), "function" | "subroutine" | "module_procedure") {
+            let name = fortran_procedure_name(source, cur)?;
+            return Some(format!("{file_path}::Function::{name}"));
+        }
+        p = cur.parent();
+    }
+    None
+}
+
+fn fortran_procedure_name<'a>(source: &'a [u8], proc: Node<'_>) -> Option<&'a str> {
+    let mut cursor = proc.walk();
+    for child in proc.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "function_statement" | "subroutine_statement" | "module_procedure_statement"
+        ) {
+            let name = child.child_by_field_name("name")?;
+            let text = node_text(source, name);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
 }
 
 fn extract_racket(
@@ -17518,11 +17585,11 @@ fn is_zig_keyword(name: &str) -> bool {
 //   * The reference-node predicate has NO Elm arm (it falls to
 //     `false`), so ZERO USAGE edges are emitted for Elm — this pass
 //     emits none either.
-//   * No CALLS edge resolves: an Elm call is a `function_call_expr` whose callee
-//     sits on the `target:` field (a `value_expr`, not an `identifier`), so the
-//     callee lookup — which only reads `function`/`name`/`method` fields
-//     or a bare first-`identifier` child — returns NULL for every Elm call.
-//     Zero resolved CALLS are emitted.
+//   * CALLS: an Elm call is a `function_call_expr`. The callee is the last
+//     `lower_case_identifier` under `target:` (bare `helper`, or the final
+//     segment of a qualified value). The source is the enclosing
+//     `value_declaration` / `function_declaration`. Calls with no enclosing
+//     function are skipped.
 //   * IMPORTS: `import X` resolves to a sibling *file*'s Module node
 //     (File/Module → Module). That is the `require`→File shape the shared
 //     indexer deliberately does not resolve (its IMPORTS pass keys on
@@ -17540,6 +17607,7 @@ fn extract_elm(
     let mut result = ExtractionResult::default();
 
     elm_walk_defs(source, root, file_path, &mut result);
+    elm_calls_pass(source, root, file_path, &mut result);
 
     Ok(result)
 }
@@ -17622,6 +17690,78 @@ fn elm_emit_function(
 /// `functionDeclarationLeft` field (or, failing the field, a
 /// `function_declaration_left` child). Falls back to a plain `name:` field
 /// (`function_declaration`).
+/// CALLS pass for Elm. `function_call_expr` carries the callee on `target:`
+/// (a `value_expr` / qualified `value_qid`), not on a `name:` field, so the
+/// generic engine never sees it. Attribute the call to the enclosing value or
+/// function declaration.
+fn elm_calls_pass(source: &[u8], root: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_call_expr" {
+            if let Some(callee) = elm_callee_name(source, node) {
+                if let Some(src) = elm_enclosing_func_qname(source, node, file_path) {
+                    result.edges.push(ExtractedEdge {
+                        edge_type: "CALLS".into(),
+                        source_qualified_name: src,
+                        target_qualified_name: format!("{file_path}::Function::{callee}"),
+                        file_path: file_path.to_string(),
+                        line: node.start_position().row as u32 + 1,
+                        properties: serde_json::json!({
+                            "callee_text": callee,
+                            "callee_name": callee,
+                        }),
+                    });
+                }
+            }
+        }
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            stack.push(child);
+        }
+    }
+}
+
+fn elm_callee_name<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str> {
+    let target = call.child_by_field_name("target")?;
+    let name = elm_last_lower(target)?;
+    let text = node_text(source, name);
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn elm_last_lower(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "lower_case_identifier" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    let mut last = None;
+    for child in node.children(&mut cursor) {
+        if let Some(found) = elm_last_lower(child) {
+            last = Some(found);
+        }
+    }
+    last
+}
+
+fn elm_enclosing_func_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+    let mut p = node.parent();
+    while let Some(cur) = p {
+        if ELM_FUNC_KINDS.contains(&cur.kind()) {
+            let name_node = elm_func_name_node(cur)?;
+            let name = node_text(source, name_node);
+            if name.is_empty() {
+                return None;
+            }
+            return Some(format!("{file_path}::Function::{name}"));
+        }
+        p = cur.parent();
+    }
+    None
+}
+
 fn elm_func_name_node(node: Node<'_>) -> Option<Node<'_>> {
     let fdl = node
         .child_by_field_name("functionDeclarationLeft")

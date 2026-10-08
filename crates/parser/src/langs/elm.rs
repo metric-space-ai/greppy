@@ -12,12 +12,11 @@
 //! of the captured name), which is enough to emit Function nodes. Type/type-alias
 //! declarations expose a real `name:` field and become `Type` / `TypeAlias`.
 //!
-//! Because `function_declaration_left` has no `name:` field, the engine's
-//! enclosing-callable resolution (which reads `child_by_field_name("name")`)
-//! cannot recover a Function's own name, so CALLS edges whose SOURCE is an Elm
-//! function are NOT resolved (same limitation as Julia). The CALLS query still
-//! captures the correct callee identifier for every `function_call_expr`. Not
-//! claimed as `supported` (no verification corpus).
+//! Elm does not run through the generic calls pass. `extract_elm` walks
+//! `function_call_expr` and attributes each call to the enclosing
+//! `value_declaration` / `function_declaration`, using the last
+//! `lower_case_identifier` under `target:` as the callee. Not claimed as
+//! `supported` (no verification corpus).
 
 use crate::registry::LangDef;
 use crate::spec::{CallSpec, DefRule, DocStyle, ImportStrategy, LangSpec, NameStrategy};

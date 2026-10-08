@@ -556,8 +556,17 @@ pub fn spec_extract(
     let mut result = ExtractionResult::default();
     let file_qname = format!("{file_path}::__file__");
 
-    spec_definitions(spec, queries, root, source, file_path, &mut result);
-    spec_calls(spec, queries, root, source, file_path, &mut result);
+    let mut spans = Vec::new();
+    spec_definitions(
+        spec,
+        queries,
+        root,
+        source,
+        file_path,
+        &mut spans,
+        &mut result,
+    );
+    spec_calls(spec, queries, root, source, file_path, &spans, &mut result);
     spec_imports(
         spec,
         queries,
@@ -614,12 +623,23 @@ fn def_label_and_qname(
     }
 }
 
+/// Byte range of one callable definition plus the qname already computed from
+/// its `@name` capture. Header/body grammars (PowerShell, CMake, Pascal, Ada,
+/// Common Lisp, Fortran) put the name where `callable_name` cannot re-read it;
+/// the calls pass uses this span only for that exact definition node.
+struct CallableSpan {
+    start: usize,
+    end: usize,
+    qname: String,
+}
+
 fn spec_definitions(
     spec: &LangSpec,
     queries: &[CompiledQuery],
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    spans: &mut Vec<CallableSpan>,
     result: &mut ExtractionResult,
 ) {
     // `Capture` languages tag the name as `@name`; `CStructural` languages tag
@@ -635,8 +655,10 @@ fn spec_definitions(
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&cq.query, root, source);
         while let Some(m) = matches.next() {
-            for cap in m.captures {
-                let Some(cap_name) = cq.capture_names.get(cap.index as usize) else {
+            let capture_count = m.captures.len();
+            for index in 0..capture_count {
+                let cap_index = m.captures[index].index;
+                let Some(cap_name) = cq.capture_names.get(cap_index as usize) else {
                     continue;
                 };
                 if cap_name != want {
@@ -645,21 +667,23 @@ fn spec_definitions(
 
                 let (def_node, name): (Node<'_>, String) = match spec.name {
                     NameStrategy::Capture => {
-                        let node = cap.node;
-                        (
-                            node.parent().unwrap_or(node),
-                            node_text(source, node).to_string(),
-                        )
+                        let node = m.captures[index].node;
+                        let parent = node.parent().unwrap_or(node);
+                        let explicit = explicit_def_ancestor(cq, m.captures, parent);
+                        let Some(def_node) = choose_capture_def(spec, parent, explicit) else {
+                            continue;
+                        };
+                        (def_node, node_text(source, node).to_string())
                     }
                     NameStrategy::CStructural => {
-                        let node = cap.node;
+                        let node = m.captures[index].node;
                         match c_def_name(source, node) {
                             Some(n) => (node, n),
                             None => continue,
                         }
                     }
                     NameStrategy::RAssign => {
-                        let node = cap.node;
+                        let node = m.captures[index].node;
                         match r_def_name(source, node) {
                             Some(n) => (node, n),
                             None => continue,
@@ -676,6 +700,13 @@ fn spec_definitions(
 
                 let (label, qname) =
                     def_label_and_qname(spec, &rule, source, def_node, &name, file_path);
+                if rule.callable {
+                    spans.push(CallableSpan {
+                        start: def_node.start_byte(),
+                        end: def_node.end_byte(),
+                        qname: qname.clone(),
+                    });
+                }
 
                 let mut properties = serde_json::Map::new();
                 if let Some(doc) = extract_doc(spec.docs, source, def_node) {
@@ -696,6 +727,57 @@ fn spec_definitions(
             }
         }
     }
+}
+
+/// An `@def` capture in this match that strictly contains `parent`. Equal ranges
+/// (the usual `(node … @name) @def` form, where `@def` IS the parent) are ignored
+/// so existing languages keep the parent as the definition node.
+fn explicit_def_ancestor<'a>(
+    cq: &CompiledQuery,
+    captures: &[tree_sitter::QueryCapture<'a>],
+    parent: Node<'a>,
+) -> Option<Node<'a>> {
+    captures.iter().find_map(|other| {
+        let other_name = cq.capture_names.get(other.index as usize)?;
+        if other_name != "def" {
+            return None;
+        }
+        let defn = other.node;
+        if defn.id() != parent.id()
+            && defn.start_byte() <= parent.start_byte()
+            && defn.end_byte() >= parent.end_byte()
+        {
+            Some(defn)
+        } else {
+            None
+        }
+    })
+}
+
+/// Pick the definition node for a `Capture` match.
+///
+/// The parent of `@name` wins whenever it has a [`DefRule`] — that is every
+/// language onboarded before body-container queries. A header with no rule of
+/// its own (CMake `argument_list`, Pascal `declProc`, Ada specifications,
+/// Fortran statements, Common Lisp `defun_header`) falls through to an `@def`
+/// ancestor that does have a rule, so the stored span covers the body.
+fn choose_capture_def<'a>(
+    spec: &LangSpec,
+    parent: Node<'a>,
+    explicit: Option<Node<'a>>,
+) -> Option<Node<'a>> {
+    if rule_for(spec, parent.kind()).is_some() {
+        return Some(parent);
+    }
+    let explicit = explicit?;
+    if explicit.id() != parent.id()
+        && explicit.start_byte() <= parent.start_byte()
+        && explicit.end_byte() >= parent.end_byte()
+        && rule_for(spec, explicit.kind()).is_some()
+    {
+        return Some(explicit);
+    }
+    None
 }
 
 /// Go `type_spec` carries its concrete kind in the body; rewrite the rule's
@@ -723,6 +805,7 @@ fn spec_calls(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    spans: &[CallableSpan],
     result: &mut ExtractionResult,
 ) {
     for cq in queries.iter().filter(|cq| cq.kind == QueryKind::Calls) {
@@ -748,7 +831,8 @@ fn spec_calls(
                 // inflated the node count ~4x (slowing indexing) and flooded
                 // symbol/semantic search (forensics F2). The call's information
                 // lives entirely in the edge + its `callee_name` property.
-                if let Some(caller_qname) = enclosing_callable_qname(spec, source, node, file_path)
+                if let Some(caller_qname) =
+                    enclosing_callable_qname(spec, source, node, file_path, spans)
                 {
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
@@ -838,20 +922,40 @@ fn enclosing_callable_qname(
     source: &[u8],
     node: Node<'_>,
     file_path: &str,
+    spans: &[CallableSpan],
 ) -> Option<String> {
     let mut p = node.parent();
     while let Some(cur) = p {
         if let Some(rule) = rule_for(spec, cur.kind()) {
             if rule.callable {
                 // Resolve the callable's own name the same way the def pass did.
-                let name = callable_name(spec, source, cur)?;
-                let (_, qname) = def_label_and_qname(spec, rule, source, cur, &name, file_path);
-                return Some(qname);
+                // A missing `name:` field used to abort the walk (`?`), which
+                // dropped every call inside header/body grammars. When this
+                // exact node was emitted as a definition, reuse that qname;
+                // otherwise keep the old abort so an unnamed nested callable
+                // (a Go func literal, for example) does not steal the call
+                // for an outer named function.
+                if let Some(name) = callable_name(spec, source, cur) {
+                    let (_, qname) = def_label_and_qname(spec, rule, source, cur, &name, file_path);
+                    return Some(qname);
+                }
+                return span_qname_for_node(spans, cur);
             }
         }
         p = cur.parent();
     }
     None
+}
+
+/// Qname recorded for this definition node. Matched by byte range so a nested
+/// callable is not attributed to an outer span with the same text.
+fn span_qname_for_node(spans: &[CallableSpan], node: Node<'_>) -> Option<String> {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    spans
+        .iter()
+        .find(|span| span.start == start && span.end == end)
+        .map(|span| span.qname.clone())
 }
 
 /// The name of a callable definition node, by the spec's name strategy.
