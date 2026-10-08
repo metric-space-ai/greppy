@@ -23,7 +23,108 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REPOSITORY_TRACKER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard cap when the tracker owner is alive and its heartbeat row has advanced.
+/// A dead owner, or a row that never moves, still expires at the base timeout.
+const REPOSITORY_TRACKER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const REPOSITORY_TRACKER_FENCE_ATTEMPT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerLivenessDecision {
+    KeepWaiting,
+    Expired,
+}
+
+/// Decides whether `capture_tracked_repository` may keep waiting to see a live
+/// tracker. The base budget is [`REPOSITORY_TRACKER_TIMEOUT`]. One observed
+/// heartbeat increase while the owner process is alive extends that budget up
+/// to [`REPOSITORY_TRACKER_PROGRESS_TIMEOUT`]. The extension is not a blind
+/// 30s sleep: it ends immediately if the owner dies or the row is replaced
+/// without a newer heartbeat.
+#[derive(Debug, Default)]
+struct TrackerLivenessWatch {
+    baseline_heartbeat_unix_ms: Option<u64>,
+    progressed: bool,
+}
+
+impl TrackerLivenessWatch {
+    fn decide(
+        &mut self,
+        elapsed: Duration,
+        owner_alive: bool,
+        heartbeat_unix_ms: Option<u64>,
+    ) -> TrackerLivenessDecision {
+        if let Some(heartbeat) = heartbeat_unix_ms {
+            match self.baseline_heartbeat_unix_ms {
+                None => self.baseline_heartbeat_unix_ms = Some(heartbeat),
+                Some(baseline) if heartbeat < baseline => {
+                    // The row was replaced (request resets heartbeat to 0).
+                    // Progress is measured from the new row, not the old one.
+                    self.baseline_heartbeat_unix_ms = Some(heartbeat);
+                    self.progressed = false;
+                }
+                Some(baseline) if heartbeat > baseline => {
+                    self.progressed = true;
+                }
+                Some(_) => {}
+            }
+        }
+        if elapsed < REPOSITORY_TRACKER_TIMEOUT {
+            return TrackerLivenessDecision::KeepWaiting;
+        }
+        if elapsed >= REPOSITORY_TRACKER_PROGRESS_TIMEOUT || !owner_alive || !self.progressed {
+            return TrackerLivenessDecision::Expired;
+        }
+        TrackerLivenessDecision::KeepWaiting
+    }
+}
+
+#[cfg(unix)]
+fn tracker_owner_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { kill(pid, 0) };
+    // EPERM means the pid exists but is not signalable by us.
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+    fn GetExitCodeProcess(process: *mut core::ffi::c_void, exit_code: *mut u32) -> i32;
+    fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+fn tracker_owner_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        let queried = GetExitCodeProcess(process, &mut exit_code) != 0;
+        CloseHandle(process);
+        queried && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tracker_owner_is_alive(_pid: u32) -> bool {
+    false
+}
 
 pub struct AgentWorkspace {
     repo_root: PathBuf,
@@ -954,8 +1055,10 @@ fn capture_tracked_repository(
         .map_or(0, |status| status.epoch.saturating_add(1));
     core.request_repository_tracker(&repository)?;
     trace_workspace_phase(run_id, "tracker-requested", started);
-    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
+    let wait_started = std::time::Instant::now();
+    let mut liveness = TrackerLivenessWatch::default();
     let active = loop {
+        let elapsed = wait_started.elapsed();
         if let Some(status) = core.repository_tracker_status(&repository)? {
             if status.state == RepositoryTrackerState::Active
                 && status.epoch >= minimum_epoch
@@ -972,23 +1075,27 @@ fn capture_tracked_repository(
                         .unwrap_or_else(|| "unknown watcher failure".into())
                 )));
             }
-        }
-        if std::time::Instant::now() >= deadline {
-            let detail = core
-                .repository_tracker_status(&repository)?
-                .map(|status| {
-                    format!(
-                        "state={:?}, epoch={}, owner_pid={}, heartbeat_age_ms={}",
-                        status.state,
-                        status.epoch,
-                        status.owner_pid,
-                        now_unix_ms().saturating_sub(status.heartbeat_unix_ms)
-                    )
-                })
-                .unwrap_or_else(|| "tracker row missing".into());
+            let owner_alive = tracker_owner_is_alive(status.owner_pid);
+            let heartbeat = status.heartbeat_unix_ms;
+            if liveness.decide(elapsed, owner_alive, Some(heartbeat))
+                == TrackerLivenessDecision::Expired
+            {
+                let detail = format!(
+                    "state={:?}, epoch={}, owner_pid={}, heartbeat_age_ms={}",
+                    status.state,
+                    status.epoch,
+                    status.owner_pid,
+                    now_unix_ms().saturating_sub(status.heartbeat_unix_ms)
+                );
+                return Err(WorkspaceError::AdapterUnavailable(format!(
+                    "repository tracker did not become live within {} seconds ({detail})",
+                    elapsed.as_secs(),
+                )));
+            }
+        } else if liveness.decide(elapsed, false, None) == TrackerLivenessDecision::Expired {
             return Err(WorkspaceError::AdapterUnavailable(format!(
-                "repository tracker did not become live within {} seconds ({detail})",
-                REPOSITORY_TRACKER_TIMEOUT.as_secs(),
+                "repository tracker did not become live within {} seconds (tracker row missing)",
+                elapsed.as_secs(),
             )));
         }
         thread::sleep(Duration::from_millis(20));
@@ -5083,6 +5190,96 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const APPLY_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_applies_proposal";
     const PROPOSAL_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_publishes_proposal";
+
+    #[test]
+    fn portable_workspace_tracker_liveness_window_extends_only_while_the_owner_is_alive_and_the_heartbeat_advances(
+    ) {
+        use TrackerLivenessDecision::{Expired, KeepWaiting};
+
+        let mut cold = TrackerLivenessWatch::default();
+        assert_eq!(
+            cold.decide(Duration::from_secs(9), false, None),
+            KeepWaiting,
+            "the base window always waits, even before a tracker row exists"
+        );
+        assert_eq!(
+            cold.decide(Duration::from_secs(10), true, Some(1_000)),
+            Expired,
+            "the first heartbeat sample is a baseline, not progress"
+        );
+
+        let mut alive = TrackerLivenessWatch::default();
+        assert_eq!(
+            alive.decide(Duration::from_millis(1), true, Some(1_000)),
+            KeepWaiting
+        );
+        assert_eq!(
+            alive.decide(Duration::from_secs(10), false, Some(2_000)),
+            Expired,
+            "a heartbeat increase must not extend the wait after the owner dies"
+        );
+
+        let mut progressing = TrackerLivenessWatch::default();
+        assert_eq!(
+            progressing.decide(Duration::from_secs(1), true, Some(1_000)),
+            KeepWaiting
+        );
+        assert_eq!(
+            progressing.decide(Duration::from_secs(2), true, Some(1_000)),
+            KeepWaiting
+        );
+        let mut flat = TrackerLivenessWatch::default();
+        assert_eq!(
+            flat.decide(Duration::from_secs(1), true, Some(1_000)),
+            KeepWaiting
+        );
+        assert_eq!(
+            flat.decide(Duration::from_secs(10), true, Some(1_000)),
+            Expired,
+            "an unchanged heartbeat does not extend the base window"
+        );
+        assert_eq!(
+            progressing.decide(Duration::from_secs(10), true, Some(2_500)),
+            KeepWaiting,
+            "an advancing heartbeat on a live owner extends the base window"
+        );
+        assert_eq!(
+            progressing.decide(Duration::from_secs(29), true, Some(2_500)),
+            KeepWaiting,
+            "flat samples still count once progress was observed and the owner is alive"
+        );
+        assert_eq!(
+            progressing.decide(Duration::from_secs(30), true, Some(9_000)),
+            Expired,
+            "progress cannot extend the wait past 30 seconds"
+        );
+
+        let mut replaced = TrackerLivenessWatch::default();
+        assert_eq!(
+            replaced.decide(Duration::from_secs(1), true, Some(5_000)),
+            KeepWaiting
+        );
+        assert_eq!(
+            replaced.decide(Duration::from_secs(2), true, Some(6_000)),
+            KeepWaiting
+        );
+        assert_eq!(
+            replaced.decide(Duration::from_secs(11), true, Some(0)),
+            Expired,
+            "a replaced row clears progress and the base window applies again"
+        );
+        assert_eq!(
+            replaced.decide(Duration::from_secs(12), true, Some(100)),
+            KeepWaiting,
+            "a newer heartbeat on the replaced row may extend the wait again"
+        );
+
+        let mut missing = TrackerLivenessWatch::default();
+        assert_eq!(
+            missing.decide(Duration::from_secs(10), false, None),
+            Expired
+        );
+    }
 
     #[cfg(unix)]
     #[test]

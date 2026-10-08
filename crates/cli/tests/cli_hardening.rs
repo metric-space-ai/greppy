@@ -3561,6 +3561,38 @@ fn first_use_query_waits_for_healthy_slow_index() {
     check_first_use_query_waits_for_healthy_slow_index(false);
 }
 
+/// Ceiling for a condition that must eventually become true. Host contention
+/// stretches process startup; it must not change the condition itself.
+const LOAD_ROBUST_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(unix)]
+fn poll_until_running(
+    mut still_running: impl FnMut() -> bool,
+    early_exit: &str,
+    failure: &str,
+    mut done: impl FnMut() -> bool,
+) {
+    let deadline = std::time::Instant::now() + LOAD_ROBUST_CEILING;
+    while !done() {
+        assert!(still_running(), "{early_exit}");
+        assert!(std::time::Instant::now() < deadline, "{failure}");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn wait_for_child_output(mut child: std::process::Child, failure: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + LOAD_ROBUST_CEILING;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None => {
+                assert!(std::time::Instant::now() < deadline, "{failure}");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn signal_process(pid: u32, signal: libc::c_int) {
     let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
@@ -3617,11 +3649,11 @@ fn process_is_running(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn wait_for_process_exit(pid: u32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + LOAD_ROBUST_CEILING;
     while process_is_running(pid) {
         assert!(
             std::time::Instant::now() < deadline,
-            "process {pid} remained alive after query demand ended"
+            "process {pid} remained alive after query demand ended (waited {LOAD_ROBUST_CEILING:?})"
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -3646,15 +3678,12 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn first-use query");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() || !demand_ready.exists() {
-        assert!(query.try_wait().unwrap().is_none(), "query exited early");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "writer did not become ready"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || query.try_wait().unwrap().is_none(),
+        "query exited early",
+        "writer did not become ready",
+        || ready.exists() && demand_ready.exists(),
+    );
     let workspace = store
         .join("workspaces")
         .join("v2")
@@ -3665,9 +3694,9 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
     let index_pid = job["pid"].as_u64().unwrap() as u32;
 
     signal_process(query.id(), libc::SIGINT);
-    let status = query.wait().unwrap();
+    let output = wait_for_child_output(query, "cancelled first-use query did not exit");
     assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&status),
+        std::os::unix::process::ExitStatusExt::signal(&output.status),
         Some(libc::SIGINT)
     );
     wait_for_process_exit(index_pid);
@@ -3783,30 +3812,19 @@ fn automatic_index_stops_only_after_last_shared_query_exits() {
     let first_demand = scratch.0.join("first-demand-ready");
     let second_demand = scratch.0.join("second-demand-ready");
     let mut first = spawn(&first_demand);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() || !first_demand.exists() {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "first query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "first writer did not become ready"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || first.try_wait().unwrap().is_none(),
+        "first query exited early",
+        "first writer did not become ready",
+        || ready.exists() && first_demand.exists(),
+    );
     let mut second = spawn(&second_demand);
-    while !second_demand.exists() {
-        assert!(
-            second.try_wait().unwrap().is_none(),
-            "second query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "second query did not attach"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || second.try_wait().unwrap().is_none(),
+        "second query exited early",
+        "second query did not attach",
+        || second_demand.exists(),
+    );
     let job_path = store
         .join("workspaces")
         .join("v2")
@@ -3817,15 +3835,31 @@ fn automatic_index_stops_only_after_last_shared_query_exits() {
     let index_pid = job["pid"].as_u64().unwrap() as u32;
 
     signal_process(first.id(), libc::SIGINT);
-    let _ = first.wait().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = wait_for_child_output(first, "first shared query did not exit after interrupt");
+    // Reaping the first query is the event that drops its demand lock. The
+    // second query still running is what proves a shared waiter remains — not
+    // a fixed sleep long enough for a loaded host to mis-cancel.
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "second query exited before the shared index could be observed"
+    );
     assert!(
         process_is_running(index_pid),
         "shared waiter must keep index alive"
     );
+    let held: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_ne!(
+        held["state"], "cancelled",
+        "cancelling one shared waiter cancelled the automatic index: {held}"
+    );
+    assert_ne!(
+        held["state"], "failed",
+        "cancelling one shared waiter failed the automatic index: {held}"
+    );
 
     signal_process(second.id(), libc::SIGTERM);
-    let _ = second.wait().unwrap();
+    let _ = wait_for_child_output(second, "second shared query did not exit after signal");
     wait_for_process_exit(index_pid);
 }
 
@@ -3848,15 +3882,12 @@ fn cancelling_attached_query_does_not_stop_explicit_foreground_index() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn explicit foreground index");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() {
-        assert!(writer.try_wait().unwrap().is_none(), "writer exited early");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "writer did not become ready"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || writer.try_wait().unwrap().is_none(),
+        "writer exited early",
+        "writer did not become ready",
+        || ready.exists(),
+    );
 
     let demand_ready = scratch.0.join("explicit-attached-demand-ready");
     let mut query = Command::new(bin())
@@ -3869,20 +3900,27 @@ fn cancelling_attached_query_does_not_stop_explicit_foreground_index() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn attached query");
-    while !demand_ready.exists() {
-        assert!(query.try_wait().unwrap().is_none(), "query exited early");
-        assert!(std::time::Instant::now() < deadline, "query did not attach");
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    poll_until_running(
+        || query.try_wait().unwrap().is_none(),
+        "query exited early",
+        "query did not attach",
+        || demand_ready.exists(),
+    );
     signal_process(query.id(), libc::SIGINT);
-    let _ = query.wait().unwrap();
+    let _ = wait_for_child_output(query, "attached query did not exit after interrupt");
+    // Query exit is the event. The explicit writer must still be alive then,
+    // and must be able to publish when its own release file appears.
     assert!(
         writer.try_wait().unwrap().is_none(),
         "query cancellation must not stop explicit writer"
     );
 
     std::fs::write(&release, b"release\n").unwrap();
-    let status = writer.wait().unwrap();
+    let status = wait_for_child_output(
+        writer,
+        "explicit foreground index did not finish after release",
+    )
+    .status;
     assert!(status.success(), "explicit writer failed: {status}");
     let (code, out, err) = run(&["search-symbol", "explicit_writer_marker"], &repo, &store);
     assert_eq!(code, 0, "stdout={out}\nstderr={err}");
@@ -4259,6 +4297,7 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
 fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
     let (repo, store, scratch) = make_repo("first-use-two-callers", "two_caller_marker");
     let ready = scratch.0.join("first-use-two-callers-ready");
+    let release = scratch.0.join("first-use-two-callers-release");
     let spawn = |demand_ready: &Path| {
         let mut command = Command::new(bin());
         command
@@ -4268,7 +4307,8 @@ fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
             .env("GREPPY_TEST_SKIP_INFERENCE", "1")
             .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
             .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
-            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "1000")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
             .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
             .env_remove("GREPPY_DISCOVER_INCLUDE")
             .env_remove("GREPPY_DISCOVER_EXCLUDE")
@@ -4278,38 +4318,35 @@ fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
     };
     let first_demand = scratch.0.join("two-callers-first-demand");
     let second_demand = scratch.0.join("two-callers-second-demand");
-    let mut first = spawn(&first_demand);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() || !first_demand.exists() {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "first query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "first writer did not reach publication hold"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    let mut second = spawn(&second_demand);
-    while !second_demand.exists() {
-        assert!(
-            second.try_wait().unwrap().is_none(),
-            "second query exited early"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "second query did not attach"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    signal_process(first.id(), libc::SIGINT);
-    let first = first.wait_with_output().unwrap();
-    let second = second.wait_with_output().unwrap();
+    let mut first = ReapedQuery::new(spawn(&first_demand));
+    poll_until_running(
+        || first.try_wait().unwrap().is_none(),
+        "first query exited early",
+        "first writer did not reach publication hold",
+        || ready.exists() && first_demand.exists(),
+    );
+    let mut second = ReapedQuery::new(spawn(&second_demand));
+    poll_until_running(
+        || second.try_wait().unwrap().is_none(),
+        "second query exited early",
+        "second query did not attach",
+        || second_demand.exists(),
+    );
+    signal_process(first.0.as_ref().expect("query child").id(), libc::SIGINT);
+    let first = first.wait_with_output(LOAD_ROBUST_CEILING);
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&first.status),
         Some(libc::SIGINT)
     );
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "attached query exited before publication was released"
+    );
+    // Publication stays held until both attachment and initiator cancellation
+    // have been observed. A short hold would expire before a loaded host
+    // finished attaching, and the second query could pass without sharing.
+    std::fs::write(&release, b"release\n").unwrap();
+    let second = second.wait_with_output(LOAD_ROBUST_CEILING);
     assert_eq!(second.status.code(), Some(0), "{second:?}");
     assert!(
         String::from_utf8_lossy(&second.stdout).contains("two_caller_marker"),
@@ -4447,20 +4484,28 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
 #[test]
 fn first_use_background_spawn_failure_returns_without_handshake_deadlock() {
     let (repo, store, _scratch) = make_repo("first-use-spawn-fail", "spawn_fail_marker");
-    let started = std::time::Instant::now();
-    let (code, out, err) = run_with_env(
-        &["search-symbol", "spawn_fail_marker"],
-        &repo,
-        &store,
-        &[("GREPPY_TEST_BACKGROUND_SPAWN_FAIL", "1")],
-    );
+    // The failpoint rejects spawn before the ownership handshake. A deadlock
+    // never returns; the ceiling is only the hang detector. Startup under
+    // contention can exceed a few seconds without entering that handshake.
+    let child = Command::new(bin())
+        .args(["search-symbol", "spawn_fail_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BACKGROUND_SPAWN_FAIL", "1")
+        .env_remove("GREPPY_DISCOVER_INCLUDE")
+        .env_remove("GREPPY_DISCOVER_EXCLUDE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn failing first-use query");
+    let output = wait_for_child_output(child, "spawn failure deadlocked the ownership handshake");
+    let code = output.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
     assert_ne!(
         code, 0,
         "spawn failpoint unexpectedly succeeded: {out} {err}"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "spawn failure deadlocked the ownership handshake"
     );
     assert!(err.contains("spawn background index"), "{out}\n{err}");
 }
