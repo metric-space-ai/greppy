@@ -4,7 +4,74 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
-Nothing yet.
+### Navigation and call graph
+
+- Rust calls into inline `mod` blocks resolve again (a 0.4.0 regression:
+  `crate::trace::f` inside `mod trace { … }` lost its callers), and calls
+  across Cargo workspace member crates resolve.
+- Calls resolve only within their language: a Java call is never bound to a
+  TypeScript definition of the same name, and the same name in another
+  language no longer hides the in-language match. Local aliases bind to their
+  target; one field hop (`self.rule.apply_to_field(…)`) resolves when the
+  field type is known; `Ok`/`Err`/`Some` never bind to user functions.
+- Call edges for PowerShell, CMake, Erlang, Elm, Pascal, Common Lisp, Ada,
+  Haskell (functions passed as arguments) and Fortran (the enclosing
+  procedure is the caller); Ada `read` returns the whole body.
+- `search-symbol` takes several names in one call and matches names
+  case-insensitively. Multi-symbol `who-calls`/`callees` rows show the call
+  line; `--limit`/`--offset` window plain-text rows like `--json`.
+- `read S --lines A:B` reads a file range, like `read-file --lines`.
+- Brackets in a qualified target's file part are literal
+  (`api/[...path].js::loadState`).
+- The index format is `greppy-indexer-v11`: existing indexes are rebuilt once
+  after the upgrade so the new edges exist. `greppy index` on an unchanged,
+  fully indexed checkout answers `index already current` at once.
+- One JS/TS file the extractor cannot repair no longer makes a repository
+  unindexable; it is skipped and counted in `index status`/`doctor`.
+
+### Editing
+
+- `--allow-syntax-errors` on replace-text, replace-lines, write, delete-lines,
+  insert-lines and patch writes an intermediate state that adds syntax
+  errors; without it the refusal names the next step (one `greppy patch`,
+  or the flag).
+- When OLD occurs a different number of times than expected, the refusal
+  lists every site with its line and says `pass --expect N`; the nearest-OLD
+  hint matches lines by similarity and also helps `--regex`/`--expect`.
+  JSON keeps `matches` and adds `count`, `expected` and `match_lines`.
+- `replace S --body` re-indents a heredoc body to the definition, keeps the
+  file's line endings, and the receipt shows only the changed lines
+  (`changed_span` in JSON).
+- Rename receipts name the right lines when the new name is longer, and
+  refusals point to live commands.
+
+### Reliability
+
+- `brief` waits through a cold summary-model load (up to 3 minutes) instead
+  of returning without a summary.
+- `diagnostics`, `doctor` and `workspace doctor` no longer report healthy
+  repositories as broken (unsupported route/k8s edge classes, a fresh
+  `cp -R` copy, an inactive workspace provider). `--device` rejects a backend
+  the host cannot have; data directories are 0700 and databases 0600.
+- bash-smart evicts its oldest retained captures instead of silently losing
+  expand ids when the machine-wide store is full, counts one unittest failure
+  as one error, and prints no partial-output line for empty output.
+- Inference daemons are bound to the build that started them; a newer greppy
+  never reuses an older build's daemon.
+- The workspace provider releases a repository's watcher when its last
+  workspace is removed (inotify leak).
+- Files that git calls clean but whose bytes differ from the Base checkout
+  (line endings) are indexed from the working tree.
+- Graph reads no longer wait for a deferred embedding job.
+- The web runtime starts without `libwayland-client` (an install hint replaces
+  the panic) and answers `starting` while its workers start.
+- Diagnostics are written to stderr, never stdout.
+
+### Release
+
+- A tag release completes on hosted runners again; the CUDA package's
+  inference acceptance runs on a GPU host (`tools/release_cuda_acceptance.sh`,
+  `docs/releases/RELEASING.md`).
 
 ## [0.4.1] — 2026-10-07
 
