@@ -7,7 +7,7 @@ publish = false
 [features]
 default = ["controller-runtime", "content-runtime"]
 controller-runtime = ["dep:deno_core", "dep:deno_error", "dep:tokio"]
-content-runtime = ["dep:servo", "dep:dpi", "dep:png", "dep:http"]
+content-runtime = ["dep:servo", "dep:dpi", "dep:png", "dep:http", "dep:surfman"]
 
 [dependencies]
 greppy-web-client = { path = "../../web-client" }
@@ -19,6 +19,12 @@ dpi = { version = "0.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 servo = { version = "=0.5.0", optional = true }
+# Direct dependency so Cargo unifies surfman with `sm-x11`. That switches the
+# Linux default connection from Wayland-only to the Unix multi backend
+# (Wayland, then X11, then Mesa surfaceless). SoftwareRenderingContext::new
+# has no other backend argument; without sm-x11 a missing Wayland socket
+# fails the content worker before any headless GL context exists.
+surfman = { version = "=0.13.0", optional = true, features = ["chains", "sm-x11"] }
 tokio = { version = "1", optional = true, features = ["rt", "macros"] }
 png = { version = "0.17", optional = true }
 http = { version = "1", optional = true }

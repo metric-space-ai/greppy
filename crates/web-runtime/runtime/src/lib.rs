@@ -16,6 +16,7 @@ pub mod profile_lock;
 pub mod policy_proxy;
 pub mod playwright_trace;
 pub mod protocol;
+mod rendering_backend;
 pub mod session;
 pub mod supervisor;
 #[cfg(feature = "content-runtime")]

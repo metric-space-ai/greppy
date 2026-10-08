@@ -1257,16 +1257,27 @@ fn authorize_text_transfer(
     Ok(())
 }
 
+fn create_software_rendering_context(
+    size: PhysicalSize<u32>,
+) -> io::Result<SoftwareRenderingContext> {
+    let libwayland_available = crate::rendering_backend::libwayland_client_available();
+    let wayland_display_set =
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
+    crate::rendering_backend::open_rendering_backend(
+        libwayland_available,
+        wayland_display_set,
+        || SoftwareRenderingContext::new(size).map_err(|error| format!("{error:?}")),
+    )
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
 impl ContentEngine {
     fn new(parent_alive: Arc<AtomicBool>, transfer_capability: String) -> io::Result<Self> {
         trace_startup("renderer-create");
-        let rendering_context = Rc::new(
-            SoftwareRenderingContext::new(PhysicalSize {
-                width: 1280,
-                height: 720,
-            })
-            .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
-        );
+        let rendering_context = Rc::new(create_software_rendering_context(PhysicalSize {
+            width: 1280,
+            height: 720,
+        })?);
         trace_startup("renderer-make-current");
         rendering_context.make_current().map_err(|error| {
             io::Error::other(format!("renderer make_current failed: {error:?}"))
@@ -1333,13 +1344,10 @@ impl ContentEngine {
     }
 
     fn build_bundle(&self, storage_key: &str) -> io::Result<Rc<EngineBundle>> {
-        let rendering_context = Rc::new(
-            SoftwareRenderingContext::new(PhysicalSize {
-                width: 1280,
-                height: 720,
-            })
-            .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
-        );
+        let rendering_context = Rc::new(create_software_rendering_context(PhysicalSize {
+            width: 1280,
+            height: 720,
+        })?);
         rendering_context.make_current().map_err(|error| {
             io::Error::other(format!("renderer make_current failed: {error:?}"))
         })?;
