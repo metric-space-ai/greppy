@@ -1941,3 +1941,56 @@ fn nested_root_relative_escape_is_still_refused() {
     assert_eq!(escape_out, "no such file: ../../probe.conf\n");
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
+
+#[test]
+fn read_resolves_a_file_qualified_symbol_written_without_the_extension() {
+    // Java/Kotlin/TS habit seen in the 0.4.1 bench (floci-1209): the file part
+    // of `path::Kind::Name` without its extension answered "no symbol".
+    let (repo, store) = fresh_workspace("extensionless");
+    std::fs::create_dir_all(repo.join("src/svc")).unwrap();
+    std::fs::write(
+        repo.join("src/svc/EcrService.java"),
+        "package svc;\npublic class EcrService {\n    public int batchDeleteImage(int n) { return n + 1; }\n}\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+
+    for target in [
+        "src/svc/EcrService::Class::EcrService",
+        "src/svc/EcrService::batchDeleteImage",
+    ] {
+        let (code, stdout, stderr) = run(&repo, &store, &["read", target]);
+        assert_eq!(code, 0, "{target}: stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.contains("src/svc/EcrService.java:"),
+            "{target} must resolve to the .java file: {stdout}"
+        );
+        assert!(!stdout.contains("no symbol"), "{target}: {stdout}");
+    }
+}
+
+#[test]
+fn read_file_head_and_tail_serve_lines() {
+    let (repo, store) = fresh_workspace("file-head-tail");
+    std::fs::write(
+        repo.join("notes.rs"),
+        "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "notes.rs", "--head", "2"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("fn a()") && stdout.contains("fn b()") && !stdout.contains("fn c()"),
+        "--head 2 must serve the first two lines: {stdout}"
+    );
+    assert!(!stdout.contains("note: a positional file"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "notes.rs", "--tail", "2"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("fn d()") && stdout.contains("fn e()") && !stdout.contains("fn c()"),
+        "--tail 2 must serve the last two lines: {stdout}"
+    );
+}

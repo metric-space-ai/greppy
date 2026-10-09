@@ -812,6 +812,38 @@ pub(crate) fn dispatch_read(
         return dispatch_read_symbols(subjects, head, tail, with_handle, json, path_filters, root);
     }
 
+    // `read FILE --head N` / `--tail N` asks for lines: serve them through the
+    // read-file range instead of answering with a note and an outline.
+    if !json && file_intents.iter().all(|is_file| *is_file) {
+        if let (Some(n), None) = (head, tail) {
+            let range = format!("1:{}", n.max(1));
+            return dispatch_read_line_range(
+                subjects,
+                &range,
+                with_handle,
+                json,
+                path_filters,
+                root,
+            );
+        }
+        if let (None, Some(n), [subject]) = (head, tail, subjects) {
+            if let Some((_, canonical)) = read_resolve_file(&file_base, &canonical_root, subject) {
+                if let Ok(text) = std::fs::read_to_string(&canonical) {
+                    let total = text.lines().count().max(1);
+                    let range = format!("{}:{total}", total.saturating_sub(n.max(1)) + 1);
+                    return dispatch_read_line_range(
+                        subjects,
+                        &range,
+                        with_handle,
+                        json,
+                        path_filters,
+                        root,
+                    );
+                }
+            }
+        }
+    }
+
     if head.is_some() || tail.is_some() || json {
         let note = "note: a positional file uses `read-file` paging; --head, --tail, and --json apply only to symbol reads";
         if json {
