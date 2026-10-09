@@ -1041,12 +1041,36 @@ fn read_smart_folds_by_structure_and_expand_chains() {
 
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
+    // A small block comes back whole: no chain of expands for nested blocks.
+    assert_eq!(
+        expanded,
+        "    for x in xs {\n        if *x > 0 {\n            n += x;\n        }\n    }\n"
+    );
+}
+
+#[test]
+fn read_smart_expand_folds_a_long_block_one_level_again() {
+    let (repo, store) = fresh_workspace("smart-long-expand");
+    let body = "            n += x;\n".repeat(160);
+    std::fs::write(
+        repo.join("lib.rs"),
+        format!("fn target(xs: &[i32]) {{\n    let mut n = 0;\n    for x in xs {{\n        if *x > 0 {{\n{body}        }}\n    }}\n    println!(\"{{n}}\");\n}}\n"),
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-smart", "target"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let id = stdout
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .expect("gap id");
+    let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
     assert!(expanded.starts_with("    for x in xs {\n"), "{expanded}");
     assert!(
-        expanded.contains("        … 4-6 folded source block — greppy expand "),
+        expanded.contains("folded source block — greppy expand "),
         "{expanded}"
     );
-    assert!(expanded.ends_with("    }\n"), "{expanded}");
 }
 
 #[test]
