@@ -1927,7 +1927,7 @@ fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "{expanded}\n{expand_stderr}");
     assert!(
-        expanded.starts_with("etc/long.txt:401-800\nsubdir line 401\n"),
+        expanded.starts_with("etc/long.txt:401-800\n401\tsubdir line 401\n"),
         "{expanded}"
     );
     assert!(!expanded.contains("repo line"), "{expanded}");
