@@ -1,17 +1,13 @@
 name: Rust dependency security audit
 
+# No path filter: "RustSec advisory database" is a required check on main and
+# release.yml requires a green run on the exact release commit. A filtered
+# workflow never reports on code-only changes, which leaves such PRs blocked
+# and such commits untaggable.
 on:
   push:
     branches: [main]
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - .github/workflows/security-audit.yml
   pull_request:
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - .github/workflows/security-audit.yml
   schedule:
     - cron: '17 4 * * 1'
   workflow_dispatch:
