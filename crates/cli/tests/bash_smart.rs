@@ -572,7 +572,7 @@ fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"ok \xe2\x80\x94 exit 0\n");
     assert!(
-        stderr.contains("bash-smart: command still running")
+        stderr.contains("bash-smart: still waiting for the command")
             && stderr.contains("pid=")
             && stderr
                 .contains("latest child output: Blocking waiting for file lock on package cache"),

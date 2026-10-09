@@ -747,6 +747,10 @@ fn read_json_miss(
     clippy::too_many_arguments,
     reason = "keeps the read compatibility decisions at one dispatch boundary"
 )]
+/// Files up to this many lines are printed whole by `read-file` and by
+/// `read PATH`; longer indexed sources answer with an outline.
+const READ_SMALL_FILE_LINES: usize = 60;
+
 pub(crate) fn dispatch_read(
     subjects: &[String],
     lines: Option<&str>,
@@ -839,6 +843,33 @@ pub(crate) fn dispatch_read(
                         path_filters,
                         root,
                     );
+                }
+            }
+        }
+    }
+
+    // `read PATH` on one small file: the file is the answer. An outline of a
+    // short file only cost agents a second call (`read-file`) in the v3 bench.
+    if !json && head.is_none() && tail.is_none() {
+        if let [subject] = subjects {
+            if file_intents.first().copied().unwrap_or(false) {
+                if let Some((_, canonical)) =
+                    read_resolve_file(&file_base, &canonical_root, subject)
+                {
+                    if let Ok(text) = std::fs::read_to_string(&canonical) {
+                        let total = text.lines().count();
+                        if (1..=READ_SMALL_FILE_LINES).contains(&total) {
+                            let range = format!("1:{total}");
+                            return dispatch_read_line_range(
+                                subjects,
+                                &range,
+                                with_handle,
+                                json,
+                                path_filters,
+                                root,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2192,7 +2223,7 @@ pub(crate) fn dispatch_read_files(
             previous_ended_with_newline = true;
             continue;
         }
-        if lines.is_none() && !all && line_count > 60 {
+        if lines.is_none() && !all && line_count > READ_SMALL_FILE_LINES {
             if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
                 if json_output {
                     json_files.push(serde_json::json!({
