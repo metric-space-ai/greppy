@@ -547,6 +547,29 @@ fn write_outside_workspace_refuses_nonzero_and_names_root_recovery() {
 }
 
 #[test]
+fn write_to_a_temp_scratch_path_outside_the_workspace_succeeds() {
+    let fixture = Fixture::new("write-scratch");
+    let scratch = fixture.base.join("scratch").join("probe.py");
+    let path = scratch.to_str().unwrap();
+    let dry = fixture.run_with_stdin(&["write", path, "--dry-run"], b"print(1)\n");
+    assert_eq!(dry.status.code(), Some(0), "{}", combined(&dry));
+    assert!(!scratch.exists());
+    let out = fixture.run_with_stdin(&["write", path], b"print(1)\n");
+    assert_eq!(out.status.code(), Some(0), "{}", combined(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("scratch file outside the workspace"),
+        "{}",
+        combined(&out)
+    );
+    assert_file(&scratch, "print(1)\n");
+    let json = fixture.run(&["write", path, "print(2)\n", "--json"]);
+    assert_eq!(json.status.code(), Some(0), "{}", combined(&json));
+    let record: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(record["scratch"], true, "{record}");
+    assert_file(&scratch, "print(2)\n");
+}
+
+#[test]
 fn symbol_edit_repairs_metadata_only_drift_without_rebuilding_graph() {
     let fixture = Fixture::new("metadata-symbol-refresh");
     let source = fixture.repo.join("lib.rs");
