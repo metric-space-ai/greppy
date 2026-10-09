@@ -743,14 +743,14 @@ fn read_json_miss(
     }))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps the read compatibility decisions at one dispatch boundary"
-)]
 /// Files up to this many lines are printed whole by `read-file` and by
 /// `read PATH`; longer indexed sources answer with an outline.
 const READ_SMALL_FILE_LINES: usize = 60;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the read compatibility decisions at one dispatch boundary"
+)]
 pub(crate) fn dispatch_read(
     subjects: &[String],
     lines: Option<&str>,
