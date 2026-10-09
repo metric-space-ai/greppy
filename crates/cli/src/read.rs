@@ -743,6 +743,10 @@ fn read_json_miss(
     }))
 }
 
+/// `expand` of a folded read-smart block up to this many lines prints it
+/// whole; longer blocks are folded one level again.
+const READ_SMART_EXPAND_WHOLE_LINES: usize = 150;
+
 /// Files up to this many lines are printed whole by `read-file` and by
 /// `read PATH`; longer indexed sources answer with an outline.
 const READ_SMALL_FILE_LINES: usize = 60;
@@ -2574,9 +2578,17 @@ pub(crate) fn dispatch_read_expand(
                     println!("expand: read-smart span changed since this pack was created");
                     return Ok(1);
                 };
-                let text = read_render_smart_source(
-                    store, project, &root_path, &path, &content, start, end, start, end, false, 1,
-                )?;
+                // Re-folding the block on expand made agents walk nested
+                // blocks one `expand` at a time (v3 bench, F5: 27 expands in
+                // one run). A block of moderate size comes back whole.
+                let text = if end - start < READ_SMART_EXPAND_WHOLE_LINES {
+                    read_line_slice(&content, start, end).to_string()
+                } else {
+                    read_render_smart_source(
+                        store, project, &root_path, &path, &content, start, end, start, end, false,
+                        1,
+                    )?
+                };
                 Some((
                     text,
                     serde_json::json!({
