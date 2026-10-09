@@ -939,6 +939,15 @@ pub(crate) fn nearest_old_candidate(
     best.map(|(start, _)| (start + 1, start + n, window(start), false))
 }
 
+/// Shell quotes keep `\n` as two characters; in the v3 bench this was the
+/// most common reason a multi-line OLD matched nothing.
+const LITERAL_NEWLINE_HINT: &str = "\nOLD contains a literal backslash-n (`\\n`), which the shell passes as two characters, not a line break: put real line breaks inside the quotes, use $'…\\n…', or select the lines with `greppy replace-lines F A:B` and pass NEW on stdin with <<'EOF'.";
+
+fn old_has_unexpanded_newline(needle: Option<&str>, content: &[u8]) -> bool {
+    needle.is_some_and(|needle| needle.contains("\\n"))
+        && !content.windows(2).any(|pair| pair == b"\\n")
+}
+
 fn pattern_zero_match_next(pattern: &str, rel: &str) -> String {
     format!("next: test the pattern with `greppy search-pattern {pattern} {rel}`")
 }
@@ -1053,6 +1062,12 @@ pub(crate) fn edit_check_cardinality(located: &Located, expect: Option<usize>) -
         let nearest = want_nearest
             .then(|| append_nearest_old_hint(&mut message, located))
             .flatten();
+        let literal_newline = count == 0
+            && located.kind == SelectorKind::Text
+            && old_has_unexpanded_newline(located.needle.as_deref(), &located.content);
+        if literal_newline {
+            message.push_str(LITERAL_NEWLINE_HINT);
+        }
         let mut refusal = EditRefusal::new("match_count", message, 13)
             .with("expected", serde_json::json!(expect))
             .with("count", serde_json::json!(count))
