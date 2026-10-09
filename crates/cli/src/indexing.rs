@@ -956,6 +956,10 @@ fn status_cache_size_is_advisory_on_entry_or_time_exhaustion() {
     );
 }
 
+/// Largest graph store `index status` still verifies with a full
+/// `integrity_check`; larger stores rely on the check at publication.
+const STATUS_FULL_INTEGRITY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 fn dispatch_index_health_with_detail(
     command: &str,
     json: bool,
@@ -1275,7 +1279,16 @@ fn dispatch_index_health_with_detail(
     status_diagnostic_phase("base_verification");
     let store_cow = crate::store_cow::diagnostics(&effective_root, &store, &store_path);
     status_diagnostic_phase("graph_integrity");
-    let diag = store.diagnostics()?;
+    // A full integrity check is O(store size): 6 s warm / 47 s cold on a
+    // 2.1 GiB store (quarkus, 257k nodes), so status on large repos always ran
+    // out of budget and answered "unknown". Every published snapshot passed
+    // integrity_check before publication; status trusts that above the
+    // threshold and doctor keeps the full check.
+    let full_integrity = command == "doctor"
+        || std::fs::metadata(&store_path)
+            .map(|meta| meta.len() <= STATUS_FULL_INTEGRITY_MAX_BYTES)
+            .unwrap_or(true);
+    let diag = store.diagnostics_with_integrity(full_integrity)?;
     status_diagnostic_phase("source_freshness");
     let mut freshness = nav_freshness_json(&store, root, &project);
     if command == "doctor" {
@@ -1434,6 +1447,7 @@ fn dispatch_index_health_with_detail(
             "expected_schema_version": diag.expected_schema_version,
             "schema_current": diag.schema_current,
             "integrity_ok": diag.integrity_ok,
+            "integrity_check": if full_integrity { "full" } else { "verified_at_publication" },
             "integrity_messages": diag.integrity_messages,
             "project_present": project_present,
             "graph_generation": graph_generation,
