@@ -1434,7 +1434,10 @@ fn replace_text_refuses_js_string_newlines_from_stdin_atomically() {
         "example.tsx",
     ] {
         std::fs::write(fixture.repo.join(path), source).unwrap();
-        for replacement in [b"XYZ\n".as_slice(), b"XYZ\r\n", b"XYZ\r"] {
+        // One trailing newline on stdin is the heredoc's own and is dropped
+        // (OLD has none); a line break that remains inside the string is
+        // still refused.
+        for replacement in [b"XYZ\n\n".as_slice(), b"XYZ\r\n\r\n", b"XYZ\r"] {
             for dry_run in [false, true] {
                 let mut args = vec!["replace-text", path, "ABC"];
                 if dry_run {
@@ -1449,6 +1452,8 @@ fn replace_text_refuses_js_string_newlines_from_stdin_atomically() {
                 assert_file(&fixture.repo.join(path), source);
             }
         }
+        let heredoc = fixture.run_with_stdin(&["replace-text", path, "ABC", "--dry-run"], b"XYZ\n");
+        assert!(heredoc.status.success(), "{}", combined(&heredoc));
         let accepted = fixture.run_with_stdin(&["replace-text", path, "ABC"], b"XYZ\\n");
         assert!(accepted.status.success(), "{}", combined(&accepted));
         assert_file(
@@ -1456,6 +1461,29 @@ fn replace_text_refuses_js_string_newlines_from_stdin_atomically() {
             "const x = document.querySelectorAll('XYZ\\n');\n",
         );
     }
+}
+
+#[test]
+fn heredoc_new_does_not_add_a_blank_line_after_an_old_without_newline() {
+    let fixture = Fixture::new("heredoc-trailing-newline");
+    std::fs::write(
+        fixture.repo.join("a.ts"),
+        "import {\n\tb,\n\tc,\n} from 'x';\n",
+    )
+    .unwrap();
+    let out = fixture.run_with_stdin(&["replace-text", "a.ts", "\tb,"], b"\ta,\n\tb,\n");
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_file(
+        &fixture.repo.join("a.ts"),
+        "import {\n\ta,\n\tb,\n\tc,\n} from 'x';\n",
+    );
+    // An OLD that ends with a newline keeps NEW's newline.
+    let out = fixture.run_with_stdin(&["replace-text", "a.ts", "\tc,\n"], b"\td,\n");
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_file(
+        &fixture.repo.join("a.ts"),
+        "import {\n\ta,\n\tb,\n\td,\n} from 'x';\n",
+    );
 }
 
 #[test]
@@ -1467,7 +1495,7 @@ fn replace_text_preserves_multiline_jsx_attribute_strings() {
             "const view = <div title=\"ABC\" />;\n",
         )
         .unwrap();
-        let accepted = fixture.run_with_stdin(&["replace-text", path, "ABC"], b"XYZ\n");
+        let accepted = fixture.run(&["replace-text", path, "ABC", "XYZ\n"]);
         assert!(accepted.status.success(), "{}", combined(&accepted));
         assert_file(
             &fixture.repo.join(path),

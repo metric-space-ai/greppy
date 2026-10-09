@@ -1852,6 +1852,21 @@ fn read_insert_file_pack(
     clippy::too_many_arguments,
     reason = "keeps page metadata explicit at the rendering boundary"
 )]
+/// Prefix every line with its number, `cat -n` style (`N<TAB>line`). The
+/// edit verbs address lines by number; a page without them made agents count
+/// lines by hand and land inserts in the wrong place (v3 bench, F1). JSON keeps
+/// the raw content.
+fn read_numbered_lines(slice: &str, start_line: usize) -> String {
+    let count = slice.split_inclusive('\n').count();
+    let width = (start_line + count.saturating_sub(1)).to_string().len();
+    let mut out = String::with_capacity(slice.len() + count * (width + 1));
+    for (offset, line) in slice.split_inclusive('\n').enumerate() {
+        out.push_str(&format!("{:>width$}\t", start_line + offset));
+        out.push_str(line);
+    }
+    out
+}
+
 fn read_render_file_page(
     store: Option<&greppy_store::Store>,
     project: &str,
@@ -1863,7 +1878,10 @@ fn read_render_file_page(
     root_path: &std::path::Path,
 ) -> Result<(String, Option<String>)> {
     let mut out = format!("{path}:{start_line}-{end_line}\n");
-    out.push_str(read_line_slice(content, start_line, end_line));
+    out.push_str(&read_numbered_lines(
+        read_line_slice(content, start_line, end_line),
+        start_line,
+    ));
     let mut handle = None;
     if with_handle {
         let store = store.ok_or_else(|| {
@@ -2198,7 +2216,7 @@ pub(crate) fn dispatch_read_files(
                 "{shown}:1-{shown_end}{}",
                 if partial { " (last line partial)" } else { "" }
             );
-            print!("{prefix}");
+            print!("{}", read_numbered_lines(prefix, 1));
             if partial {
                 println!();
             }
