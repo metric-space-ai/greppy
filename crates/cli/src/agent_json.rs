@@ -42,6 +42,10 @@ pub struct JsonResult {
 pub struct JsonEmitter {
     session_emitted: bool,
     result_emitted: bool,
+    /// Turns and usage already reported in `turn_complete` events, so an error
+    /// result still carries what the run consumed.
+    turns: u64,
+    usage: Usage,
 }
 
 impl JsonEmitter {
@@ -91,6 +95,17 @@ impl JsonEmitter {
     }
 
     pub fn turn_complete(&mut self, stop: &str, usage: &Usage) {
+        self.turns += 1;
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
+        self.usage.cache_read_input_tokens = self
+            .usage
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        self.usage.cache_creation_input_tokens = self
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
         write_line(&turn_complete_event(stop, usage));
     }
 
@@ -183,14 +198,15 @@ pub fn emit_error_result(
     if !message.is_empty() {
         emitter.error(message);
     }
+    let (turns, usage) = (emitter.turns, emitter.usage);
     emitter.result(&JsonResult {
         status: if code == 130 { "cancelled" } else { "error" },
         exit_code: code,
         session_id: session.session_id.clone(),
         run_id: session.run_id.clone(),
         stop: String::new(),
-        turns: 0,
-        usage: Usage::default(),
+        turns,
+        usage,
         proposal_ref: None,
         commit: None,
         stat: None,
@@ -239,6 +255,26 @@ fn clip_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_results_carry_the_usage_of_completed_turns() {
+        // 0.4.1 bench: an aborted greppy -p run reported turns 0 and zero usage
+        // although 48 turn_complete events had carried the real numbers.
+        let mut emitter = JsonEmitter::new();
+        let turn = Usage {
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_read_input_tokens: 100,
+            cache_creation_input_tokens: 1,
+        };
+        emitter.turn_complete("tool_use", &turn);
+        emitter.turn_complete("end_turn", &turn);
+        assert_eq!(emitter.turns, 2);
+        assert_eq!(emitter.usage.input_tokens, 20);
+        assert_eq!(emitter.usage.output_tokens, 6);
+        assert_eq!(emitter.usage.cache_read_input_tokens, 200);
+        assert_eq!(emitter.usage.cache_creation_input_tokens, 2);
+    }
 
     #[test]
     fn session_and_result_vocabulary_is_exact() {
