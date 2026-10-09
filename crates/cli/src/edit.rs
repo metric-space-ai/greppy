@@ -28,6 +28,14 @@ pub(crate) fn dispatch_edit_inner(
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let file_base = resolve_file_operand_base(root, &root_path);
+    if let EditCommand::Write {
+        path, new, dry_run, ..
+    } = &command
+    {
+        if let Some(target) = scratch_write_target(&root_path, &file_base, path) {
+            return write_scratch_file(&target, new.clone(), *dry_run, json);
+        }
+    }
     // Symbol selectors depend on the structural graph. Heal workspace drift
     // before taking the edit transaction lock: structural publication owns its
     // own workspace-store writer locks, and waiting for it while holding the
@@ -1108,6 +1116,120 @@ pub(crate) fn edit_expect_positive(expect: Option<usize>) -> EditResult<()> {
 /// There is exactly one stdin, so two arguments asking for it leave the
 /// caller's intent unrecoverable — one of them would get nothing, or both would
 /// get half. The collision is refused before any of them reads a byte.
+/// A `write` below the system temp directory and outside the workspace is a
+/// scratch file (a repro script, a probe). Refusing it made agents put such
+/// files into the repository (v3 bench, F9), so it is written plainly: no
+/// transaction, no undo, no index.
+fn scratch_write_target(
+    root_path: &std::path::Path,
+    file_base: &std::path::Path,
+    path: &str,
+) -> Option<std::path::PathBuf> {
+    let candidate = file_base.join(path);
+    let parent = candidate.parent()?;
+    let name = candidate.file_name()?;
+    // The parent may not exist yet; resolve its nearest existing ancestor.
+    let mut existing = parent.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        missing.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?.to_path_buf();
+    }
+    if missing.iter().any(|part| part == "..") {
+        return None;
+    }
+    let mut resolved = existing.canonicalize().ok()?;
+    for part in missing.into_iter().rev() {
+        resolved.push(part);
+    }
+    resolved.push(name);
+    let root = root_path.canonicalize().ok()?;
+    if resolved.starts_with(&root) {
+        return None;
+    }
+    let scratch_roots = [std::env::temp_dir(), std::path::PathBuf::from("/tmp")];
+    let scratch = scratch_roots
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .find(|dir| resolved.starts_with(dir) && resolved != *dir)?;
+    // Another repository below the temp directory is not scratch space: a
+    // write there still needs `--root` like any other workspace.
+    let inside_repository = resolved
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| *dir != scratch)
+        .any(|dir| dir.join(".git").exists());
+    (!inside_repository).then_some(resolved)
+}
+
+fn write_scratch_file(
+    target: &std::path::Path,
+    new: Option<String>,
+    dry_run: bool,
+    json: bool,
+) -> Result<i32> {
+    let bytes = match edit_positional_payload(new, "NEW") {
+        Ok(bytes) => bytes,
+        Err(refusal) => {
+            if json {
+                println!("{}", edit_refusal_json(&refusal, None));
+            } else {
+                eprintln!("greppy: {}", refusal.message);
+            }
+            return Ok(refusal.exit);
+        }
+    };
+    if std::fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        let message = format!(
+            "refusing to write scratch file through a symlink: {}",
+            target.display()
+        );
+        if json {
+            let refusal = EditRefusal::new("scratch_symlink", message, 20);
+            println!("{}", edit_refusal_json(&refusal, None));
+        } else {
+            eprintln!("greppy: {message}");
+        }
+        return Ok(20);
+    }
+    if !dry_run {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| Error::io("create scratch directory", source))?;
+        }
+        let staging = target.with_file_name(format!(
+            ".{}.greppy-{}",
+            target.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+        std::fs::write(&staging, &bytes)
+            .map_err(|source| Error::io("write scratch file", source))?;
+        std::fs::rename(&staging, target).map_err(|source| {
+            let _ = std::fs::remove_file(&staging);
+            Error::io("publish scratch file", source)
+        })?;
+    }
+    let verb = if dry_run { "would write" } else { "wrote" };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": if dry_run { "dry_run" } else { "written" },
+                "path": target.to_string_lossy(),
+                "bytes": bytes.len(),
+                "scratch": true,
+            })
+        );
+    } else {
+        println!(
+            "{verb} {} ({} bytes) — scratch file outside the workspace: no undo, not indexed",
+            target.display(),
+            bytes.len()
+        );
+    }
+    Ok(0)
+}
+
 pub(crate) fn edit_positional_payload(
     payload: Option<String>,
     name: &'static str,
