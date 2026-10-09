@@ -4828,7 +4828,17 @@ pub(crate) fn dispatch_edit_grammar(
             allow_syntax_errors,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
-                let new_bytes = edit_positional_payload(new, "NEW")?;
+                let from_stdin = new.is_none();
+                let mut new_bytes = edit_positional_payload(new, "NEW")?;
+                // A heredoc always ends NEW with a newline. When OLD does not
+                // end with one, that newline is an artifact of the heredoc and
+                // left a stray blank line after every such edit (v3 bench, F3).
+                if from_stdin && !regex && !old.ends_with('\n') && new_bytes.ends_with(b"\n") {
+                    new_bytes.pop();
+                    if new_bytes.ends_with(b"\r") && !old.ends_with('\r') {
+                        new_bytes.pop();
+                    }
+                }
                 edit_expect_positive(expect)?;
                 let spec = WhereSpec {
                     file: Some(file),
