@@ -455,13 +455,13 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
                 let latest = heartbeat_tail(&stderr_path).or_else(|| heartbeat_tail(&stdout_path));
                 if let Some(latest) = latest {
                     eprintln!(
-                            "bash-smart: command still running — pid={}, elapsed={}s; latest child output: {latest}",
+                            "bash-smart: still waiting for the command (pid={}, elapsed={}s); the result follows when it exits; latest child output: {latest}",
                             child.id(),
                             elapsed.as_secs()
                         );
                 } else {
                     eprintln!(
-                            "bash-smart: command still running — pid={}, elapsed={}s; child output is being captured and will be summarized on exit",
+                            "bash-smart: still waiting for the command (pid={}, elapsed={}s); the result follows when it exits",
                             child.id(),
                             elapsed.as_secs()
                         );

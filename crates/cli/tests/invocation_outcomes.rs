@@ -69,25 +69,15 @@ fn read_code_flag_returns_source_and_names_the_noop() {
 }
 
 #[test]
-fn read_path_positional_offers_indexed_symbols_instead_of_the_file() {
+fn read_path_positional_prints_a_short_file() {
     let (repo, store) = indexed_workspace("read-path");
 
     let (code, stdout, stderr) = run(&repo, &store, &["read", "src/lexer.rs"]);
 
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert!(
-        stdout.contains("`src/lexer.rs` is a file — read a symbol:"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("CommentIndentation"), "{stdout}");
-    assert!(
-        stdout.contains("greppy read-file src/lexer.rs --lines A:B"),
-        "{stdout}"
-    );
-    assert!(
-        !stdout.contains("pub struct CommentIndentation"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("pub struct CommentIndentation"), "{stdout}");
+    assert!(stdout.contains("pub fn block_tokens"), "{stdout}");
+    assert!(!stdout.contains("is a file — read a symbol"), "{stdout}");
 }
 
 #[test]

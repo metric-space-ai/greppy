@@ -1129,7 +1129,9 @@ fn print_search_pattern_rows(
     root_path: &std::path::Path,
 ) {
     const FULL_LIMIT: usize = 25;
-    const SUMMARY_ROWS: usize = 5;
+    // Five rows made agents re-query for the next page on every larger
+    // result (v3 bench: "40 matches; showing 5"); twenty stays compact.
+    const SUMMARY_ROWS: usize = 20;
     let mut per_file: std::collections::BTreeMap<&str, usize> = Default::default();
     for row in rows {
         *per_file.entry(&row.hit.file).or_insert(0) += 1;

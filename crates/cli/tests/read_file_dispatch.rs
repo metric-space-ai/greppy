@@ -726,12 +726,23 @@ fn read_is_symbols_only_whole_and_doc_extended() {
 
     let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
     assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
+    // A short file is its own answer, the same as `read-file lib.rs`.
+    assert!(path_out.contains("pub fn target()"), "{path_out}");
+    assert!(
+        !path_out.contains("is a file — read a symbol"),
+        "{path_out}"
+    );
+
+    let long = format!("pub fn target() {{}}\n{}", "// line\n".repeat(60));
+    std::fs::write(repo.join("lib.rs"), &long).unwrap();
+    index(&repo, &store);
+    let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
+    assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
     assert!(
         path_out.starts_with("`lib.rs` is a file — read a symbol:\n"),
         "{path_out}"
     );
-    assert!(path_out.contains("target"), "{path_out}");
-    assert!(!path_out.contains("pub fn target()"), "{path_out}");
+    assert!(!path_out.contains("// line"), "{path_out}");
 }
 
 #[test]
