@@ -1308,10 +1308,15 @@ fn repository_tracker_fence(
                 before.detail.as_deref().unwrap_or("none"),
             )));
         }
+        // Parallel workspace creations in one process share the pid and can
+        // read the same clock value; a per-process sequence keeps every fence
+        // file distinct so one creator never removes another's fence.
+        static FENCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
-            "greppy-tracker-fence-{}-{}-{attempt}",
+            "greppy-tracker-fence-{}-{}-{}-{attempt}",
             std::process::id(),
-            now_unix_ns()
+            now_unix_ns(),
+            FENCE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let path = git_dir.join(&name);
         let virtual_path = format!(".git/{name}");
