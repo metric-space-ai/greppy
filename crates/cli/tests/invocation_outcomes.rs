@@ -81,6 +81,27 @@ fn read_path_positional_prints_a_short_file() {
 }
 
 #[test]
+fn invented_option_is_dropped_with_the_real_usage() {
+    let (repo, store) = indexed_workspace("invented-option");
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["who-calls", "block_tokens", "--frobnicate"],
+    );
+
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("`who-calls` has no such option; answered without it"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("usage: greppy who-calls SYMBOL"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn unknown_kind_searches_without_the_filter_and_lists_valid_values() {
     let (repo, store) = indexed_workspace("kind");
 

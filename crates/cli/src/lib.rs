@@ -1093,7 +1093,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             ) {
                 if let Some(reduced) = argv_without_unknown_flag(&argv, first) {
                     if let Some(unknown) = unknown_flag_name(first) {
-                        println!("note: ignoring unknown option `{unknown}`");
+                        // A bare "ignoring" line was overlooked in the v3
+                        // bench; naming the real options makes the next
+                        // call correct instead of repeating the guess.
+                        println!(
+                            "note: ignoring unknown option `{unknown}`: `{sub}` has no such option; answered without it"
+                        );
+                        if let Some(usage) = subcommand_usage(sub) {
+                            println!("usage: {usage}");
+                        }
                     }
                     return run_os(reduced);
                 }
