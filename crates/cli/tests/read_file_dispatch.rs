@@ -1672,7 +1672,7 @@ fn concurrent_read_file_ranges_never_report_empty_success() {
         let (code, stdout, stderr) = worker.join().expect("read worker");
         assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
         assert!(
-            stdout.starts_with("source.txt:32-96\nline 32\n"),
+            stdout.starts_with("source.txt:32-96\n32\tline 32\n"),
             "{stdout}"
         );
         assert!(stdout.ends_with("line 96\n"), "{stdout}");
