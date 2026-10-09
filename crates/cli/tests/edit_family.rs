@@ -2396,6 +2396,28 @@ fn old_that_matches_nowhere_points_at_the_whitespace_variant() {
 }
 
 #[test]
+fn old_with_a_literal_backslash_n_names_the_shell_quoting_cause() {
+    let fixture = Fixture::new("literal-backslash-n");
+    std::fs::write(fixture.repo.join("a.txt"), "first\nsecond\n").unwrap();
+    let out = fixture.run(&["replace-text", "a.txt", "first\\nsecond", "x"]);
+    assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+    let text = combined(&out);
+    assert!(text.contains("OLD occurs 0 times"), "{text}");
+    assert!(text.contains("literal backslash-n"), "{text}");
+    assert_file(&fixture.repo.join("a.txt"), "first\nsecond\n");
+
+    // A file that really contains backslash-n gets no such hint.
+    std::fs::write(fixture.repo.join("b.txt"), "say(\"a\\nb\")\n").unwrap();
+    let out = fixture.run(&["replace-text", "b.txt", "say(\"c\\nd\")", "x"]);
+    assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+    assert!(
+        !combined(&out).contains("literal backslash-n"),
+        "{}",
+        combined(&out)
+    );
+}
+
+#[test]
 fn rename_receipt_lines_stay_exact_when_the_new_name_is_longer() {
     // changed_byte_ranges are in the original file's coordinates; shifting
     // them by the length delta moved every later site onto an earlier line.
