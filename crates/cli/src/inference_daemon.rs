@@ -3694,17 +3694,26 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(matches!(
-            request(
-                &endpoint,
-                serde_json::json!({"op": "infer"}),
-                Duration::from_secs(3),
-                4096,
-                4096,
-            ),
-            RequestOutcome::Response(ref value) if value["ok"] == true
-        ));
-        assert_eq!(diagnostic(&endpoint)["backend"], "test-2");
+        // The reload is proven by the response itself: the second model owner
+        // served it. The status probe can only confirm the backend while the
+        // model is still loaded; with a 150 ms model TTL a slow runner may
+        // already have evicted it again (macOS CI, PR #307).
+        match request(
+            &endpoint,
+            serde_json::json!({"op": "infer"}),
+            Duration::from_secs(3),
+            4096,
+            4096,
+        ) {
+            RequestOutcome::Response(value) if value["ok"] == true => {
+                assert_eq!(value["model_owner"], 2, "{value}");
+            }
+            _ => panic!("reload request failed"),
+        }
+        let status = diagnostic(&endpoint);
+        if status["state"] != "evicted" {
+            assert_eq!(status["backend"], "test-2", "{status}");
+        }
         assert_eq!(loads.load(Ordering::SeqCst), 2);
         assert_eq!(server.join().expect("server thread"), 0);
     }
