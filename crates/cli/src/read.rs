@@ -1848,10 +1848,6 @@ fn read_insert_file_pack(
         .map_err(Error::from)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps page metadata explicit at the rendering boundary"
-)]
 /// Prefix every line with its number, `cat -n` style (`N<TAB>line`). The
 /// edit verbs address lines by number; a page without them made agents count
 /// lines by hand and land inserts in the wrong place (v3 bench, F1). JSON keeps
@@ -1867,6 +1863,10 @@ fn read_numbered_lines(slice: &str, start_line: usize) -> String {
     out
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps page metadata explicit at the rendering boundary"
+)]
 fn read_render_file_page(
     store: Option<&greppy_store::Store>,
     project: &str,
@@ -2089,7 +2089,10 @@ pub(crate) fn dispatch_read_files(
                 }));
                 continue;
             }
-            let group = format!("{shown}:{start}-{end}\n{text}");
+            let group = format!(
+                "{shown}:{start}-{end}\n{}",
+                read_numbered_lines(&text, start)
+            );
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             let stdout = std::io::stdout();
             let mut output = stdout.lock();
