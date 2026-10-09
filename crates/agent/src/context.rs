@@ -322,6 +322,34 @@ pub(crate) fn compaction_due(messages: &[Message], max_bytes: usize) -> bool {
     checkpoint_plan(messages, max_bytes).is_some()
 }
 
+/// Size of the live history in the unit [`compaction_due`] measures.
+pub(crate) fn history_bytes(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(message_bytes)
+        .fold(0usize, |n, size| n.saturating_add(size))
+}
+
+/// Like [`compact_with_model`], but keeps the structured failure (with the
+/// usage of a rejected answer) so the loop can retry or continue uncompacted.
+pub(crate) fn try_compact_with_model(
+    model: &mut dyn crate::model::ModelStream,
+    messages: &mut Vec<Message>,
+    system: &mut Option<String>,
+    template: &crate::protocol::ModelRequest,
+    max_bytes: usize,
+) -> Result<Option<crate::protocol::Usage>, CheckpointError> {
+    checkpoint_history_with_limit(
+        model,
+        &template.model,
+        template.max_tokens,
+        messages,
+        system,
+        max_bytes,
+    )
+    .map(|result| result.map(|result| result.usage))
+}
+
 fn checkpoint_plan(
     messages: &[Message],
     max_bytes: usize,

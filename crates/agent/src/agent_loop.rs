@@ -306,6 +306,7 @@ pub fn run_agent_loop_with_history(
 
     let mut total_usage = Usage::default();
     let mut turns: usize = 0;
+    let mut compaction_threshold = COMPACTION_BYTES;
     // Every exit from the loop below sets this before `break`.
     let mut last_stop: LoopStop;
     let mut final_text = String::new();
@@ -330,8 +331,7 @@ pub fn run_agent_loop_with_history(
 
         // Snapshot the pre-compaction window only when a checkpoint is due,
         // not on every turn.
-        const COMPACTION_BYTES: usize = 256 * 1024;
-        if crate::context::compaction_due(&messages, COMPACTION_BYTES) {
+        if crate::context::compaction_due(&messages, compaction_threshold) {
             let template = ModelRequest {
                 model: config.model.clone(),
                 system: system.clone(),
@@ -341,21 +341,55 @@ pub fn run_agent_loop_with_history(
                 max_tokens: config.max_tokens,
             };
             let archive = messages.clone();
-            if let Some(usage) = crate::context::compact_with_model(
+            // A checkpoint is transactional: a rejected or failed attempt leaves
+            // history and system untouched. One malformed summary must not end
+            // the run (0.4.1 bench: "invalid summary JSON" aborted a greppy -p
+            // run after 48 turns), so retry once, then continue uncompacted and
+            // try again only after the history has grown.
+            let mut outcome = crate::context::try_compact_with_model(
                 model,
                 &mut messages,
                 &mut system,
                 &template,
                 COMPACTION_BYTES,
-            )? {
-                total_usage = sum_usage(total_usage, usage);
-                on_event(LoopEvent::ContextCompacted {
-                    archive,
-                    messages: messages.clone(),
-                    summary: crate::context::saved_summary(system.as_deref())
-                        .unwrap()
-                        .to_owned(),
-                });
+            );
+            if let Err(first) = &outcome {
+                if !matches!(first.source, Some(ClientError::Cancelled)) {
+                    if let Some(usage) = first.usage {
+                        total_usage = sum_usage(total_usage, usage);
+                    }
+                    outcome = crate::context::try_compact_with_model(
+                        model,
+                        &mut messages,
+                        &mut system,
+                        &template,
+                        COMPACTION_BYTES,
+                    );
+                }
+            }
+            match outcome {
+                Ok(Some(usage)) => {
+                    total_usage = sum_usage(total_usage, usage);
+                    compaction_threshold = COMPACTION_BYTES;
+                    on_event(LoopEvent::ContextCompacted {
+                        archive,
+                        messages: messages.clone(),
+                        summary: crate::context::saved_summary(system.as_deref())
+                            .unwrap()
+                            .to_owned(),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(ClientError::Cancelled) = error.source {
+                        return Err(LoopError::from(ClientError::Cancelled));
+                    }
+                    if let Some(usage) = error.usage {
+                        total_usage = sum_usage(total_usage, usage);
+                    }
+                    compaction_threshold = crate::context::history_bytes(&messages)
+                        .saturating_add(COMPACTION_RETRY_GROWTH_BYTES);
+                }
             }
         }
         if cancel_requested(config) {
@@ -733,6 +767,12 @@ fn extract_text(message: &Message) -> String {
     out
 }
 
+/// History size that triggers a context checkpoint.
+const COMPACTION_BYTES: usize = 256 * 1024;
+/// After a failed checkpoint, wait for this much more history before retrying,
+/// instead of re-asking on every turn.
+const COMPACTION_RETRY_GROWTH_BYTES: usize = 64 * 1024;
+
 fn sum_usage(a: Usage, b: Usage) -> Usage {
     Usage {
         input_tokens: a.input_tokens.saturating_add(b.input_tokens),
@@ -1070,6 +1110,62 @@ mod tests {
         // Usage summed.
         assert_eq!(result.usage.input_tokens, 220);
         assert_eq!(result.usage.output_tokens, 48);
+    }
+
+    #[test]
+    fn malformed_checkpoint_answers_never_end_the_run() {
+        // 0.4.1 bench: one non-JSON checkpoint answer aborted greppy -p after 48
+        // turns ("invalid summary JSON"), although history was intact.
+        struct ProseCheckpointModel {
+            actions: usize,
+            checkpoints: usize,
+        }
+        impl ModelStream for ProseCheckpointModel {
+            fn stream_turn(
+                &mut self,
+                req: &ModelRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> Result<TurnResult, ClientError> {
+                if req
+                    .system
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Create an accurate continuation checkpoint"))
+                {
+                    self.checkpoints += 1;
+                    return text_turn("Here is a summary of the work so far.", usage(20, 5)).result;
+                }
+                if self.actions == 40 {
+                    return text_turn("done", usage(1, 1)).result;
+                }
+                self.actions += 1;
+                tool_turn(
+                    None,
+                    vec![(&format!("call-{}", self.actions), "echo", json!({}))],
+                    usage(1, 1),
+                )
+                .result
+            }
+        }
+        let mut model = ProseCheckpointModel {
+            actions: 0,
+            checkpoints: 0,
+        };
+        let mut env = FakeEnv::new(vec![echo_tool()])
+            .with_outcome("echo", ToolOutcome::ok("evidence ".repeat(1200)));
+        let config = AgentConfig::default().with_model("fixture");
+        let (result, events) = run(&mut model, &mut env, &config, "Fix clamp").unwrap();
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        assert_eq!(result.final_text, "done");
+        assert_eq!(model.actions, 40);
+        assert!(model.checkpoints >= 2, "a failed checkpoint is retried");
+        // Failed attempts are retried once, then only after the history grew,
+        // not on every turn.
+        assert!(model.checkpoints < 20, "checkpoints={}", model.checkpoints);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::ContextCompacted { .. })));
+        // Usage of the rejected checkpoint answers is still counted.
+        assert!(result.usage.input_tokens >= 40 + 20 * model.checkpoints as u64);
     }
 
     #[test]
