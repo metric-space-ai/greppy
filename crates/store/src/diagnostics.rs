@@ -53,8 +53,21 @@ impl Store {
     /// that is only partial because it omits non-call-graph classes (routes,
     /// k8s, …) stays healthy; `incomplete_provider_count` still discloses it.
     pub fn diagnostics(&self) -> Result<StoreDiagnostics> {
+        self.diagnostics_with_integrity(true)
+    }
+
+    /// Like [`Store::diagnostics`], but `full_integrity = false` skips the
+    /// O(database size) `PRAGMA integrity_check` and reports the check every
+    /// snapshot already passed before it was published. A full check of a
+    /// multi-GiB store takes seconds to minutes, which is far beyond a status
+    /// budget; `greppy doctor` keeps the full check.
+    pub fn diagnostics_with_integrity(&self, full_integrity: bool) -> Result<StoreDiagnostics> {
         let schema_version = self.schema_version()?;
-        let integrity_messages = self.integrity_check_messages()?;
+        let integrity_messages = if full_integrity {
+            self.integrity_check_messages()?
+        } else {
+            vec!["ok".to_string()]
+        };
         let integrity_ok = matches!(integrity_messages.as_slice(), [single] if single == "ok");
         let mut projects = Vec::new();
         for project in self.list_projects()? {
@@ -89,6 +102,18 @@ impl Store {
 mod tests {
     use super::*;
     use crate::{workspace_state as ws, IndexSkip, Project, ProviderState, WorkspaceState};
+
+    #[test]
+    fn diagnostics_without_full_integrity_keep_every_other_field() {
+        let store = Store::open_memory().unwrap();
+        let full = store.diagnostics().unwrap();
+        let trusted = store.diagnostics_with_integrity(false).unwrap();
+        assert!(trusted.integrity_ok);
+        assert_eq!(trusted.integrity_messages, vec!["ok".to_string()]);
+        assert_eq!(trusted.schema_version, full.schema_version);
+        assert_eq!(trusted.schema_current, full.schema_current);
+        assert_eq!(trusted.projects.len(), full.projects.len());
+    }
 
     #[test]
     fn diagnostics_expose_schema_integrity_workspace_and_provider_incompleteness() {
