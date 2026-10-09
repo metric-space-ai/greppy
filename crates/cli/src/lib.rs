@@ -3428,13 +3428,27 @@ fn has_case_variant_suggestion(suggestions: &[String], query: &str) -> bool {
 
 fn indexed_path_matches_query(indexed_path: &str, query_path: &str) -> bool {
     let normalized_query = query_path.replace('\\', "/");
-    if normalized_query.contains('/') {
-        indexed_path == normalized_query.trim_start_matches("./")
+    let query = normalized_query.trim_start_matches("./");
+    let path = std::path::Path::new(indexed_path);
+    let exact = if query.contains('/') {
+        indexed_path == query
     } else {
-        std::path::Path::new(indexed_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(normalized_query.as_str())
+        path.file_name().and_then(|name| name.to_str()) == Some(query)
+    };
+    if exact {
+        return true;
+    }
+    // Java/Kotlin/TS habit: `src/svc/EcrService::Class::EcrService` names the
+    // file without its extension. Match the extension-less spelling too; when
+    // several files share the stem (`foo.ts` and `foo.tsx`) every match is
+    // returned, so the caller still reports the ambiguity instead of guessing.
+    if std::path::Path::new(query).extension().is_some() {
+        return false;
+    }
+    if query.contains('/') {
+        path.with_extension("").to_str() == Some(query)
+    } else {
+        path.file_stem().and_then(|stem| stem.to_str()) == Some(query)
     }
 }
 
