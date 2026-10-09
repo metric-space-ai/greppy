@@ -13,7 +13,7 @@ fn read_file_clamps_past_eof_without_opening_a_graph() {
         &["read-file", "sample.txt", "--lines", "2:80"],
     );
     assert_eq!(code, 0, "{out}\n{err}");
-    assert_eq!(out, "sample.txt:2-3\nsecond\nthird");
+    assert_eq!(out, "sample.txt:2-3\n2\tsecond\n3\tthird");
     assert_eq!(
         err,
         "note: read-file --lines 2:80 ends past EOF; clamped to 2:3\n"
@@ -496,7 +496,10 @@ fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
         ],
     );
     assert_eq!(code, 0, "{out} {err}");
-    assert!(out.contains("dump.txt:1-3\nalpha\nbeta\ngamma\n"), "{out}");
+    assert!(
+        out.contains("dump.txt:1-3\n1\talpha\n2\tbeta\n3\tgamma\n"),
+        "{out}"
+    );
     assert!(
         !store.join("workspaces").exists() && !store.join("graph.db").exists(),
         "plain bounded reads must not create a graph"
@@ -535,7 +538,10 @@ fn invalid_selected_text_does_not_hide_later_file_spans() {
     );
     assert_eq!(code, 1, "{out} {err}");
     assert!(out.contains("cannot read file invalid.txt:"), "{out}");
-    assert!(out.contains("valid.txt:1-2\nbeta\r\ngamma\n"), "{out}");
+    assert!(
+        out.contains("valid.txt:1-2\n1\tbeta\r\n2\tgamma\n"),
+        "{out}"
+    );
     assert!(!out.contains("no such file") && !out.contains("ignored"));
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
@@ -809,7 +815,7 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--all"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(stdout.contains(&source), "{stdout}");
+    assert!(stdout.contains(&numbered(&source)), "{stdout}");
     assert_eq!(
         std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
         source
@@ -916,7 +922,7 @@ fn changed_source_never_offers_stale_outline_selectors_or_starts_refresh() {
     for command in ["read", "read-file"] {
         let (code, stdout, stderr) = run(&repo, &store, &[command, "lib.rs"]);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
-        assert!(stdout.contains(&after), "{stdout}");
+        assert!(stdout.contains(&numbered(&after)), "{stdout}");
         assert!(!stdout.contains("is a file — read a symbol:"), "{stdout}");
         assert!(!stdout.contains("old_name"), "{stdout}");
     }
@@ -935,7 +941,7 @@ fn source_read_outline_threshold_and_unindexed_fallback_do_not_start_indexing() 
     index(&repo, &store);
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(stdout.contains(&source), "{stdout}");
+    assert!(stdout.contains(&numbered(&source)), "{stdout}");
 
     let (cold_repo, cold_store) = fresh_workspace("outline-no-index");
     let source = format!("pub fn cold_target() {{}}\n{}", "// cold line\n".repeat(79));
@@ -943,7 +949,7 @@ fn source_read_outline_threshold_and_unindexed_fallback_do_not_start_indexing() 
     for command in ["read-file", "read"] {
         let (code, stdout, stderr) = run(&cold_repo, &cold_store, &[command, "lib.rs"]);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
-        assert!(stdout.contains(&source), "{stdout}");
+        assert!(stdout.contains(&numbered(&source)), "{stdout}");
     }
     fn has_graph_or_index_job(path: &Path) -> bool {
         if !path.exists() {
@@ -1334,7 +1340,7 @@ fn read_file_default_bounds_one_long_utf8_line_without_a_false_handle() {
         args.extend_from_slice(tail);
         let (code, out, err) = run(&repo, &store, &args);
         assert_eq!(code, 0, "{err}");
-        assert_eq!(out, format!("huge.ndjson:1-1\n{content}"));
+        assert_eq!(out, format!("huge.ndjson:1-1\n1\t{content}"));
     }
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
@@ -1352,7 +1358,7 @@ fn read_file_byte_budget_continues_after_a_complete_line() {
     assert!(out.contains("--lines 2:2\n"));
     let (code, out, err) = run(&repo, &store, &["read-file", "large.txt", "--lines", "2:2"]);
     assert_eq!(code, 0, "{err}");
-    assert_eq!(out, "large.txt:2-2\ntail\n");
+    assert_eq!(out, "large.txt:2-2\n2\ttail\n");
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
 
@@ -1446,9 +1452,12 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
 
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.starts_with("long.txt:1-400\nline 1\n"), "{stdout}");
     assert!(
-        stdout.contains("line 400\n405 more lines — greppy expand "),
+        stdout.starts_with("long.txt:1-400\n  1\tline 1\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("400\tline 400\n405 more lines — greppy expand "),
         "{stdout}"
     );
     assert!(stdout.ends_with(" continues at 401\n"), "{stdout}");
@@ -1462,7 +1471,7 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
     assert!(
-        expanded.starts_with("long.txt:401-800\nline 401\n"),
+        expanded.starts_with("long.txt:401-800\n401\tline 401\n"),
         "{expanded}"
     );
     assert!(
@@ -1507,8 +1516,11 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
 
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(stdout.starts_with("long.txt:1-400\nline 1\n"), "{stdout}");
-    assert!(stdout.contains("line 400\nhandle: geh2:"), "{stdout}");
+    assert!(
+        stdout.starts_with("long.txt:1-400\n  1\tline 1\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("400\tline 400\nhandle: geh2:"), "{stdout}");
     assert!(!stdout.contains("line 401\n"), "{stdout}");
     let id = stdout
         .lines()
@@ -1519,7 +1531,7 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
     let (expand_code, expanded, expand_err) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "{expanded}\n{expand_err}");
     assert!(
-        expanded.starts_with("long.txt:401-800\nline 401\n"),
+        expanded.starts_with("long.txt:401-800\n401\tline 401\n"),
         "{expanded}"
     );
     assert!(!expanded.contains("line 400\n"), "{expanded}");
@@ -1532,10 +1544,13 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
     );
     assert_eq!(range_code, 0, "{range_out}\n{range_err}");
     assert!(
-        range_out.starts_with("long.txt:800-805\nline 800\n"),
+        range_out.starts_with("long.txt:800-805\n800\tline 800\n"),
         "{range_out}"
     );
-    assert!(range_out.contains("line 805\nhandle: geh2:"), "{range_out}");
+    assert!(
+        range_out.contains("805\tline 805\nhandle: geh2:"),
+        "{range_out}"
+    );
     let handle = range_out
         .lines()
         .find_map(|line| line.strip_prefix("handle: "))
@@ -1576,11 +1591,11 @@ fn read_file_range_and_all_bypass_pagination() {
         &["read-file", "config.json", "--lines", "2:3"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert_eq!(stdout, "config.json:2-3\nb\nc\n");
+    assert_eq!(stdout, "config.json:2-3\n2\tb\n3\tc\n");
 
     let (all_code, all_out, all_err) = run(&repo, &store, &["read-file", "config.json", "--all"]);
     assert_eq!(all_code, 0, "stdout={all_out}\nstderr={all_err}");
-    assert_eq!(all_out, "config.json:1-4\na\nb\nc\nd\n");
+    assert_eq!(all_out, "config.json:1-4\n1\ta\n2\tb\n3\tc\n4\td\n");
 }
 
 #[test]
@@ -1607,7 +1622,7 @@ fn read_file_missing_target_and_exact_range_skip_global_cache_writes() {
         &["read-file", "config.json", "--lines", "1:2"],
     );
     assert_eq!(code, 0, "{stdout} {stderr}");
-    assert_eq!(stdout, "config.json:1-2\nfirst\nsecond\n");
+    assert_eq!(stdout, "config.json:1-2\n1\tfirst\n2\tsecond\n");
     assert!(
         !store.join("gc.state").exists(),
         "exact file reads must not run global maintenance"
@@ -1681,7 +1696,7 @@ fn read_file_accepts_explicit_absolute_path_outside_repo_only() {
     assert_eq!(
         stdout,
         format!(
-            "{}:1-3\n{{\n  \"passed\": false\n}}\n",
+            "{}:1-3\n1\t{{\n2\t  \"passed\": false\n3\t}}\n",
             canonical_external.display()
         )
     );
@@ -1709,7 +1724,10 @@ fn read_file_follows_relative_symlink_to_external_dependency() {
         &["read-file", "node_modules/.bin/vp", "--all"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert_eq!(stdout, "node_modules/.bin/vp:1-2\n#!/bin/sh\necho linked\n");
+    assert_eq!(
+        stdout,
+        "node_modules/.bin/vp:1-2\n1\t#!/bin/sh\n2\techo linked\n"
+    );
 }
 
 #[test]
@@ -1895,7 +1913,7 @@ fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
     );
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with("etc/long.txt:1-400\nsubdir line 1\n"),
+        stdout.starts_with("etc/long.txt:1-400\n  1\tsubdir line 1\n"),
         "{stdout}"
     );
     assert!(stdout.contains("subdir line 400\n"), "{stdout}");
@@ -2004,4 +2022,16 @@ fn read_file_head_and_tail_serve_lines() {
         stdout.contains("fn d()") && stdout.contains("fn e()") && !stdout.contains("fn c()"),
         "--tail 2 must serve the last two lines: {stdout}"
     );
+}
+
+/// read-file output for a whole file: every line prefixed `N<TAB>`, right-
+/// aligned to the widest line number.
+fn numbered(source: &str) -> String {
+    let count = source.split_inclusive('\n').count();
+    let width = count.to_string().len();
+    source
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| format!("{:>width$}\t{line}", index + 1))
+        .collect()
 }

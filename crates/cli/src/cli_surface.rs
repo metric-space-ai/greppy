@@ -318,6 +318,7 @@ pub enum Command {
         path_opts: Vec<String>,
     },
     /// Read files directly, in 400-line pages unless a range or all lines were requested.
+    /// Each line is printed as `N<TAB>text`; --json keeps the raw content.
     #[command(name = "read-file")]
     ReadFile {
         /// Repository-relative or absolute file paths.
