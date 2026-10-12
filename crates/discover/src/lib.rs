@@ -463,7 +463,7 @@ pub fn walk_scoped_with_policy_and_overrides(
                             .strip_prefix(&relative)
                             .is_some_and(|rest| rest.starts_with('/'))
                 });
-            in_scope && scoped_hidden_components_are_explicit(&relative, &scopes)
+            in_scope && scoped_hidden_components_are_explicit(&relative, scopes)
         });
     }
     let walker = builder.build();
