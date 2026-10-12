@@ -72,6 +72,7 @@ mod from_embedder {
                 Self::SetScrollStates(..) => target!("SetScrollStates"),
                 Self::PaintMetric(..) => target!("PaintMetric"),
                 Self::EvaluateJavaScript(..) => target!("EvaluateJavaScript"),
+                Self::EvaluateStructuredDom(..) => target!("EvaluateStructuredDom"),
                 Self::CreateMemoryReport(..) => target!("CreateMemoryReport"),
                 Self::SendImageKeysForPipeline(..) => target!("SendImageKeysForPipeline"),
                 Self::PreferencesUpdated(..) => target!("PreferencesUpdated"),

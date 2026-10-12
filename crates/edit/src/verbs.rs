@@ -591,7 +591,8 @@ fn outer_brace_offsets(content: &[u8]) -> Option<(usize, usize)> {
     (content[open] == b'{' && content[close] == b'}').then_some((open, close))
 }
 
-fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
+/// Keep a selected body's outer braces when the replacement supplies only inner content.
+pub fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
     if outer_brace_offsets(requested).is_some() {
         return requested.to_vec();
     }
@@ -1829,6 +1830,11 @@ fn plan_semantic_file(
     scope_matches: usize,
     options: &VerbOptions,
 ) -> Result<SemanticFilePlan> {
+    let language = if language == Language::C {
+        crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+    } else {
+        language
+    };
     let applied = apply_in_memory(&snapshot, &ops)?;
     let syntax_before = syntax_counts(language, &snapshot.content);
     let syntax_after = syntax_counts(language, &applied.content);
@@ -2435,6 +2441,13 @@ fn run_pipeline(
     {
         return Ok(certificate);
     }
+    let language = language.map(|language| {
+        if language == Language::C {
+            crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+        } else {
+            language
+        }
+    });
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
     let mut formatter_expanded = false;

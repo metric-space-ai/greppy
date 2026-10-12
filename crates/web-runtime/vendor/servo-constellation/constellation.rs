@@ -1503,6 +1503,9 @@ where
             ) => {
                 self.handle_evaluate_javascript(webview_id, evaluation_id, script);
             },
+            EmbedderToConstellationMessage::EvaluateStructuredDom(webview_id, evaluation_id, request) => {
+                self.handle_evaluate_structured_dom(webview_id, evaluation_id, request);
+            },
             EmbedderToConstellationMessage::CreateMemoryReport(sender) => {
                 self.mem_profiler_chan.send(ProfilerMsg::Report(sender));
             },
@@ -1685,6 +1688,22 @@ where
                 evaluation_id,
                 Err(JavaScriptEvaluationError::InternalError),
             );
+        }
+    }
+
+    fn handle_evaluate_structured_dom(
+        &mut self, webview_id: WebViewId, evaluation_id: JavaScriptEvaluationId, request: String,
+    ) {
+        let browsing_context_id = BrowsingContextId::from(webview_id);
+        let Some(pipeline) = self.browsing_contexts.get(&browsing_context_id)
+            .and_then(|context| self.pipelines.get(&context.pipeline_id)) else {
+            self.handle_finish_javascript_evaluation(evaluation_id, Err(JavaScriptEvaluationError::InternalError));
+            return;
+        };
+        if pipeline.event_loop.send(ScriptThreadMessage::EvaluateStructuredDom(
+            webview_id, pipeline.id, evaluation_id, request,
+        )).is_err() {
+            self.handle_finish_javascript_evaluation(evaluation_id, Err(JavaScriptEvaluationError::InternalError));
         }
     }
 

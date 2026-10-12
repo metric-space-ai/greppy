@@ -3,6 +3,8 @@
 //! Builds the `POST /v1/messages` JSON body and incrementally parses the
 //! server-sent event stream into provider-neutral [`StreamEvent`]s.
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 use crate::protocol::{
@@ -143,6 +145,8 @@ enum BlockKind {
 /// Ordered protocol states for an Anthropic Messages SSE stream.
 ///
 /// `AwaitingStart → InMessage → (InBlock ↔ InMessage) → Terminal → Stopped`.
+/// Text/thinking blocks are sequential. Tool-use blocks may overlap by index;
+/// `InBlock` persists until every open tool-use block has explicitly stopped.
 ///
 /// `message_delta` with a stop_reason moves to `Terminal`. `message_stop` is
 /// legal exactly once (from `InMessage` or `Terminal`) and moves to `Stopped`.
@@ -186,6 +190,10 @@ pub struct SseParser {
     pending_input_usage: Usage,
     /// Protocol state machine.
     state: ProtocolState,
+    /// Tool-use blocks may overlap; deltas and stops are routed by index.
+    open_tools: BTreeSet<usize>,
+    /// A content index may be declared exactly once, even after its stop.
+    started_indices: BTreeSet<usize>,
 }
 
 impl SseParser {
@@ -358,10 +366,13 @@ impl SseParser {
     fn handle_content_block_start(&mut self, data: &str) -> SseItem {
         match self.state {
             ProtocolState::InMessage => {}
-            ProtocolState::InBlock { .. } => {
+            ProtocolState::InBlock { kind: BlockKind::ToolUse, .. } => {}
+            ProtocolState::InBlock { index, kind } => {
                 return malformed(
                     "content_block_start",
-                    "content_block_start while a block is open".to_string(),
+                    format!(
+                        "content_block_start while a block is open (index={index}, kind={kind:?}); expected content_block_stop before another start"
+                    ),
                 )
             }
             ProtocolState::AwaitingStart => {
@@ -398,10 +409,23 @@ impl SseParser {
             return malformed("content_block_start", "missing content_block");
         };
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !self.open_tools.is_empty() && block_type != "tool_use" {
+            return malformed(
+                "content_block_start",
+                "only tool_use blocks may overlap open tool_use blocks",
+            );
+        }
+        if self.started_indices.contains(&index) {
+            return malformed(
+                "content_block_start",
+                format!("duplicate content block index: {index}"),
+            );
+        }
 
         match block_type {
             // Text / thinking starts are silent; deltas carry the payload.
             "text" => {
+                self.started_indices.insert(index);
                 self.state = ProtocolState::InBlock {
                     index,
                     kind: BlockKind::Text,
@@ -409,6 +433,7 @@ impl SseParser {
                 SseItem::Ignored
             }
             "thinking" => {
+                self.started_indices.insert(index);
                 self.state = ProtocolState::InBlock {
                     index,
                     kind: BlockKind::Thinking,
@@ -435,6 +460,8 @@ impl SseParser {
                         )
                     }
                 };
+                self.started_indices.insert(index);
+                self.open_tools.insert(index);
                 self.state = ProtocolState::InBlock {
                     index,
                     kind: BlockKind::ToolUse,
@@ -444,6 +471,7 @@ impl SseParser {
             "" => malformed("content_block_start", "missing content_block.type"),
             // Unknown block type: keep the block open so stop can close it.
             _ => {
+                self.started_indices.insert(index);
                 self.state = ProtocolState::InBlock {
                     index,
                     kind: BlockKind::Unknown,
@@ -486,7 +514,9 @@ impl SseParser {
             Some(i) => i as usize,
             None => return malformed("content_block_delta", "missing content_block_delta.index"),
         };
-        if index != open_index {
+        if (open_kind == BlockKind::ToolUse && !self.open_tools.contains(&index))
+            || (open_kind != BlockKind::ToolUse && index != open_index)
+        {
             return malformed(
                 "content_block_delta",
                 format!("index mismatch: open={open_index}, delta={index}"),
@@ -563,8 +593,8 @@ impl SseParser {
     }
 
     fn handle_content_block_stop(&mut self, data: &str) -> SseItem {
-        let open_index = match self.state {
-            ProtocolState::InBlock { index, .. } => index,
+        let (open_index, open_kind) = match self.state {
+            ProtocolState::InBlock { index, kind } => (index, kind),
             ProtocolState::InMessage | ProtocolState::AwaitingStart => {
                 return malformed(
                     "content_block_stop",
@@ -595,13 +625,24 @@ impl SseParser {
             Some(i) => i as usize,
             None => return malformed("content_block_stop", "missing content_block_stop.index"),
         };
-        if index != open_index {
+        if (open_kind == BlockKind::ToolUse && !self.open_tools.contains(&index))
+            || (open_kind != BlockKind::ToolUse && index != open_index)
+        {
             return malformed(
                 "content_block_stop",
                 format!("index mismatch: open={open_index}, stop={index}"),
             );
         }
-        self.state = ProtocolState::InMessage;
+        if open_kind == BlockKind::ToolUse {
+            self.open_tools.remove(&index);
+        }
+        self.state = match self.open_tools.iter().next().copied() {
+            Some(index) => ProtocolState::InBlock {
+                index,
+                kind: BlockKind::ToolUse,
+            },
+            None => ProtocolState::InMessage,
+        };
         SseItem::Event(StreamEvent::BlockFinished { index })
     }
 
@@ -1266,6 +1307,266 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         let err = parse_all(fixture).expect_err("must fail");
         assert!(err.contains("message_delta"), "err={err}");
         assert!(err.contains("before message_start"), "err={err}");
+    }
+
+    // Exact bytes of one actual-shape diagnostic first response, not the
+    // unavailable historical actor response or a full actor acceptance run.
+    const GLM_PARALLEL_TOOLS: &str = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+
+    #[test]
+    fn sse_captured_parallel_tools_preserve_each_call_and_argument() {
+        let events = parse_all(GLM_PARALLEL_TOOLS).expect("indexed tool-use overlap is valid");
+        let tools: Vec<_> = events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ToolCallStarted { .. }
+                        | StreamEvent::ToolCallArgumentsDelta { .. }
+                        | StreamEvent::BlockFinished { index: 2 | 3 }
+                )
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            vec![
+                StreamEvent::ToolCallStarted {
+                    index: 2,
+                    id: "call_5fa6967629d34f238f6ff6f9".into(),
+                    name: "greppy".into(),
+                },
+                StreamEvent::ToolCallStarted {
+                    index: 3,
+                    id: "call_bbec7d7ef9a548ad9a9e75a8".into(),
+                    name: "greppy".into(),
+                },
+                StreamEvent::ToolCallArgumentsDelta {
+                    index: 2,
+                    json_fragment: r#"{"args":["where-am-i"]}"#.into(),
+                },
+                StreamEvent::BlockFinished { index: 2 },
+                StreamEvent::ToolCallArgumentsDelta {
+                    index: 3,
+                    json_fragment:
+                        r#"{"args":["web", "session", "create", "--profile", "project", "--json"]}"#
+                            .into(),
+                },
+                StreamEvent::BlockFinished { index: 3 },
+            ]
+        );
+    }
+
+    fn tool_overlap_prefix() -> &'static str {
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"g\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"g\"}}\n\n",
+        )
+    }
+
+    #[test]
+    fn sse_parallel_tools_allow_reverse_stop_order_and_split_arguments() {
+        let fixture = tool_overlap_prefix().to_owned()
+            + r#"event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"b\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"2}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":3}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let events = parse_all(&fixture).expect("reverse stops and interleaved fragments");
+        assert_eq!(
+            events[3],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "{\"b\":".into(),
+            }
+        );
+        assert_eq!(
+            events[4],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 2,
+                json_fragment: "{\"a\":1}".into(),
+            }
+        );
+        assert_eq!(
+            events[5],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "2}".into(),
+            }
+        );
+        assert_eq!(events[6], StreamEvent::BlockFinished { index: 3 });
+        assert_eq!(events[7], StreamEvent::BlockFinished { index: 2 });
+        assert!(matches!(
+            events[8],
+            StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
+        ));
+        assert_eq!(events.len(), 9);
+    }
+
+    #[test]
+    fn sse_parallel_tools_remain_strict_about_indices_kinds_and_stops() {
+        let invalid = [
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"duplicate","name":"g"}}),
+                "duplicate",
+            ),
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}),
+                "only tool_use",
+            ),
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":""}}),
+                "only tool_use",
+            ),
+            (
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+                "index mismatch",
+            ),
+            (
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"wrong"}}),
+                "non-text",
+            ),
+            (
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":4}),
+                "index mismatch",
+            ),
+            (
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                "open",
+            ),
+            ("message_stop", json!({"type":"message_stop"}), "open"),
+        ];
+        for (name, data, expected) in invalid {
+            let fixture = format!("{}event: {name}\ndata: {data}\n\n", tool_overlap_prefix());
+            let error = parse_all(&fixture).expect_err("invalid concurrent lifecycle");
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        let close_one = format!("{}event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":2}}\n\n", tool_overlap_prefix());
+        for trailer in [
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"again\",\"name\":\"g\"}}\n\n",
+        ] {
+            assert!(parse_all(&(close_one.clone() + trailer)).is_err());
+        }
+    }
+
+    #[test]
+    fn sse_text_to_tool_requires_explicit_block_stop() {
+        // Minimal synthetic analogue of the retained actor error, not a replay
+        // of its unavailable raw gateway SSE. Never infer a missing stop.
+        let fixture = r#"event: message_start
+data: {"type":"message_start","message":{"model":"m"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"I'll inspect."}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t1","name":"inspect","input":{}}}
+
+"#;
+        let mut parser = SseParser::new();
+        let items: Vec<_> = fixture
+            .lines()
+            .flat_map(|line| parser.feed_line(line))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                SseItem::Event(StreamEvent::Started { model: "m".into() }),
+                SseItem::Ignored,
+                SseItem::Event(StreamEvent::TextDelta { text: "I'll inspect.".into() }),
+                malformed(
+                    "content_block_start",
+                    "content_block_start while a block is open (index=2, kind=Text); expected content_block_stop before another start",
+                ),
+            ]
+        );
+
+        let valid = fixture.replace(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3",
+        ) + r#"event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"README.md\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":3}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let events = parse_all(&valid).expect("explicit stop permits the next block");
+        assert_eq!(events[2], StreamEvent::BlockFinished { index: 2 });
+        assert_eq!(
+            events[3],
+            StreamEvent::ToolCallStarted {
+                index: 3,
+                id: "t1".into(),
+                name: "inspect".into(),
+            }
+        );
+        assert_eq!(
+            events[4],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "{\"path\":".into(),
+            }
+        );
+        assert_eq!(
+            events[5],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "\"README.md\"}".into(),
+            }
+        );
+        assert_eq!(events[6], StreamEvent::BlockFinished { index: 3 });
+        assert!(matches!(
+            events[7],
+            StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
+        ));
+        assert_eq!(events.len(), 8);
     }
 
     #[test]

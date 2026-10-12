@@ -103,10 +103,15 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "overlay_edges",
         sql: include_str!("migrations/0016_overlay_edges.sql"),
     },
+    Migration {
+        version: 17,
+        name: "definition_overrides",
+        sql: include_str!("migrations/0017_definition_overrides.sql"),
+    },
 ];
 
 /// Current schema version this crate knows about.
-pub const CURRENT_VERSION: u32 = 16;
+pub const CURRENT_VERSION: u32 = 17;
 
 /// Apply pending migrations. Returns the number of migrations applied.
 pub fn migrate(conn: &Connection) -> Result<usize, Error> {

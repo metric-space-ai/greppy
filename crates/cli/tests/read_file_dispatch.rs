@@ -1,6 +1,301 @@
 //! Contract coverage for read, read-smart, and read-file.
 
 use std::path::{Path, PathBuf};
+
+#[test]
+fn enum_variant_read_repairs_legacy_span_and_handle_without_reindex() {
+    let (repo, store) = fresh_workspace("enum-variant-span");
+    let original =
+        "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n    Tail,\n}\n";
+    std::fs::write(repo.join("lib.rs"), original).unwrap();
+    index(&repo, &store);
+    let database = only_graph_db_below(&store);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM nodes WHERE qualified_name='lib.rs::Kind::Branch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let before: String = conn
+        .query_row("SELECT group_concat(sha256) FROM file_state", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    conn.execute_batch("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'; DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v14'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.rust_caller_edges_repair.v13','complete');").unwrap();
+    drop(conn);
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read", "lib.rs::Kind::Branch", "--handle", "--json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    let source = value["source"].as_str().unwrap();
+    assert!(source.contains("condition: bool"), "{value}");
+    assert!(source.contains("    },"), "{value}");
+    assert!(!source.contains("Tail"), "{value}");
+    let handle = value["handle"].as_str().unwrap();
+    let replacement = "    Branch {\n        condition: bool,\n        cycles: u32,\n    },\n";
+    let (edit_code, edit_out, edit_err) = run(
+        &repo,
+        &store,
+        &["replace-span", handle, replacement, "--dry-run"],
+    );
+    assert_eq!(edit_code, 0, "{edit_out}\n{edit_err}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+        original
+    );
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM nodes WHERE qualified_name='lib.rs::Kind::Branch'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        id
+    );
+    assert_eq!(
+        conn.query_row("SELECT end_line FROM nodes WHERE id=?1", [id], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        conn.query_row("SELECT group_concat(sha256) FROM file_state", [], |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn read_file_json_source_text_cannot_fabricate_or_override_handles() {
+    let (repo, store) = fresh_workspace("json-handle-source-collision");
+    let content = format!("handle: bogus\n{}", "ordinary\n".repeat(400));
+    std::fs::write(repo.join("collision.txt"), &content).unwrap();
+    for (args, requested) in [
+        (vec!["read-file", "collision.txt", "--all", "--json"], false),
+        (
+            vec![
+                "read-file",
+                "collision.txt",
+                "--lines",
+                "1:2",
+                "--handle",
+                "--json",
+            ],
+            true,
+        ),
+        (
+            vec!["read-file", "collision.txt", "--handle", "--json"],
+            true,
+        ),
+    ] {
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let file = &value["files"][0];
+        assert!(file["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("handle: bogus\n"));
+        if requested {
+            assert!(file["handle"].as_str().unwrap().starts_with("geh2:"));
+            assert_ne!(file["handle"], "bogus");
+        } else {
+            assert!(file["handle"].is_null());
+        }
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn read_file_json_reports_bounded_io_errors_as_one_document() {
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, store) = fresh_workspace("json-bounded-io-error");
+    let sealed = repo.join("sealed.txt");
+    std::fs::write(repo.join("readable.txt"), "first\nsecond\n").unwrap();
+    std::fs::write(&sealed, "private\n").unwrap();
+    let original = std::fs::metadata(&sealed).unwrap().permissions();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&sealed).is_ok() {
+        // Privileged users bypass POSIX read denial; this fixture requires it.
+        std::fs::set_permissions(&sealed, original).unwrap();
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+        return;
+    }
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "read-file",
+            "readable.txt",
+            "sealed.txt",
+            "--lines",
+            "1:1",
+            "--json",
+        ],
+    );
+    std::fs::set_permissions(&sealed, original).unwrap();
+    assert_eq!(code, 1, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["files"][0]["content"], "first\n");
+    assert_eq!(value["files"][1]["path"], "sealed.txt");
+    assert!(value["files"][1]["error"].is_string());
+    assert!(
+        err.is_empty(),
+        "JSON diagnostic must stay structured: {err}"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_json_accepts_option_before_or_after_exact_range_operand() {
+    let (repo, store) = fresh_workspace("json-range-option");
+    let path = repo.join("sample.txt");
+    std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+
+    for args in [
+        vec!["--json", "read-file", "sample.txt", "--lines", "2:3"],
+        vec!["read-file", "--json", "sample.txt", "--lines", "2:3"],
+        vec!["read-file", "sample.txt", "--lines", "2:3", "--json"],
+    ] {
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["command"], "read-file", "argv={args:?}\n{out}");
+        assert_eq!(value["files"][0]["path"], "sample.txt");
+        assert_eq!(value["files"][0]["start_line"], 2);
+        assert_eq!(value["files"][0]["end_line"], 3);
+        assert_eq!(value["files"][0]["content"], "second\nthird\n");
+        assert!(
+            err.is_empty(),
+            "JSON output must not gain a context notice: {err}"
+        );
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_json_keeps_multi_file_errors_and_structured_page_metadata() {
+    let (repo, store) = fresh_workspace("json-page-metadata");
+    std::fs::write(
+        repo.join("paged.txt"),
+        (1..=401).map(|n| format!("line {n}\n")).collect::<String>(),
+    )
+    .unwrap();
+
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "--json",
+            "read-file",
+            "paged.txt",
+            "missing.txt",
+            "--handle",
+        ],
+    );
+    assert_eq!(code, 1, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["files"][0]["start_line"], 1);
+    assert_eq!(value["files"][0]["end_line"], 400);
+    assert!(value["files"][0].get("rendered").is_none(), "{value}");
+    assert!(value["files"][0]["handle"]
+        .as_str()
+        .unwrap()
+        .starts_with("geh2:"));
+    assert_eq!(value["files"][0]["continuation"]["next_line"], 401);
+    assert_eq!(value["files"][0]["continuation"]["remaining_lines"], 1);
+    assert_eq!(value["files"][1]["path"], "missing.txt");
+    assert_eq!(value["files"][1]["error"], "no such file");
+    assert!(
+        err.is_empty(),
+        "JSON output must not gain a context notice: {err}"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_json_reports_truncation_without_fabricating_a_handle() {
+    let (repo, store) = fresh_workspace("json-truncation");
+    std::fs::write(repo.join("huge.txt"), "x".repeat(100_000)).unwrap();
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", "huge.txt", "--json", "--handle"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["files"][0]["truncated"], true);
+    assert!(value["files"][0]["content"].as_str().unwrap().len() <= 65_536);
+    assert!(value["files"][0]["handle"].is_null());
+    assert!(value["files"][0]["handle_unavailable"]
+        .as_str()
+        .unwrap()
+        .contains("--lines A:B"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_unknown_options_refuse_before_opening_any_file() {
+    let (repo, store) = fresh_workspace("unknown-option-no-read");
+    let path = repo.join("long.jsonl");
+    std::fs::write(&path, format!("SECRET_PAYLOAD_{}\n", "x".repeat(2_000_000))).unwrap();
+    for option in ["--head", "--tail", "--invented-read-window"] {
+        let (code, out, err) = run(
+            &repo,
+            &store,
+            &["read-file", path.to_str().unwrap(), option, "5"],
+        );
+        assert_eq!(code, 64, "{out}\n{err}");
+        assert!(
+            out.contains("no files were read") && out.contains("--lines A:B"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("SECRET_PAYLOAD_") && !out.contains("no such file: 5"),
+            "{out}"
+        );
+        assert!(out.len() + err.len() < 2048);
+    }
+    for leading in ["--diagnostics", "--max-bytes=128", "--limit=1"] {
+        for option in ["--head=5", "--invented-read-window=5"] {
+            let (code, out, err) = run(
+                &repo,
+                &store,
+                &[leading, "read-file", path.to_str().unwrap(), option],
+            );
+            assert_eq!(code, 64, "{out}\n{err}");
+            assert!(out.contains("no files were read"), "{out}\n{err}");
+            assert!(!out.contains("SECRET_PAYLOAD_"));
+            assert!(out.len() + err.len() < 2048);
+        }
+    }
+    let absent = repo.join("missing.txt");
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", absent.to_str().unwrap(), "--head", "5"],
+    );
+    assert_eq!(code, 64, "{out}\n{err}");
+    assert!(
+        !out.contains("no such file"),
+        "argument validation must precede file IO: {out}"
+    );
+    assert!(
+        !store.exists(),
+        "invalid file arguments must not open a graph store"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -67,6 +362,189 @@ fn only_graph_db_below(root: &Path) -> PathBuf {
         "expected one graph.db below {root:?}: {found:?}"
     );
     found.pop().unwrap()
+}
+
+#[test]
+fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
+    use std::io::Write;
+    let (repo, store) = fresh_workspace("large-bounded-prefix");
+    let path = repo.join("dump.txt");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"alpha\nbeta\ngamma\n\xff").unwrap();
+    file.set_len(635_837_957).unwrap();
+    drop(file);
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "read-file",
+            path.to_str().unwrap(),
+            "--lines",
+            "1:3",
+            "--max-bytes",
+            "1200",
+        ],
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("dump.txt:1-3\nalpha\nbeta\ngamma\n"), "{out}");
+    assert!(
+        !store.join("workspaces").exists() && !store.join("graph.db").exists(),
+        "plain bounded reads must not create a graph"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn invalid_selected_or_whole_file_text_is_never_reported_missing() {
+    let (repo, store) = fresh_workspace("invalid-file-text");
+    let path = repo.join("dump.txt");
+    std::fs::write(&path, b"alpha\n\xff\n").unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--lines", "1:2"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.contains("requested lines 1:2") && out.contains("UTF-8"),
+        "{out} {err}"
+    );
+    assert!(!out.contains("no such file") && !err.contains("no such file"));
+    let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--all"]);
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(out.contains("cannot read file dump.txt:"), "{out} {err}");
+    assert!(!out.contains("no such file"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn invalid_selected_text_does_not_hide_later_file_spans() {
+    let (repo, store) = fresh_workspace("invalid-first-file");
+    std::fs::write(repo.join("invalid.txt"), b"alpha\n\xff\n").unwrap();
+    std::fs::write(repo.join("valid.txt"), b"beta\r\ngamma\nignored\n").unwrap();
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", "invalid.txt", "valid.txt", "--lines", "1:2"],
+    );
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(out.contains("cannot read file invalid.txt:"), "{out}");
+    assert!(out.contains("valid.txt:1-2\nbeta\r\ngamma\n"), "{out}");
+    assert!(!out.contains("no such file") && !out.contains("ignored"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn cold_symbol_reads_bootstrap_after_file_handle_and_preserve_it() {
+    for command in ["read", "read-smart", "who-calls", "impact"] {
+        let (repo, store) = fresh_workspace(command);
+        let source = "pub fn schema_marker() -> i32 { 41 }\npub fn use_marker() -> i32 { schema_marker() }\n";
+        std::fs::write(repo.join("lib.rs"), source).unwrap();
+        let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        let handle = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("handle: "))
+            .expect("file handle before graph publication");
+        let graph_db = only_graph_db_below(&store);
+        assert!(!graph_db.parent().unwrap().join("index.job").exists());
+
+        let (code, stdout, stderr) = run(&repo, &store, &[command, "lib.rs::schema_marker"]);
+        assert_eq!(code, 0, "{command}: {stdout}\n{stderr}");
+        let expected = if matches!(command, "read" | "read-smart") {
+            "41"
+        } else {
+            "use_marker"
+        };
+        assert!(stdout.contains(expected), "{stdout}");
+
+        let (code, stdout, stderr) = run(
+            &repo,
+            &store,
+            &[
+                "replace-span",
+                handle,
+                "pub fn schema_marker() -> i32 { 42 }\n",
+                "--dry-run",
+            ],
+        );
+        assert_eq!(code, 0, "original handle lost: {stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+            source
+        );
+    }
+}
+
+#[test]
+fn cold_linked_symbol_read_after_file_handle_attaches_published_base() {
+    let (repo, store) = fresh_workspace("cold-linked-handle");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn schema_marker() -> i32 { 41 }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "lib.rs"]);
+    git(&[
+        "-c",
+        "user.name=Cold Read Test",
+        "-c",
+        "user.email=cold-read@test.invalid",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    // Structural first use reuses a published immutable Base; it intentionally
+    // avoids building a new one inside a query. Establish that Base first.
+    let first = repo.parent().unwrap().join("first");
+    git(&["worktree", "add", "-qb", "first", first.to_str().unwrap()]);
+    index(&first, &store);
+    let linked = repo.parent().unwrap().join("linked");
+    git(&["worktree", "add", "-qb", "linked", linked.to_str().unwrap()]);
+    let (code, stdout, stderr) = run(&linked, &store, &["read-file", "lib.rs", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let (code, stdout, stderr) = run(&linked, &store, &["read", "lib.rs::schema_marker"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("pub fn schema_marker"), "{stdout}");
+    let (code, stdout, stderr) = run(&linked, &store, &["index", "status", "--json"]);
+    assert!([0, 73].contains(&code), "{stdout}\n{stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["store_cow"]["mode"], "overlay", "{status}");
+    assert_eq!(status["graph_generation"], 1, "{status}");
+}
+
+#[test]
+fn cold_file_handle_symbol_read_respects_auto_index_opt_out() {
+    let (repo, store) = fresh_workspace("cold-handle-opt-out");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn schema_marker() -> i32 { 41 }\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let output = Command::new(bin())
+        .args(["read", "lib.rs::schema_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_AUTO_REINDEX", "0")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(format!("{stdout}{stderr}").contains("cold"));
+    assert!(!only_graph_db_below(&store)
+        .parent()
+        .unwrap()
+        .join("index.job")
+        .exists());
 }
 
 #[test]
@@ -139,10 +617,156 @@ fn read_is_symbols_only_whole_and_doc_extended() {
     let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
     assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
     assert!(
-        path_out.starts_with("note: `lib.rs` is a path; reading it as a file\nlib.rs:1-6\n"),
+        path_out.starts_with("`lib.rs` is a file — read a symbol:\n"),
         "{path_out}"
     );
-    assert!(path_out.contains("pub fn target()"), "{path_out}");
+    assert!(path_out.contains("target"), "{path_out}");
+    assert!(!path_out.contains("pub fn target()"), "{path_out}");
+}
+
+#[test]
+fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available() {
+    let (repo, store) = fresh_workspace("outline-large");
+    let source = format!(
+        "pub fn target() -> i32 {{ 731 }}\n{}",
+        "// private source content, not an outline\n".repeat(60)
+    );
+    std::fs::write(repo.join("lib.rs"), &source).unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.starts_with(
+            "Source outline for `lib.rs` — large indexed source; text: --lines A:B or --all:"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("731"), "{stdout}");
+    assert!(
+        stdout.contains("full text: greppy read-file lib.rs --all"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("private source content"), "{stdout}");
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("handle: ")),
+        "{stdout}"
+    );
+    let selector = stdout
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read", selector]);
+    assert_eq!(
+        code, 0,
+        "outline selector does not resolve: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("pub fn target() -> i32 { 731 }"),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "lib.rs", "--lines", "1:1", "--handle"],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("731"), "{stdout}");
+    let handle = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .unwrap();
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &[
+            "replace-span",
+            handle,
+            "pub fn target() -> i32 { 732 }\n",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--all"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&source), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn changed_source_never_offers_stale_outline_selectors_or_starts_refresh() {
+    let (repo, store) = fresh_workspace("outline-stale");
+    let before = format!(
+        "pub fn old_name() {{}}\n{}",
+        "// same-length source\n".repeat(65)
+    );
+    std::fs::write(repo.join("lib.rs"), &before).unwrap();
+    index(&repo, &store);
+    let database = only_graph_db_below(&store);
+    let job = database.parent().unwrap().join("index.job");
+    let old_job = std::fs::read(&job).ok();
+    let after = before.replace("old_name", "new_name");
+    assert_eq!(before.len(), after.len());
+    std::fs::write(repo.join("lib.rs"), &after).unwrap();
+    for command in ["read", "read-file"] {
+        let (code, stdout, stderr) = run(&repo, &store, &[command, "lib.rs"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains(&after), "{stdout}");
+        assert!(!stdout.contains("is a file — read a symbol:"), "{stdout}");
+        assert!(!stdout.contains("old_name"), "{stdout}");
+    }
+    assert_eq!(
+        std::fs::read(&job).ok(),
+        old_job,
+        "passive outline started a refresh"
+    );
+}
+
+#[test]
+fn source_read_outline_threshold_and_unindexed_fallback_do_not_start_indexing() {
+    let (repo, store) = fresh_workspace("outline-threshold");
+    let source = format!("pub fn target() {{}}\n{}", "// line\n".repeat(59));
+    std::fs::write(repo.join("lib.rs"), &source).unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&source), "{stdout}");
+
+    let (cold_repo, cold_store) = fresh_workspace("outline-no-index");
+    let source = format!("pub fn cold_target() {{}}\n{}", "// cold line\n".repeat(79));
+    std::fs::write(cold_repo.join("lib.rs"), &source).unwrap();
+    for command in ["read-file", "read"] {
+        let (code, stdout, stderr) = run(&cold_repo, &cold_store, &[command, "lib.rs"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains(&source), "{stdout}");
+    }
+    fn has_graph_or_index_job(path: &Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        std::fs::read_dir(path).unwrap().any(|entry| {
+            let child = entry.unwrap().path();
+            if child.is_dir() {
+                has_graph_or_index_job(&child)
+            } else {
+                child
+                    .file_name()
+                    .is_some_and(|name| name == "graph.db" || name == "index.job")
+            }
+        })
+    }
+    // CLI startup may create gc.state/global.gc without graph preparation.
+    // The contract is no graph publication or index job, not no cache folder.
+    assert!(
+        !has_graph_or_index_job(&cold_store),
+        "plain reads prepared a graph"
+    );
 }
 
 #[test]
@@ -341,6 +965,105 @@ fn read_refuses_same_file_field_function_collision_until_exactly_qualified() {
 }
 
 #[test]
+fn read_file_default_bounds_one_long_utf8_line_without_a_false_handle() {
+    let (repo, store) = fresh_workspace("byte-budget-utf8");
+    let content = "€".repeat(100_000);
+    std::fs::write(repo.join("huge.ndjson"), &content).unwrap();
+    // Implicit byte previews need neither handles nor a continuation store.
+    std::fs::write(&store, "not a store directory").unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "huge.ndjson", "--handle"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.len() < 66_500, "unbounded output: {} bytes", out.len());
+    assert!(out.starts_with("huge.ndjson:1-1 (last line partial)\n"));
+    assert!(out.contains(&"€".repeat(21_845)));
+    assert!(!out.contains('\u{fffd}'));
+    assert!(out.contains(
+        "truncated at 65535 source bytes (default limit 65536); total line count unknown"
+    ));
+    assert!(
+        out.contains("234465 source bytes omitted according to file size at open (300000 bytes)")
+    );
+    assert!(out.contains("--lines 1:1\n"));
+    assert!(out.contains("rereads the partial line in full"));
+    assert!(!out.contains("handle: geh"));
+
+    for tail in [&["--all"][..], &["--lines", "1:1"][..]] {
+        let mut args = vec!["read-file", "huge.ndjson"];
+        args.extend_from_slice(tail);
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, format!("huge.ndjson:1-1\n{content}"));
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_byte_budget_continues_after_a_complete_line() {
+    let (repo, store) = fresh_workspace("byte-budget-boundary");
+    let content = format!("{}\ntail\n", "x".repeat(65_535));
+    std::fs::write(repo.join("large.txt"), &content).unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "large.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("large.txt:1-1\n"));
+    assert!(!out.contains("last line partial"));
+    assert!(out.contains("5 source bytes omitted according to file size at open"));
+    assert!(out.contains("--lines 2:2\n"));
+    let (code, out, err) = run(&repo, &store, &["read-file", "large.txt", "--lines", "2:2"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "large.txt:2-2\ntail\n");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() {
+    use std::io::{Seek, SeekFrom, Write};
+    let (repo, store) = fresh_workspace("byte-budget-sparse");
+    let path = repo.join("huge.txt");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&vec![b'x'; 65_537]).unwrap();
+    file.seek(SeekFrom::Start(8 * 1024 * 1024 * 1024)).unwrap();
+    file.write_all(b"\xff").unwrap();
+    drop(file);
+    let (code, out, err) = run(&repo, &store, &["read-file", "huge.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.len() < 66_500);
+    assert!(out.contains("total line count unknown"));
+    assert!(out.contains("8589869057 source bytes omitted according to file size at open"));
+    assert!(out.contains("--lines 1:1\n"));
+    // Ordinary successful commands may maintain the cache GC receipt/lock.
+    // That is not an initialized graph or an indexing/model job.
+    assert!(
+        !store.exists()
+            || std::fs::read_dir(&store).unwrap().all(|entry| {
+                matches!(
+                    entry.unwrap().file_name().to_str(),
+                    Some("gc.state" | "locks")
+                )
+            }),
+        "preview must not initialize a graph store"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_default_rejects_invalid_utf8_inside_observed_prefix() {
+    let (repo, store) = fresh_workspace("byte-budget-invalid-prefix");
+    let mut bytes = vec![b'x'; 100_000];
+    bytes[12] = 0xff;
+    std::fs::write(repo.join("invalid.txt"), bytes).unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "invalid.txt"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(out.contains("cannot read file invalid.txt"));
+    assert!(!out.contains("truncated at"));
+    // EOF is not a truncation boundary: an incomplete final character is invalid.
+    std::fs::write(repo.join("invalid.txt"), b"abc\xe2\x82").unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "invalid.txt"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(out.contains("cannot read file invalid.txt"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
     let content = (1..=805)
@@ -485,6 +1208,54 @@ fn read_file_range_and_all_bypass_pagination() {
     let (all_code, all_out, all_err) = run(&repo, &store, &["read-file", "config.json", "--all"]);
     assert_eq!(all_code, 0, "stdout={all_out}\nstderr={all_err}");
     assert_eq!(all_out, "config.json:1-4\na\nb\nc\nd\n");
+}
+
+#[test]
+fn read_file_missing_target_and_exact_range_skip_global_cache_writes() {
+    let (repo, store) = fresh_workspace("no-global-gc");
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "missing.rs", "--lines", "1:250"],
+    );
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("no such file: missing.rs"),
+        "{stdout} {stderr}"
+    );
+    assert!(
+        !store.join("gc.state").exists(),
+        "a refused file read must not run global maintenance"
+    );
+    std::fs::write(repo.join("config.json"), "first\nsecond\n").unwrap();
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "config.json", "--lines", "1:2"],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert_eq!(stdout, "config.json:1-2\nfirst\nsecond\n");
+    assert!(
+        !store.join("gc.state").exists(),
+        "exact file reads must not run global maintenance"
+    );
+    assert!(
+        !store.exists(),
+        "file reads must not create a graph cache namespace"
+    );
+}
+
+#[test]
+fn index_status_skips_global_cache_writes() {
+    let (repo, store) = fresh_workspace("status-no-global-gc");
+    let (code, stdout, stderr) = run(&repo, &store, &["index", "status", "--json"]);
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["status"], "no_index");
+    assert!(
+        !store.join("gc.state").exists(),
+        "a read-only status request must not run global maintenance"
+    );
 }
 
 #[test]

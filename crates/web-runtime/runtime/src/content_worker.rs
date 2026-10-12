@@ -231,6 +231,24 @@ fn alloc_wait_nonce() -> io::Result<String> {
     Ok(rnd.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// A destructive read may pump a navigation between dispatch and callback.
+/// Reject old-document results, but never retry a read which returned an error.
+fn take_wait_completion_in_document<T>(
+    generation: &Cell<u64>,
+    expected: u64,
+    take: impl FnOnce() -> io::Result<Option<T>>,
+) -> io::Result<Option<T>> {
+    if generation.get() != expected {
+        return Ok(None);
+    }
+    let completed = take()?;
+    if generation.get() != expected {
+        Ok(None)
+    } else {
+        Ok(completed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WakePoll {
     Ready,
@@ -1192,6 +1210,8 @@ struct ContentEngine {
     /// Carries the Web API shims. Shared by every page, so a shim reaches
     /// frames and popups too, not just the tab the agent drove.
     user_content: Rc<UserContentManager>,
+    transfer_capability: String,
+    transfer_root: PathBuf,
     _proxy: PolicyProxy,
 }
 
@@ -1205,8 +1225,40 @@ impl Drop for ContentEngine {
     }
 }
 
+fn authorize_text_transfer(
+    path: &Path,
+    supplied_capability: &str,
+    expected_capability: &str,
+    transfer_root: &Path,
+) -> io::Result<()> {
+    let same_length = supplied_capability.len() == expected_capability.len();
+    let difference = supplied_capability
+        .bytes()
+        .zip(expected_capability.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        });
+    if !same_length || difference != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "page.textToFile requires daemon authorization",
+        ));
+    }
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if path.parent() != Some(transfer_root) || !valid_name {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "page.textToFile destination is not daemon-owned",
+        ));
+    }
+    Ok(())
+}
+
 impl ContentEngine {
-    fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
+    fn new(parent_alive: Arc<AtomicBool>, transfer_capability: String) -> io::Result<Self> {
         trace_startup("renderer-create");
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
@@ -1257,6 +1309,8 @@ impl ContentEngine {
             wake,
             profile,
             user_content,
+            transfer_capability,
+            transfer_root: std::env::temp_dir().join("transfers"),
             _proxy: proxy,
         })
     }
@@ -1427,11 +1481,7 @@ impl ContentEngine {
         }
     }
 
-    fn spin_until(
-        &self,
-        timeout: Duration,
-        predicate: impl FnMut() -> bool,
-    ) -> io::Result<bool> {
+    fn spin_until(&self, timeout: Duration, predicate: impl FnMut() -> bool) -> io::Result<bool> {
         self.spin_until_on(&self.wake, timeout, predicate)
     }
 
@@ -1853,6 +1903,27 @@ impl ContentEngine {
         self.evaluate_until(webview, script, ACTION_TIMEOUT)
     }
 
+    fn evaluate_structured_dom(
+        &self,
+        webview: WebView,
+        request: &serde_json::Value,
+    ) -> io::Result<JSValue> {
+        let saved = Rc::new(RefCell::new(None));
+        let callback_slot = Rc::clone(&saved);
+        webview.evaluate_structured_dom(request.to_string(), move |result| {
+            *callback_slot.borrow_mut() = Some(result);
+        });
+        let ready = Rc::clone(&saved);
+        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some())? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out evaluating structured DOM query",
+            ));
+        }
+        let result = saved.borrow_mut().take().expect("evaluation completed");
+        result.map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
+    }
+
     /// Playwright awaits a Promise returned by `page.evaluate`. Servo's
     /// evaluate callback reports the Promise object itself, whose enumerable
     /// property map is empty, so serialize it through a page-realm slot and
@@ -1873,16 +1944,19 @@ impl ContentEngine {
         script: &str,
         timeout: Duration,
     ) -> io::Result<JSValue> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid evaluate timeout"))?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid evaluate timeout")
+        })?;
         let token = alloc_wait_nonce()?;
         let key = Self::wait_slot_key(&token);
         let key_js = serde_json::to_string(&key).map_err(io::Error::other)?;
         let source_js = serde_json::to_string(script).map_err(io::Error::other)?;
         let wrapper = format!(
             r#"(function(key, source) {{
-  var value = eval(source);
+  var value;
+  try {{ value = eval(source); }} catch (error) {{
+    return [-1, {{ name: String(error && error.name || "Error"), message: String(error && error.message || error) }}];
+  }}
   if (!value || typeof value.then !== "function") return [0, value];
   var slot = {{ done: 0, status: "", value: undefined }};
   window[key] = slot;
@@ -1909,14 +1983,47 @@ impl ContentEngine {
         };
         let JSValue::Array(mut parts) = first else {
             self.drop_wait_slot(&webview, &token, None);
-            return Err(io::Error::other("page.evaluate returned an invalid await envelope"));
+            return Err(io::Error::other(
+                "page.evaluate returned an invalid await envelope",
+            ));
         };
         if parts.len() < 2 {
             self.drop_wait_slot(&webview, &token, None);
-            return Err(io::Error::other("page.evaluate returned an incomplete await envelope"));
+            return Err(io::Error::other(
+                "page.evaluate returned an incomplete await envelope",
+            ));
         }
         let value = parts.remove(1);
-        let pending = match parts.remove(0) {
+        let status = parts.remove(0);
+        if matches!(status, JSValue::Number(number) if number == -1.0) {
+            let JSValue::Object(error) = value else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an invalid error envelope",
+                ));
+            };
+            let Some(JSValue::String(name)) = error.get("name") else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an incomplete error envelope",
+                ));
+            };
+            let Some(JSValue::String(message)) = error.get("message") else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an incomplete error envelope",
+                ));
+            };
+            // eval(source) compiles inside a valid wrapper: Servo therefore
+            // reports its SyntaxError as EvaluationFailure, not CompilationFailure.
+            // Preserve the actual exception class rather than guessing from text.
+            // A script may also deliberately throw SyntaxError at runtime, so do
+            // not claim that every such exception proves compilation failed.
+            let diagnostic = if name == "SyntaxError" {
+                format!("page JavaScript raised SyntaxError: {message}; check its syntax and the runtime-supported ECMAScript features, or retry with a simpler expression")
+            } else {
+                format!("page JavaScript raised {name}: {message}")
+            };
+            return Err(io::Error::other(diagnostic));
+        }
+        let pending = match status {
             JSValue::Number(value) => value != 0.0,
             JSValue::Boolean(value) => value,
             _ => false,
@@ -2115,6 +2222,8 @@ impl ContentEngine {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
+        // Cleanup keeps its legacy best-effort allowance. Destructive completion
+        // retrieval below always spends this caller deadline, including public PW.
         let io_deadline = strict_boolean.then_some(deadline);
         let wake = self.wake_for_webview(&webview);
         let mut token = alloc_wait_nonce()?;
@@ -2158,12 +2267,19 @@ impl ContentEngine {
         // installation reply is in flight. Only the installed document may
         // certify its reply; otherwise the loop rebinds before inspecting it.
         if delegate.document_generation.get() == document_generation {
-            if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-            {
+            if let Some(result) = self.finish_if_expected_nonce(
+                &webview,
+                delegate,
+                &token,
+                document_generation,
+                Some(deadline),
+                strict_boolean,
+            )? {
                 return result;
             }
-            if jsvalue_is_truthy(&first) {
+            if delegate.document_generation.get() == document_generation
+                && jsvalue_is_truthy(&first)
+            {
                 self.drop_wait_slot(&webview, &token, io_deadline);
                 if !strict_boolean {
                     self.settle_pump_tokens(&webview);
@@ -2205,12 +2321,19 @@ impl ContentEngine {
                     }
                 };
                 if delegate.document_generation.get() == document_generation {
-                    if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-                    {
+                    if let Some(result) = self.finish_if_expected_nonce(
+                        &webview,
+                        delegate,
+                        &token,
+                        document_generation,
+                        Some(deadline),
+                        strict_boolean,
+                    )? {
                         return result;
                     }
-                    if jsvalue_is_truthy(&first) {
+                    if delegate.document_generation.get() == document_generation
+                        && jsvalue_is_truthy(&first)
+                    {
                         self.drop_wait_slot(&webview, &token, io_deadline);
                         if !strict_boolean {
                             self.settle_pump_tokens(&webview);
@@ -2220,9 +2343,14 @@ impl ContentEngine {
                 }
                 continue;
             }
-            if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-            {
+            if let Some(result) = self.finish_if_expected_nonce(
+                &webview,
+                delegate,
+                &token,
+                document_generation,
+                Some(deadline),
+                strict_boolean,
+            )? {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2253,10 +2381,18 @@ impl ContentEngine {
             ) {
                 WakePoll::Ready => {}
                 WakePoll::TimedOut => {
-                    if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
-                    {
+                    if let Some(result) = self.finish_if_expected_nonce(
+                        &webview,
+                        delegate,
+                        &token,
+                        document_generation,
+                        Some(deadline),
+                        strict_boolean,
+                    )? {
                         return result;
+                    }
+                    if delegate.document_generation.get() != document_generation {
+                        continue;
                     }
                     self.drop_wait_slot(&webview, &token, io_deadline);
                     return Err(io::Error::new(
@@ -2298,7 +2434,7 @@ impl ContentEngine {
         token: &str,
         deadline: Option<Instant>,
     ) -> io::Result<Option<(String, JSValue)>> {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
+        let budget = crate::wait_contract::wait_completion_budget(deadline);
         if budget.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -2338,12 +2474,19 @@ impl ContentEngine {
         webview: &WebView,
         delegate: &Delegate,
         token: &str,
+        document_generation: u64,
         deadline: Option<Instant>,
+        strict_budget: bool,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = self.take_completed_wait_slot(webview, token, deadline)? else {
+        let Some((status, value)) = take_wait_completion_in_document(
+            &delegate.document_generation,
+            document_generation,
+            || self.take_completed_wait_slot(webview, token, deadline),
+        )?
+        else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
@@ -2360,7 +2503,7 @@ impl ContentEngine {
                 }),
                 other => WaitOutcome::Error(other.to_owned()),
             },
-            deadline.is_some(),
+            strict_budget,
         )))
     }
 
@@ -2420,10 +2563,18 @@ impl ContentEngine {
                 .and_then(|name| name.to_str())
                 .unwrap_or("upload.bin")
                 .to_owned();
+            let modified = std::fs::metadata(&path)?.modified()?;
+            let modified_ms = match modified.duration_since(std::time::UNIX_EPOCH) {
+                Ok(elapsed) => i64::try_from(elapsed.as_millis()).map_err(io::Error::other)?,
+                Err(before_epoch) => {
+                    -i64::try_from(before_epoch.duration().as_millis()).map_err(io::Error::other)?
+                }
+            };
             payloads.push(json!({
                 "name": name,
                 "type": "application/octet-stream",
                 "b64": base64_encode(&bytes),
+                "lastModified": modified_ms,
             }));
         }
         let (webview, _) = self.page(page_id)?.clone();
@@ -2446,7 +2597,7 @@ impl ContentEngine {
       var raw = atob(file.b64);
       var buf = new Uint8Array(raw.length);
       for (var i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream" }}));
+      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream", lastModified: file.lastModified }}));
     }});
     input.files = dt.files;
     var changed = 0;
@@ -2613,7 +2764,12 @@ impl ContentEngine {
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || created.url().is_some())? {
+                // A URL can be visible before initial HeadParsed/Complete
+                // events settle. Publishing then makes the first async
+                // evaluation look interrupted by a navigation it never made.
+                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || {
+                    created.url().is_some() && created.load_status() == LoadStatus::Complete
+                })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out creating page",
@@ -2769,6 +2925,7 @@ impl ContentEngine {
                 // top-level navigation only and has stalled at HeadParsed.
                 delegate.navigation_failure.replace(None);
                 let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+                let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
                 let loading = webview.clone();
                 let expected = url.clone();
@@ -2790,6 +2947,13 @@ impl ContentEngine {
                         let url_settled = loading.url().is_some_and(|current| {
                             urls_match(&current, &expected)
                                 || previous.as_ref().is_some_and(|old| current != *old)
+                                // A redirect can commit a new document at the
+                                // previous URL. Its request and document epochs,
+                                // rather than a URL change, prove the commit.
+                                || (denied.main_frame_navigation_epoch.get()
+                                    != navigation_epoch_before
+                                    && denied.document_generation.get()
+                                        != document_generation_before)
                         });
                         if !url_settled || !stamped {
                             return url_settled;
@@ -3080,6 +3244,12 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 evaluate_serialized(self.evaluate_awaited(webview, &delegate, &source)?)
             }
+            "page.structuredDom" => {
+                let page_id = required_str(&params, "page")?;
+                let request = params.get("request").ok_or_else(|| io::Error::other("missing request"))?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                evaluate_serialized(self.evaluate_structured_dom(webview, request)?)
+            }
             "page.waitForFunction" | "page.waitForBoolean" => {
                 let page_id = required_str(&params, "page")?;
                 let source = required_str(&params, "source")?;
@@ -3204,6 +3374,56 @@ impl ContentEngine {
                     JSValue::String(html) => Ok(json!({ "html": html })),
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
+            }
+            "page.textToFile" => {
+                let page_id = required_str(&params, "page")?;
+                let path = PathBuf::from(required_str(&params, "path")?);
+                let capability = required_str(&params, "capability")?;
+                authorize_text_transfer(
+                    &path,
+                    &capability,
+                    &self.transfer_capability,
+                    &self.transfer_root,
+                )?;
+                let max_bytes = params
+                    .get("max_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| io::Error::other("page.textToFile requires max_bytes"))?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                let text = match self.evaluate(
+                    webview,
+                    "(document.body && document.body.innerText) || \"\"",
+                )? {
+                    JSValue::String(text) => text,
+                    other => return Err(io::Error::other(format!("text returned {other:?}"))),
+                };
+                let bytes = text.as_bytes();
+                if bytes.len() as u64 > max_bytes {
+                    return Err(io::Error::other(format!(
+                        "resource_limit: artifact limit exceeded ({} > {max_bytes})",
+                        bytes.len()
+                    )));
+                }
+                let write_result = (|| {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    std::io::Write::write_all(&mut file, bytes)?;
+                    file.sync_all()?;
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_readonly(true);
+                    std::fs::set_permissions(&path, permissions)?;
+                    Ok::<_, io::Error>(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                Ok(json!({
+                    "byte_count": bytes.len(),
+                    "digest": crate::artifacts::hex_sha256(bytes),
+                }))
             }
             "page.take_navigation_failure" => {
                 let page_id = required_str(&params, "page")?;
@@ -5249,9 +5469,10 @@ fn response_for_request<'a>(
     request_id: Option<&str>,
 ) -> Option<&'a serde_json::Value> {
     let request_id = request_id?;
-    responses.iter().rev().find(|row| {
-        row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id)
-    })
+    responses
+        .iter()
+        .rev()
+        .find(|row| row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id))
 }
 
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {
@@ -5386,6 +5607,22 @@ fn serialize_jsvalue(value: JSValue) -> io::Result<serde_json::Value> {
 mod serialize_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn text_transfer_requires_daemon_capability_and_owned_destination() {
+        let root = PathBuf::from("/daemon-owned/transfers");
+        let owned = root.join("ab".repeat(32));
+        assert!(authorize_text_transfer(&owned, "secret", "secret", &root).is_ok());
+
+        let forged_capability = authorize_text_transfer(&owned, "forged", "secret", &root)
+            .expect_err("controller capability must not authorize transfer");
+        assert_eq!(forged_capability.kind(), io::ErrorKind::PermissionDenied);
+
+        let arbitrary = PathBuf::from("/attacker-selected").join("cd".repeat(32));
+        let forged_destination = authorize_text_transfer(&arbitrary, "secret", "secret", &root)
+            .expect_err("daemon capability must stay confined to its owned root");
+        assert_eq!(forged_destination.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn click_navigation_epoch_survives_redirect_request_id_changes() {
@@ -5671,6 +5908,46 @@ mod serialize_tests {
         assert!(!jsvalue_is_truthy(&JSValue::String(String::new())));
         assert!(jsvalue_is_truthy(&JSValue::String("ok".into())));
         assert!(jsvalue_is_truthy(&JSValue::Object(Default::default())));
+    }
+
+    #[test]
+    fn completion_retrieval_rejects_navigation_without_repeating_the_read() {
+        let generation = Cell::new(1);
+        let reads = Cell::new(0);
+        let old = take_wait_completion_in_document(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            generation.set(2);
+            Ok(Some("old-document completion"))
+        })
+        .unwrap();
+        assert_eq!(old, None);
+        assert_eq!(reads.get(), 1);
+        let stale = take_wait_completion_in_document(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            Ok(Some("must not read new document with old nonce"))
+        })
+        .unwrap();
+        assert_eq!(stale, None);
+        assert_eq!(reads.get(), 1);
+        let current =
+            take_wait_completion_in_document(&generation, 2, || Ok(Some("new document"))).unwrap();
+        assert_eq!(current, Some("new document"));
+    }
+
+    #[test]
+    fn consumed_completion_timeout_is_not_retried_or_hidden_by_navigation() {
+        let generation = Cell::new(1);
+        let reads = Cell::new(0);
+        let result = take_wait_completion_in_document::<()>(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            generation.set(2);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "consumed slot callback expired",
+            ))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
@@ -6433,7 +6710,7 @@ pub fn run() -> io::Result<()> {
     trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
-    let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
+    let mut engine = ContentEngine::new(Arc::clone(&parent_alive), capability.clone())?;
     trace_startup("read-hello");
     match read_message(&mut protocol_in)? {
         Message::Hello {

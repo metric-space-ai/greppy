@@ -1,6 +1,192 @@
 use super::*;
 use clap::Parser;
 
+#[test]
+fn overlay_publication_refuses_rogue_staged_rows_and_preserves_active_snapshot() {
+    let root = test_tempdir("overlay-publication-invariant");
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(source.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+    let base_path = root.join("base.db");
+    {
+        let mut base = greppy_store::Store::open(&base_path).unwrap();
+        greppy_indexer::index_with_options(
+            &mut base,
+            &source,
+            "fixture",
+            &greppy_indexer::IndexOptions::default(),
+        )
+        .unwrap();
+        crate::store_cow::mark_rust_caller_edges_repaired(&base).unwrap();
+    }
+    let active_path = root.join("active.db");
+    {
+        let mut active = greppy_store::Store::open(&active_path).unwrap();
+        active
+            .upsert_project(&greppy_store::Project {
+                name: "fixture".into(),
+                indexed_at: "now".into(),
+                root_path: source.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        active
+            .insert_raw_edges(&[greppy_store::NewRawEdge {
+                project: "fixture".into(),
+                file_path: "src/rogue.ts".into(),
+                source_qname: "run".into(),
+                target_qname: "rogue".into(),
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            }])
+            .unwrap();
+    }
+    let before = std::fs::read(&active_path).unwrap();
+    let overlay = crate::store_cow::OverlaySpec {
+        base_path,
+        base_commit: "a".repeat(40),
+        visibility: greppy_store::VisibilityIndex::new(
+            ["src/lib.rs".to_string()],
+            Vec::<String>::new(),
+        )
+        .unwrap(),
+    };
+    let error = crate::indexing::index_overlay_snapshot(
+        &active_path,
+        &source,
+        "fixture",
+        &overlay,
+        None,
+        &greppy_indexer::IndexOptions::default(),
+        false,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("src/rogue.ts"), "{error}");
+    assert_eq!(std::fs::read(&active_path).unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn expired_output_cleanup_preserves_old_schema_and_skips_busy_writers() {
+    let root = test_tempdir("output-cleanup-no-migration");
+    let graph = root.join("graph.db");
+    let mut store = greppy_store::Store::open(&graph).unwrap();
+    store
+        .upsert_project(&greppy_store::Project {
+            name: "fixture".into(),
+            indexed_at: "2026-10-03T00:00:00Z".into(),
+            root_path: root.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    store.conn().execute_batch("INSERT INTO expand_packs(id,project,command,query,graph_generation,created_at,expires_at,summary_json,payload_text) VALUES ('expired','fixture','bash-smart','',0,1,2,'{}','expired'),('live','fixture','bash-smart','',0,1,999999999999,'{}','live'); DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+    drop(store);
+    let held = rusqlite::Connection::open(&graph).unwrap();
+    held.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(prune_expired_evidence_packs_in_existing_store(&graph, 3), 0);
+    assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    held.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(prune_expired_evidence_packs_in_existing_store(&graph, 3), 1);
+    let schema: String = held
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema, "16");
+    let overrides: i64 = held
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='definition_identity_overrides'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(overrides, 0, "output cleanup must not migrate the graph");
+    let remaining: String = held
+        .query_row("SELECT id FROM expand_packs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, "live");
+    drop(held);
+    let missing = root.join("missing.db");
+    assert_eq!(
+        prune_expired_evidence_packs_in_existing_store(&missing, 3),
+        0
+    );
+    assert!(!missing.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn disposable_initializers_use_ensured_path_after_late_durable_store() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let volume = std::path::Path::new("/Volumes/tmp");
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(volume) else {
+        return;
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.dev() == std::fs::metadata("/Volumes").unwrap().dev()
+    {
+        return;
+    }
+    let _restore = EnvRestore::capture(&["HOME", "GREPPY_STORE_DIR"]);
+    let base = tempfile::tempdir().unwrap();
+    assert!(
+        base.path().starts_with(volume),
+        "fixture TMPDIR must use disposable volume"
+    );
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::set_var("HOME", base.path().join("home"));
+        std::env::remove_var("GREPPY_STORE_DIR");
+    }
+    let repo = base.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    // Reproduce the review interleaving before any tmp ownership is established.
+    let cached_lookup = workspace_locator::store_path(&repo);
+    assert!(!cached_lookup.exists());
+    let durable_data = greppy_core::cache::data_root();
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", &durable_data);
+    }
+    let old_store = ensured_workspace_store_path(&repo).unwrap();
+    unsafe {
+        std::env::remove_var("GREPPY_STORE_DIR");
+    }
+    let ensured = ensured_workspace_store_path(&repo).unwrap();
+    assert_eq!(ensured, old_store);
+    assert_ne!(ensured, cached_lookup);
+    // Initialization locks and opens the returned authoritative path. The
+    // writer identity remains the workspace hash even across path selection.
+    let writer = greppy_freshness::try_acquire(&ensured).unwrap();
+    assert_eq!(writer.path(), greppy_freshness::lock_path_for(&ensured));
+    assert_eq!(
+        writer.path(),
+        greppy_freshness::lock_path_for(&cached_lookup)
+    );
+    assert!(matches!(
+        greppy_freshness::try_acquire(&cached_lookup),
+        Err(greppy_freshness::LockError::Held { .. })
+    ));
+    let store = open_default_store_pack_writer(Some(repo.to_str().unwrap())).unwrap();
+    let opened: String = store
+        .conn()
+        .query_row("PRAGMA database_list", [], |row| row.get(2))
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(&opened).canonicalize().unwrap(),
+        ensured.canonicalize().unwrap()
+    );
+    assert!(!cached_lookup.exists());
+    assert!(!cached_lookup.parent().unwrap().exists());
+    drop(store);
+    drop(writer);
+}
+
 struct InterruptedOnce {
     reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -34,8 +220,10 @@ fn base_build_owner_watchdog_retries_interrupted_reads() {
 #[cfg(not(feature = "cpu-only"))]
 #[test]
 fn product_build_contains_embedding_and_summary_gpu_backends() {
-    assert!(greppy_embed_native::HAS_GPU_BACKEND);
-    assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+    const {
+        assert!(greppy_embed_native::HAS_GPU_BACKEND);
+        assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+    }
 }
 
 #[cfg(unix)]
@@ -114,6 +302,165 @@ fn transient_freshness_states_never_trigger_reindex() {
         assert!(!freshness_state_can_trigger_reindex(state), "state={state}");
     }
     assert!(freshness_state_can_trigger_reindex("drift"));
+}
+
+#[test]
+fn rejected_background_admission_returns_no_live_launch() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_HEAVY_GATE", "GREPPY_STORE_DIR"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let gate = scratch.path().join("reject.py");
+    std::fs::write(
+        &gate,
+        "import sys\nprint('Capacity gate: test rejection', file=sys.stderr)\nsys.exit(75)\n",
+    )
+    .unwrap();
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore these values.
+    unsafe {
+        std::env::set_var("GREPPY_HEAVY_GATE", &gate);
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+    }
+    assert!(
+        spawn_background_job_handle(Some(root.to_str().unwrap()), "test", "index", None).is_none()
+    );
+    let job = read_background_job(&background_job_path(&root)).unwrap();
+    assert_eq!(job["state"], "failed", "{job}");
+    assert!(
+        job["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("Capacity gate"),
+        "{job}"
+    );
+    assert!(!background_job_writer_active(&root));
+}
+
+#[test]
+fn indexed_refusal_recovery_matches_observed_freshness_state() {
+    let refreshing = serde_json::json!({
+        "state": "refreshing", "fresh": false,
+        "reasons": ["head_oid changed", "index signature changed", "files modified since last index"]
+    });
+    assert_eq!(freshness_refusal_exit(&refreshing), 75);
+    let message = indexed_stale_skip_message("search-symbol", &refreshing);
+    assert!(message.contains("publication is in progress"), "{message}");
+    assert!(message.contains("greppy index status --json"), "{message}");
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("run `greppy index .` first"), "{message}");
+    assert!(
+        message.contains("files modified since last index"),
+        "{message}"
+    );
+    let unknown = serde_json::json!({
+        "state": "unknown", "reasons": ["Store-CoW freshness proof failed: private row absent from Delta visibility manifest"]
+    });
+    let message = indexed_stale_skip_message("search-symbol", &unknown);
+    assert!(
+        message.contains("freshness could not be verified"),
+        "{message}"
+    );
+    assert!(message.contains("retrying this command"), "{message}");
+    assert!(
+        message.contains("resolve the reported freshness failure"),
+        "{message}"
+    );
+    assert!(message.contains("Delta visibility manifest"), "{message}");
+    assert!(!message.contains("host capacity"), "{message}");
+    assert!(!message.contains("publication is in progress"), "{message}");
+    let failed = serde_json::json!({
+        "state": "failed", "reasons": ["files modified since last index"]
+    });
+    let message = indexed_stale_skip_message("search-symbol", &failed);
+    assert!(
+        message.contains("automatic index preparation failed"),
+        "{message}"
+    );
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("host capacity"), "{message}");
+    assert!(!message.contains("publication is in progress"), "{message}");
+    let drift = serde_json::json!({
+        "state": "drift", "reasons": ["files modified since last index"]
+    });
+    assert!(indexed_stale_skip_message("search-symbol", &drift).contains(STALE_REMEDIATION));
+}
+
+#[test]
+fn semantic_refusal_preserves_admission_reason_and_selected_root() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("selected repo's root");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let store = scratch.path().join("selected store");
+    // SAFETY: this test holds TEST_ENV_LOCK and restores the environment.
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", &store);
+    }
+    let error = "Automatic indexing deferred by shared host admission; no index work started. Capacity gate: another thread owns the heavy-job lease";
+    start_background_job_record(
+        &background_job_path(&root),
+        &serde_json::json!({"state": "failed", "last_error": error}),
+    )
+    .unwrap();
+    let freshness = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "failed", "fresh": false, "reasons": ["head_oid changed"]}),
+        root.to_str(),
+    );
+    assert_eq!(freshness_refusal_exit(&freshness), 75);
+    assert_eq!(freshness["preparation_failure_kind"], "admission_deferred");
+    assert_eq!(freshness["preparation_error"], error);
+    let diagnostics = freshness["diagnostics_command"].as_str().unwrap();
+    assert!(
+        diagnostics.contains(&format!(
+            "--root {}",
+            shell_quote_cli(&root.to_string_lossy())
+        )),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.starts_with(&format!(
+            "GREPPY_STORE_DIR={}",
+            shell_quote_cli(&store.to_string_lossy())
+        )),
+        "{diagnostics}"
+    );
+    for message in [
+        vector_stale_skip_message("semantic-search", &freshness),
+        indexed_stale_skip_message("who-calls", &freshness),
+    ] {
+        assert!(message.contains(error), "{message}");
+        assert!(message.contains(diagnostics), "{message}");
+        assert!(!message.contains(STALE_REMEDIATION), "{message}");
+        assert!(!message.contains("publication is in progress"), "{message}");
+    }
+    let refreshing = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "refreshing", "fresh": false}),
+        root.to_str(),
+    );
+    assert!(
+        refreshing.get("preparation_error").is_none(),
+        "{refreshing}"
+    );
+    let fresh = serde_json::json!({"state": "fresh", "fresh": true});
+    assert_eq!(
+        preparation_refusal_diagnostics(fresh.clone(), root.to_str()),
+        fresh
+    );
+    start_background_job_record(
+        &background_job_path(&root),
+        &serde_json::json!({"state": "failed", "last_error": "fixture extraction error"}),
+    )
+    .unwrap();
+    let broken = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "failed", "fresh": false}),
+        root.to_str(),
+    );
+    assert_eq!(freshness_refusal_exit(&broken), EXIT_IO as i32);
+    assert!(
+        vector_stale_skip_message("semantic-search", &broken).contains("fixture extraction error")
+    );
 }
 
 #[test]
@@ -328,6 +675,47 @@ fn rename_identity_planner_subprocess_helper() {
             })
             .unwrap();
     }
+    let preview_before = [
+        "selected.rs",
+        "caller.rs",
+        "unrelated_a.rs",
+        "unrelated_b.rs",
+    ]
+    .map(|file| (file, std::fs::read(success_root.join(file)).unwrap()));
+    let preview = run_trained_rename(
+        &success_root,
+        success_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        true,
+        false,
+    )
+    .unwrap()
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
+    assert!(!preview.published);
+    let preview_json = edit_record_json(&preview, false, None);
+    let operations = preview_json["operations"].as_array().unwrap();
+    assert!(!operations.is_empty());
+    assert!(
+        operations
+            .iter()
+            .map(|operation| operation["changed_byte_ranges"].as_array().unwrap().len())
+            .sum::<usize>()
+            >= 2
+    );
+    for (file, bytes) in &preview_before {
+        assert_eq!(std::fs::read(success_root.join(file)).unwrap(), *bytes);
+    }
+    for operation in operations {
+        let file = operation["file"].as_str().unwrap();
+        let before = preview_before
+            .iter()
+            .find(|(path, _)| *path == file)
+            .unwrap();
+        assert_eq!(operation["file_sha256_before"], edit_sha256_hex(&before.1));
+        assert!(operation.get("handle").is_none());
+        assert!(operation.get("result_span").is_none());
+    }
     let outcome = run_trained_rename(
         &success_root,
         success_root.to_str(),
@@ -339,6 +727,15 @@ fn rename_identity_planner_subprocess_helper() {
     .unwrap()
     .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
     assert!(outcome.published);
+    let applied_json = edit_record_json(&outcome, false, None);
+    assert!(!applied_json["operations"].as_array().unwrap().is_empty());
+    for operation in applied_json["operations"].as_array().unwrap() {
+        let file = operation["file"].as_str().unwrap();
+        assert_eq!(
+            operation["file_sha256_after"],
+            edit_sha256_hex(&std::fs::read(success_root.join(file)).unwrap())
+        );
+    }
     assert!(std::fs::read_to_string(success_root.join("selected.rs"))
         .unwrap()
         .contains("fn advance"));
@@ -469,7 +866,7 @@ fn rename_identity_planner_subprocess_helper() {
     std::fs::create_dir(free_root.join(".git")).unwrap();
     std::fs::write(
         free_root.join("selected_free.rs"),
-        "pub fn get_lit_str() {}\npub fn selected_caller() {\n    get_lit_str();\n    get_lit_str();\n    get_lit_str();\n}\n",
+        "use crate::internals::symbol::*;\nstruct Container;\nimpl Container {\n    fn from_ast(cx: &Ctxt, meta: &Meta) -> Result<(), Error> {\n        if let Some(s) = get_lit_str(cx, TAG, &meta)? { let _ = s; }\n        if let Some(s) = get_lit_str(cx, CONTENT, &meta)? { let _ = s; }\n        if let Some(s) = get_lit_str(cx, EXPECTING, &meta)? { let _ = s; }\n        Ok(())\n    }\n}\npub fn get_lit_str(cx: &Ctxt, attr_name: Symbol, meta: &Meta) -> Result<Option<String>, Error> { unimplemented!() }\n",
     )
     .unwrap();
     let unrelated_free = "pub fn get_lit_str() {}\npub fn unrelated_caller() { get_lit_str(); }\n";
@@ -497,7 +894,7 @@ fn rename_identity_planner_subprocess_helper() {
     assert!(free_outcome.published);
     assert_eq!(
         std::fs::read_to_string(free_root.join("selected_free.rs")).unwrap(),
-        "pub fn get_str_literal() {}\npub fn selected_caller() {\n    get_str_literal();\n    get_str_literal();\n    get_str_literal();\n}\n"
+        "use crate::internals::symbol::*;\nstruct Container;\nimpl Container {\n    fn from_ast(cx: &Ctxt, meta: &Meta) -> Result<(), Error> {\n        if let Some(s) = get_str_literal(cx, TAG, &meta)? { let _ = s; }\n        if let Some(s) = get_str_literal(cx, CONTENT, &meta)? { let _ = s; }\n        if let Some(s) = get_str_literal(cx, EXPECTING, &meta)? { let _ = s; }\n        Ok(())\n    }\n}\npub fn get_str_literal(cx: &Ctxt, attr_name: Symbol, meta: &Meta) -> Result<Option<String>, Error> { unimplemented!() }\n"
     );
     assert_eq!(
         std::fs::read_to_string(free_root.join("unrelated_free.rs")).unwrap(),
@@ -514,6 +911,10 @@ fn rename_identity_planner_subprocess_helper() {
         (
             "closure-shadow",
             "pub fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n",
+        ),
+        (
+            "block-glob-shadow",
+            "pub fn get_lit_str() {}\nfn caller() { use other::*; get_lit_str(); get_lit_str(); }\n",
         ),
     ] {
         let root = test_tempdir(name);
@@ -543,7 +944,7 @@ fn rename_identity_planner_subprocess_helper() {
         .expect("mixed-identity caller must refuse");
         assert!(
             matches!(
-                refusal.code.as_str(),
+                refusal.code,
                 "ambiguous_reference" | "unresolved_reference_identity"
             ),
             "{}: {}",
@@ -635,8 +1036,114 @@ fn embedding_eta_uses_backend_prior_then_measured_throughput() {
     assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
     assert_eq!(initial_embedding_eta_seconds(1_200, "metal"), Some(150));
     assert_eq!(initial_embedding_eta_seconds(1_200, "cuda"), Some(100));
+    assert_eq!(
+        initial_embedding_eta_seconds(19_786, "shared-daemon:auto"),
+        None
+    );
+    assert_eq!(initial_embedding_eta_seconds(19_786, "unknown"), None);
+    assert_eq!(initial_embedding_eta_seconds(0, "unknown"), Some(0));
     assert_eq!(observed_embedding_eta_seconds(10, 100, 5_000), Some(45));
     assert_eq!(observed_embedding_rate_milli(10, 5_000), Some(2_000));
+}
+
+#[test]
+fn embedding_eta_does_not_treat_cached_documents_as_gpu_inference() {
+    // A fast cached prefix followed by uncached documents must not predict
+    // that the GPU processes documents at the cache-copy rate.
+    let (inferred, workload) = embedding_inference_workload(1_000, 2_000, 400, 500);
+    assert_eq!((inferred, workload), (100, 1_100));
+    assert_eq!(
+        observed_embedding_eta_seconds(inferred, workload, 10_000),
+        Some(100)
+    );
+    assert_eq!(
+        observed_embedding_rate_milli(inferred, 10_000),
+        Some(10_000)
+    );
+
+    let (inferred, workload) = embedding_inference_workload(900, 2_000, 400, 500);
+    assert_eq!(
+        observed_embedding_eta_seconds(inferred, workload, 1_000),
+        None
+    );
+    assert_eq!(observed_embedding_rate_milli(inferred, 1_000), None);
+    assert_eq!(embedding_inference_workload(100, 200, 150, 50), (0, 100));
+    assert_eq!(
+        embedding_inference_workload(2_000, 2_000, 400, 500),
+        (1_100, 1_100)
+    );
+}
+
+#[test]
+fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&[
+        "GREPPY_STORE_DIR",
+        "GREPPY_BACKGROUND_JOB",
+        ENV_DELEGATED_BACKGROUND_JOB,
+    ]);
+    let scratch = tempfile::tempdir().unwrap();
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::remove_var("GREPPY_BACKGROUND_JOB");
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+    let path = scratch.path().join("index.job");
+    let mut job = BackgroundJobGuard::from_env();
+    job.attach_foreground(path.clone());
+    job.device = Some("metal:0".into());
+    job.embedding_started("metal", 19_786);
+    let initial = read_background_job(&path).unwrap();
+    assert_eq!(initial["eta_seconds"], 2_474);
+    assert_eq!(initial["eta_basis"], "backend_prior");
+
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 2_249,
+        total_documents: 19_786,
+        local_store_reuse: 2_249,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
+        current_symbol: None,
+    });
+    let cached = read_background_job(&path).unwrap();
+    assert_eq!(cached["state"], "embedding");
+    assert_eq!(cached["backend"], "metal");
+    assert_eq!(cached["device"], "metal:0");
+    assert_eq!(cached["eta_seconds"], 2_193);
+    assert_eq!(cached["eta_basis"], "backend_prior");
+    assert!(cached["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 19_786,
+        total_documents: 19_786,
+        local_store_reuse: 19_786,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
+        current_symbol: None,
+    });
+    let finished = read_background_job(&path).unwrap();
+    assert_eq!(finished["eta_seconds"], 0);
+    assert_eq!(finished["eta_basis"], "completed_embedding_work");
+    assert!(finished["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_started("metal", 20);
+    job.embedding_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(2_001));
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 1,
+        total_documents: 20,
+        local_store_reuse: 0,
+        global_cache_hits: 0,
+        global_cache_misses: 1,
+        current_symbol: None,
+    });
+    let slow = read_background_job(&path).unwrap();
+    assert_eq!(slow["rate_milli_spans_per_second"], 0);
+    assert_eq!(slow["eta_basis"], "observed_inference");
+    assert!(slow["eta_seconds"].as_u64().unwrap() >= 38_019);
+    job.complete();
 }
 
 #[test]
@@ -1846,6 +2353,48 @@ fn ten_agents_reuse_published_summary_without_private_duplicates() {
     assert_eq!(base.count().expect("count Base summaries"), 1);
     drop(base);
     std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn grounded_bit_writes_outrank_false_workspace_base_and_global_summaries() {
+    let root = test_tempdir("grounded-bit-writes-cache");
+    let workspace = greppy_store::SummaryCache::open(&root.join("workspace")).unwrap();
+    let base = greppy_store::SummaryCache::open(&root.join("base")).unwrap();
+    let global = greppy_store::SummaryCache::open(&root.join("global")).unwrap();
+    let path = "reference/audio-aot-state.rs";
+    let source = "pub fn and_word(s: &mut Core, value: u16) { s.m_isr = s.m_sr & 0x10; if value == 0 { s.m_isr |= 4; } if value & 0x8000 != 0 { s.m_isr |= 8; } s.m_aluo = value; }";
+    let key = "missing-model-must-not-load";
+    let cache_key = format!("{key}#{SUMMARY_CACHE_GENERATION}");
+    let hash = greppy_store::span_hash(path, source);
+    let wrong = vec!["Sets the AOT word value and clears the interrupt flag".to_owned()];
+    for cache in [&workspace, &base, &global] {
+        cache.put(&cache_key, &hash, &wrong).unwrap();
+    }
+    let config = QwenSummaryConfig {
+        model_id: key.into(),
+        gguf: root.join("missing.gguf"),
+        tokenizer: root.join("missing-tokenizer.json"),
+        device: greppy_qwen35_native::DevicePreference::Cpu,
+    };
+    assert_eq!(
+        summarize_source_cached(
+            &config,
+            key,
+            (Some(&workspace), Some(&base), Some(&global)),
+            path,
+            source,
+            false
+        ),
+        Some(vec![
+            "Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes"
+                .to_owned()
+        ])
+    );
+    // Repair the returned description without globally flushing independent caches.
+    for cache in [&workspace, &base, &global] {
+        assert_eq!(cache.get(&cache_key, &hash).unwrap(), Some(wrong.clone()));
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -3068,4 +3617,96 @@ fn completed_publication_and_successor_identity_block_demand_cancellation() {
         "a successor generation cannot be overwritten"
     );
     assert!(!background_demand_may_cancel(None, false, 41, 9));
+}
+
+#[test]
+fn gated_index_demand_child() {
+    if std::env::var_os("GREPPY_TEST_GATED_DEMAND_CHILD").is_none() {
+        return;
+    }
+    let _guard = BackgroundJobGuard::from_env();
+    let ready = std::env::var_os("GREPPY_TEST_GATED_DEMAND_READY").unwrap();
+    std::fs::write(ready, b"monitor started").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    panic!("the index child did not stop after its last query waiter exited");
+}
+
+#[cfg(unix)]
+#[test]
+fn gated_index_demand_cancels_the_published_wrapper_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let job_path = root.path().join("index.job");
+    let wrapper_pid = std::process::id();
+    let store = root.path().join("store");
+    let ready = root.path().join("ready");
+    let demand = greppy_core::cache::acquire_named_lock_in(
+        &store,
+        "isolated-query-demand",
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    start_background_job_record(
+        &job_path,
+        &serde_json::json!({
+            "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+            "kind": "index",
+            "pid": wrapper_pid,
+            "started_at_unix_secs": 1,
+            "target_generation": 17,
+            "state": "refreshing"
+        }),
+    )
+    .unwrap();
+    let log = std::fs::File::create(root.path().join("child.log")).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::gated_index_demand_child", "--nocapture"])
+        .env("GREPPY_TEST_GATED_DEMAND_CHILD", "1")
+        .env("GREPPY_TEST_GATED_DEMAND_READY", &ready)
+        .env("GREPPY_BACKGROUND_JOB", &job_path)
+        .env_remove(ENV_DELEGATED_BACKGROUND_JOB)
+        .env(ENV_BACKGROUND_DEMAND_LOCK, "isolated-query-demand")
+        .env("GREPPY_STORE_DIR", &store)
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    assert_ne!(child.id(), wrapper_pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !ready.exists() {
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("owned demand-monitor fixture did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        read_background_job(&job_path).unwrap()["state"],
+        "refreshing"
+    );
+    drop(demand);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("owned demand-monitor fixture exceeded its deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
+    let job = read_background_job(&job_path).unwrap();
+    assert_eq!(job["pid"], wrapper_pid);
+    assert_eq!(job["started_at_unix_secs"], 1);
+    assert_eq!(job["target_generation"], 17);
+    assert_eq!(job["state"], "cancelled");
+    assert!(job["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("last query waiter exited"));
 }

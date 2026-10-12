@@ -9,7 +9,12 @@ use super::*;
 pub(crate) fn dispatch_edit(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
     match dispatch_edit_inner(command, json, root) {
         Err(error @ Error::Invalid(_)) => {
-            eprintln!("greppy: {error}");
+            if json {
+                let refusal = EditRefusal::new("INVALID_REQUEST", error.to_string(), 20);
+                println!("{}", edit_refusal_json(&refusal, None));
+            } else {
+                eprintln!("greppy: {error}");
+            }
             Ok(20)
         }
         result => result,
@@ -64,9 +69,8 @@ pub(crate) fn dispatch_edit_inner(
     let _transaction_lock = if dry_run {
         None
     } else {
-        Some(acquire_edit_transaction_lock(&edit_journal_dir(
-            &root_path,
-        ))?)
+        let journal = ensured_workspace_store_path(&root_path)?.with_file_name(EDIT_JOURNAL_DIR);
+        Some(acquire_edit_transaction_lock(&journal)?)
     };
     Ok(dispatch_edit_grammar(command, json, root, &root_path, &file_base)?.0)
 }
@@ -817,7 +821,7 @@ pub(crate) fn edit_positional_payload(
 /// Validate a candidate without writing it. Parser locations refer to the
 /// proposed content, which may have different line numbers from the live file.
 fn edit_validate_syntax(path: &str, before: &[u8], after: &[u8]) -> EditResult<()> {
-    let language = greppy_edit::language_for_path(std::path::Path::new(path));
+    let language = greppy_edit::txn::syntax_language_for_path(std::path::Path::new(path), before);
     if !language.is_supported() {
         return Ok(());
     }
@@ -938,7 +942,67 @@ pub(crate) fn edit_publish(
     Ok(record)
 }
 
-pub(crate) fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditedContent {
+fn edit_check_regex_replacement(regex: &regex::bytes::Regex, replacement: &[u8]) -> EditResult<()> {
+    let mut at = 0;
+    while at < replacement.len() {
+        if replacement[at] != b'$' {
+            at += 1;
+            continue;
+        }
+        at += 1;
+        if replacement.get(at) == Some(&b'$') {
+            at += 1;
+            continue;
+        }
+        let start;
+        let end;
+        if replacement.get(at) == Some(&b'{') {
+            start = at + 1;
+            let Some(close) = replacement[start..].iter().position(|b| *b == b'}') else {
+                continue;
+            };
+            end = start + close;
+            at = end + 1;
+        } else {
+            start = at;
+            while replacement
+                .get(at)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                at += 1;
+            }
+            end = at;
+            if start == end {
+                continue;
+            }
+        }
+        let Ok(name) = std::str::from_utf8(&replacement[start..end]) else {
+            // The byte-regex engine treats invalid UTF-8 in ${...} literally.
+            continue;
+        };
+        let known = if let Ok(index) = name.parse::<usize>() {
+            index < regex.captures_len()
+        } else {
+            regex
+                .capture_names()
+                .flatten()
+                .any(|capture| capture == name)
+        };
+        if !known {
+            return Err(EditRefusal::new(
+                "unknown_replacement_capture",
+                format!("--regex expands captures in NEW, but capture '{name}' does not exist in OLD; nothing written. Use $$ for a literal dollar sign, or omit --regex for a literal OLD pattern."),
+                17,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditResult<EditedContent> {
+    if let Some(regex) = &located.regex {
+        edit_check_regex_replacement(regex, new_bytes)?;
+    }
     // A line-oriented span stops before the newline that ends its last line,
     // because that newline belongs to the file (see `SelectorKind::line_oriented`).
     // New text that carries one of its own would therefore add a blank line the
@@ -967,7 +1031,7 @@ pub(crate) fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditedCont
         };
         edits.push((*start, *end, replacement));
     }
-    edit_splice(&located.content, &mut edits)
+    Ok(edit_splice(&located.content, &mut edits))
 }
 
 pub(crate) fn edit_op_delete(located: &Located) -> EditedContent {
@@ -1360,7 +1424,9 @@ pub(crate) fn edit_journal_open(
     if before.is_empty() {
         return None;
     }
-    let dir = edit_journal_dir(root_path);
+    let dir = ensured_workspace_store_path(root_path)
+        .ok()?
+        .with_file_name(EDIT_JOURNAL_DIR);
     std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).ok()?;
     let seed = format!(
         "{}-{}",
@@ -1641,7 +1707,7 @@ pub(crate) fn edit_resolve_new_path(
                 if !normalized.pop() {
                     return Err(EditRefusal::new(
                         "path_outside_repo",
-                        format!("{file} is outside {}", workspace.display()),
+                        format!("{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", workspace.display()),
                         17,
                     ));
                 }
@@ -1652,7 +1718,7 @@ pub(crate) fn edit_resolve_new_path(
     let Ok(relative) = normalized.strip_prefix(&workspace) else {
         return Err(EditRefusal::new(
             "path_outside_repo",
-            format!("{file} is outside {}", workspace.display()),
+            format!("{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", workspace.display()),
             17,
         ));
     };
@@ -1838,7 +1904,31 @@ pub(crate) fn run_trained_write(
     dry_run: bool,
     verify: bool,
 ) -> EditResult<EditRecord> {
+    match std::fs::metadata(root_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(EditRefusal::new(
+                "workspace_root_missing",
+                format!(
+                    "workspace root {} does not exist; nothing written. Create this directory, then retry with --root and a path relative to it",
+                    root_path.display()
+                ),
+                17,
+            ));
+        }
+        Err(error) => {
+            return Err(EditRefusal::new(
+                "workspace_root_unavailable",
+                format!(
+                    "cannot inspect workspace root {}: {error}; nothing written. Restore access to this directory before retrying",
+                    root_path.display()
+                ),
+                17,
+            ));
+        }
+        Ok(_) => {}
+    }
     let (rel, abs) = edit_resolve_new_path(root_path, file_base, path)?;
+
     if abs.is_dir() {
         return Err(EditRefusal::new(
             "file_exists",
@@ -1864,7 +1954,7 @@ pub(crate) fn run_trained_write(
         if !canonical.starts_with(&root) {
             return Err(EditRefusal::new(
                 "path_outside_repo",
-                format!("{path} is outside {}", root.display()),
+                format!("{path} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", root.display()),
                 17,
             ));
         }
@@ -2030,6 +2120,34 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             }
             input_hunk_number += 1;
             let input_line = index + 1;
+            // Positions remain advisory; counts disambiguate actual file
+            // headers from removed/added content beginning with ---/+++.
+            let header_fields: Vec<&str> = lines[index].split_whitespace().collect();
+            let declared_counts = (|| {
+                let count = |field: &str, prefix| {
+                    let range = field.strip_prefix(prefix)?;
+                    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+                    start.parse::<usize>().ok()?;
+                    count.parse::<usize>().ok()
+                };
+                Some((
+                    count(header_fields.get(1)?, '-')?,
+                    count(header_fields.get(2)?, '+')?,
+                ))
+            })();
+            let counted_header = header_fields
+                .iter()
+                .skip(1)
+                .take(2)
+                .any(|field| field.starts_with('-') || field.starts_with('+'));
+            if counted_header && (declared_counts.is_none() || header_fields.get(3) != Some(&"@@"))
+            {
+                return Err(EditRefusal::new(
+                    "invalid_patch",
+                    format!("{path}: hunk {input_hunk_number} at patch input line {input_line} has invalid unified-diff ranges; use @@ -OLD,COUNT +NEW,COUNT @@ with non-negative integers — nothing written"),
+                    20,
+                ));
+            }
             let declared_old_line = lines[index]
                 .split_whitespace()
                 .find(|field| field.starts_with('-'))
@@ -2041,10 +2159,32 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             let mut new_lines = Vec::new();
             while index < lines.len()
                 && !lines[index].starts_with("@@")
-                && !lines[index].starts_with("--- ")
                 && !lines[index].starts_with("diff --git ")
             {
                 let line = lines[index];
+                let header_pair = line.starts_with("--- ")
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.starts_with("+++ "));
+                if header_pair {
+                    match declared_counts {
+                        Some((old, new)) if old_lines.len() == old && new_lines.len() == new => {
+                            break;
+                        }
+                        Some(_) => {} // Still inside the declared hunk: these are payload lines.
+                        None if old_lines.is_empty() && new_lines.is_empty() => {}
+                        None => {
+                            return Err(EditRefusal::new(
+                                "invalid_patch",
+                                format!(
+                                    "{path}: ---/+++ at patch input line {} is ambiguous in a count-free hunk; supply an explicit @@ -OLD,COUNT +NEW,COUNT @@ header to distinguish file headers from content — nothing written",
+                                    index + 1
+                                ),
+                                20,
+                            ));
+                        }
+                    }
+                }
                 match line.as_bytes().first() {
                     Some(b' ') => {
                         old_lines.push(line[1..].to_string());
@@ -2061,7 +2201,7 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                                 index + 1
                             ),
                             20,
-                        ))
+                        ));
                     }
                 }
                 index += 1;
@@ -2069,9 +2209,30 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             if old_lines.is_empty() {
                 return Err(EditRefusal::new(
                     "invalid_patch",
-                    format!("{path}: a hunk has no context line to anchor on"),
+                    if new_lines.is_empty() {
+                        format!(
+                            "{path}: hunk {input_hunk_number} at patch input line {input_line} is empty; remove its @@ header or add hunk content with context — nothing written"
+                        )
+                    } else {
+                        format!(
+                            "{path}: hunk {input_hunk_number} at patch input line {input_line} contains only additions and has no existing line to anchor on; include an unchanged context line — nothing written"
+                        )
+                    },
                     20,
                 ));
+            }
+            if let Some((old, new)) = declared_counts {
+                if old_lines.len() != old || new_lines.len() != new {
+                    return Err(EditRefusal::new(
+                        "invalid_patch",
+                        format!(
+                            "{path}: hunk {input_hunk_number} at patch input line {input_line} declares {old} old and {new} new lines, but contains {} old and {} new lines; regenerate the unified diff with correct counts — nothing written",
+                            old_lines.len(),
+                            new_lines.len()
+                        ),
+                        20,
+                    ));
+                }
             }
             hunks.push(TrainedPatchHunk {
                 input_hunk_number,
@@ -2143,8 +2304,8 @@ fn apply_trained_patch_file(
                 return Err(EditRefusal::new(
                     "patch_context",
                     format!(
-                        "{path}: hunk context did not match (the @@ line {} is advisory) — nothing written",
-                        hunk.declared_old_line
+                        "{path}: input hunk {} at patch line {}: hunk context did not match (the @@ line {} is advisory). Removed and context lines must match complete source lines, not substrings; regenerate with `git diff --no-color -- PATH`, or use `greppy replace-text` for an intentional substring replacement — nothing written",
+                        hunk.input_hunk_number, hunk.input_line, hunk.declared_old_line
                     ),
                     13,
                 ))
@@ -2687,9 +2848,9 @@ fn rust_free_function_reference_inventory(
                 .collect::<Vec<_>>();
             if !selected_files.contains(&rel)
                 && unqualified
-                && unplanned
-                    .iter()
-                    .all(|site| rust_local_free_function_owns_site(&content, short_name, *site))
+                && unplanned.iter().all(|site| {
+                    rust_local_free_function_owns_site(&content, short_name, *site, false)
+                })
             {
                 continue;
             }
@@ -2707,6 +2868,7 @@ fn rust_local_free_function_owns_site(
     content: &[u8],
     short_name: &str,
     site: (usize, usize),
+    glob_import_shadows: bool,
 ) -> bool {
     let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
         return false;
@@ -2739,7 +2901,7 @@ fn rust_local_free_function_owns_site(
             "use_declaration" | "let_declaration" | "parameter"
         ) && (node.kind() == "use_declaration" || node.start_byte() <= reference.start_byte())
         {
-            let active_scope = if node.kind() == "parameter" {
+            let (active_scope, active_module_scope) = if node.kind() == "parameter" {
                 let mut owner = node.parent();
                 let mut active = false;
                 while let Some(scope) = owner {
@@ -2751,10 +2913,11 @@ fn rust_local_free_function_owns_site(
                     }
                     owner = scope.parent();
                 }
-                active
+                (active, false)
             } else {
                 let mut owner = node.parent();
                 let mut active = false;
+                let mut module_scope = false;
                 while let Some(scope) = owner {
                     if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
                         let key = (scope.start_byte(), scope.end_byte());
@@ -2763,17 +2926,26 @@ fn rust_local_free_function_owns_site(
                         } else {
                             reference_module == Some(key)
                         };
+                        module_scope = active && scope.kind() != "block";
                         break;
                     }
                     owner = scope.parent();
                 }
-                active
+                (active, module_scope)
             };
             if active_scope {
-                let mut declaration_stack = vec![node];
+                // Only the pattern binds a name. Calls in a let initializer
+                // and names in a parameter type cannot shadow the function.
+                let binding = if matches!(node.kind(), "let_declaration" | "parameter") {
+                    node.child_by_field_name("pattern").unwrap_or(node)
+                } else {
+                    node
+                };
+                let mut declaration_stack = vec![binding];
                 while let Some(part) = declaration_stack.pop() {
                     if node.kind() == "use_declaration"
                         && matches!(part.kind(), "use_wildcard" | "wildcard_import")
+                        && (glob_import_shadows || !active_module_scope)
                     {
                         return false;
                     }
@@ -3236,9 +3408,24 @@ pub(crate) fn run_trained_rename(
         .first()
         .map(|operation| edit_operation_line_span(operation, root_path));
     let already = certificate.status == greppy_edit::Status::AlreadySatisfied;
+    // Preserve the planner's exact change witness for both previews and writes.
+    // Rename receipts need ranges/checksums, not another copy of function bodies.
+    let operations = certificate
+        .operations
+        .iter()
+        .map(|operation| EditOperation {
+            file: edit_operation_path(operation, root_path),
+            ranges: operation.changed_byte_ranges.clone(),
+            sha_before: Some(operation.file_sha256_before.clone()),
+            sha_after: operation.file_sha256_after.clone(),
+            diff: operation.unified_diff.clone(),
+            ..EditOperation::default()
+        })
+        .collect();
     let mut record = EditRecord {
         files,
         span,
+        operations,
         published: !dry_run,
         already_as_sent: already && !dry_run,
         ..EditRecord::default()
@@ -3262,7 +3449,10 @@ fn rust_selected_local_free_function_owns_site(
     definition_site: (usize, usize),
     reference_site: (usize, usize),
 ) -> bool {
-    if !rust_local_free_function_owns_site(content, short_name, reference_site) {
+    // A same-module item is resolved ahead of glob imports. Keep glob imports
+    // conservative when proving an unrelated local definition, but do not let
+    // them hide calls to the selected item in its own module.
+    if !rust_local_free_function_owns_site(content, short_name, reference_site, false) {
         return false;
     }
     let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
@@ -3328,15 +3518,16 @@ fn rust_selected_local_free_function_owns_site(
             let mut ancestor = candidate.parent();
             let mut binding_owner = None;
             while let Some(node) = ancestor {
-                if matches!(
-                    node.kind(),
-                    "let_declaration"
-                        | "parameter"
-                        | "for_expression"
-                        | "match_arm"
-                        | "let_condition"
-                        | "closure_parameters"
-                ) {
+                let binds_candidate = match node.kind() {
+                    "parameter" | "closure_parameters" => true,
+                    "let_declaration" | "for_expression" | "match_arm" | "let_condition" => {
+                        node.child_by_field_name("pattern").is_some_and(|pattern| {
+                            pattern.byte_range().contains(&candidate.start_byte())
+                        })
+                    }
+                    _ => false,
+                };
+                if binds_candidate {
                     binding_owner = Some(node);
                     break;
                 }
@@ -3401,6 +3592,88 @@ fn rust_selected_local_free_function_owns_site(
     true
 }
 
+/// A full Rust replacement that supplies outer attributes owns those attributes
+/// too. Without supplied attributes, preserve the existing prefix as before;
+/// body-only edits never call this helper.
+fn edit_rust_attribute_replacement_range(
+    content: &[u8],
+    range: (usize, usize),
+    replacement: &[u8],
+) -> (usize, usize) {
+    let Ok(requested) = greppy_parser::parse(greppy_edit::Language::Rust, replacement) else {
+        return range;
+    };
+    let mut cursor = requested.root_node().walk();
+    let supplies_attributes = requested
+        .root_node()
+        .named_children(&mut cursor)
+        .find_map(|node| match node.kind() {
+            "attribute_item" => Some(true),
+            "line_comment" | "block_comment" => None,
+            _ => Some(false),
+        })
+        .unwrap_or(false);
+    if !supplies_attributes {
+        return range;
+    }
+    let Ok(tree) = greppy_parser::parse(greppy_edit::Language::Rust, content) else {
+        return range;
+    };
+    let Some(offset) = content
+        .get(range.0..range.1)
+        .and_then(|bytes| bytes.iter().position(|byte| !byte.is_ascii_whitespace()))
+    else {
+        return range;
+    };
+    let Some(mut node) = tree
+        .root_node()
+        .descendant_for_byte_range(range.0 + offset, range.1.saturating_sub(1))
+    else {
+        return range;
+    };
+    while !matches!(
+        node.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "impl_item"
+            | "mod_item"
+            | "const_item"
+            | "static_item"
+    ) {
+        let Some(parent) = node.parent() else {
+            return range;
+        };
+        node = parent;
+    }
+    if node.end_byte() > range.1 {
+        return range;
+    }
+    let mut start = node.start_byte();
+    let mut previous = node.prev_named_sibling();
+    while let Some(prefix) = previous {
+        match prefix.kind() {
+            "attribute_item" => start = prefix.start_byte(),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = prefix.prev_named_sibling();
+    }
+    let line_start = content[..start]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |offset| offset + 1);
+    if content[line_start..start]
+        .iter()
+        .all(|byte| byte.is_ascii_whitespace())
+    {
+        start = line_start;
+    }
+    (start.min(range.0), range.1)
+}
+
 pub(crate) fn dispatch_edit_grammar(
     command: EditCommand,
     json: bool,
@@ -3417,7 +3690,7 @@ pub(crate) fn dispatch_edit_grammar(
             verify,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
-                let new_bytes = edit_positional_payload(new, "NEW")?;
+                let mut new_bytes = edit_positional_payload(new, "NEW")?;
                 let spec = WhereSpec {
                     file: None,
                     old: None,
@@ -3429,8 +3702,28 @@ pub(crate) fn dispatch_edit_grammar(
                     target: None,
                     path: None,
                 };
-                let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let mut located =
+                    edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
+                if !body
+                    && greppy_edit::language_for_path(std::path::Path::new(&located.rel))
+                        == greppy_edit::Language::Rust
+                {
+                    edit_check_cardinality(&located, Some(1))?;
+                    located.ranges[0] = edit_rust_attribute_replacement_range(
+                        &located.content,
+                        located.ranges[0],
+                        &new_bytes,
+                    );
+                }
+                if body {
+                    edit_check_cardinality(&located, Some(1))?;
+                    let (start, end) = located.ranges[0];
+                    new_bytes = greppy_edit::verbs::replacement_body_preserving_delimiters(
+                        &located.content[start..end],
+                        &new_bytes,
+                    );
+                }
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3465,7 +3758,7 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, kind, root, root_path, file_base)?;
                 edit_check_cardinality(&located, expect)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3491,7 +3784,7 @@ pub(crate) fn dispatch_edit_grammar(
                     path: None,
                 };
                 let located = edit_locate(&spec, SelectorKind::Lines, root, root_path, file_base)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3516,7 +3809,7 @@ pub(crate) fn dispatch_edit_grammar(
                     path: None,
                 };
                 let located = edit_locate(&spec, SelectorKind::Target, root, root_path, file_base)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3875,11 +4168,33 @@ mod patch_rollback_tests {
     }
 
     #[test]
+    fn trailing_empty_hunk_reports_exact_header_and_recovery() {
+        let diff = b"--- a/patch-repro.txt\n+++ b/patch-repro.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n@@\n";
+        let refusal = match parse_trained_patch(diff) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("empty hunk must be refused"),
+        };
+        assert_eq!(refusal.code, "invalid_patch");
+        assert!(refusal
+            .message
+            .contains("hunk 2 at patch input line 7 is empty"));
+        assert!(refusal.message.contains("remove its @@ header"));
+        assert!(refusal.message.contains("nothing written"));
+        let recovered = &diff[..diff.len() - 3];
+        let files =
+            parse_trained_patch(recovered).unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks.len(), 1);
+    }
+
+    #[test]
     fn qualified_rust_free_function_rename_preserves_distinct_copy() {
         let dir = tempfile::tempdir().unwrap();
         let selected =
             b"fn get_lit_str() {}\nfn selected_caller() { get_lit_str(); get_lit_str(); }\n";
-        let unrelated = b"fn get_lit_str() {}\nfn unrelated_caller() { get_lit_str(); }\n";
+        // A module-level wildcard cannot shadow an explicit local function.
+        // Serde's two independent attr.rs copies both import symbol::*.
+        let unrelated = b"mod symbols { pub const TAG: u8 = 0; }\nuse symbols::*;\nfn get_lit_str() {}\nfn unrelated_caller() { let Some(value) = Some(get_lit_str()) else { return; }; let _ = value; }\n";
         std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
         std::fs::write(dir.path().join("unrelated.rs"), unrelated).unwrap();
         let sites = greppy_edit::verbs::rename_identifier_sites(
@@ -3977,18 +4292,51 @@ mod patch_rollback_tests {
         assert!(rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[1]
+            sites[1],
+            true
         ));
         assert!(rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[3]
+            sites[3],
+            true
         ));
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[4]
+            sites[4],
+            true
         ));
+    }
+
+    #[test]
+    fn rust_local_binding_proof_ignores_initializer_references_and_parameter_types() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"fn get_lit_str() {}\nfn caller() { let value = get_lit_str(); }\n", true),
+            (b"fn get_lit_str() {}\nfn caller() { let Some(value) = Some(get_lit_str()) else { return; }; }\n", true),
+            (b"fn get_lit_str() {}\nfn caller() { let get_lit_str = || {}; get_lit_str(); }\n", false),
+            (b"type get_lit_str = ();\nfn get_lit_str() {}\nfn caller(arg: get_lit_str) { get_lit_str(); }\n", true),
+        ];
+        for (source, expected) in cases {
+            let sites = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new("bindings.rs"),
+                source,
+                &[(0, source.len())],
+                "get_lit_str",
+            )
+            .unwrap();
+            assert_eq!(
+                rust_local_free_function_owns_site(
+                    source,
+                    "get_lit_str",
+                    *sites.last().unwrap(),
+                    false
+                ),
+                *expected,
+                "{}",
+                String::from_utf8_lossy(source),
+            );
+        }
     }
 
     #[test]
@@ -4029,6 +4377,22 @@ mod patch_rollback_tests {
             "get_lit_str",
             module_sites[0],
             module_sites[2],
+        ));
+
+        let block_glob = b"fn get_lit_str() {}\nfn caller() { use other::*; get_lit_str(); }\n";
+        let glob_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("block-glob.rs"),
+            block_glob,
+            &[(0, block_glob.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(glob_sites.len(), 2);
+        assert!(!rust_selected_local_free_function_owns_site(
+            block_glob,
+            "get_lit_str",
+            glob_sites[0],
+            glob_sites[1],
         ));
 
         let mixed_form =
@@ -4115,6 +4479,24 @@ mod patch_rollback_tests {
                 sites[2],
             ));
         }
+
+        let serde_shape = b"fn get_lit_str() {}\nfn caller() { if let Some(_) = get_lit_str() {} if let Some(_) = get_lit_str() {} if let Some(_) = get_lit_str() {} }\n";
+        let serde_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("serde-shape.rs"),
+            serde_shape,
+            &[(0, serde_shape.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(serde_sites.len(), 4);
+        for site in &serde_sites[1..] {
+            assert!(rust_selected_local_free_function_owns_site(
+                serde_shape,
+                "get_lit_str",
+                serde_sites[0],
+                *site,
+            ));
+        }
     }
 
     #[test]
@@ -4131,7 +4513,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[2]
+            sites[2],
+            true
         ));
     }
 
@@ -4149,7 +4532,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[1]
+            sites[1],
+            true
         ));
     }
 
@@ -4167,7 +4551,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[2]
+            sites[2],
+            true
         ));
     }
 
@@ -4186,7 +4571,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[1]
+            sites[1],
+            false
         ));
     }
 
@@ -4231,10 +4617,92 @@ mod patch_rollback_tests {
             "get_lit_str",
             "selected.rs::get_lit_str",
         )
-        .err()
-        .expect("live call omitted from graph plan must refuse");
+        .expect_err("live call omitted from graph plan must refuse");
         assert_eq!(refusal.code, "unresolved_reference_identity");
         assert!(refusal.message.contains("glob_call.rs"));
+    }
+
+    #[test]
+    fn partial_line_patch_refusal_identifies_hunk_and_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.txt");
+        let original = b"head\nlock();declare();\ntail\n";
+        std::fs::write(&path, original).unwrap();
+        let diff = b"--- a/example.txt\n+++ b/example.txt\n@@ -99,1 +99,2 @@\n-head\n+HEAD\n+extra\n@@ -88,1 +89,2 @@\n-lock();\n+timer();\n+lock();\n";
+        assert_eq!(
+            std::str::from_utf8(original)
+                .unwrap()
+                .matches("lock();")
+                .count(),
+            1
+        );
+        for dry_run in [false, true] {
+            let refusal = match run_trained_patch_with_publish_hook(
+                dir.path(),
+                dir.path(),
+                diff.to_vec(),
+                dry_run,
+                false,
+                |_| panic!("partial-line hunk must refuse before any publish"),
+            ) {
+                Err(refusal) => refusal,
+                Ok(_) => panic!("partial source line was accepted as a complete diff line"),
+            };
+            assert_eq!(refusal.code, "patch_context");
+            assert_eq!(refusal.exit, 13);
+            assert!(refusal.message.contains("input hunk 2 at patch line 7"));
+            assert!(refusal.message.contains("@@ line 88 is advisory"));
+            assert!(refusal
+                .message
+                .contains("complete source lines, not substrings"));
+
+            assert!(refusal.message.contains("git diff --no-color -- PATH"));
+            assert!(refusal.message.contains("greppy replace-text"));
+            assert!(refusal.message.contains("nothing written"));
+            assert!(!refusal.message.contains("declare();"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        let corrected = parse_trained_patch(
+            b"--- a/example.txt\n+++ b/example.txt\n@@ -99,1 +99,2 @@\n-head\n+HEAD\n+extra\n@@ -88,1 +89,2 @@\n-lock();declare();\n+timer();\n+lock();declare();\n",
+        )
+        .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        let (after, _) = apply_trained_patch_file("example.txt", original, &corrected[0].hunks)
+            .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        assert_eq!(after, b"HEAD\nextra\ntimer();\nlock();declare();\ntail\n");
+    }
+
+    #[test]
+    fn guarded_c_header_write_and_invalid_replacement_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = include_bytes!("../../edit/tests/fixtures/guarded-protocol.h").to_vec();
+        run_trained_write(
+            dir.path(),
+            dir.path(),
+            "protocol.h",
+            valid.clone(),
+            false,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(std::fs::read(dir.path().join("protocol.h")).unwrap(), valid);
+        let malformed = String::from_utf8(valid.clone()).unwrap().replacen(
+            "fma_codec_name(uint32_t codec);",
+            "fma_codec_name(uint32_t codec;",
+            1,
+        );
+        let refusal = match run_trained_write(
+            dir.path(),
+            dir.path(),
+            "protocol.h",
+            malformed.into_bytes(),
+            false,
+            false,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed header accepted"),
+        };
+        assert_eq!(refusal.code, "invalid_result");
+        assert_eq!(std::fs::read(dir.path().join("protocol.h")).unwrap(), valid);
     }
 
     #[test]

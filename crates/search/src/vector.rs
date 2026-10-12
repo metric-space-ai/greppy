@@ -41,13 +41,7 @@ pub fn vector_search_exact(
 
 /// Count embeddings in the same scope used by [`vector_search_exact`].
 pub fn count_vector_search_scope(store: &Store, query: &VectorSearchQuery<'_>) -> Result<i64> {
-    Ok(store.count_vector_embeddings(
-        query.project,
-        query.model_id,
-        query.prompt_version,
-        query.task,
-        query.graph_generation,
-    )?)
+    Ok(store.count_vector_search_scope(query)?)
 }
 
 /// Build the canonical vector-search scope for EmbeddingGemma code retrieval.
@@ -64,6 +58,7 @@ pub fn embeddinggemma_code_retrieval_scope<'a>(
         task: EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
         graph_generation,
         file_path: None,
+        path_prefixes: None,
         limit,
         min_score: None,
     }
@@ -134,6 +129,7 @@ mod tests {
             task: EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
             graph_generation: Some(11),
             file_path: None,
+            path_prefixes: None,
             limit: 10,
             min_score: None,
         }

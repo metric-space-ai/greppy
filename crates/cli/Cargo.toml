@@ -41,6 +41,7 @@ crossterm = { workspace = true }
 serde = { workspace = true }
 unicode-segmentation = "1"
 unicode-width = "0.2"
+url = "2.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

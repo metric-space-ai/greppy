@@ -14,6 +14,195 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+#[test]
+fn json_write_accepts_positive_exponent_and_refuses_invalid_replacement_atomically() {
+    let (repo, store, _scratch) = make_repo("json-exponent", "marker");
+    let payload = r#"{"finite_max_error": 2.842105616405627e+18}"#;
+    let (exit, stdout, stderr) = run(&["write", "repro.json", payload], &repo, &store);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("repro.json")).unwrap(),
+        payload
+    );
+    for invalid in [r#"{"x":2e+}"#, r#"{"x":+2}"#, r#"{"x":2e++18}"#] {
+        let (exit, stdout, stderr) = run(&["write", "repro.json", invalid], &repo, &store);
+        assert_eq!(exit, 13, "{stdout}\n{stderr}");
+        assert!(stderr.contains("syntax validation failed"), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("repro.json")).unwrap(),
+            payload
+        );
+    }
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn semantic_admission_refusal_precedes_model_asset_materialization() {
+    let (repo, store, _scratch) = make_repo("semantic-no-assets-before-admission", "sample");
+    let model_root = store.with_file_name("isolated-inference");
+    let gate = repo.join("deny-heavy.py");
+    std::fs::write(
+        &gate,
+        "import sys\nprint('Capacity gate: fixture denied', file=sys.stderr)\nsys.exit(75)\n",
+    )
+    .unwrap();
+    for args in [
+        vec![
+            "search",
+            "returns a sample integer",
+            "--json",
+            "--diagnostics",
+        ],
+        vec!["impact", "sample", "--json", "--diagnostics"],
+        vec!["brief", "sample", "--json", "--diagnostics"],
+        vec!["brief", "sample", "other", "--json", "--diagnostics"],
+    ] {
+        let output = Command::new(bin())
+            .args(&args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_HEAVY_GATE", &gate)
+            .env("GREPPY_SHARED_INFERENCE_ROOT", &model_root)
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .env_remove("GREPPY_AUTO_REINDEX")
+            // If the request gets as far as materialization, this independent
+            // debug failpoint produces the wrong backend error instead of denial.
+            .env("GREPPY_TEST_EMBED_ASSET_MISSING", "1")
+            .output()
+            .unwrap();
+        let out = String::from_utf8(output.stdout).unwrap();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            matches!(output.status.code(), Some(73 | 75)),
+            "args={args:?}\n{out}\n{err}"
+        );
+        // Both cold structural-open and initialized-store paths must refuse
+        // before touching model assets. The separate cold JSON contract owns
+        // consistency of their machine-readable error envelopes.
+        if output.status.code() == Some(75) {
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                value["freshness"]["preparation_failure_kind"], "admission_deferred",
+                "{value}"
+            );
+            assert!(
+                value["freshness"]["preparation_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fixture denied"),
+                "{value}"
+            );
+        } else {
+            assert!(
+                err.contains("fixture denied") && err.contains("no index work started"),
+                "args={args:?}\n{out}\n{err}"
+            );
+        }
+        assert!(
+            !model_root.join("models").exists(),
+            "refused command {args:?} must not materialize either model"
+        );
+    }
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn cold_first_use_json_admission_denial_is_structured_for_each_command() {
+    for (n, args) in [
+        vec!["search", "returns a sample integer", "--json"],
+        vec!["impact", "sample", "--json"],
+        vec!["brief", "sample", "--json"],
+        vec!["brief", "sample", "other", "--json"],
+        vec!["impact", "sample", "--json", "--diagnostics"],
+        vec!["impact", "sample", "--json", "--max-bytes", "256"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (repo, store, _scratch) = make_repo(&format!("cold-json-denial-{n}"), "sample");
+        let models = store.with_file_name("isolated-inference");
+        let gate = repo.join("deny-heavy.py");
+        std::fs::write(&gate, "import sys\nprint('Capacity gate: cold fixture denied', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+        assert!(
+            !store.exists(),
+            "each command must start without any graph store"
+        );
+        let output = Command::new(bin())
+            .args(&args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_HEAVY_GATE", &gate)
+            .env("GREPPY_SHARED_INFERENCE_ROOT", &models)
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .env_remove("GREPPY_AUTO_REINDEX")
+            .env("GREPPY_TEST_EMBED_ASSET_MISSING", "1")
+            .output()
+            .unwrap();
+        let out = String::from_utf8(output.stdout).unwrap();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(75),
+            "args={args:?}\n{out}\n{err}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "preparation_deferred", "{value}");
+        assert_eq!(value["fresh"], false, "{value}");
+        assert_eq!(
+            value["freshness"]["preparation_failure_kind"],
+            "admission_deferred"
+        );
+        assert_eq!(
+            value["freshness"]["root_path"],
+            repo.canonicalize().unwrap().to_str().unwrap()
+        );
+        let diagnostic = value["freshness"]["diagnostics_command"].as_str().unwrap();
+        assert!(
+            diagnostic.contains(store.to_str().unwrap())
+                && diagnostic.contains("index status --json")
+        );
+        assert!(value["freshness"]["preparation_error"]
+            .as_str()
+            .unwrap()
+            .contains("cold fixture denied"));
+        assert!(
+            value.get("results").is_none()
+                && value.get("hits").is_none()
+                && value.get("total_exact").is_none(),
+            "refusal must not masquerade as an empty answer: {value}"
+        );
+        assert!(
+            !models.join("models").exists(),
+            "no model materialization before admission"
+        );
+    }
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn cold_first_use_runner_failure_is_not_reclassified_from_error_text() {
+    let (repo, store, _scratch) = make_repo("cold-json-runner-failure", "sample");
+    let gate = repo.join("broken-heavy.py");
+    std::fs::write(&gate, "import sys\nprint('Automatic indexing deferred by shared host admission; no index work started. misleading text', file=sys.stderr)\nsys.exit(1)\n").unwrap();
+    let output = Command::new(bin())
+        .args(["impact", "sample", "--json"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_HEAVY_GATE", &gate)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_AUTO_REINDEX")
+        .output()
+        .unwrap();
+    let out = String::from_utf8(output.stdout).unwrap();
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(73), "{out}\n{err}");
+    assert!(!out.contains("preparation_deferred"), "{out}");
+    assert!(
+        err.contains("admission runner exited") && err.contains("misleading text"),
+        "{err}"
+    );
+}
+
 /// Path to the binary under test (provided by cargo for integration tests).
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
@@ -1587,12 +1776,137 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
     assert!(v["stats"]["nodes"].as_u64().unwrap_or(0) >= 1);
     assert!(v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(v["provider_failure_count"], 0);
+    let (compact_code, compact_out, compact_err) =
+        run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(compact_code, code, "{compact_err}");
+    let compact: serde_json::Value = serde_json::from_str(&compact_out).unwrap();
+    for key in [
+        "healthy",
+        "fresh",
+        "writer_active",
+        "startup_active",
+        "embedding_complete",
+        "provider_failure_count",
+    ] {
+        assert_eq!(compact[key], v[key], "health changed for {key}");
+    }
+    assert!(compact.get("providers").is_none(), "{compact}");
+    let guidance = compact["diagnostics_command"].as_str().unwrap();
+    assert!(guidance.starts_with("GREPPY_STORE_DIR="), "{guidance}");
+    assert!(
+        guidance.contains(store.to_string_lossy().as_ref()),
+        "{guidance}"
+    );
+    assert!(guidance.contains("greppy --root "), "{guidance}");
+    assert!(
+        guidance.contains(v["root_path"].as_str().unwrap()),
+        "{guidance}"
+    );
+    assert!(
+        guidance.ends_with("index status --json --diagnostics"),
+        "{guidance}"
+    );
+    assert!(!compact_err.contains("still running"), "{compact_err}");
     assert!(
         v["providers"]
             .as_array()
             .is_some_and(|rows| !rows.is_empty()),
         "health JSON must retain detailed provider capabilities: {v:?}"
     );
+}
+
+#[test]
+fn index_status_empty_admission_deferred_store_does_not_report_discovery_loss() {
+    let (repo, store, _scratch) = make_real_git_repo("status-deferred-no-discovery");
+    for n in 0..100 {
+        std::fs::write(
+            repo.join(format!("src/tracked_{n}.rs")),
+            "pub fn tracked() {}\n",
+        )
+        .unwrap();
+    }
+    git(&repo, &["add", "."]);
+    let db = store
+        .join("workspaces/v2")
+        .join(greppy_core::workspace::workspace_hash(&repo))
+        .join("graph.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    drop(greppy_store::Store::open(&db).unwrap());
+    std::fs::write(
+        db.parent().unwrap().join("index.job"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "greppy.background-job.v2",
+            "kind": "index",
+            "pid": 0,
+            "started_at_unix_secs": 1,
+            "state": "failed",
+            "failure_kind": "admission_deferred",
+            "completed_spans": 0,
+            "total_spans": 0,
+            "error": "Automatic indexing deferred by shared host admission; no index work started"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for args in [
+        vec!["index", "status", "--json"],
+        vec!["index", "status", "--json", "--diagnostics"],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 73, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["project_present"], false, "{value}");
+        assert_eq!(value["graph_generation"], serde_json::Value::Null);
+        assert_eq!(value["git_tracked_files"], 101);
+        assert_eq!(value["coverage_warning"], serde_json::Value::Null);
+        assert_eq!(value["background_job"]["state"], "failed");
+        assert_eq!(
+            value["background_job"]["failure_kind"],
+            "admission_deferred"
+        );
+        assert!(!out.contains("discovery may be dropping files"), "{out}");
+        assert!(!db.parent().unwrap().join("index.spawn").exists());
+    }
+}
+
+#[test]
+#[cfg(not(feature = "ci-test-assets"))]
+fn index_status_does_not_materialize_inference_assets() {
+    let (repo, store, _scratch) = make_repo("status-no-assets", "status_identity_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let inference_root = store.parent().unwrap().join("cold-inference");
+    let inference_path = inference_root.to_str().unwrap();
+    for args in [
+        vec!["index", "status", "--json"],
+        vec!["index", "status", "--json", "--diagnostics"],
+    ] {
+        let output = Command::new(bin())
+            .args(&args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_SHARED_INFERENCE_ROOT", inference_path)
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .output()
+            .expect("spawn inference-enabled status");
+        let code = output.status.code().unwrap_or(-1);
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            code, 73,
+            "missing embeddings must remain unhealthy: {out}\n{err}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["fresh"], true);
+        assert_eq!(value["embedding_complete"], false);
+        assert_eq!(value["vectors_missing_with_model"], true);
+        assert!(
+            !inference_root
+                .join("models/v1/embeddinggemma-300m-q4k")
+                .exists(),
+            "status must not extract or verify model assets"
+        );
+    }
 }
 
 #[test]
@@ -3619,7 +3933,23 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
     let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
     assert_eq!(status["writer_active"], false);
     assert_eq!(status["startup_active"], false);
-    assert_eq!(status["background_state"], "abandoned");
+    assert_eq!(status["background_state"], "process_alive");
+    assert_eq!(
+        status["background_observation"]["recorded_process_alive"],
+        true
+    );
+    assert_eq!(
+        status["background_observation"]["process_identity_confirmed"],
+        false
+    );
+    let recovery = status["background_observation"]["recovery"]
+        .as_str()
+        .unwrap();
+    assert!(
+        recovery.contains("retry the original command"),
+        "{recovery}"
+    );
+    assert!(!recovery.contains("Observe the existing job"), "{recovery}");
 
     let (code, out, err) = run(&["search-symbol", "stale_pid_marker"], &repo, &store);
     assert_eq!(
@@ -3768,6 +4098,59 @@ fn first_use_query_ignores_stale_record_while_foreground_writer_publishes() {
 }
 
 #[test]
+fn rejected_refresh_admission_never_claims_publication_is_running() {
+    let (repo, store, _scratch) = make_repo("refresh-admission-rejected", "refresh_marker");
+    let (code, out, err) = run_with_env(&["index"], &repo, &store, &[]);
+    assert_eq!(code, 0, "{out} {err}");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn refresh_marker() -> i32 { 8 }\n",
+    )
+    .unwrap();
+    let gate = repo.join("reject-index-admission.py");
+    std::fs::write(&gate, "import sys\nprint('Capacity gate: another thread owns the heavy-job lease', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "refresh_marker"],
+        &repo,
+        &store,
+        &[("GREPPY_HEAVY_GATE", gate.to_str().unwrap())],
+    );
+    assert_ne!(
+        code, 0,
+        "rejected launch unexpectedly served stale hits: {out} {err}"
+    );
+    assert!(
+        err.contains("no index work started")
+            || err.contains("automatic index preparation did not start"),
+        "{out} {err}"
+    );
+    assert!(
+        err.contains("Capacity gate") || err.contains("admission"),
+        "{out} {err}"
+    );
+    assert!(!err.contains("publication is in progress"), "{out} {err}");
+    assert!(
+        err.contains("retry this command") || err.contains("Retry the original command"),
+        "{out} {err}"
+    );
+    let (code, out, err) = run_with_env(&["index", "status", "--json"], &repo, &store, &[]);
+    assert_eq!(
+        code, 73,
+        "failed preparation makes index health unhealthy: {out} {err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["writer_active"], false, "{status}");
+    assert_eq!(status["background_job"]["state"], "failed", "{status}");
+    assert!(
+        status["background_job"]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("Capacity gate"),
+        "{status}"
+    );
+}
+
+#[test]
 fn first_use_background_spawn_failure_returns_without_handshake_deadlock() {
     let (repo, store, _scratch) = make_repo("first-use-spawn-fail", "spawn_fail_marker");
     let started = std::time::Instant::now();
@@ -3840,6 +4223,51 @@ fn foreground_index_publishes_observable_progress_while_building() {
 
 #[cfg(unix)]
 #[test]
+fn refreshing_query_refusal_reports_publication_and_original_command_recovery() {
+    let (repo, store, _scratch) = make_repo("refreshing-recovery", "old_refresh_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out} {err}");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn new_refresh_marker() -> i32 { 9 }\n",
+    )
+    .unwrap();
+    let mut writer = hold_index_before_publish(&repo, &store, "refreshing-recovery");
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "refresh_marker", "--code"],
+        &repo,
+        &store,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    assert_eq!(code, 75, "{out} {err}");
+    assert!(out.contains("publication is in progress"), "{out} {err}");
+    assert!(out.contains("index status --json"), "{out} {err}");
+    assert!(out.contains("GREPPY_STORE_DIR="), "{out} {err}");
+    assert!(
+        out.contains(store.to_string_lossy().as_ref()),
+        "{out} {err}"
+    );
+    assert!(out.contains("greppy --root "), "{out} {err}");
+    assert!(
+        out.contains(repo.canonicalize().unwrap().to_string_lossy().as_ref()),
+        "{out} {err}"
+    );
+    assert!(out.contains("retry this command"), "{out} {err}");
+    assert!(!out.contains("run `greppy index .` first"), "{out} {err}");
+    assert!(!out.contains("pub fn old_refresh_marker"), "{out} {err}");
+    let output = query_after_releasing_writer(
+        &["search-symbol", "refresh_marker", "--code"],
+        &repo,
+        &store,
+        &mut writer,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("pub fn new_refresh_marker"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn query_wait_for_active_refresh_returns_fresh_results_without_retry() {
     let (repo, store, _scratch) = make_repo("bounded-query-refresh", "old_refresh_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
@@ -3901,7 +4329,9 @@ fn read_queries_handle_lifecycle_contention_without_silent_wait() {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{command} blocked on a lifecycle lease instead of returning its command-specific result");
+                panic!(
+                    "{command} blocked on a lifecycle lease instead of returning its command-specific result"
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

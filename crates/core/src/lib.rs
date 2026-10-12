@@ -35,7 +35,12 @@
 ///   existing resolved CALLS edges must not survive as a no-op incremental run.
 ///   v6 -> v7: retain grouped Rust reexports and scoped function-item usages;
 ///   existing ambiguous caller edges need complete re-extraction/resolution.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v7";
+///   v7 -> v8: recognize imported Effect.fn callback bindings as Functions.
+///   v8 -> v9: persist Rust declared-field and trait receiver facts required
+///   by caller repair; unchanged-source v8 nodes need full re-extraction.
+///   v9 -> v10: persist JS/TS computed, private, string and numeric methods;
+///   unchanged-source v9 graphs lack their reference-source definitions.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v10";
 
 pub mod cache;
 pub mod diag;

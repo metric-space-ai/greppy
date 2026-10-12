@@ -80,7 +80,7 @@ NAVIGATE:
                                     points, test roots, each module with its most used
                                     symbols
   who-calls S                       every place that uses S: calls, imports, type references
-  callees S                         what S uses, and where those are defined
+  callees S                         the indexed definitions S directly calls; outgoing CALLS only
   brief S                           what S does in one sentence, its signature, then its body
                                     sketched: one line per step with the symbol used there and
                                     what happens

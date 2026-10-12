@@ -52,7 +52,7 @@ pub enum SeeCommand {
     ///
     ///   greppy web extract 'css=a.lnk' --fields text,href
     Extract {
-        /// Node query, same grammar as `find`.
+        /// Node query, same grammar as `find`; select output with --fields, not `=>`.
         query: String,
         /// Comma-separated fields: text, href, value, id, tag, attr:NAME.
         #[arg(long, default_value = "text")]
@@ -113,6 +113,18 @@ pub enum DomCommand {
     },
 }
 
+pub(super) fn requests_json(command: &SeeCommand) -> bool {
+    match command {
+        SeeCommand::Match { json, .. }
+        | SeeCommand::Find { json, .. }
+        | SeeCommand::Extract { json, .. }
+        | SeeCommand::Inspect { json, .. } => *json,
+        SeeCommand::Dom { command } => match command {
+            DomCommand::Html { json, .. } | DomCommand::Stats { json, .. } => *json,
+        },
+    }
+}
+
 pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
     match command {
         SeeCommand::Match { query, count, json } => run_match(&query, count, json),
@@ -127,11 +139,16 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                 return emit_error(json, invalid(&format!("web find: {message}")));
             }
             let take = if first { 1 } else { limit };
-            let body = format!(
-                "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) \
-                 {{ return describe(e, false); }}) }};"
-            );
-            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+            let legacy = query_expression(&query, &format!(
+                "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) {{ return describe(e, false); }}) }};"
+            ));
+            super::runtimes::structured_dom(
+                root,
+                json,
+                session,
+                serde_json::json!({"op":"find","query":normalize_node_query(&query),"limit":take,"fields":[]}),
+                &legacy,
+            )
         }
         SeeCommand::Extract {
             query,
@@ -140,9 +157,6 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             session,
             json,
         } => {
-            if let Err(message) = validate_query(&query) {
-                return emit_error(json, invalid(&format!("web extract: {message}")));
-            }
             if let Err(message) = validate_query(&query) {
                 return emit_error(json, invalid(&format!("web extract: {message}")));
             }
@@ -179,22 +193,25 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                     );
                 }
             }
-            let list = serde_json::Value::String(wanted.join(",")).to_string();
-            let body = format!(
-                "var want = {list}.split(','); \
+            let fields_json = serde_json::Value::String(wanted.join(",")).to_string();
+            let legacy = query_expression(&query, &format!(
+                "var want = {fields_json}.split(','); \
                  return {{ count: nodes.length, rows: nodes.slice(0, {limit}).map(function(e) {{ \
-                   var row = {{}}; \
-                   want.forEach(function(f) {{ \
+                   var row = {{}}; want.forEach(function(f) {{ \
                      if (f.indexOf('attr:') === 0) row[f] = e.getAttribute(f.slice(5)); \
                      else if (f === 'text') row.text = String(e.textContent == null ? '' : e.textContent).replace(/\\s+/g, ' ').trim(); \
                      else if (f === 'tag') row.tag = e.tagName.toLowerCase(); \
                      else if (f === 'id') row.id = e.id || null; \
                      else row[f] = e[f] === undefined ? null : e[f]; \
-                   }}); \
-                   return row; \
-                 }}) }};"
-            );
-            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+                   }}); return row; }}) }};"
+            ));
+            super::runtimes::structured_dom(
+                root,
+                json,
+                session,
+                serde_json::json!({"op":"extract","query":normalize_node_query(&query),"limit":limit,"fields":wanted}),
+                &legacy,
+            )
         }
         SeeCommand::Inspect {
             query,
@@ -404,6 +421,42 @@ mod tests {
     }
 
     #[test]
+    fn css_projection_has_actionable_preflight_diagnostics() {
+        for query in [
+            "css=#reviews, #review-form, .review-toolbar, .review-add, div[data-block=reviews] => text",
+            "#reviews => text",
+            r##"css="#reviews => text""##,
+            "css=a[href='=>'] => href",
+        ] {
+            for result in [validate_query(query), validate_condition_query(query)] {
+                let message = result.expect_err(query);
+                assert!(message.contains("invalid CSS query"), "{message}");
+                assert!(message.contains("--fields text"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn literal_css_arrows_and_other_query_kinds_are_preserved() {
+        for query in [
+            r#"css=a[data-label="=> text"]"#,
+            "a[data-label='=>']",
+            r#"css=#foo\=\>bar"#,
+            "css=a/* => text */ > span",
+            r#"css=a[data-label="escaped\" => text"]"#,
+            "text= => text",
+            "text~/=> text/i",
+            "xpath=//*[@title='=>']",
+            "div~span",
+        ] {
+            assert!(validate_query(query).is_ok(), "{query}");
+            assert!(validate_condition_query(query).is_ok(), "{query}");
+        }
+        // Unrelated malformed CSS stays an engine/parser responsibility.
+        assert!(validate_query("css=[").is_ok());
+    }
+
+    #[test]
     fn node_query_quotes_are_only_cli_grouping() {
         assert_eq!(normalize_node_query("css=a b"), "css=a b");
         assert_eq!(normalize_node_query(r#"css="a b""#), "css=a b");
@@ -566,6 +619,50 @@ fn wait_condition_used_as_node_query(query: &str) -> Option<String> {
     }
 }
 
+/// Recognize unsupported projection syntax without parsing CSS. Quotes,
+/// comments and escapes can contain literal arrows in valid selectors.
+fn css_projection_suffix(query: &str) -> bool {
+    let normalized = normalize_node_query(query);
+    let selector = if let Some(selector) = normalized.strip_prefix("css=") {
+        selector
+    } else {
+        if let Some(split) = normalized.find(['=', '~']) {
+            let kind = &normalized[..split];
+            if !kind.is_empty() && kind.bytes().all(|byte| byte.is_ascii_lowercase()) {
+                let op = normalized.as_bytes()[split];
+                if op == b'=' || matches!(kind, "css" | "xpath" | "text" | "role" | "id" | "tag") {
+                    return false;
+                }
+            }
+        }
+        &normalized
+    };
+    let mut chars = selector.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            chars.next();
+        } else if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else if ch == '=' && chars.peek() == Some(&'>') {
+            return true;
+        }
+    }
+    false
+}
+
 fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result<(), String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -573,6 +670,9 @@ fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result
     }
     if let Some(message) = wait_condition_used_as_node_query(trimmed) {
         return Err(message);
+    }
+    if css_projection_suffix(trimmed) {
+        return Err("invalid CSS query: `=>` is not an extraction operator; remove the suffix and use `greppy web extract 'css=SELECTOR' --fields text` (or --fields text,href)".into());
     }
     const KINDS: [&str; 6] = ["css", "xpath", "text", "role", "id", "tag"];
     let Some(split) = trimmed.find(['=', '~']) else {

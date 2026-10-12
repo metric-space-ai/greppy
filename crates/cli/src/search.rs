@@ -188,8 +188,10 @@ fn search_symbol_name_contains(node: &greppy_store::Node, query: &str) -> bool {
 
 fn search_symbol_no_match_status(
     query: &str,
+    root_path: &std::path::Path,
     path_filters: &QueryPathFilters,
     matches_outside_filter: usize,
+    unsupported_files: &[String],
 ) {
     println!("status: no_matches");
     if path_filters.is_empty() {
@@ -201,6 +203,19 @@ fn search_symbol_no_match_status(
         );
     } else {
         println!("scope: path filter {}", path_filters.shown());
+        for path in unsupported_files {
+            println!("coverage: definition extraction is unsupported for indexed file {path}");
+            println!(
+                "next: search its live text: greppy search-pattern {} --fixed --path {} --root {}",
+                shell_example_arg(query),
+                shell_example_arg(path),
+                shell_example_arg(&root_path.to_string_lossy())
+            );
+        }
+        if unsupported_files.len() == path_filters.filters.len() {
+            println!("message: these files have no definition provider; reindexing does not add symbol coverage");
+            return;
+        }
         println!(
             "message: no definition named `{query}` under path filter: {}",
             path_filters.shown()
@@ -300,11 +315,23 @@ fn semantic_no_match_status(query: &str, path_filters: &QueryPathFilters) {
     println!("next: refresh semantic definitions after source changes: greppy index .");
 }
 
+fn search_definition_start_line(content: &str, stored_start: i64) -> i64 {
+    usize::try_from(stored_start)
+        .ok()
+        .map(|line| crate::read::read_definition_start(content, line))
+        .and_then(|line| i64::try_from(line).ok())
+        .unwrap_or(stored_start)
+}
+
 fn search_print_node_source(root_path: &std::path::Path, node: &greppy_store::Node) {
+    let start_line = std::fs::read_to_string(root_path.join(&node.file_path))
+        .ok()
+        .map(|content| search_definition_start_line(&content, node.start_line))
+        .unwrap_or(node.start_line);
     if let Some(span) = read_span_with_meta(
         root_path,
         &node.file_path,
-        node.start_line,
+        start_line,
         node.end_line,
         usize::MAX,
         false,
@@ -413,6 +440,14 @@ pub(crate) fn dispatch_search_symbols(
     let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
     if let FreshnessServe::Refuse(freshness) = &decision {
+        crate::context_status::invalidate(&root_path);
+        if let Ok(generation) = current_graph_generation(&store, root) {
+            crate::context_status::restricted(
+                &root_path,
+                generation.saturating_add(1),
+                crate::context_status::Capability::Graph,
+            );
+        }
         if json {
             search_symbols_json(
                 &store,
@@ -435,6 +470,7 @@ pub(crate) fn dispatch_search_symbols(
     }
     let freshness = decision.freshness().clone();
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
+
     if provider_policy_blocks_query(&incomplete_providers)? {
         if json {
             search_symbols_json(
@@ -502,15 +538,42 @@ pub(crate) fn dispatch_search_symbols(
             &path_filters,
             Some(total_filtered),
         )?;
+        if total_filtered > 0 {
+            crate::context_status::acknowledge(
+                &root_path,
+                crate::context_status::Capability::Graph,
+            );
+        }
         return Ok(if total_filtered == 0 { 1 } else { 0 });
     }
     if !contained.is_empty() {
         contained.truncate(cli_result_limit_unless_all(20, all));
         search_print_symbol_rows(&root_path, &contained, code);
+        crate::context_status::acknowledge(&root_path, crate::context_status::Capability::Graph);
         return Ok(0);
     }
 
-    search_symbol_no_match_status(q, &path_filters, matches_outside_filter);
+    // File state is read through the logical overlay view, unlike skip rows
+    // which may live only in the immutable Base. Diagnose actual indexed
+    // unsupported files, never a guessed extension or a nonexistent filter.
+    let mut unsupported_files = Vec::new();
+    for path in path_filters.repo_prefixes() {
+        let language = greppy_parser::language_for_path(std::path::Path::new(&path));
+        if !language.is_supported() {
+            if let Some(state) = store.get_file_state(&project, &path)? {
+                if state.language == language.name() {
+                    unsupported_files.push(path);
+                }
+            }
+        }
+    }
+    search_symbol_no_match_status(
+        q,
+        &root_path,
+        &path_filters,
+        matches_outside_filter,
+        &unsupported_files,
+    );
 
     let wanted_normalized = search_name_normalized(q);
     let mut similar = nodes
@@ -682,10 +745,14 @@ pub(crate) fn search_code_definition_entry(
             });
         }
     };
+    let start_line = std::str::from_utf8(&content)
+        .ok()
+        .map(|text| search_definition_start_line(text, row.start_line))
+        .unwrap_or(row.start_line);
     let Some(span) = read_span_with_meta(
         root_path,
         &row.file_path,
-        row.start_line,
+        start_line,
         row.end_line,
         usize::MAX,
         false,
@@ -693,7 +760,7 @@ pub(crate) fn search_code_definition_entry(
         return Ok(None);
     };
     let (byte_start, byte_end) =
-        line_range_to_bytes(&content, row.start_line as usize, span.end_line as usize);
+        line_range_to_bytes(&content, start_line as usize, span.end_line as usize);
     let mut handle = greppy_edit::EditHandle::for_range(
         root_path,
         std::path::Path::new(&row.file_path),
@@ -709,7 +776,7 @@ pub(crate) fn search_code_definition_entry(
     Ok(Some(SearchCodeDefinitionEntry {
         qualified_name: row.qualified_name.clone(),
         file: row.file_path.clone(),
-        start_line: row.start_line,
+        start_line,
         end_line: span.end_line,
         source: span.text,
         handle: handle.encode(),
@@ -1005,8 +1072,22 @@ fn print_search_pattern_rows(
     }
     let summarize = !all && rows.len() > FULL_LIMIT;
     let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
-    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
-    if shown < rows.len() {
+    let offset = cli_result_offset();
+    let start = offset.min(rows.len());
+    let shown = default_shown
+        .min(cli_result_limit_raw().unwrap_or(usize::MAX))
+        .min(rows.len() - start);
+    let buffered = OUTPUT_CAPTURE.with(|capture| capture.borrow().is_some());
+    if buffered {
+        NAV_TEXT_WINDOW.with(|window| {
+            *window.borrow_mut() = Some(NavTextWindow {
+                offset,
+                total: rows.len(),
+                rows: Vec::new(),
+            });
+        });
+    }
+    if !buffered && shown < rows.len() {
         // A limited query must not list every omitted file in its preamble.
         println!(
             "— {} matches in {} files; showing {}",
@@ -1023,7 +1104,8 @@ fn print_search_pattern_rows(
     } else {
         None
     };
-    for (index, row) in rows.iter().take(shown).enumerate() {
+    for (index, row) in rows.iter().skip(start).take(shown).enumerate() {
+        let row_start = output_capture_position();
         if let Some(node) = &row.node {
             print_search_row(
                 &row.hit.file,
@@ -1066,6 +1148,7 @@ fn print_search_pattern_rows(
                 println!();
             }
         }
+        record_nav_text_row(start + index, row_start);
     }
 }
 
@@ -1313,17 +1396,29 @@ pub(crate) fn dispatch_semantic(
             "search requires a plain-English query".into(),
         ));
     }
-    // Result purposes reach the Qwen daemon; overlap its model load with the
-    // embedding query and vector search.
-    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
+    let mut prefixes = path_filters.repo_prefixes();
+    if !path_filters.is_empty() && prefixes.is_empty() {
+        semantic_no_match_status(q, &path_filters);
+        return Ok(1);
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    if prefixes.iter().any(String::is_empty) {
+        prefixes.clear();
+    }
 
     // Stale/unknown snapshots are never served. Semantic search is always
     // vector-backed on current main, so auto-refresh is allowed only when the
     // embedding model can be rebuilt in the same atomic snapshot.
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
     let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale_semantic(&mut store, root, allow_reindex)?;
+    if prefixes.is_empty() {
+        maybe_reindex_stale_semantic(&mut store, root, allow_reindex)?;
+    } else if allow_reindex {
+        // Refresh structure first; meanings will be prepared only for this scope.
+        maybe_reindex_stale(&mut store, root)?;
+    }
     let project = project_for(root)?;
     let decision =
         freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false, false);
@@ -1347,29 +1442,22 @@ pub(crate) fn dispatch_semantic(
         return Ok(1);
     }
 
-    let cfg = match embedding_config_for_required_use(embedding_args) {
-        Ok(cfg) => cfg,
-        Err(error) if embedding_asset_missing_error(&error) => {
-            if json {
-                emit_semantic_backend_unavailable(
-                    &project,
-                    q,
-                    paths,
-                    root,
-                    true,
-                    "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
-                )?;
-            } else {
-                println!("semantic index unavailable — embedding assets could not be resolved");
-            }
-            return Ok(1);
-        }
-        Err(error) => return Err(error),
-    };
+    // Freshness and admission need model identity, not materialized assets.
+    // A cold/refused query must not extract or load either model first.
+    let cfg = embedding_config_for_daemon_probe(embedding_args)?
+        .ok_or_else(|| Error::Config("embedding model identity is unavailable".into()))?;
     {
         let generation = current_graph_generation(&store, root)?;
         let candidate_limit = vector_exact_candidate_limit()?;
         if !freshness_json_is_fresh(&freshness) {
+            if let Ok(root_path) = resolve_root(root) {
+                crate::context_status::invalidate(&root_path);
+                crate::context_status::restricted(
+                    &root_path,
+                    generation.saturating_add(1),
+                    crate::context_status::Capability::Semantic,
+                );
+            }
             let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
                 &project,
                 &cfg.model_id,
@@ -1377,6 +1465,7 @@ pub(crate) fn dispatch_semantic(
                 SEMANTIC_VECTOR_CANDIDATE_LIMIT,
             );
             scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
+            scope.path_prefixes = Some(&prefixes);
             let total = greppy_search::count_vector_search_scope(&store, &scope)?;
             if json {
                 semantic_vector_json(
@@ -1398,10 +1487,12 @@ pub(crate) fn dispatch_semantic(
             }
             return Ok(freshness_refusal_exit(&freshness));
         }
-        if !embedding_generation_complete(&store, &project, generation, &cfg.model_id) {
+        if !embedding_scope_complete(&store, &project, generation, &cfg.model_id, &prefixes) {
             let root_path = resolve_root(root)?;
             drop(store);
-            store = wait_for_embedding_publication(root, &root_path, &project, generation, &cfg)?;
+            store = wait_for_embedding_publication(
+                root, &root_path, &project, generation, &cfg, &prefixes,
+            )?;
             let reopened_decision = freshness_serve_decision_with_policy(
                 &store,
                 root,
@@ -1432,6 +1523,14 @@ pub(crate) fn dispatch_semantic(
                 return Ok(1);
             }
             if !freshness_json_is_fresh(&freshness) {
+                if let Ok(root_path) = resolve_root(root) {
+                    crate::context_status::invalidate(&root_path);
+                    crate::context_status::restricted(
+                        &root_path,
+                        generation.saturating_add(1),
+                        crate::context_status::Capability::Semantic,
+                    );
+                }
                 if json {
                     semantic_vector_json(
                         &store,
@@ -1460,6 +1559,7 @@ pub(crate) fn dispatch_semantic(
             Some(generation),
             SEMANTIC_VECTOR_CANDIDATE_LIMIT,
         );
+        scope.path_prefixes = Some(&prefixes);
         let total = greppy_search::count_vector_search_scope(&store, &scope)?;
         if total == 0 {
             if json {
@@ -1504,6 +1604,28 @@ pub(crate) fn dispatch_semantic(
             return Ok(1);
         }
 
+        let cfg = match embedding_config_for_required_use(embedding_args) {
+            Ok(cfg) => cfg,
+            Err(error) if embedding_asset_missing_error(&error) => {
+                if json {
+                    emit_semantic_backend_unavailable(
+                    &project,
+                    q,
+                    paths,
+                    root,
+                    true,
+                    "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
+                )?;
+                } else {
+                    println!("semantic index unavailable — embedding assets could not be resolved");
+                }
+                return Ok(1);
+            }
+            Err(error) => return Err(error),
+        };
+        // Only a query with a current published vector snapshot will emit
+        // purposes. Overlap summary loading with its actual embedding work.
+        prewarm_summary_daemon();
         match embed_query_cached(&cfg, root, q) {
             Ok(query_vector) => {
                 scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
@@ -1582,10 +1704,23 @@ fn wait_for_embedding_publication(
     project: &str,
     requested_generation: u64,
     cfg: &EmbeddingModelConfig,
+    prefixes: &[String],
 ) -> Result<greppy_store::Store> {
     let mut announced = false;
+    crate::context_status::restricted(
+        effective_root,
+        requested_generation,
+        crate::context_status::Capability::Semantic,
+    );
     loop {
-        let mut launch = spawn_background_embed_handle(root, cfg).ok_or_else(|| {
+        let mut launch = spawn_background_job_handle_scoped(
+            root,
+            "embedding-first-use",
+            "embedding",
+            Some(cfg),
+            prefixes,
+        )
+        .ok_or_else(|| {
             let detail = background_embedding_failure(embedding_progress_value(
                 effective_root,
                 cfg,
@@ -1601,8 +1736,18 @@ fn wait_for_embedding_publication(
         let follow_attached_owner = matches!(launch, BackgroundJobLaunch::Attached { .. })
             && !initial_job.as_ref().is_some_and(|job| {
                 job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding")
+                    && job
+                        .get("path_prefixes")
+                        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+                        .unwrap_or_default()
+                        == prefixes
             });
         if !announced {
+            crate::context_status::restricted(
+                effective_root,
+                requested_generation,
+                crate::context_status::Capability::Semantic,
+            );
             let progress = initial_job.unwrap_or_else(|| {
                 embedding_progress_value(effective_root, cfg, requested_generation)
             });
@@ -1638,15 +1783,33 @@ fn wait_for_embedding_publication(
         }
         let store = open_default_store_query_writer(root)?;
         let published_generation = current_graph_generation(&store, root)?;
-        let publication_complete =
-            embedding_generation_complete(&store, project, published_generation, &cfg.model_id);
+        let publication_complete = embedding_scope_complete(
+            &store,
+            project,
+            published_generation,
+            &cfg.model_id,
+            prefixes,
+        );
         match observe_background_embedding(
             read_background_job(launch.path()).as_ref(),
             false,
             publication_complete,
             follow_attached_owner,
         ) {
-            BackgroundEmbeddingObservation::Published => return Ok(store),
+            BackgroundEmbeddingObservation::Published => {
+                if embedding_generation_complete(
+                    &store,
+                    project,
+                    published_generation,
+                    &cfg.model_id,
+                ) {
+                    crate::context_status::acknowledge(
+                        effective_root,
+                        crate::context_status::Capability::Semantic,
+                    );
+                }
+                return Ok(store);
+            }
             BackgroundEmbeddingObservation::FollowIndex => {
                 drop(store);
                 continue;
@@ -1735,7 +1898,9 @@ pub(crate) fn semantic_vector_purposes(
     // One cache connection for every purpose span of this command.
     #[cfg(any(unix, windows))]
     let summary_cache = summary_runtime.as_ref().and_then(|_| {
-        greppy_store::SummaryCache::open(&workspace_locator::store_dir(&root_path)).ok()
+        greppy_core::cache::ensure_workspace_store(&root_path)
+            .ok()
+            .and_then(|directory| greppy_store::SummaryCache::open(&directory).ok())
     });
     #[cfg(any(unix, windows))]
     let base_summary_cache = summary_runtime.as_ref().and_then(|_| {
@@ -2051,6 +2216,7 @@ pub(crate) fn semantic_vector_json_with_expand(
         "prompt_version": greppy_embed_native::PROMPT_VERSION,
         "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
         "graph_generation": graph_generation,
+        "embedding_complete": embedding_generation_complete(store, project, graph_generation, &cfg.model_id),
         "fresh": freshness
             .and_then(|v| v.get("fresh"))
             .and_then(serde_json::Value::as_bool)

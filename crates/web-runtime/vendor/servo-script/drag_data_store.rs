@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use indexmap::IndexMap;
 use js::context::JSContext;
@@ -26,6 +27,8 @@ pub(crate) enum Kind {
         bytes: Vec<u8>,
         name: DOMString,
         type_: String,
+        #[ignore_malloc_size_of = "SystemTime is stored inline"]
+        modified: SystemTime,
     },
 }
 
@@ -53,12 +56,17 @@ impl Kind {
     ) -> Option<DomRoot<File>> {
         match self {
             Kind::Text { .. } => None,
-            Kind::File { bytes, name, type_ } => Some(File::new(
+            Kind::File {
+                bytes,
+                name,
+                type_,
+                modified,
+            } => Some(File::new(
                 cx,
                 global,
                 BlobImpl::new_from_bytes(bytes.clone(), type_.clone()),
                 name.clone(),
-                None,
+                Some(*modified),
             )),
         }
     }

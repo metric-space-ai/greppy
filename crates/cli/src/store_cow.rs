@@ -18,8 +18,8 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v2";
-const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
+const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY;
+const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = greppy_indexer::RUST_CALLER_EDGES_REPAIR_COMPLETE;
 const BASE_EMBEDDING_DEFERRED_META_PREFIX: &str = "store_cow.embedding_deferred.v1:";
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
@@ -364,6 +364,31 @@ pub(crate) fn overlay_freshness_proof(
         }
     }
 
+    validate_overlay_delta_visibility(store, &cached)?;
+
+    let total_inventory = store
+        .file_count(project)
+        .map_err(|error| Error::Store(format!("count Store-CoW inventory: {error}")))?;
+    let total_inventory = usize::try_from(total_inventory)
+        .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
+    Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+}
+
+/// Check the intended manifest against the complete staged Delta, including
+/// rows materialized by embedding and language repair. Query-time validation
+/// alone is too late: a completed job must not publish an unusable snapshot.
+pub(crate) fn validate_overlay_delta_visibility(
+    store: &greppy_store::Store,
+    visibility: &VisibilityIndex,
+) -> Result<()> {
+    if !store.is_overlay() {
+        return Err(Error::Invalid(
+            "Store-CoW visibility validation requires an attached Base".into(),
+        ));
+    }
+    let dirty = visibility
+        .dirty_paths()
+        .collect::<std::collections::BTreeSet<_>>();
     let private_paths = private_delta_paths(store)?;
     if let Some(unbound) = private_paths
         .iter()
@@ -373,13 +398,7 @@ pub(crate) fn overlay_freshness_proof(
             "private Store-CoW row `{unbound}` is absent from the Delta visibility manifest"
         )));
     }
-
-    let total_inventory = store
-        .file_count(project)
-        .map_err(|error| Error::Store(format!("count Store-CoW inventory: {error}")))?;
-    let total_inventory = usize::try_from(total_inventory)
-        .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
-    Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+    Ok(())
 }
 
 fn visibility_changed_paths(cached: &VisibilityIndex, live: &VisibilityIndex) -> Vec<String> {
@@ -406,13 +425,97 @@ fn visibility_changed_paths(cached: &VisibilityIndex, live: &VisibilityIndex) ->
 
 fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::BTreeSet<String>> {
     let mut private_paths = std::collections::BTreeSet::new();
-    for query in [
-        "SELECT rel_path FROM main.file_state",
-        "SELECT rel_path FROM main.index_skips",
-        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'",
-        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
-        "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
-        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
+    // Embedding publication materializes identical Base definitions in main
+    // because vectors require writable node foreign keys. These are derived
+    // rows, not source changes. Exempt only exact Base copies and vectors bound
+    // to them; an unrelated or changed private definition still needs visibility.
+    let nodes = if store.is_overlay() {
+        "SELECT d.file_path FROM main.nodes d
+         WHERE d.file_path <> '' AND d.label <> 'Folder'
+         AND NOT EXISTS (
+             SELECT 1 FROM greppy_base.nodes b
+             LEFT JOIN temp.base_node_span_overrides s ON s.project=b.project AND s.node_id=b.id
+               AND s.qualified_name=b.qualified_name AND s.old_start_line=b.start_line AND s.old_end_line=b.end_line
+             WHERE b.project = d.project AND b.qualified_name = d.qualified_name
+               AND b.label = d.label AND b.name = d.name
+               AND b.file_path = d.file_path AND COALESCE(s.start_line,b.start_line) = d.start_line
+               AND COALESCE(s.end_line,b.end_line) = d.end_line AND b.properties = d.properties
+               AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
+         )"
+    } else {
+        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'"
+    };
+    let raw_edges = if store.is_overlay() {
+        // Older Effect.fn repair re-extracted every visible JS/TS file into
+        // main, even when its complete raw-edge contribution was unchanged.
+        // A repair marker alone cannot authorize arbitrary private edges.
+        "WITH candidates AS (
+             SELECT o.project, o.file_path FROM main.js_ts_reference_override_files o
+             JOIN main.schema_meta m ON m.key='greppy.effect_fn_repair_v8.' || o.project
+               AND m.value='complete'
+             WHERE NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path=o.file_path)
+               AND EXISTS (SELECT 1 FROM greppy_base.file_state s
+                           WHERE s.project=o.project AND s.rel_path=o.file_path)
+         ), delta_groups AS (
+             SELECT d.project,d.file_path,d.source_qname,d.target_qname,d.edge_type,d.properties,COUNT(*) AS n
+             FROM main.raw_edges d JOIN candidates c
+               ON c.project=d.project AND c.file_path=d.file_path
+             GROUP BY d.project,d.file_path,d.source_qname,d.target_qname,d.edge_type,d.properties
+         ), base_groups AS (
+             SELECT b.project,b.file_path,b.source_qname,b.target_qname,b.edge_type,b.properties,COUNT(*) AS n
+             FROM greppy_base.raw_edges b JOIN candidates c
+               ON c.project=b.project AND c.file_path=b.file_path
+             GROUP BY b.project,b.file_path,b.source_qname,b.target_qname,b.edge_type,b.properties
+         ), delta_difference AS (
+             SELECT * FROM delta_groups EXCEPT SELECT * FROM base_groups
+         ), base_difference AS (
+             SELECT * FROM base_groups EXCEPT SELECT * FROM delta_groups
+         ), mismatches AS (
+             SELECT project,file_path FROM delta_difference
+             UNION SELECT project,file_path FROM base_difference
+         )
+         SELECT DISTINCT d.file_path FROM main.raw_edges d WHERE d.file_path <> ''
+         AND NOT EXISTS (SELECT 1 FROM candidates c
+                         WHERE c.project=d.project AND c.file_path=d.file_path
+                           AND NOT EXISTS (SELECT 1 FROM mismatches x
+                                           WHERE x.project=c.project AND x.file_path=c.file_path))
+         UNION SELECT o.file_path FROM main.js_ts_reference_override_files o
+         WHERE NOT EXISTS (SELECT 1 FROM candidates c
+                           WHERE c.project=o.project AND c.file_path=o.file_path
+                             AND NOT EXISTS (SELECT 1 FROM mismatches x
+                                             WHERE x.project=c.project AND x.file_path=c.file_path))"
+    } else {
+        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''"
+    };
+    let vectors = if store.is_overlay() {
+        "SELECT v.file_path FROM main.vector_embeddings v
+         WHERE v.file_path <> '' AND NOT EXISTS (
+             SELECT 1 FROM nodes d JOIN greppy_base.nodes b
+               ON b.project = d.project AND b.qualified_name = d.qualified_name
+             LEFT JOIN temp.base_node_span_overrides s ON s.project=b.project AND s.node_id=b.id
+               AND s.qualified_name=b.qualified_name AND s.old_start_line=b.start_line AND s.old_end_line=b.end_line
+             WHERE (v.node_id IS NULL OR d.id = v.node_id) AND d.project = v.project
+               AND d.qualified_name = v.qualified_name AND d.file_path = v.file_path
+               AND b.label = d.label AND b.name = d.name
+               AND b.file_path = d.file_path AND COALESCE(s.start_line,b.start_line) = d.start_line
+               AND COALESCE(s.end_line,b.end_line) = d.end_line AND b.properties = d.properties
+               AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
+               AND v.start_line >= d.start_line AND v.end_line >= v.start_line
+               AND (v.end_line <= d.end_line OR d.end_line = d.start_line)
+         )"
+    } else {
+        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''"
+    };
+    for (query, reference_repair) in [
+        ("SELECT rel_path FROM main.file_state", false),
+        ("SELECT rel_path FROM main.index_skips", false),
+        (nodes, false),
+        (raw_edges, true),
+        (
+            "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
+            false,
+        ),
+        (vectors, false),
     ] {
         let mut statement = store
             .conn()
@@ -423,7 +526,18 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
             .map_err(|error| Error::Store(format!("query Store-CoW Delta paths: {error}")))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| Error::Store(format!("read Store-CoW Delta paths: {error}")))?;
-        private_paths.extend(paths);
+        for path in paths {
+            if reference_repair
+                && store
+                    .js_ts_reference_repair_path_is_certified(&path)
+                    .map_err(|error| {
+                        Error::Store(format!("verify JS/TS derived repair: {error}"))
+                    })?
+            {
+                continue;
+            }
+            private_paths.insert(path);
+        }
     }
     Ok(private_paths)
 }
@@ -716,7 +830,20 @@ pub(crate) fn visibility_for_open_connection(
         .unwrap_or_else(|| visibility_against(root, base_commit))
 }
 
-/// Repair a pre-PR138 Delta whose workspace state already advertises v7 but
+fn rust_repair_requires_source_refresh(
+    store: &greppy_store::Store,
+    root: &Path,
+    project: &str,
+) -> bool {
+    let root = root.to_string_lossy();
+    crate::freshness::freshness_is_reindexable_stale(&crate::nav_freshness_json_uncached(
+        store,
+        Some(root.as_ref()),
+        project,
+    ))
+}
+
+/// Repair a Delta from an older Rust path resolver whose workspace state already advertises v7 but
 /// whose resolved Rust caller edges were produced by the old resolver.
 ///
 /// The repair consumes the composed visible raw-edge view, including raw edges
@@ -732,7 +859,8 @@ pub(crate) fn repair_persisted_v7_delta(
     root: &Path,
     project: &str,
 ) -> Result<bool> {
-    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+        .attach_overlay(base_path, visibility)?;
     let pending = persisted_v7_delta_needs_repair(&delta, root)?;
     drop(delta);
     if !pending {
@@ -751,7 +879,8 @@ pub(crate) fn repair_persisted_v7_delta(
                 let observed = greppy_store::Store::open_with(
                     delta_path,
                     greppy_store::OpenOptions::read_only(),
-                )?;
+                )?
+                .attach_overlay(base_path, visibility)?;
                 if !persisted_v7_delta_needs_repair(&observed, root)? {
                     return Ok(false);
                 }
@@ -767,18 +896,61 @@ pub(crate) fn repair_persisted_v7_delta(
         }
     };
     let current =
-        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::query_writer())?;
+        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::query_writer())?
+            .attach_overlay(base_path, visibility)?;
     if !persisted_v7_delta_needs_repair(&current, root)? {
         return Ok(false);
     }
     drop(current);
     let mut overlay = greppy_store::Store::open_overlay(base_path, delta_path, visibility)?;
+    // Defer migration until the normal freshness refresh publishes edited sources.
+    // Keep the repair marker pending and never authorize a stale graph.
+    if rust_repair_requires_source_refresh(&overlay, root, project) {
+        return Ok(false);
+    }
+    let mut progress = crate::BackgroundJobGuard::from_env();
+    progress.attach_foreground(crate::background_job_path(root));
+    progress.finalization_phase("repairing_graph");
+    match complete_visible_overlay_rust_repair(&mut overlay, root, project) {
+        Ok(_) => progress.complete(),
+        Err(error) => {
+            progress.fail(&error);
+            return Err(error);
+        }
+    }
+    Ok(true)
+}
+
+/// Complete compatibility work before a snapshot is announced ready. The
+/// caller owns the writer/admission lifetime; an uncertified Base still needs
+/// actual visible-source recovery and resolution, never a blind marker.
+pub(crate) fn complete_visible_overlay_rust_repair(
+    overlay: &mut greppy_store::Store,
+    root: &Path,
+    project: &str,
+) -> Result<bool> {
+    if rust_repair_requires_source_refresh(overlay, root, project) {
+        return Ok(false);
+    }
+    let effect_repaired =
+        greppy_indexer::recover_visible_effect_fn_bindings(overlay, project, root)?;
+    let js_repaired = greppy_indexer::recover_persisted_js_ts_usages(overlay, project, root)?;
+    if greppy_indexer::rust_caller_edges_repaired(overlay)?
+        && greppy_indexer::anyhow_factory_edges_repaired(overlay)?
+        && greppy_indexer::direct_self_field_edges_repaired(overlay)?
+    {
+        return Ok(effect_repaired || js_repaired);
+    }
     let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
         let existing_edges: i64 = overlay
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM main.overlay_edges WHERE project = ?1",
+                // The structural spine has no parser raw facts. Its presence
+                // is valid even in a fresh graph containing only definitions.
+                "SELECT COUNT(*) FROM main.overlay_edges
+                 WHERE project = ?1
+                   AND edge_type NOT IN ('CONTAINS_FILE', 'CONTAINS_FOLDER', 'DEFINES')",
                 [project],
                 |row| row.get(0),
             )
@@ -790,7 +962,9 @@ pub(crate) fn repair_persisted_v7_delta(
             ));
         }
     }
-    greppy_indexer::rebuild_visible_overlay_edges(&mut overlay, project)?;
+    drop(raw_edges);
+    greppy_indexer::recover_persisted_rust_usages(overlay, project, root)?;
+    greppy_indexer::rebuild_visible_overlay_edges(overlay, project)?;
     overlay
         .conn()
         .execute(
@@ -807,6 +981,76 @@ pub(crate) fn repair_persisted_v7_delta(
     Ok(true)
 }
 
+/// Repair an already-indexed single/private store on normal query open.
+/// This shares the one-shot resolver marker with CoW, but never attaches or
+/// scans an immutable Base. The writer lock covers re-check through commit.
+pub(crate) fn ensure_persisted_single_store_repaired(
+    path: &Path,
+    root: &Path,
+    project: &str,
+) -> Result<()> {
+    let observed = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+    if !persisted_v7_delta_needs_repair(&observed, root)? {
+        return Ok(());
+    }
+    if rust_repair_requires_source_refresh(&observed, root, project) {
+        return Ok(());
+    }
+    drop(observed);
+    if !crate::index_admission::inline_refresh_is_admitted() {
+        return refresh_persisted_graph_under_admission(path, root, None);
+    }
+    let deadline = std::time::Instant::now() + crate::NAV_FRESHNESS_BUDGET;
+    let _lock = loop {
+        match greppy_freshness::try_acquire(path) {
+            Ok(lock) => break lock,
+            Err(greppy_freshness::LockError::Held { path: lock_path }) => {
+                let observed =
+                    greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+                if !persisted_v7_delta_needs_repair(&observed, root)? {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Lock(format!(
+                        "timed out waiting for single-store Rust repair; lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut store =
+        greppy_store::Store::open_with(path, greppy_store::OpenOptions::query_writer())?;
+    if persisted_v7_delta_needs_repair(&store, root)? {
+        if rust_repair_requires_source_refresh(&store, root, project) {
+            return Ok(());
+        }
+        let mut progress = crate::BackgroundJobGuard::from_env();
+        progress.attach_foreground(crate::background_job_path(root));
+        progress.finalization_phase("repairing_graph");
+        let repair = (|| -> Result<()> {
+            greppy_indexer::recover_persisted_js_ts_usages(&mut store, project, root)?;
+            if !greppy_indexer::rust_caller_edges_repaired(&store)?
+                || !greppy_indexer::anyhow_factory_edges_repaired(&store)?
+                || !greppy_indexer::direct_self_field_edges_repaired(&store)?
+            {
+                greppy_indexer::rebuild_single_store_rust_edges(&mut store, project)?;
+            }
+            Ok(())
+        })();
+        match repair {
+            Ok(_) => progress.complete(),
+            Err(error) => {
+                progress.fail(&error);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_persisted_v7_delta_repaired(
     delta_path: &Path,
     base_path: &Path,
@@ -814,17 +1058,61 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
     root: &Path,
     project: &str,
 ) -> Result<()> {
-    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+        .attach_overlay(base_path, visibility)?;
     if !persisted_v7_delta_needs_repair(&delta, root)? {
         return Ok(());
     }
     drop(delta);
+    if !crate::index_admission::inline_refresh_is_admitted() {
+        let visible =
+            greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+                .attach_overlay(base_path, visibility)?;
+        if rust_repair_requires_source_refresh(&visible, root, project) {
+            return Ok(());
+        }
+        drop(visible);
+        return refresh_persisted_graph_under_admission(
+            delta_path,
+            root,
+            Some((base_path, visibility)),
+        );
+    }
     repair_persisted_v7_delta(delta_path, base_path, visibility, root, project)?;
     let repaired =
-        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+            .attach_overlay(base_path, visibility)?;
     if persisted_v7_delta_needs_repair(&repaired, root)? {
+        if rust_repair_requires_source_refresh(&repaired, root, project) {
+            return Ok(());
+        }
         return Err(Error::Lock(
             "persisted Delta repair did not publish its completion marker".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_persisted_graph_under_admission(
+    path: &Path,
+    root: &Path,
+    overlay: Option<(&Path, &VisibilityIndex)>,
+) -> Result<()> {
+    let root_string = root.to_string_lossy();
+    crate::freshness::wait_for_index_publication(
+        Some(root_string.as_ref()),
+        root,
+        "rust-graph-repair",
+    )?;
+    let published = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+    let published = match overlay {
+        Some((base, visibility)) => published.attach_overlay(base, visibility)?,
+        None => published,
+    };
+    if persisted_v7_delta_needs_repair(&published, root)? {
+        return Err(Error::Index(
+            "admitted graph preparation did not publish the caller/usage compatibility repair"
+                .into(),
         ));
     }
     Ok(())
@@ -858,10 +1146,44 @@ pub(crate) fn persisted_v7_delta_needs_repair(
             paths_resolve_equal(Path::new(&state.root_path), root)
                 && indexer_base == greppy_core::INDEXER_VERSION_BASE
         })
-        && marker.as_deref() != Some(RUST_CALLER_EDGES_REPAIR_COMPLETE))
+        && (marker.as_deref() != Some(RUST_CALLER_EDGES_REPAIR_COMPLETE)
+            || !greppy_indexer::js_ts_usages_repaired(delta)?
+            || !greppy_indexer::anyhow_factory_edges_repaired(delta)?
+            || !greppy_indexer::direct_self_field_edges_repaired(delta)?
+            || delta
+                .conn()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.js_ts_reference_override_files o
+                 WHERE NOT EXISTS(SELECT 1 FROM main.schema_meta m
+                   WHERE m.key='greppy.effect_fn_repair_v9.' || o.project AND m.value='complete'))",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| Error::Store(format!("read JS/TS repair version: {error}")))?))
 }
 
 pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
+    if store.is_overlay() && !greppy_indexer::rust_caller_edges_repaired(store)? {
+        let base_marker = store.conn().query_row(
+            "SELECT value FROM greppy_base.schema_meta WHERE key = ?1",
+            [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            |row| row.get::<_, String>(0),
+        );
+        let base_current = match base_marker {
+            Ok(value) => value == RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(error) => {
+                return Err(Error::Store(format!(
+                    "read Base Rust repair marker: {error}"
+                )))
+            }
+        };
+        if !base_current {
+            // A sparse Delta rebuild does not certify an older immutable
+            // Base. Leave repair pending for its one-shot visible raw pass.
+            return Ok(());
+        }
+    }
     store
         .conn()
         .execute(
@@ -1227,11 +1549,22 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
             Some((_, commit)) => commit.clone(),
             None => git_output(&primary, &["rev-parse", "HEAD"])?,
         };
+        // An older identity cannot take the cold structural-only shortcut:
+        // its unchanged declaration nodes still need current extraction. The
+        // identity-derived path distinguishes it from a current Base whose
+        // summary cache is missing, without trusting an unverified manifest.
+        let current_identity = base_identity_parts(&primary, &base_commit)?;
+        let current_layout = BaseStoreLayout::new(shared_data_root, &current_identity)
+            .map_err(|error| Error::io("resolve current bound Base identity", error))?;
+        let incompatible_bound_graph = existing_binding
+            .as_ref()
+            .is_some_and(|(path, _)| !paths_resolve_equal(path, &current_layout.graph));
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
                 Some(prepared) => Some(prepared),
                 None if structural_first_use
                     && !missing_bound_graph
+                    && !incompatible_bound_graph
                     && !has_verified_previous_indexer_base(
                         &primary,
                         &base_commit,
@@ -1264,10 +1597,12 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                         inherited_leases,
                     );
                     Some(prepare_base_store_paths(
-                        &primary,
-                        clean.path(),
-                        clean.path(),
-                        &base_commit,
+                        BaseSourcePaths {
+                            repo_root: &primary,
+                            source_path: clean.path(),
+                            worktree_path: clean.path(),
+                            base_commit: &base_commit,
+                        },
                         shared_data_root,
                         embedding_args,
                         progress_path,
@@ -1383,13 +1718,60 @@ impl TemporaryBaseWorktree {
     }
 }
 
+fn create_base_build_staging(
+    worktree_path: &Path,
+) -> Result<(
+    tempfile::TempDir,
+    greppy_core::cache::FileLock,
+    std::ffi::OsString,
+)> {
+    let scratch_root = temporary_base_checkout_root()?;
+    let _ = greppy_core::cache::reap_stale_base_build_dirs(
+        &scratch_root,
+        greppy_core::cache::BASE_BUILD_STAGING_TTL,
+    );
+    let staging = tempfile::Builder::new()
+        .prefix("greppy-base-build-")
+        .tempdir_in(&scratch_root)
+        .map_err(|error| Error::io("create Base build staging directory", error))?;
+    let staging_lease = greppy_core::cache::create_base_build_staging_lease(staging.path())
+        .map_err(|error| Error::io("lease Base build staging directory", error))?;
+    let mut lease_roots = vec![std::fs::canonicalize(staging.path())
+        .map_err(|error| Error::io("resolve Base staging lease", error))?];
+    // Git may return the canonical /private/... spelling while the configured
+    // scratch root uses /tmp/... (or another directory alias). Compare the same
+    // namespace so the child's checkout lease is not silently omitted.
+    let canonical_scratch = std::fs::canonicalize(&scratch_root)
+        .map_err(|error| Error::io("resolve Base scratch staging root", error))?;
+    let canonical_worktree = std::fs::canonicalize(worktree_path)
+        .map_err(|error| Error::io("resolve Base staging worktree", error))?;
+    if let Some(checkout) = canonical_worktree.ancestors().find(|ancestor| {
+        ancestor.parent() == Some(canonical_scratch.as_path())
+            && ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("greppy-linked-base-checkout-"))
+    }) {
+        lease_roots.push(
+            std::fs::canonicalize(checkout)
+                .map_err(|error| Error::io("resolve Base checkout lease", error))?,
+        );
+    }
+    if let Some(inherited) = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES) {
+        lease_roots.extend(std::env::split_paths(&inherited));
+    }
+    lease_roots.sort();
+    lease_roots.dedup();
+    let child_leases = std::env::join_paths(&lease_roots)
+        .map_err(|error| Error::Invalid(format!("cannot pass Base staging leases: {error}")))?;
+    Ok((staging, staging_lease, child_leases))
+}
+
 fn temporary_base_checkout_root() -> Result<PathBuf> {
-    // Honor TMPDIR consistently on every platform. Rust's Windows
-    // `temp_dir()` follows GetTempPath and would otherwise ignore an explicit
-    // scratch directory supplied by the caller.
-    let root = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    // Default Mac staging uses the designated mounted disposable volume.
+    // Explicit isolated stores retain their caller-supplied TMPDIR.
+    let root = greppy_core::cache::base_build_scratch_root()
+        .map_err(|error| Error::io("prepare disposable Base staging root", error))?;
     if !root.is_absolute() {
         return Err(Error::Invalid(format!(
             "temporary Base checkout directory must be absolute: {}",
@@ -1531,26 +1913,53 @@ fn has_verified_previous_indexer_base(
     shared_data_root: &Path,
 ) -> Result<bool> {
     let current_identity = base_identity_parts(repo_root, base_commit)?;
-    if current_identity.indexer_version != "greppy-indexer-v7" {
-        return Ok(false);
-    }
-    return has_verified_previous_indexer_base_for_identity(shared_data_root, &current_identity);
+    has_verified_previous_indexer_base_for_identity(shared_data_root, &current_identity)
 }
 
 fn has_verified_previous_indexer_base_for_identity(
     shared_data_root: &Path,
     current_identity: &BaseStoreIdentity,
 ) -> Result<bool> {
-    if current_identity.indexer_version != "greppy-indexer-v7" {
-        return Ok(false);
+    Ok(verified_previous_indexer_base_layout(shared_data_root, current_identity)?.is_some())
+}
+
+/// Only reviewed structural migrations may retain a previous Base. All other
+/// identity fields (source tree, parser/model/prompts and encoding) stay exact.
+fn verified_previous_indexer_base_layout(
+    shared_data_root: &Path,
+    current_identity: &BaseStoreIdentity,
+) -> Result<Option<(BaseStoreLayout, BaseStoreIdentity)>> {
+    let versions: &[&str] = match current_identity.indexer_version.as_str() {
+        "greppy-indexer-v7" => &["greppy-indexer-v6"],
+        "greppy-indexer-v8" => &["greppy-indexer-v7", "greppy-indexer-v6"],
+        // v9 needs declaration properties that older Bases never extracted.
+        // Reusing their byte-identical sources would preserve incomplete nodes.
+        _ => &[],
+    };
+    // Schema17 only adds private override tables. A copied schema16 graph
+    // upgrades in staging and keeps unchanged definitions/vectors; the
+    // published schema16 Base stays immutable.
+    let schemas: Vec<u32> = if current_identity.store_schema_version == 17 {
+        vec![17, 16]
+    } else {
+        vec![current_identity.store_schema_version]
+    };
+    for version in versions {
+        for schema in &schemas {
+            let mut previous_identity = current_identity.clone();
+            previous_identity.indexer_version = (*version).into();
+            previous_identity.store_schema_version = *schema;
+            let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
+                .map_err(|error| Error::io("construct previous Base Store layout", error))?;
+            if layout
+                .read_verified_manifest()
+                .is_ok_and(|manifest| manifest.identity == previous_identity)
+            {
+                return Ok(Some((layout, previous_identity)));
+            }
+        }
     }
-    let mut previous_identity = current_identity.clone();
-    previous_identity.indexer_version = "greppy-indexer-v6".into();
-    let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
-        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
-    Ok(layout
-        .read_verified_manifest()
-        .is_ok_and(|manifest| manifest.identity == previous_identity))
+    Ok(None)
 }
 
 impl Drop for TemporaryBaseWorktree {
@@ -1648,10 +2057,12 @@ pub(crate) fn prepare_base_store(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
     prepare_base_store_paths(
-        workspace.repo_root(),
-        workspace.repository_path(),
-        workspace.worktree_path(),
-        workspace.base_commit(),
+        BaseSourcePaths {
+            repo_root: workspace.repo_root(),
+            source_path: workspace.repository_path(),
+            worktree_path: workspace.worktree_path(),
+            base_commit: workspace.base_commit(),
+        },
         shared_data_root,
         embedding_args,
         None,
@@ -1660,17 +2071,27 @@ pub(crate) fn prepare_base_store(
     )
 }
 
+struct BaseSourcePaths<'a> {
+    repo_root: &'a Path,
+    source_path: &'a Path,
+    worktree_path: &'a Path,
+    base_commit: &'a str,
+}
+
 fn prepare_base_store_paths(
-    repo_root: &Path,
-    source_path: &Path,
-    worktree_path: &Path,
-    base_commit: &str,
+    source: BaseSourcePaths<'_>,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
     progress_path: Option<&Path>,
     deadline: Option<std::time::Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
+    let BaseSourcePaths {
+        repo_root,
+        source_path,
+        worktree_path,
+        base_commit,
+    } = source;
     let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
     let identity = base_identity_parts(repo_root, base_commit)?;
     let identity_hash = identity
@@ -1726,40 +2147,7 @@ fn prepare_base_store_paths(
         shared_data_root,
         greppy_core::cache::BASE_BUILD_STAGING_TTL,
     );
-    let staging = tempfile::Builder::new()
-        .prefix("greppy-base-build-")
-        .tempdir_in(shared_data_root)
-        .map_err(|error| Error::io("create Base build staging directory", error))?;
-    let _staging_lease = greppy_core::cache::create_base_build_staging_lease(staging.path())
-        .map_err(|error| Error::io("lease Base build staging directory", error))?;
-    let mut lease_roots = vec![std::fs::canonicalize(staging.path())
-        .map_err(|error| Error::io("resolve Base staging lease", error))?];
-    // Git may return the canonical /private/... spelling while the configured
-    // shared root uses /tmp/... (or another directory alias). Compare the same
-    // namespace so the child's checkout lease is not silently omitted.
-    let canonical_shared = std::fs::canonicalize(shared_data_root)
-        .map_err(|error| Error::io("resolve shared Base staging root", error))?;
-    let canonical_worktree = std::fs::canonicalize(worktree_path)
-        .map_err(|error| Error::io("resolve Base staging worktree", error))?;
-    if let Some(checkout) = canonical_worktree.ancestors().find(|ancestor| {
-        ancestor.parent() == Some(canonical_shared.as_path())
-            && ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("greppy-linked-base-checkout-"))
-    }) {
-        lease_roots.push(
-            std::fs::canonicalize(checkout)
-                .map_err(|error| Error::io("resolve Base checkout lease", error))?,
-        );
-    }
-    if let Some(inherited) = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES) {
-        lease_roots.extend(std::env::split_paths(&inherited));
-    }
-    lease_roots.sort();
-    lease_roots.dedup();
-    let child_leases = std::env::join_paths(&lease_roots)
-        .map_err(|error| Error::Invalid(format!("cannot pass Base staging leases: {error}")))?;
+    let (staging, _staging_lease, child_leases) = create_base_build_staging(worktree_path)?;
     let staging_data = staging.path().join("data");
     std::fs::create_dir_all(&staging_data)
         .map_err(|error| Error::io("create Base build data directory", error))?;
@@ -1959,18 +2347,31 @@ fn seed_previous_indexer_base(
     worktree_path: &Path,
     staged_graph: &Path,
 ) -> Result<Option<PathBuf>> {
-    if current_identity.indexer_version != "greppy-indexer-v7" {
-        return Ok(None);
-    }
-    let mut previous_identity = current_identity.clone();
-    previous_identity.indexer_version = "greppy-indexer-v6".into();
-    let previous_layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
-        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
-    let Ok(previous_manifest) = previous_layout.read_verified_manifest() else {
+    let Some((previous_layout, previous_identity)) =
+        verified_previous_indexer_base_layout(shared_data_root, current_identity)?
+    else {
         return Ok(None);
     };
-    if previous_manifest.identity != previous_identity {
-        return Ok(None);
+    // Keep the immutable generation and its summary file alive through both
+    // copies. A completed graph must not be evicted midway through seeding.
+    let _previous_reader = previous_layout
+        .acquire_reader(true)
+        .map_err(|error| Error::io("lease previous Base for structural migration", error))?
+        .ok_or_else(|| {
+            Error::Lock(
+                "previous Base is being published or reclaimed; retain the pending migration"
+                    .into(),
+            )
+        })?;
+    // Selection may race with lease acquisition. Reverify the exact generation
+    // and both digests while eviction/publication are excluded, before staging.
+    let manifest = previous_layout
+        .read_verified_manifest()
+        .map_err(|error| Error::io("reverify leased previous Base generation", error))?;
+    if manifest.identity != previous_identity {
+        return Err(Error::Invalid(
+            "previous Base identity changed before migration lease".into(),
+        ));
     }
     let parent = staged_graph
         .parent()
@@ -1987,7 +2388,14 @@ fn seed_previous_indexer_base(
     std::io::copy(&mut previous_graph, &mut migrated_graph)
         .map_err(|error| Error::io("copy previous Base graph for migration", error))?;
     drop(migrated_graph);
-    let root = worktree_path.to_string_lossy();
+    // The indexer keys workspace compatibility by its canonical repository
+    // root. Temporary checkouts can have a different lexical spelling on
+    // macOS (`/var/...` versus `/private/var/...`); persisting the lexical
+    // path makes the v6 workspace lookup miss, forcing a full rebuild whose
+    // node cascade discards otherwise reusable vectors.
+    let canonical_worktree = std::fs::canonicalize(worktree_path)
+        .map_err(|error| Error::io("resolve migrated Base worktree", error))?;
+    let root = canonical_worktree.to_string_lossy();
     let store =
         greppy_store::Store::open_with(staged_graph, greppy_store::OpenOptions::query_writer())?;
     store
@@ -2000,8 +2408,8 @@ fn seed_previous_indexer_base(
     store
         .conn()
         .execute(
-            "UPDATE main.workspace_state SET root_path = ?1",
-            rusqlite::params![root.as_ref()],
+            "UPDATE main.workspace_state SET root_path = ?1, schema_version = ?2",
+            rusqlite::params![root.as_ref(), store.schema_version()?],
         )
         .map_err(|error| Error::Store(format!("retarget migrated Base workspace: {error}")))?;
     let staged_summary_cache = parent
@@ -2579,21 +2987,24 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    struct TmpdirRestore(Option<std::ffi::OsString>);
+    struct TmpdirRestore {
+        _environment: EnvRestore,
+    }
 
     impl TmpdirRestore {
         fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("TMPDIR");
+            let environment = EnvRestore::capture(&[
+                "TMPDIR",
+                "GREPPY_STORE_DIR",
+                greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
+            ]);
             std::env::set_var("TMPDIR", path);
-            Self(previous)
-        }
-    }
-
-    impl Drop for TmpdirRestore {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var("TMPDIR", value),
-                None => std::env::remove_var("TMPDIR"),
+            // Mac defaults intentionally ignore TMPDIR. These fixtures exercise
+            // caller-supplied TMPDIR placement with an explicit isolated store.
+            std::env::set_var("GREPPY_STORE_DIR", path.join("isolated-store"));
+            std::env::remove_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES);
+            Self {
+                _environment: environment,
             }
         }
     }
@@ -2650,9 +3061,10 @@ mod tests {
         }
     }
 
-    fn assert_persisted_v7_delta_query_is_correct(root: &str) -> std::result::Result<(), String> {
-        let cli = crate::Cli::try_parse_from(["greppy", "--root", root, "who-calls", "target"])
-            .map_err(|error| error.to_string())?;
+    fn assert_persisted_v7_delta_query_is_correct(
+        root: &str,
+        cli: crate::Cli,
+    ) -> std::result::Result<(), String> {
         let exit = crate::dispatch(cli).map_err(|error| error.to_string())?;
         if exit != 0 {
             return Err(format!("who-calls CLI returned exit code {exit}"));
@@ -2685,6 +3097,757 @@ mod tests {
     }
 
     #[test]
+    fn rejected_admission_does_not_run_hidden_single_store_repair() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvRestore::capture(&[
+            "GREPPY_STORE_DIR",
+            "GREPPY_PROJECT_IDENTITY",
+            "GREPPY_HEAVY_GATE",
+            "GREPPY_AUTO_REINDEX",
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+        ]);
+        for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] {
+            std::env::remove_var(name);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let root = repo.path().canonicalize().unwrap();
+        let gate = scratch.path().join("reject-gate.py");
+        std::fs::write(
+            &gate,
+            "import sys\nprint('another owner holds the lease', file=sys.stderr)\nsys.exit(75)\n",
+        )
+        .unwrap();
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        std::env::set_var("GREPPY_HEAVY_GATE", &gate);
+        std::env::set_var("GREPPY_AUTO_REINDEX", "1");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        let path = crate::workspace_locator::store_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = greppy_store::Store::open(&path).unwrap();
+        greppy_indexer::index(&mut store, &root, "p").unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let generation = store
+            .get_workspace_state(root.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap()
+            .graph_generation;
+        drop(store);
+        let error = ensure_persisted_single_store_repaired(&path, &root, "p").unwrap_err();
+        assert!(
+            error.to_string().contains("shared host admission"),
+            "{error}"
+        );
+        let store =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).unwrap();
+        assert!(persisted_v7_delta_needs_repair(&store, &root).unwrap());
+        assert_eq!(
+            store
+                .get_workspace_state(root.to_string_lossy().as_ref())
+                .unwrap()
+                .unwrap()
+                .graph_generation,
+            generation
+        );
+        let job = crate::read_background_job(&crate::background_job_path(&root)).unwrap();
+        assert_eq!(job["state"], "failed");
+        assert!(job["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("another owner holds the lease"));
+        assert!(greppy_freshness::try_acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn effect_fn_normal_overlay_upgrade_defers_changed_source_then_repairs_once() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let routing = repo.path().join("src/routing.ts");
+        let changed = repo.path().join("src/changed.ts");
+        std::fs::write(&routing, "import { Effect } from 'effect';\nconst target = Effect.fn('target')(function* () { return 1; });\nexport const caller = Effect.fn('caller')(function* () { return yield* target(); });\n").unwrap();
+        std::fs::write(&changed, "export function changed() { return 1; }\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Effect.fn base"]);
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            for name in ["target", "caller"] {
+                let node = base
+                    .get_node_by_qname("p", &format!("src/routing.ts::Function::{name}"))
+                    .unwrap()
+                    .unwrap();
+                base.update_node_identity(
+                    node.id,
+                    "Variable",
+                    &format!("src/routing.ts::Variable::{name}"),
+                )
+                .unwrap();
+            }
+            base.conn().execute("UPDATE raw_edges SET source_qname=replace(source_qname,'::Function::','::Variable::') WHERE file_path='src/routing.ts'", []).unwrap();
+            for mut state in base.list_workspace_states().unwrap() {
+                state.indexer_version = "greppy-indexer-v7".into();
+                base.upsert_workspace_state(&state).unwrap();
+            }
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        std::fs::write(&changed, "export function changed() { return 2; }\n").unwrap();
+        {
+            let mut overlay = greppy_store::Store::open_overlay(
+                &base_path,
+                &delta_path,
+                &VisibilityIndex::default(),
+            )
+            .unwrap();
+            assert!(
+                !complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap(),
+                "source refresh must precede repair instead of returning a fingerprint error"
+            );
+        }
+        let visibility =
+            VisibilityIndex::new(["src/changed.ts".to_string()], Vec::<String>::new()).unwrap();
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(["src/changed.ts".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let refreshed =
+            greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+        assert_eq!(
+            refreshed.files_indexed, 1,
+            "only dirty source needs normal extraction"
+        );
+        let target = overlay
+            .get_node_by_qname("p", "src/routing.ts::Function::target")
+            .unwrap()
+            .unwrap();
+        let caller = overlay
+            .get_node_by_qname("p", "src/routing.ts::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(overlay
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert!(overlay
+            .get_node_by_qname("p", "src/routing.ts::Variable::target")
+            .unwrap()
+            .is_none());
+        complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap();
+        assert!(!complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap());
+        assert_eq!(
+            greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options)
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn rust_enum_variant_span_repair_keeps_vector_backed_base_copy_derived() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n}\n",
+        )
+        .unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn()
+                .execute(
+                    "UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'",
+                    [],
+                )
+                .unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let visibility = VisibilityIndex::default();
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let original = overlay
+            .get_node_by_qname("p", "src/a.rs::Kind::Branch")
+            .unwrap()
+            .unwrap();
+        let project = overlay.get_project("p").unwrap().unwrap();
+        overlay.upsert_project(&project).unwrap();
+        let copied_id = overlay
+            .insert_writable_node(&greppy_store::NewNode {
+                project: original.project.clone(),
+                label: original.label.clone(),
+                name: original.name.clone(),
+                qualified_name: original.qualified_name.clone(),
+                file_path: original.file_path.clone(),
+                start_line: original.start_line,
+                end_line: original.end_line,
+                properties: original.properties.clone(),
+            })
+            .unwrap();
+        assert!(copied_id > 0, "vectors require a writable Delta identity");
+        overlay
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "test-model".into(),
+                prompt_version: "v1".into(),
+                task: "definition".into(),
+                node_id: Some(copied_id),
+                chunk_idx: 0,
+                qualified_name: original.qualified_name.clone(),
+                file_path: original.file_path.clone(),
+                start_line: original.start_line,
+                end_line: original.end_line,
+                content_sha256: "a".repeat(64),
+                graph_generation: 1,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        assert_eq!(
+            greppy_indexer::recover_persisted_rust_enum_variant_spans(
+                &mut overlay,
+                "p",
+                repo.path()
+            )
+            .unwrap(),
+            1
+        );
+        let repaired = overlay.get_node(copied_id).unwrap().unwrap();
+        assert_eq!(
+            (repaired.id, repaired.start_line, repaired.end_line),
+            (copied_id, 2, 4)
+        );
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        assert_eq!(
+            overlay
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.vector_embeddings WHERE node_id=?1",
+                    [copied_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        drop(overlay);
+        let reopened =
+            greppy_store::Store::open_overlay_read_only(&base_path, &delta_path, &visibility)
+                .unwrap();
+        assert!(private_delta_paths(&reopened).unwrap().is_empty());
+        assert_eq!(reopened.get_node(copied_id).unwrap().unwrap().end_line, 4);
+        drop(reopened);
+        // Removing a derived vector copy reveals the repaired Base definition,
+        // with its original negative ID and unchanged physical Base bytes.
+        let mut reopened =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        reopened.delete_node(copied_id).unwrap();
+        assert_eq!(reopened.get_node(original.id).unwrap().unwrap().end_line, 4);
+        drop(reopened);
+        let hidden = greppy_store::Store::open_overlay_read_only(
+            &base_path,
+            &delta_path,
+            &VisibilityIndex::new(vec!["src/a.rs".to_string()], Vec::<String>::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(hidden.get_node(original.id).unwrap().is_none());
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn persisted_overlay_repair_certifies_composed_manifest_context() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::create_dir_all(repo.path().join("member/src")).unwrap();
+        std::fs::write(
+            repo.path().join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("member/src/lib.rs"),
+            "pub fn unchanged_member() {}\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "member base"]);
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "pub fn changed_delta() {}\n").unwrap();
+        let visibility =
+            VisibilityIndex::new(["src/a.rs".to_string()], Vec::<String>::new()).unwrap();
+        {
+            let mut overlay =
+                greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(["src/a.rs".to_string()].into_iter().collect()),
+                ..Default::default()
+            };
+            greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+            // A genuinely legacy resolved reference without raw facts must
+            // still be refused; structural edges alone are safe to certify.
+            let caller = overlay
+                .get_node_by_qname("p", "src/a.rs::Function::changed_delta")
+                .unwrap()
+                .unwrap();
+            let target = overlay
+                .get_node_by_qname("p", "member/src/lib.rs::Function::unchanged_member")
+                .unwrap()
+                .unwrap();
+            overlay
+                .insert_edge(&greppy_store::NewEdge {
+                    project: "p".into(),
+                    source_id: caller.id,
+                    target_id: target.id,
+                    edge_type: "CALLS".into(),
+                    properties: Default::default(),
+                })
+                .unwrap();
+            let error =
+                complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap_err();
+            assert!(error.to_string().contains("no persisted raw edges"));
+            overlay
+                .conn()
+                .execute(
+                    "DELETE FROM main.overlay_edges WHERE project='p' AND edge_type='CALLS'",
+                    [],
+                )
+                .unwrap();
+            complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap();
+            assert!(!persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
+        }
+        // A physical Delta has no member file states, so its Cargo digest is
+        // deliberately different. Validate the published logical graph instead.
+        let delta =
+            greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        assert!(!greppy_indexer::anyhow_factory_edges_repaired(&delta).unwrap());
+        drop(delta);
+        ensure_persisted_v7_delta_repaired(&delta_path, &base_path, &visibility, repo.path(), "p")
+            .unwrap();
+        assert!(
+            !repair_persisted_v7_delta(&delta_path, &base_path, &visibility, repo.path(), "p")
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn visible_overlay_repair_certifies_actual_base_references_once() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "pub fn target() {}\npub fn caller() { let _ = target; }\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "reference base"]);
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
+                .unwrap();
+        }
+        let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut store =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let target = store
+            .get_node_by_qname("p", "src/a.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("p", "src/a.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap()
+            .is_empty());
+        assert!(complete_visible_overlay_rust_repair(&mut store, repo.path(), "p").unwrap());
+        assert!(store
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+        assert!(!complete_visible_overlay_rust_repair(&mut store, repo.path(), "p").unwrap());
+        let base =
+            greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        assert!(
+            !greppy_indexer::rust_caller_edges_repaired(&base).unwrap(),
+            "immutable Base is not falsely certified"
+        );
+    }
+
+    #[test]
+    fn sparse_cow_marker_does_not_certify_an_unrepaired_base() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+        }
+        let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let store =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        mark_rust_caller_edges_repaired(&store).unwrap();
+        assert!(
+            !greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
+            "Delta-only work cannot mark a legacy Base complete"
+        );
+        drop(store);
+        let base =
+            greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::query_writer())
+                .unwrap();
+        greppy_indexer::mark_rust_caller_edges_repaired(&base).unwrap();
+        drop(base);
+        let store =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        mark_rust_caller_edges_repaired(&store).unwrap();
+        assert!(
+            greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
+            "a current Base makes sparse publication current without a Base pass"
+        );
+    }
+
+    #[test]
+    fn persisted_rust_repair_defers_to_refresh_after_source_edits() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _env = EnvRestore::capture(&["GREPPY_STORE_DIR", "GREPPY_PROJECT_IDENTITY", "GREPPY_AUTO_REINDEX", "GREPPY_TEST_SKIP_INFERENCE", ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT]);
+                for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] { std::env::remove_var(name); }
+                let scratch = tempfile::tempdir().unwrap();
+                let repo = fixture();
+                let root = crate::resolving::resolve_root(Some(&repo.path().to_string_lossy())).unwrap();
+                let root_string = root.to_string_lossy().into_owned();
+                std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+                std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+                std::env::set_var("GREPPY_AUTO_REINDEX", "0");
+                std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+                let path = crate::workspace_locator::store_path(&root);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let mut store = greppy_store::Store::open(&path).unwrap();
+                greppy_indexer::index(&mut store, &root, "p").unwrap();
+                store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+                let original_states = format!("{:?}", store.list_file_states("p").unwrap());
+                drop(store);
+                std::fs::write(root.join("src/a.rs"), "pub fn refreshed_target() {}\npub fn refreshed_caller() { refreshed_target(); }\n").unwrap();
+                for store in [crate::freshness::open_default_store(Some(&root_string)).unwrap(), crate::freshness::open_default_store_query_writer(Some(&root_string)).unwrap()] {
+                    assert!(persisted_v7_delta_needs_repair(&store, &root).unwrap());
+                    assert_eq!(format!("{:?}", store.list_file_states("p").unwrap()), original_states);
+                    let proof = crate::nav_freshness_json_uncached(&store, Some(&root_string), "p");
+                    assert!(crate::freshness::freshness_is_reindexable_stale(&proof), "{proof:?}");
+                    assert!(matches!(crate::freshness::freshness_serve_decision(&store, Some(&root_string), "p"), crate::FreshnessServe::Refuse(_)), "deferred migration must not authorize a stale graph");
+                }
+                // Exercise the same atomic publication used by the automatic
+                // query refresh, without spawning the unit-test executable.
+                crate::indexing::index_atomic_snapshot(&path, &root, "p", None, &greppy_indexer::IndexOptions::default(), false, None).unwrap();
+                let store = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+                assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+                let target = store.get_node_by_qname("p", "src/a.rs::Function::refreshed_target").unwrap().unwrap();
+                let caller = store.get_node_by_qname("p", "src/a.rs::Function::refreshed_caller").unwrap().unwrap();
+                assert!(store.incoming_edges(target.id, Some("CALLS"), 20).unwrap().iter().any(|edge| edge.source_id == caller.id));
+                assert!(store.get_node_by_qname("p", "src/a.rs::Function::a").unwrap().is_none());
+            }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn persisted_single_store_rust_repair_preserves_cache_and_is_one_shot() {
+        let test = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(persisted_single_store_rust_repair_preserves_cache_and_is_one_shot_body)
+            .unwrap();
+        if let Err(panic) = test.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn persisted_single_store_rust_repair_preserves_cache_and_is_one_shot_body() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvRestore::capture(&[
+            "GREPPY_STORE_DIR",
+            "GREPPY_PROJECT_IDENTITY",
+            "GREPPY_AUTO_REINDEX",
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+        ]);
+        for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] {
+            std::env::remove_var(name);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let root = crate::resolving::resolve_root(Some(&repo.path().to_string_lossy())).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"vcop2-tools\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub mod m68000_aot;\npub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\npub fn amount() {}\npub fn valid() { let _ = amount; }\n").unwrap();
+        std::fs::write(root.join("src/m68000_aot.rs"), "pub fn compile() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/callers.rs"),
+            "use vcop2_tools::m68000_aot::{compile};\nfn caller() { compile(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/other.py"),
+            "def py_target():\n    pass\ndef py_caller():\n    py_target()\n",
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "single-store fixture"]);
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        std::env::set_var("GREPPY_AUTO_REINDEX", "0");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        let path = crate::workspace_locator::store_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = greppy_store::Store::open(&path).unwrap();
+        let indexed = greppy_indexer::index(&mut store, &root, "p").unwrap();
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+        let target = store
+            .get_node_by_qname("p", "src/m68000_aot.rs::Function::compile")
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("p", "tests/callers.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        store
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "fixture".into(),
+                prompt_version: "fixture".into(),
+                task: "code".into(),
+                node_id: Some(caller.id),
+                chunk_idx: 0,
+                qualified_name: caller.qualified_name.clone(),
+                file_path: caller.file_path.clone(),
+                start_line: 2,
+                end_line: 2,
+                content_sha256: "a".repeat(64),
+                graph_generation: indexed.graph_generation,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        let nodes_before = format!(
+            "{:?}",
+            store.list_nodes_by_label("p", "Function", 100).unwrap()
+        );
+        let states_before = format!("{:?}", store.list_file_states("p").unwrap());
+        let workspace_before = format!("{:?}", store.list_workspace_states().unwrap());
+        let vector_before: Vec<u8> = store
+            .conn()
+            .query_row(
+                "SELECT vector FROM vector_embeddings WHERE project = 'p'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let py_before: i64 = store.conn().query_row("SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id=e.source_id WHERE n.file_path='src/other.py'", [], |row| row.get(0)).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE target_id=?1 AND edge_type IN ('CALLS','USAGE','IMPORTS')",
+                [target.id],
+            )
+            .unwrap();
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project: "p".into(),
+                source_id: caller.id,
+                target_id: caller.id,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let constructor = store
+            .get_node_by_qname("p", "src/lib.rs::Instruction::AddImmediateByte")
+            .unwrap()
+            .unwrap();
+        let decode = store
+            .get_node_by_qname("p", "src/lib.rs::Function::decode")
+            .unwrap()
+            .unwrap();
+        let amount = store
+            .get_node_by_qname("p", "src/lib.rs::Function::amount")
+            .unwrap()
+            .unwrap();
+        let valid = store
+            .get_node_by_qname("p", "src/lib.rs::Function::valid")
+            .unwrap()
+            .unwrap();
+        store
+            .insert_raw_edges(&[greppy_store::NewRawEdge {
+                project: "p".into(),
+                file_path: "src/lib.rs".into(),
+                source_qname: decode.qualified_name.clone(),
+                target_qname: amount.qualified_name.clone(),
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount", "line": 3}),
+            }])
+            .unwrap();
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project: "p".into(),
+                source_id: decode.id,
+                target_id: amount.id,
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount"}),
+            })
+            .unwrap();
+        store.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE target_id=?1 AND edge_type='USAGE'",
+                [constructor.id],
+            )
+            .unwrap();
+        store.conn().execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v2','complete')", []).unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_rust_repair BEFORE INSERT ON edges WHEN NEW.edge_type='CALLS' BEGIN SELECT RAISE(ABORT,'fixture repair failure'); END;").unwrap();
+        drop(store);
+        let root_string = root.to_string_lossy().into_owned();
+        assert!(crate::freshness::open_default_store(Some(&root_string)).is_err());
+        let store =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())
+                .unwrap();
+        assert!(
+            !greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
+            "failed replacement cannot publish completeness"
+        );
+        assert_eq!(
+            store
+                .outgoing_edges(caller.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1,
+            "failed repair rolls back old edge deletion"
+        );
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER reject_rust_repair")
+            .unwrap();
+        drop(store);
+        let store = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert!(store
+            .outgoing_edges(caller.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .all(|edge| edge.target_id != caller.id));
+        assert!(store
+            .incoming_edges(constructor.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == decode.id));
+        let amount_usages = store.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
+        assert!(amount_usages.iter().all(|edge| edge.source_id != decode.id));
+        assert!(amount_usages.iter().any(|edge| edge.source_id == valid.id));
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+        assert_eq!(
+            format!(
+                "{:?}",
+                store.list_nodes_by_label("p", "Function", 100).unwrap()
+            ),
+            nodes_before
+        );
+        assert_eq!(
+            format!("{:?}", store.list_file_states("p").unwrap()),
+            states_before
+        );
+        assert_eq!(
+            format!("{:?}", store.list_workspace_states().unwrap()),
+            workspace_before
+        );
+        assert_eq!(
+            store
+                .conn()
+                .query_row(
+                    "SELECT vector FROM vector_embeddings WHERE project='p'",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+            vector_before
+        );
+        assert_eq!(store.conn().query_row("SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id=e.source_id WHERE n.file_path='src/other.py'", [], |row| row.get::<_, i64>(0)).unwrap(), py_before);
+        drop(store);
+        // A trigger makes any repeated relation resolution fail, so successful
+        // ordinary read and writer opens prove the marker skips that work.
+        let store =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())
+                .unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_repeat_repair BEFORE INSERT ON edges BEGIN SELECT RAISE(ABORT,'repair repeated'); END;").unwrap();
+        drop(store);
+        drop(crate::freshness::open_default_store(Some(&root_string)).unwrap());
+        drop(crate::freshness::open_default_store_query_writer(Some(&root_string)).unwrap());
+    }
+
+    #[test]
     fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors() {
         let test = std::thread::Builder::new()
             .name("persisted-v7-delta-repair".into())
@@ -2697,6 +3860,14 @@ mod tests {
     }
 
     fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors_body() {
+        let timing_start = std::time::Instant::now();
+        let timing = |stage: &str| {
+            eprintln!(
+                "cow_repair_stage={stage} elapsed_ms={}",
+                timing_start.elapsed().as_millis()
+            );
+        };
+        timing("start");
         let _env_lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2708,10 +3879,13 @@ mod tests {
             ENV_BASE_COMMIT,
             crate::ENV_STRUCTURAL_FIRST_USE,
         ]);
+        timing("environment-lock-acquired");
         let scratch = tempfile::tempdir().unwrap();
         // The freshness proof compares the live workspace with the exact
         // pinned Git tree, so this regression must use a real repository.
+        timing("fixture-start");
         let repo = fixture();
+        timing("fixture-created");
         // Ordinary navigation resolves an explicit root before locating both
         // workspace state and its store. Persist the synthetic fixture under
         // that same spelling: macOS aliases /var to /private/var, and Windows
@@ -2727,7 +3901,17 @@ mod tests {
         std::fs::write(root.join("src/alias_chain/sub.rs"), "pub fn target() {}\n").unwrap();
         std::fs::write(
             root.join("src/caller.rs"),
-            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n",
+            "use crate::alias_chain::outer;\npub fn caller() { let _ = outer; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/base.rs"),
+            "pub fn base_caller() { crate::alias_chain::sub::target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/stable.rs"),
+            "pub fn stable_caller() { crate::alias_chain::sub::target(); }\n",
         )
         .unwrap();
         git(&root, &["add", "."]);
@@ -2735,7 +3919,7 @@ mod tests {
         let base_commit = git(&root, &["rev-parse", "HEAD"]);
         std::fs::write(
             root.join("src/caller.rs"),
-            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n// dirty Delta\n",
+            "use crate::alias_chain::outer;\npub fn caller() { let _ = outer; }\n// dirty Delta\n",
         )
         .unwrap();
         std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
@@ -2806,6 +3990,30 @@ mod tests {
                 properties: serde_json::json!({"ref_name": "target"}),
             })
             .unwrap();
+            // Persist real source fingerprints for this pre-fix Base fixture.
+            for rel in [
+                "src/alias_chain/mod.rs",
+                "src/alias_chain/sub.rs",
+                "src/base.rs",
+                "src/stable.rs",
+            ] {
+                let bytes = std::fs::read(root.join(rel)).unwrap();
+                let metadata = greppy_discover::stable_metadata(
+                    &std::fs::symlink_metadata(root.join(rel)).unwrap(),
+                );
+                base.upsert_file_state(&greppy_store::FileState {
+                    project: "p".into(),
+                    rel_path: rel.into(),
+                    language: "Rust".into(),
+                    sha256: greppy_store::file_state::sha256_hex(&bytes),
+                    mtime_ns: metadata.mtime_ns.unwrap_or_default(),
+                    size: metadata.size as i64,
+                    parser_version: "fixture".into(),
+                    extractor_version: "fixture".into(),
+                    last_indexed_generation: 7,
+                })
+                .unwrap();
+            }
             base.insert_raw_edges(&[
                 greppy_store::NewRawEdge {
                     project: "p".into(),
@@ -2842,6 +4050,7 @@ mod tests {
             ])
             .unwrap();
         }
+        timing("base-store-populated");
         let base_identity = base_identity_parts(&root, &base_commit).unwrap();
         let base_layout = BaseStoreLayout::new(scratch.path(), &base_identity).unwrap();
         let summary_dir = scratch.path().join("base-summary-cache");
@@ -2854,6 +4063,7 @@ mod tests {
         base_layout
             .publish_graph_with_summary(base_identity, &staged_base_path, &summary_path)
             .unwrap();
+        timing("base-published");
         let base_path = base_layout.graph.clone();
         let caller_rel_path = "src/caller.rs";
         let caller_metadata = greppy_discover::stable_metadata(
@@ -2924,7 +4134,7 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO main.schema_meta (key, value) VALUES (?1, ?2)",
                     [
-                        "greppy.rust_caller_edges_repair.v1",
+                        "greppy.rust_caller_edges_repair.v2",
                         RUST_CALLER_EDGES_REPAIR_COMPLETE,
                     ],
                 )
@@ -3000,6 +4210,7 @@ mod tests {
                 .unwrap();
         }
 
+        timing("delta-populated");
         let visibility =
             greppy_store::VisibilityIndex::new(["src/caller.rs".to_string()], Vec::<String>::new())
                 .unwrap();
@@ -3062,26 +4273,48 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
+        timing("freshness-proven");
         let held = greppy_freshness::try_acquire(&delta_path).unwrap();
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let first_start = std::sync::Arc::clone(&start);
         let first_root = root_string.clone();
+        // Parse the complete Clap surface on the existing fixture thread;
+        // only the normal query/repair dispatch must run concurrently here.
+        let first_cli = crate::Cli::try_parse_from([
+            "greppy",
+            "--root",
+            first_root.as_str(),
+            "who-calls",
+            "target",
+        ])
+        .unwrap();
         let first = std::thread::spawn(move || {
             first_start.wait();
-            assert_persisted_v7_delta_query_is_correct(&first_root)
+            assert_persisted_v7_delta_query_is_correct(&first_root, first_cli)
         });
         let second_start = std::sync::Arc::clone(&start);
         let second_root = root_string.clone();
+        let second_cli = crate::Cli::try_parse_from([
+            "greppy",
+            "--root",
+            second_root.as_str(),
+            "who-calls",
+            "target",
+        ])
+        .unwrap();
         let second = std::thread::spawn(move || {
             second_start.wait();
-            assert_persisted_v7_delta_query_is_correct(&second_root)
+            assert_persisted_v7_delta_query_is_correct(&second_root, second_cli)
         });
         start.wait();
         // Exercise the normal freshness wait budget rather than the old
         // repair-local cap: a legitimate graph-only repair may exceed two
         // seconds while still being a live publication.
+        timing("contending-queries-started");
         std::thread::sleep(std::time::Duration::from_millis(2_500));
+        timing("fixture-sleep-ended");
         drop(held);
+        timing("fixture-lock-released");
         first
             .join()
             .unwrap_or_else(|_| Err("first concurrent query panicked".into()))
@@ -3117,11 +4350,16 @@ mod tests {
             .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
             .unwrap()
             .unwrap();
-        assert!(repaired
-            .incoming_edges(target.id, Some("CALLS"), 10)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == stable_caller.id));
+        assert_eq!(
+            repaired
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .filter(|edge| edge.source_id == stable_caller.id)
+                .count(),
+            1,
+            "validated migration preserves exactly one stable logical caller"
+        );
         assert_eq!(
             repaired
                 .conn()
@@ -3149,8 +4387,8 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0,
-            "an unchanged Base relation is not copied into the repair set"
+            1,
+            "one validated overlay preserves the masked legacy Base caller"
         );
         assert_eq!(
             repaired
@@ -3196,12 +4434,15 @@ mod tests {
         };
         // The one-shot composed rebuild shadows an existing Base relation too.
         // Store visibility suppresses the matching Base row, so this is one
-        // visible relation, not two. Only missing Base edges carry repair markers.
+        // visible relation, not two. Validated CALLS also carry repair markers
+        // because the legacy Base caller projection is masked during migration.
+        // Exact reexport resolution also retains the caller's import of outer.
         let expected_relations = [
             ("src/alias_chain/mod.rs::__file__", "IMPORTS", 1),
             ("src/base.rs::Function::base_caller", "CALLS", 1),
             ("src/caller.rs::Function::caller", "USAGE", 0),
-            ("src/stable.rs::Function::stable_caller", "CALLS", 0),
+            ("src/caller.rs::__file__", "IMPORTS", 0),
+            ("src/stable.rs::Function::stable_caller", "CALLS", 1),
         ]
         .into_iter()
         .map(|(source, kind, repaired)| {
@@ -3313,17 +4554,24 @@ mod tests {
             .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
             .unwrap()
             .unwrap();
-        assert!(after_dirty
-            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == stable_caller_after_dirty.id));
+        assert_eq!(
+            after_dirty
+                .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .filter(|edge| edge.source_id == stable_caller_after_dirty.id)
+                .count(),
+            1,
+            "sparse publication keeps exactly one validated stable caller"
+        );
         let later_relations = overlay_relations(&after_dirty);
-        assert!(
+        assert_eq!(
             later_relations
                 .iter()
-                .all(|row| row.0 != "src/stable.rs::Function::stable_caller"),
-            "ordinary bounded publication must prune the temporary Base shadow"
+                .filter(|row| row.0 == "src/stable.rs::Function::stable_caller" && row.3 == 1)
+                .count(),
+            1,
+            "ordinary bounded publication must retain the validated masked Base caller"
         );
         assert_eq!(
             later_relations
@@ -3334,7 +4582,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.3 == 1)
                 .collect::<Vec<_>>(),
-            "both missing Base relations must survive ordinary Delta publication"
+            "missing and validated masked Base relations must survive ordinary Delta publication"
         );
         let caller_after_dirty = after_dirty
             .get_node_by_qname("p", "src/caller.rs::Function::caller")
@@ -3364,102 +4612,225 @@ mod tests {
     }
 
     #[test]
-    fn v7_base_seed_copies_verified_v6_graph_and_summary() {
-        let data_root = tempfile::tempdir().unwrap();
-        let sources = tempfile::tempdir().unwrap();
-        let graph = sources.path().join("graph.db");
-        let summary_dir = sources.path().join("summary");
-        let summary = {
-            let cache = greppy_store::SummaryCache::open(&summary_dir).unwrap();
-            drop(cache);
-            summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE)
-        };
-        let root = "/old/base/root";
-        {
-            let mut store = greppy_store::Store::open(&graph).unwrap();
-            store
-                .upsert_project(&greppy_store::Project {
-                    name: "fixture".into(),
-                    indexed_at: "2026-09-27T00:00:00Z".into(),
-                    root_path: root.into(),
-                })
+    fn compatible_base_seed_copies_verified_graph_vectors_and_summary() {
+        for (previous_version, current_version, previous_schema) in [
+            ("greppy-indexer-v6", "greppy-indexer-v7", 17),
+            ("greppy-indexer-v7", "greppy-indexer-v8", 17),
+            ("greppy-indexer-v7", "greppy-indexer-v8", 16),
+            ("greppy-indexer-v6", "greppy-indexer-v8", 17),
+        ] {
+            let data_root = tempfile::tempdir().unwrap();
+            let sources = tempfile::tempdir().unwrap();
+            let graph = sources.path().join("graph.db");
+            let summary_dir = sources.path().join("summary");
+            let summary = {
+                let cache = greppy_store::SummaryCache::open(&summary_dir).unwrap();
+                drop(cache);
+                summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE)
+            };
+            let root = "/old/base/root";
+            let retained_id;
+            {
+                let mut store = greppy_store::Store::open(&graph).unwrap();
+                store
+                    .upsert_project(&greppy_store::Project {
+                        name: "fixture".into(),
+                        indexed_at: "2026-09-27T00:00:00Z".into(),
+                        root_path: root.into(),
+                    })
+                    .unwrap();
+                store
+                    .upsert_workspace_state(&greppy_store::WorkspaceState {
+                        root_path: root.into(),
+                        git_dir: None,
+                        git_common_dir: None,
+                        head_oid: None,
+                        index_signature: None,
+                        schema_version: previous_schema,
+                        indexer_version: previous_version.into(),
+                        graph_generation: 1,
+                        updated_at: "2026-09-27T00:00:00Z".into(),
+                    })
+                    .unwrap();
+                retained_id = store
+                    .insert_node(&greppy_store::NewNode {
+                        project: "fixture".into(),
+                        label: "Function".into(),
+                        name: "retained".into(),
+                        qualified_name: "fixture.rs::Function::retained".into(),
+                        file_path: "fixture.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        properties: serde_json::json!({}),
+                    })
+                    .unwrap();
+                store
+                    .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                        project: "fixture".into(),
+                        model_id: "fixture-embedding".into(),
+                        prompt_version: "fixture-prompt".into(),
+                        task: "definition".into(),
+                        node_id: Some(retained_id),
+                        chunk_idx: 0,
+                        qualified_name: "fixture.rs::Function::retained".into(),
+                        file_path: "fixture.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        content_sha256: greppy_store::file_state::sha256_hex(b"fn retained() {}"),
+                        graph_generation: 1,
+                        vector: vec![1.0, 0.0],
+                    })
+                    .unwrap();
+            }
+            if previous_schema == 16 {
+                let conn = rusqlite::Connection::open(&graph).unwrap();
+                conn.execute_batch("DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+            }
+            let previous_identity = BaseStoreIdentity {
+                format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+                canonical_repository_identity: "fixture-repository".into(),
+                git_object_format: "sha1".into(),
+                base_tree_oid: "1111111111111111111111111111111111111111".into(),
+                store_schema_version: previous_schema,
+                indexer_version: previous_version.into(),
+                parser_and_extractor_versions: "fixture-parser".into(),
+                summary_model_and_prompt_version: "fixture-summary".into(),
+                embedding_model: "fixture-embedding".into(),
+                embedding_prompt_version: "fixture-prompt".into(),
+                embedding_dimensions: 2,
+                embedding_encoding: "f32+i8-v1".into(),
+            };
+            let previous_layout =
+                BaseStoreLayout::new(data_root.path(), &previous_identity).unwrap();
+            previous_layout
+                .publish_graph_with_summary(previous_identity.clone(), &graph, &summary)
                 .unwrap();
-            store
-                .upsert_workspace_state(&greppy_store::WorkspaceState {
-                    root_path: root.into(),
-                    git_dir: None,
-                    git_common_dir: None,
-                    head_oid: None,
-                    index_signature: None,
-                    schema_version: store.schema_version().unwrap(),
-                    indexer_version: "greppy-indexer-v6".into(),
-                    graph_generation: 1,
-                    updated_at: "2026-09-27T00:00:00Z".into(),
-                })
-                .unwrap();
-        }
-        let previous_identity = BaseStoreIdentity {
-            format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
-            canonical_repository_identity: "fixture-repository".into(),
-            git_object_format: "sha1".into(),
-            base_tree_oid: "1111111111111111111111111111111111111111".into(),
-            store_schema_version: greppy_store::migrate::CURRENT_VERSION,
-            indexer_version: "greppy-indexer-v6".into(),
-            parser_and_extractor_versions: "fixture-parser".into(),
-            summary_model_and_prompt_version: "fixture-summary".into(),
-            embedding_model: "fixture-embedding".into(),
-            embedding_prompt_version: "fixture-prompt".into(),
-            embedding_dimensions: 2,
-            embedding_encoding: "f32+i8-v1".into(),
-        };
-        let previous_layout = BaseStoreLayout::new(data_root.path(), &previous_identity).unwrap();
-        previous_layout
-            .publish_graph_with_summary(previous_identity.clone(), &graph, &summary)
-            .unwrap();
-        let previous_summary_hash = greppy_store::file_state::sha256_hex(
-            &std::fs::read(&previous_layout.summary_cache).unwrap(),
-        );
+            let previous_summary_hash = greppy_store::file_state::sha256_hex(
+                &std::fs::read(&previous_layout.summary_cache).unwrap(),
+            );
 
-        let mut current_identity = previous_identity;
-        current_identity.indexer_version = "greppy-indexer-v7".into();
-        assert!(
-            has_verified_previous_indexer_base_for_identity(data_root.path(), &current_identity)
+            let mut current_identity = previous_identity;
+            current_identity.indexer_version = current_version.into();
+            current_identity.store_schema_version = greppy_store::migrate::CURRENT_VERSION;
+            let immutable_graph_hash = greppy_store::file_state::sha256_hex(
+                &std::fs::read(&previous_layout.graph).unwrap(),
+            );
+            let mut different_model = current_identity.clone();
+            different_model.embedding_model.push_str("-different");
+            assert!(
+                !has_verified_previous_indexer_base_for_identity(
+                    data_root.path(),
+                    &different_model
+                )
                 .unwrap(),
-            "a verified v6 Base must force structural first-use migration"
-        );
-        let migrated_root = data_root.path().join("migrated-worktree");
-        let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
-        let staged_summary = seed_previous_indexer_base(
-            data_root.path(),
-            &current_identity,
-            &migrated_root,
-            &staged_graph,
-        )
-        .unwrap()
-        .expect("verified v6 Base should seed v7 staging");
+                "different model must never reuse embeddings"
+            );
+            let mut unknown_upgrade = current_identity.clone();
+            unknown_upgrade.indexer_version = "greppy-indexer-v99".into();
+            assert!(!has_verified_previous_indexer_base_for_identity(
+                data_root.path(),
+                &unknown_upgrade
+            )
+            .unwrap());
 
-        assert_eq!(
-            greppy_store::file_state::sha256_hex(&std::fs::read(&staged_summary).unwrap()),
-            previous_summary_hash
-        );
-        let migrated =
-            greppy_store::Store::open_with(&staged_graph, greppy_store::OpenOptions::read_only())
+            assert!(
+                has_verified_previous_indexer_base_for_identity(
+                    data_root.path(),
+                    &current_identity
+                )
+                .unwrap(),
+                "a verified v6 Base must force structural first-use migration"
+            );
+            let migrated_root = data_root.path().join("migrated-worktree");
+            std::fs::create_dir_all(&migrated_root).unwrap();
+            let migrated_root = migrated_root.canonicalize().unwrap();
+            let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
+            let staged_summary = seed_previous_indexer_base(
+                data_root.path(),
+                &current_identity,
+                &migrated_root,
+                &staged_graph,
+            )
+            .unwrap()
+            .expect("verified v6 Base should seed v7 staging");
+
+            assert_eq!(
+                greppy_store::file_state::sha256_hex(&std::fs::read(&staged_summary).unwrap()),
+                previous_summary_hash
+            );
+            let migrated = greppy_store::Store::open_with(
+                &staged_graph,
+                greppy_store::OpenOptions::read_only(),
+            )
+            .unwrap();
+            assert_eq!(
+                migrated.schema_version().unwrap(),
+                greppy_store::migrate::CURRENT_VERSION
+            );
+            let retained = migrated
+                .get_node_by_qname("fixture", "fixture.rs::Function::retained")
+                .unwrap()
                 .unwrap();
-        assert_eq!(
-            migrated.list_projects().unwrap()[0].root_path,
-            migrated_root.to_string_lossy()
-        );
-        assert_eq!(
-            migrated.list_workspace_states().unwrap()[0].root_path,
-            migrated_root.to_string_lossy()
-        );
-        assert_eq!(
-            greppy_store::file_state::sha256_hex(
-                &std::fs::read(&previous_layout.summary_cache).unwrap()
-            ),
-            previous_summary_hash,
-            "published v6 summary cache remains immutable"
-        );
+            assert_eq!(retained.id, retained_id);
+            let retained_vector: (i64, String, i64, Vec<u8>) = migrated.conn().query_row("SELECT node_id,content_sha256,graph_generation,vector FROM vector_embeddings WHERE qualified_name='fixture.rs::Function::retained'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+            assert_eq!(retained_vector.0, retained_id);
+            assert_eq!(
+                retained_vector.1,
+                greppy_store::file_state::sha256_hex(b"fn retained() {}")
+            );
+            assert_eq!(retained_vector.2, 1);
+            let previous = greppy_store::Store::open_with(
+                &previous_layout.graph,
+                greppy_store::OpenOptions::read_only(),
+            )
+            .unwrap();
+            let previous_vector: Vec<u8> = previous.conn().query_row("SELECT vector FROM vector_embeddings WHERE qualified_name='fixture.rs::Function::retained'", [], |row| row.get(0)).unwrap();
+            assert_eq!(retained_vector.3, previous_vector);
+            assert_eq!(
+                greppy_store::file_state::sha256_hex(
+                    &std::fs::read(&previous_layout.graph).unwrap()
+                ),
+                immutable_graph_hash
+            );
+            assert_eq!(
+                migrated.list_projects().unwrap()[0].root_path,
+                migrated_root.to_string_lossy()
+            );
+            assert_eq!(
+                migrated.list_workspace_states().unwrap()[0].root_path,
+                migrated_root.to_string_lossy()
+            );
+            assert_eq!(
+                migrated.list_workspace_states().unwrap()[0].schema_version,
+                greppy_store::migrate::CURRENT_VERSION,
+                "migrated workspace metadata must not force a second full rebuild"
+            );
+            assert_eq!(
+                greppy_store::file_state::sha256_hex(
+                    &std::fs::read(&previous_layout.summary_cache).unwrap()
+                ),
+                previous_summary_hash,
+                "published v6 summary cache remains immutable"
+            );
+            // A v8 cache must not seed v9 with identical source/model identity:
+            // its Rust declaration facts may be incomplete.
+            let mut v8_identity = current_identity.clone();
+            v8_identity.indexer_version = "greppy-indexer-v8".into();
+            let v8_layout = BaseStoreLayout::new(data_root.path(), &v8_identity).unwrap();
+            if !v8_layout.graph.exists() {
+                v8_layout
+                    .publish_graph_with_summary(v8_identity.clone(), &graph, &summary)
+                    .unwrap();
+            }
+            let mut v9_identity = v8_identity;
+            v9_identity.indexer_version = "greppy-indexer-v9".into();
+            assert!(
+                verified_previous_indexer_base_layout(data_root.path(), &v9_identity)
+                    .unwrap()
+                    .is_none(),
+                "v9 must re-extract old Base declaration facts"
+            );
+        }
     }
 
     #[test]
@@ -3543,6 +4914,92 @@ mod tests {
     }
 
     #[test]
+    fn base_graph_staging_uses_scratch_and_hands_off_checkout_lease() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outer = tempfile::tempdir().unwrap();
+        let scratch = outer.path().join("scratch");
+        let shared = outer.path().join("shared");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let _restore = TmpdirRestore::set(&scratch);
+        let checkout = tempfile::Builder::new()
+            .prefix("greppy-linked-base-checkout-")
+            .tempdir_in(&scratch)
+            .unwrap();
+        let checkout_lease =
+            greppy_core::cache::create_base_build_staging_lease(checkout.path()).unwrap();
+        let worktree = checkout.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let (staging, staging_lease, inherited) = create_base_build_staging(&worktree).unwrap();
+        let canonical_scratch = std::fs::canonicalize(&scratch).unwrap();
+        let roots = std::env::split_paths(&inherited).collect::<Vec<_>>();
+        assert!(roots.contains(&std::fs::canonicalize(staging.path()).unwrap()));
+        assert!(roots.contains(&std::fs::canonicalize(checkout.path()).unwrap()));
+        assert!(roots
+            .iter()
+            .all(|path| path.starts_with(&canonical_scratch)));
+        assert!(std::fs::read_dir(&shared).unwrap().next().is_none());
+        let staged_graph = staging.path().join("graph.db");
+        drop(greppy_store::Store::open(&staged_graph).unwrap());
+        let staged_summary = staging.path().join("summary.json");
+        std::fs::write(&staged_summary, b"[]").unwrap();
+        let identity = BaseStoreIdentity {
+            format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+            canonical_repository_identity: "scratch-publication-fixture".into(),
+            git_object_format: "sha1".into(),
+            base_tree_oid: "1111111111111111111111111111111111111111".into(),
+            store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+            indexer_version: "fixture-indexer".into(),
+            parser_and_extractor_versions: "fixture-parser".into(),
+            summary_model_and_prompt_version: "fixture-summary".into(),
+            embedding_model: "fixture-embedding".into(),
+            embedding_prompt_version: "fixture-prompt".into(),
+            embedding_dimensions: 2,
+            embedding_encoding: "f32+i8-v1".into(),
+        };
+        let layout = BaseStoreLayout::new(&shared, &identity).unwrap();
+        let _builder = layout.acquire_builder(false).unwrap().unwrap();
+        layout
+            .publish_graph_with_summary(identity, &staged_graph, &staged_summary)
+            .unwrap();
+        layout.read_verified_manifest().unwrap();
+        assert!(layout.graph.starts_with(&shared));
+        assert_eq!(
+            std::fs::read(&layout.graph).unwrap(),
+            std::fs::read(&staged_graph).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&layout.summary_cache).unwrap(),
+            std::fs::read(&staged_summary).unwrap()
+        );
+        let previous = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES);
+        std::env::set_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES, inherited);
+        let retained = greppy_core::cache::retain_base_build_staging_leases_from_env();
+        match previous {
+            Some(value) => {
+                std::env::set_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES, value)
+            }
+            None => std::env::remove_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES),
+        }
+        let retained = retained.unwrap();
+        assert!(retained.len() >= 2);
+        drop(staging_lease);
+        drop(checkout_lease);
+        // Independently retained child leases prevent reclamation after parent loss.
+        assert_eq!(
+            greppy_core::cache::reap_stale_base_build_dirs(&scratch, std::time::Duration::ZERO)
+                .unwrap(),
+            0
+        );
+        drop(retained);
+        let staging_path = staging.path().to_path_buf();
+        drop(staging);
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
     fn temporary_base_checkout_uses_tmpdir_and_cleans_up() {
         let _env = crate::TEST_ENV_LOCK
             .lock()
@@ -3621,6 +5078,497 @@ mod tests {
         let paths = private_delta_paths(&store).unwrap();
         assert!(!paths.contains("src"));
         assert!(paths.contains("src/lib.rs"));
+    }
+
+    fn materialized_base_embedding_fixture(
+        visibility: &VisibilityIndex,
+    ) -> (tempfile::TempDir, greppy_store::Store) {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let node = greppy_store::NewNode {
+            project: "p".into(),
+            label: "Function".into(),
+            name: "run".into(),
+            qualified_name: "src/lib.rs::Function::run".into(),
+            file_path: "src/lib.rs".into(),
+            start_line: 2,
+            end_line: 4,
+            properties: serde_json::json!({"signature": "fn run()"}),
+        };
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            base.upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+            base.insert_node(&node).unwrap();
+        }
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            visibility,
+        )
+        .unwrap();
+        overlay
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+        let id = overlay.insert_writable_node(&node).unwrap();
+        overlay
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "fixture".into(),
+                prompt_version: "fixture".into(),
+                task: "code".into(),
+                node_id: Some(id),
+                chunk_idx: 0,
+                qualified_name: node.qualified_name,
+                file_path: node.file_path,
+                start_line: 2,
+                end_line: 4,
+                content_sha256: "a".repeat(64),
+                graph_generation: 1,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        (scratch, overlay)
+    }
+
+    #[test]
+    fn overlay_publication_allows_identical_base_materialization() {
+        let visibility = VisibilityIndex::default();
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+    }
+
+    #[test]
+    fn overlay_publication_rejects_undeclared_private_rows() {
+        let visibility = VisibilityIndex::default();
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+        overlay
+            .conn()
+            .execute(
+                "UPDATE main.vector_embeddings SET file_path='src/rogue.rs'",
+                [],
+            )
+            .unwrap();
+        let error = validate_overlay_delta_visibility(&overlay, &visibility)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("src/rogue.rs"), "{error}");
+        assert!(error.contains("Delta visibility manifest"), "{error}");
+    }
+
+    #[test]
+    fn overlay_publication_allows_declared_private_changes() {
+        let visibility =
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap();
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+        overlay
+            .conn()
+            .execute("UPDATE main.nodes SET name='changed'", [])
+            .unwrap();
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+    }
+
+    #[test]
+    fn private_delta_paths_allow_identical_base_embedding_materialization() {
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&VisibilityIndex::default());
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        // Legacy node-less chunks must still bind by complete visible identity.
+        overlay
+            .conn()
+            .execute("UPDATE main.vector_embeddings SET node_id=NULL", [])
+            .unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        overlay
+            .conn()
+            .execute("DELETE FROM main.nodes", [])
+            .unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+    }
+
+    #[test]
+    fn private_delta_paths_reject_changed_or_rogue_materialization() {
+        for mutation in [
+            "UPDATE main.nodes SET name='changed'",
+            "UPDATE main.nodes SET label='Variable'",
+            "UPDATE main.nodes SET properties='{}'",
+            "UPDATE main.nodes SET end_line=5",
+            "UPDATE main.vector_embeddings SET qualified_name='rogue'",
+            "UPDATE main.vector_embeddings SET file_path='src/rogue.rs'",
+            "UPDATE main.vector_embeddings SET start_line=1",
+            "UPDATE main.vector_embeddings SET end_line=5",
+            "INSERT INTO main.file_state (project,rel_path,sha256) VALUES ('p','src/lib.rs','rogue')",
+            "INSERT INTO main.file_content (project,rel_path,line,snippet,file_path) VALUES ('p','src/lib.rs',2,'rogue','src/lib.rs')",
+            "INSERT INTO main.raw_edges (project,file_path,source_qname,target_qname,edge_type,properties) VALUES ('p','src/lib.rs','run','rogue','CALLS','{}')",
+        ] {
+            let (_scratch, overlay) =
+                materialized_base_embedding_fixture(&VisibilityIndex::default());
+            overlay.conn().execute(mutation, []).unwrap();
+            assert!(
+                !private_delta_paths(&overlay).unwrap().is_empty(),
+                "undeclared Delta modification escaped the freshness guard: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_delta_paths_do_not_exempt_hidden_base_copies() {
+        for visibility in [
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap(),
+            VisibilityIndex::new(Vec::<String>::new(), ["src/lib.rs".to_string()]).unwrap(),
+        ] {
+            let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.rs"));
+        }
+    }
+
+    fn unchanged_repair_edges_fixture(
+        visibility: &VisibilityIndex,
+        with_base_state: bool,
+        with_base_edges: bool,
+    ) -> (tempfile::TempDir, greppy_store::Store) {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            base.upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "now".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+            if with_base_state {
+                base.conn().execute("INSERT INTO main.file_state(project,rel_path,sha256) VALUES('p','src/lib.ts','base')", []).unwrap();
+            }
+            let edge = greppy_store::NewRawEdge {
+                project: "p".into(),
+                file_path: "src/lib.ts".into(),
+                source_qname: "run".into(),
+                target_qname: "target".into(),
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"line": 2}),
+            };
+            if with_base_edges {
+                base.insert_raw_edges(&[edge.clone(), edge]).unwrap();
+            }
+        }
+        let overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            visibility,
+        )
+        .unwrap();
+        overlay.conn().execute_batch(
+            "INSERT INTO main.projects SELECT * FROM greppy_base.projects;
+             INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
+             SELECT project,file_path,source_qname,target_qname,edge_type,properties FROM greppy_base.raw_edges;
+             INSERT INTO main.js_ts_reference_override_files VALUES('p','src/lib.ts');
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');"
+        ).unwrap();
+        (scratch, overlay)
+    }
+
+    #[test]
+    fn overlay_publication_allows_complete_unchanged_js_repair() {
+        for with_base_edges in [false, true] {
+            let visibility = VisibilityIndex::default();
+            let (_scratch, overlay) =
+                unchanged_repair_edges_fixture(&visibility, true, with_base_edges);
+            validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_delta_paths_allow_only_complete_unchanged_repair_edges() {
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        for mutation in [
+            "DELETE FROM main.raw_edges",
+            "DELETE FROM main.raw_edges WHERE id=(SELECT MIN(id) FROM main.raw_edges)",
+            "INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties) SELECT project,file_path,source_qname,target_qname,edge_type,properties FROM main.raw_edges LIMIT 1",
+            "UPDATE main.raw_edges SET target_qname='rogue'",
+            "UPDATE main.raw_edges SET properties='{}'",
+            "DELETE FROM main.js_ts_reference_override_files",
+            "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
+        ] {
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+            overlay.conn().execute(mutation, []).unwrap();
+            assert!(private_delta_paths(&overlay).unwrap().contains("src/lib.ts"), "{mutation}");
+        }
+        for visibility in [
+            VisibilityIndex::new(["src/lib.ts".to_string()], Vec::<String>::new()).unwrap(),
+            VisibilityIndex::new(Vec::<String>::new(), ["src/lib.ts".to_string()]).unwrap(),
+        ] {
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&visibility, true, true);
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"));
+            overlay
+                .conn()
+                .execute("DELETE FROM main.raw_edges", [])
+                .unwrap();
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"));
+        }
+    }
+
+    #[test]
+    fn private_delta_paths_validate_overrides_even_without_private_edges() {
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, false);
+        assert!(
+            private_delta_paths(&overlay).unwrap().is_empty(),
+            "certified empty Base contribution must remain valid"
+        );
+        overlay
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
+                [],
+            )
+            .unwrap();
+        assert!(private_delta_paths(&overlay)
+            .unwrap()
+            .contains("src/lib.ts"));
+
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+        overlay.conn().execute_batch("DELETE FROM main.raw_edges; DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p';").unwrap();
+        assert!(private_delta_paths(&overlay)
+            .unwrap()
+            .contains("src/lib.ts"));
+
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), false, false);
+        assert!(
+            private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"),
+            "override without Base file identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn effect_fn_repair_does_not_republish_unchanged_base_edges() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("src/plain.ts"),
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "plain JS base"]);
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &VisibilityIndex::default(),
+        )
+        .unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
+        assert!(overlay.list_delta_raw_edges("p").unwrap().is_empty());
+        let count: i64 = overlay
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.js_ts_reference_override_files",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(!greppy_indexer::recover_visible_effect_fn_bindings(
+            &mut overlay,
+            "p",
+            repo.path()
+        )
+        .unwrap());
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn changed_clean_js_repair_and_legacy_migration_are_certified_without_ownership() {
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("src/plain.mjs"),
+            "export function target() {}
+export function caller() { target(); }
+",
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            // A byte-identical retained Base has facts from an older extractor.
+            base.conn().execute("INSERT INTO raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
+                VALUES('p','src/plain.mjs','src/plain.mjs::__file__','obsolete','USAGE','{}')", []).unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let visibility = VisibilityIndex::default();
+        let delta_path = scratch.path().join("delta.db");
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        overlay
+            .conn()
+            .execute(
+                "INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
+        assert!(!overlay.list_delta_raw_edges("p").unwrap().is_empty());
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        // Already-current v8 private facts must gain a certificate even when
+        // extraction finds no changes. The ordinary clean Base stays private-free.
+        overlay.conn().execute_batch(
+            "DELETE FROM main.schema_meta WHERE key LIKE 'greppy.js_ts_reference_repair_certificate_v1.%';
+             DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.p';"
+        ).unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        drop(overlay);
+        // Reopening validates persisted proof, not an in-memory exemption.
+        let overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        overlay
+            .conn()
+            .execute(
+                "UPDATE main.raw_edges SET target_qname='rogue' WHERE file_path='src/plain.mjs'",
+                [],
+            )
+            .unwrap();
+        assert!(validate_overlay_delta_visibility(&overlay, &visibility).is_err());
+    }
+
+    #[test]
+    fn derived_js_certificate_does_not_authorize_other_private_rows() {
+        for mutation in [
+            "INSERT INTO main.file_state(project,rel_path,sha256) VALUES('p','src/lib.ts','base')",
+            "UPDATE main.raw_edges SET properties='{}'",
+            "DELETE FROM main.raw_edges WHERE id=(SELECT MIN(id) FROM main.raw_edges)",
+            "INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties) SELECT project,file_path,source_qname,target_qname,edge_type,properties FROM main.raw_edges LIMIT 1",
+            "UPDATE main.schema_meta SET value='incomplete' WHERE key='greppy.effect_fn_repair_v9.p'",
+            "UPDATE main.schema_meta SET value='{}' WHERE key LIKE 'greppy.js_ts_reference_repair_certificate_v1.%'",
+        ] {
+            let visibility = VisibilityIndex::default();
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&visibility, true, true);
+            // Make the reference contribution intentionally differ from Base.
+            overlay.conn().execute("UPDATE main.raw_edges SET target_qname='repaired'", []).unwrap();
+            overlay.conn().execute("INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v9.p','complete')", []).unwrap();
+            overlay.certify_js_ts_reference_repair("p", "src/lib.ts", "base").unwrap();
+            validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+            overlay.conn().execute(mutation, []).unwrap();
+            assert!(validate_overlay_delta_visibility(&overlay, &visibility).is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn completed_jsx_base_recovery_keeps_delta_visibility_and_has_independent_trigger() {
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "JSX source"]);
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let state;
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            state = base
+                .get_workspace_state(repo.path().to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let visibility = VisibilityIndex::default();
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &visibility,
+        )
+        .unwrap();
+        overlay.upsert_workspace_state(&state).unwrap();
+        // Establish the independent Rust certificates through real resolution.
+        // JSX recovery must then clear its own pending state without relying
+        // on a synthetic Rust marker or completing unrelated repair work.
+        greppy_indexer::recover_persisted_rust_usages(&mut overlay, "p", repo.path()).unwrap();
+        greppy_indexer::rebuild_visible_overlay_edges(&mut overlay, "p").unwrap();
+        greppy_indexer::mark_rust_caller_edges_repaired(&overlay).unwrap();
+        assert!(greppy_indexer::anyhow_factory_edges_repaired(&overlay).unwrap());
+        assert!(!greppy_indexer::js_ts_usages_repaired(&overlay).unwrap());
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');").unwrap();
+        assert!(persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
+        assert!(
+            greppy_indexer::recover_persisted_js_ts_usages(&mut overlay, "p", repo.path()).unwrap()
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        assert!(!persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        let target = overlay
+            .get_node_by_qname("p", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(target.id, Some("USAGE"), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(overlay);
+        let hidden = VisibilityIndex::new(Vec::<String>::new(), vec!["view.tsx".into()]).unwrap();
+        let overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &hidden,
+        )
+        .unwrap();
+        assert!(overlay
+            .list_raw_edges("p")
+            .unwrap()
+            .iter()
+            .all(|edge| edge.file_path != "view.tsx"));
+        assert!(overlay
+            .incoming_edges(target.id, Some("USAGE"), 100)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

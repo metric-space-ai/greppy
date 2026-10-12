@@ -506,9 +506,8 @@ mod tests {
             }))
             .unwrap(),
         );
-        assert_eq!(
-            sanitize_human(evil).as_bytes().contains(&0x1b),
-            false,
+        assert!(
+            !sanitize_human(evil).as_bytes().contains(&0x1b),
             "{}",
             sanitize_human(evil)
         );

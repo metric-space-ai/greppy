@@ -41,11 +41,11 @@ pub struct Cli {
     pub no_gpu: bool,
 
     /// Cap the number of rows returned by navigation and search commands.
-    /// `--max` is accepted as a Postel-style alias; `--all` still lifts caps.
+    /// `--max` is an alias; `--all` lifts default caps but preserves an explicit --limit.
     #[arg(long, alias = "max", global = true, value_name = "N")]
     pub limit: Option<usize>,
 
-    /// Hard stdout payload budget for navigation, search, and read commands.
+    /// Hard stdout payload budget for navigation, search, read, and human web views.
     /// Result rows/content are trimmed before status and continuation metadata.
     #[arg(long, global = true, value_name = "N")]
     pub max_bytes: Option<usize>,
@@ -86,6 +86,9 @@ pub enum Command {
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
+        /// With `index status --json`, retain full provider, path and overlay diagnostics.
+        #[arg(long)]
+        diagnostics: bool,
         /// Warm the worktree and shared Base Store `greppy -p` will use.
         ///
         /// The built-in agent works in a per-repository worktree with its own
@@ -303,6 +306,9 @@ pub enum Command {
         /// Also print a compact edit handle for every printed span.
         #[arg(long)]
         handle: bool,
+        /// Emit a compact machine-readable file/range result.
+        #[arg(long)]
+        json: bool,
         /// Only results under this file or directory (repeatable).
         #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,
@@ -329,11 +335,14 @@ pub enum Command {
         file: String,
         #[arg(value_name = "OLD", allow_hyphen_values = true)]
         old: String,
+        /// Replacement text (stdin when omitted). With --regex, use $$ for a literal $.
         #[arg(value_name = "NEW", allow_hyphen_values = true)]
         new: Option<String>,
         #[arg(long)]
         expect: Option<usize>,
-        /// Treat OLD as a regular expression.
+        /// Treat OLD as a regular expression and expand capture references in NEW:
+        /// $1 or ${name} insert captures; $$ inserts a literal $ (use $$ROOT to
+        /// preserve shell $ROOT). Unknown capture references are refused before anything is written.
         #[arg(long)]
         regex: bool,
         #[arg(long = "dry-run")]
@@ -502,10 +511,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// What `S` calls — direct outgoing CALLS edges (the callees of `S`),
-    /// printed as `qualified_name file:line`. Backed by the search
-    /// `callees_of` helper. With `--code`, also prints each callee's
-    /// source span.
+    /// Resolved indexed definitions called by `S` — direct outgoing CALLS
+    /// edges, printed as `qualified_name file:line`. External or unresolved
+    /// calls are not included; an empty answer does not prove the source has
+    /// no calls. Use `greppy read S` for source. With `--code`, also prints
+    /// each resolved callee's source span.
     Callees {
         /// The symbols to answer for. Several are answered in one call:
         /// `greppy callees A B C`. `-` reads them from the pipe.
