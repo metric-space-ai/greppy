@@ -30,6 +30,7 @@ pub(crate) fn grep_passthrough_args(argv: &[OsString]) -> &[OsString] {
             || token_lossy.starts_with("--offset=")
             || token == "--no-gpu"
             || token == "--no-summaries"
+            || token == "--diagnostics"
         {
             index += 1;
             continue;
@@ -603,43 +604,18 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
 }
 
 /// Distinguish a command-like grep pattern from a typo without consuming stdin.
-/// Explicit `-` retains grep's unbounded producer wait; implicit input uses the
-/// same bounded producer grace and empty-input policy as normal passthrough.
+/// This bounded probe is only for ambiguous command-like patterns. Ordinary
+/// passthrough delegates stdin directly, including producers with arbitrary
+/// startup delay and closed empty streams.
 pub(crate) fn stdin_supplies_grep_pattern(args: &[OsString]) -> bool {
     match grep_stdin_demand(args) {
         StdinDemand::Explicit(_) => true,
-        StdinDemand::WhenNonTerminal(_) => stdin_availability() == StdinAvailability::Data,
+        StdinDemand::WhenNonTerminal(_) => matches!(
+            stdin_availability(),
+            StdinAvailability::Data | StdinAvailability::Empty
+        ),
         StdinDemand::None | StdinDemand::Unknown => false,
     }
-}
-
-pub(crate) fn missing_stdin_message(demand: StdinDemand<'_>, tool: &str) -> Option<String> {
-    let pattern = match (demand, stdin_availability()) {
-        (StdinDemand::None | StdinDemand::Unknown, _) => return None,
-        (StdinDemand::Explicit(_), _) => return None,
-        (StdinDemand::WhenNonTerminal(_), StdinAvailability::Terminal) => return None,
-        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::Data) => {
-            let _ = pattern;
-            return None;
-        }
-        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::Empty) => pattern,
-        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::IdleTimeout) => pattern,
-        (_, StdinAvailability::Unknown) => return None,
-    };
-
-    let mut message = format!(
-        "status: missing_input\nmessage: {tool} needs a file/path argument or data on stdin; stdin has no data after waiting for a producer\nnext: pass a file/path, pipe data into this command, or add `-` as the path to wait for a slow producer"
-    );
-    if let Some(pattern) = pattern {
-        let path = std::path::Path::new(pattern);
-        if path.is_dir() {
-            let shown = pattern.to_string_lossy();
-            message.push_str(&format!(
-                "\nnext: `{shown}` is an existing directory; if you meant to warm its code graph, run `greppy index {shown}`"
-            ));
-        }
-    }
-    Some(message)
 }
 
 #[cfg(test)]

@@ -152,3 +152,146 @@ fn short_fixed_match_is_unchanged_and_no_match_stays_nonzero() {
     let missing = fixture.run(&["search-pattern", "not_present", "--code"]);
     assert_eq!(missing.status.code(), Some(1));
 }
+
+fn page_headers(output: &Output) -> Vec<String> {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("page") && line.contains(".rs:"))
+        .map(|line| line.split_whitespace().next().unwrap().to_owned())
+        .collect()
+}
+
+fn page_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    for file in 0..6 {
+        let source = (0..2)
+            .map(|line| {
+                format!(
+                    "pub fn FMA_CODEC_VP9_{file}_{line}() -> i32 {{ {} }}\n",
+                    file * 2 + line
+                )
+            })
+            .collect::<String>();
+        std::fs::write(fixture.repo.join(format!("page{file}.rs")), source).unwrap();
+    }
+    fixture
+}
+
+#[test]
+fn text_pattern_offset_pages_complete_matches_without_repeats() {
+    let fixture = page_fixture();
+    for code in [false, true] {
+        let mut first = vec!["search-pattern", "FMA_CODEC_VP9", "--limit", "6"];
+        if code {
+            first.push("--code");
+        }
+        let initial = fixture.run(&first);
+        let first_headers = page_headers(&initial);
+        assert_eq!(
+            first_headers,
+            [
+                "page0.rs:1",
+                "page0.rs:2",
+                "page1.rs:1",
+                "page1.rs:2",
+                "page2.rs:1",
+                "page2.rs:2"
+            ]
+        );
+        let mut second = first.clone();
+        second.extend(["--offset", "6"]);
+        let next = fixture.run(&second);
+        let second_headers = page_headers(&next);
+        assert_eq!(
+            second_headers,
+            [
+                "page3.rs:1",
+                "page3.rs:2",
+                "page4.rs:1",
+                "page4.rs:2",
+                "page5.rs:1",
+                "page5.rs:2"
+            ]
+        );
+        let text = String::from_utf8(next.stdout).unwrap();
+        assert!(
+            text.contains("shown: 6\ntotal: 12\noffset: 6\ntruncated: false"),
+            "{text}"
+        );
+        let mut beyond = first.clone();
+        beyond.extend(["--offset", "20"]);
+        let empty = fixture.run(&beyond);
+        assert!(page_headers(&empty).is_empty());
+        assert!(String::from_utf8(empty.stdout)
+            .unwrap()
+            .contains("shown: 0\ntotal: 12\noffset: 20\ntruncated: false"));
+    }
+}
+
+#[test]
+fn text_pattern_byte_budget_advances_by_complete_matches() {
+    let fixture = page_fixture();
+    let first = fixture.run(&[
+        "search-pattern",
+        "FMA_CODEC_VP9",
+        "--code",
+        "--limit",
+        "6",
+        "--max-bytes",
+        "500",
+    ]);
+    let headers = page_headers(&first);
+    assert!(!headers.is_empty() && headers.len() < 6);
+    let text = String::from_utf8(first.stdout).unwrap();
+    assert!(
+        text.contains(&format!(
+            "shown: {}\ntotal: 12\noffset: 0\ntruncated: true",
+            headers.len()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("--offset {}", headers.len())),
+        "{text}"
+    );
+    assert!(
+        !text.contains("showing 6"),
+        "pre-budget count must not survive: {text}"
+    );
+    let next = fixture.run(&[
+        "search-pattern",
+        "FMA_CODEC_VP9",
+        "--code",
+        "--limit",
+        "6",
+        "--max-bytes",
+        "500",
+        "--offset",
+        &headers.len().to_string(),
+    ]);
+    let next_headers = page_headers(&next);
+    assert!(!next_headers.is_empty());
+    assert!(next_headers.iter().all(|header| !headers.contains(header)));
+}
+
+#[test]
+fn text_pattern_all_preserves_explicit_limit_and_offset() {
+    let fixture = page_fixture();
+    let output = fixture.run(&[
+        "search-pattern",
+        "FMA_CODEC_VP9",
+        "--all",
+        "--code",
+        "--limit",
+        "2",
+        "--offset",
+        "2",
+    ]);
+    assert_eq!(page_headers(&output), ["page1.rs:1", "page1.rs:2"]);
+}

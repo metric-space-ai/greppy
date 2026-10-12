@@ -66,6 +66,7 @@ fn main() {
         task: "code",
         graph_generation: Some(1),
         file_path: None,
+        path_prefixes: None,
         min_score: None,
         limit: 20,
     };

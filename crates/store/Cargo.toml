@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # Enables `Connection::commit_hook`, used only by the fsync-batching
 # regression test to count committed write transactions precisely.

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::MutableHandleValue;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{reflect_dom_object_with_cx, Reflector};
 
 use crate::dom::bindings::codegen::Bindings::DataTransferItemListBinding::DataTransferItemListMethods;
 use crate::dom::bindings::error::{Error, Fallible};
@@ -157,7 +157,12 @@ impl DataTransferItemListMethods<crate::DomTypeHolder> for DataTransferItemList 
             type_.make_ascii_lowercase();
             let bytes = data.file_bytes().unwrap_or_default();
             let name = data.name().clone();
-            data_store.add(Kind::File { bytes, name, type_ })
+            data_store.add(Kind::File {
+                bytes,
+                name,
+                type_,
+                modified: data.get_modified(),
+            })
         };
         index.map(|id| {
             self.frozen_types.clear();

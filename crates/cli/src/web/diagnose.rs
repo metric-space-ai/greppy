@@ -87,6 +87,18 @@ pub enum TraceCommand {
     },
 }
 
+pub(super) fn requests_json(command: &DiagnoseCommand) -> bool {
+    match command {
+        DiagnoseCommand::Console { json, .. }
+        | DiagnoseCommand::Network { json, .. }
+        | DiagnoseCommand::Endpoint { json }
+        | DiagnoseCommand::Events { json, .. } => *json,
+        DiagnoseCommand::Trace { command } => match command {
+            TraceCommand::Start { json, .. } | TraceCommand::Stop { json, .. } => *json,
+        },
+    }
+}
+
 /// Refuse a command that the compatibility contract lists as `unsupported`.
 ///
 /// The contract's own vocabulary requires these to fail explicitly: a silent

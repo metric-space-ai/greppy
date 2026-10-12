@@ -45,6 +45,20 @@ pub(crate) fn wait_io_budget(deadline: Option<Instant>, fallback: Duration) -> D
     }
 }
 
+/// Completed slots are consumed by one evaluation. A shorter callback timeout
+/// can lose that completion, so strict callers spend their original remainder.
+pub(crate) fn wait_completion_budget(deadline: Option<Instant>) -> Duration {
+    let Some(deadline) = deadline else {
+        return Duration::from_millis(80);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining < Duration::from_millis(1) {
+        Duration::ZERO
+    } else {
+        remaining
+    }
+}
+
 pub(crate) fn wait_error_detail(message: &str) -> (&'static str, &'static str, &'static str) {
     if message.contains("INVALID_WAIT_PREDICATE") {
         (
@@ -156,5 +170,15 @@ mod tests {
         }
         assert_eq!(wait_error_detail("STALE_REF: replaced").0, "STALE_REF");
         assert_eq!(wait_error_detail("timeout: waitForFunction").0, "TIMEOUT");
+    }
+
+    #[test]
+    fn destructive_completion_read_spends_original_remainder() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let budget = wait_completion_budget(Some(deadline));
+        assert!(budget > Duration::from_millis(120));
+        assert!(budget <= Duration::from_secs(2));
+        assert_eq!(wait_completion_budget(Some(Instant::now())), Duration::ZERO);
+        assert_eq!(wait_completion_budget(None), Duration::from_millis(80));
     }
 }

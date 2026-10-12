@@ -605,9 +605,59 @@ pub(crate) fn detach_command(command: &mut std::process::Command) {
     }
 }
 
+/// Mark ambient descriptors close-on-exec in the detached child only.
+/// Register this before any explicit child FD handoff: a later `dup2` hook
+/// installs that channel at its fixed descriptor and clears CLOEXEC there.
+/// Rust's exec-error pipe remains open long enough to report pre-exec/exec
+/// failures and is closed automatically only by a successful exec.
+#[cfg(unix)]
+pub(crate) fn seal_detached_child_fds(command: &mut std::process::Command) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let maximum = unsafe { libc::getdtablesize() };
+    if maximum < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe {
+        command.pre_exec(move || {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    libc::c_uint::MAX,
+                    CLOSE_RANGE_CLOEXEC,
+                ) == 0
+                {
+                    return Ok(());
+                }
+            }
+            for fd in 3..maximum {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0
+                    && flags & libc::FD_CLOEXEC == 0
+                    && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn seal_detached_child_fds(_command: &mut std::process::Command) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        // Inference owners outlive a requesting workflow and must release
+        // its host admission lease and other ambient channels on exec.
+        seal_detached_child_fds(command)?;
         detach_command(command);
         command.spawn().map(|_| ())
     }
@@ -2122,6 +2172,276 @@ fn wide_string(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn inheritable_locked_file(path: &std::path::Path) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let fd = file.as_raw_fd();
+        assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        file
+    }
+
+    #[cfg(unix)]
+    fn lock_available(path: &std::path::Path) -> bool {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn sleeping_child() -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_fd_seal_releases_parent_lease_while_daemon_remains_alive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        use std::os::fd::AsRawFd;
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = sleeping_child();
+        seal_detached_child_fds(&mut command).unwrap();
+        let mut daemon = command.spawn().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
+        drop(lease);
+        assert!(
+            lock_available(&path),
+            "detached daemon inherited the host lease"
+        );
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon did not remain alive"
+        );
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_spawn_entrypoint_drops_lease_while_detached_owner_stays_live() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        struct OwnedProbe {
+            pid: libc::pid_t,
+            stop: std::os::unix::net::UnixStream,
+        }
+        impl Drop for OwnedProbe {
+            fn drop(&mut self) {
+                let _ = self.stop.write_all(b"stop\n");
+                // Only reap our direct child. Its explicit stdin channel
+                // also closes when this parent exits; no unrelated daemon
+                // or PID receives a signal.
+                let mut status = 0;
+                loop {
+                    let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                    if result >= 0
+                        || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let marker = temp.path().join("owned.pid");
+        let (stop_reader, stop_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stderr_path = temp.path().join("owned.stderr");
+        let started = std::time::Instant::now();
+        let (mut pid_reader, pid_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let pid_fd = pid_writer.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$$\" > \"$1\"; IFS= read -r stop",
+                "greppy-owned-detached-probe",
+            ])
+            .arg(&marker)
+            .stdin(std::process::Stdio::from(OwnedFd::from(stop_reader)))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        // Capture the exact child PID before exec. A successful spawn means
+        // these bytes were already written, so cleanup ownership is installed
+        // before any readiness deadline can fail.
+        unsafe {
+            command.pre_exec(move || {
+                let bytes = libc::getpid().to_ne_bytes();
+                if libc::write(pid_fd, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        spawn_detached(&mut command).unwrap();
+        drop(pid_writer);
+        let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        pid_reader.read_exact(&mut bytes).unwrap();
+        let pid = libc::pid_t::from_ne_bytes(bytes);
+        let _owner = OwnedProbe {
+            pid,
+            stop: stop_writer,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(ready_pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.parse::<libc::pid_t>().ok())
+            {
+                assert_eq!(ready_pid, pid);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned detached probe did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
+        drop(lease);
+        assert!(
+            lock_available(&path),
+            "inference spawn retained the parent's host lease"
+        );
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            0,
+            "detached owner already exited; that cannot prove descriptor sealing; \
+             wait status={status}, elapsed={:?}, stderr={:?}",
+            started.elapsed(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_spawn_failure_preserves_parent_descriptor_flags() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = std::process::Command::new(temp.path().join("missing-inference-owner"));
+        assert!(spawn_detached(&mut command).is_err());
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            before
+        );
+        drop(lease);
+        assert!(lock_available(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_running_child_still_retains_inherited_parent_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let mut child = sleeping_child().spawn().unwrap();
+        drop(lease);
+        assert!(
+            !lock_available(&path),
+            "ordinary heavy child lost its inherited lease"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child did not remain alive"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(lock_available(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_ordinary_spawn_keeps_lease_while_detached_child_drops_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let detached_barrier = barrier.clone();
+        let detached = std::thread::spawn(move || {
+            let mut command = sleeping_child();
+            seal_detached_child_fds(&mut command).unwrap();
+            detached_barrier.wait();
+            command.spawn().unwrap()
+        });
+        let ordinary_barrier = barrier.clone();
+        let ordinary = std::thread::spawn(move || {
+            let mut command = sleeping_child();
+            ordinary_barrier.wait();
+            command.spawn().unwrap()
+        });
+        barrier.wait();
+        let mut detached = detached.join().unwrap();
+        let mut ordinary = ordinary.join().unwrap();
+        drop(lease);
+        assert!(
+            !lock_available(&path),
+            "concurrent ordinary child lost the lease"
+        );
+        let _ = ordinary.kill();
+        let _ = ordinary.wait();
+        assert!(lock_available(&path), "detached child retained the lease");
+        assert!(detached.try_wait().unwrap().is_none());
+        let _ = detached.kill();
+        let _ = detached.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_detached_spawn_does_not_change_parent_descriptor_flags() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = std::process::Command::new(temp.path().join("missing-runtime"));
+        seal_detached_child_fds(&mut command).unwrap();
+        assert!(command.spawn().is_err());
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(lease);
+        assert!(lock_available(&path));
+    }
 
     #[test]
     fn runtime_status_reports_only_the_loaded_backend() {

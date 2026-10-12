@@ -675,8 +675,12 @@ fn browser_documented_command_paths_parse_including_nested_verbs() {
 
 #[test]
 fn browser_command_path_guard_retains_invalid_nested_verb() {
-    let paths = web_command_paths_named_in("  greppy web session new   a context\n");
-    let path = vec!["web".to_owned(), "session".to_owned(), "new".to_owned()];
+    let paths = web_command_paths_named_in("  greppy web session invalid-verb   a context\n");
+    let path = vec![
+        "web".to_owned(),
+        "session".to_owned(),
+        "invalid-verb".to_owned(),
+    ];
     assert!(paths.contains(&path));
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_greppy"))
         .args(&path)

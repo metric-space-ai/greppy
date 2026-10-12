@@ -38,7 +38,25 @@ pub struct ExpandPack {
 impl Store {
     pub fn insert_expand_pack(&self, pack: &NewExpandPack) -> Result<String> {
         let now = unix_now_secs();
-        let ttl = pack.ttl_secs.max(1);
+        let mut ttl = pack.ttl_secs.max(1);
+        if pack.command == "bash-smart" {
+            if let Some(payload) = pack
+                .payload_json
+                .as_ref()
+                .filter(|payload| payload.get("retained_artifact_dir").is_some())
+            {
+                let deadline = payload
+                    .get("retained_until")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| Error::Store("retained capture deadline missing".into()))?;
+                ttl = ttl.min(deadline.saturating_sub(now.saturating_add(60)));
+                if ttl == 0 {
+                    return Err(Error::Store(
+                        "retained capture deadline elapsed; no expansion handle published".into(),
+                    ));
+                }
+            }
+        }
         let expires_at = now.saturating_add(ttl);
         self.prune_expired_expand_packs_at(now)?;
 
@@ -106,12 +124,18 @@ impl Store {
     }
 
     pub fn prune_expired_expand_packs_at(&self, now: u64) -> Result<usize> {
-        self.conn()
+        let removed = self
+            .conn()
             .execute(
                 "DELETE FROM expand_packs WHERE expires_at <= ?1",
                 params![now as i64],
             )
-            .map_err(Error::Sqlite)
+            .map_err(Error::Sqlite)?;
+        if let Err(error) = self.prune_retained_captures_at(now.min(unix_now_secs())) {
+            // Optional artifact GC must not break unrelated packs or execution.
+            tracing::warn!(%error, "retained capture cleanup deferred");
+        }
+        Ok(removed)
     }
 }
 

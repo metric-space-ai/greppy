@@ -264,7 +264,7 @@ pub mod rust_queries {
             name: (type_identifier) @enum_name
             body: (enum_variant_list
                 (enum_variant
-                    name: (identifier) @enum_variant)))
+                    name: (identifier) @enum_variant) @enum_variant_item))
 
         (const_item
             name: (identifier) @assoc_const) @assoc_const_item
@@ -357,7 +357,7 @@ pub mod js_queries {
             name: (identifier) @name) @def
 
         (method_definition
-            name: (property_identifier) @name) @def
+            name: (_) @name) @def
 
         (variable_declarator
             name: (identifier) @name
@@ -418,7 +418,7 @@ pub mod ts_queries {
             name: (type_identifier) @name) @def
 
         (method_definition
-            name: (property_identifier) @name) @def
+            name: (_) @name) @def
 
         (variable_declarator
             name: (identifier) @name

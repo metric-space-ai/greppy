@@ -127,6 +127,20 @@ mod tests {
     }
 
     #[test]
+    fn built_in_prompt_retains_approved_pre_reading_guidance() {
+        use sha2::{Digest, Sha256};
+        // Restore the pre-e3261805 wording, matching the approved public
+        // contract. Prompt changes require explicit owner approval in both
+        // surfaces; a green guard must not silently add an unapproved block.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(SYSTEM_PROMPT.as_bytes())),
+            "ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1"
+        );
+        assert!(SYSTEM_PROMPT.contains("read S | read-smart S"));
+        assert!(SYSTEM_PROMPT.contains("read-file PATH [--lines A:B]"));
+    }
+
+    #[test]
     fn system_prompt_non_empty_and_under_8_kib() {
         assert!(!SYSTEM_PROMPT.is_empty());
         assert!(

@@ -39,6 +39,10 @@ type AttachHold = Box<dyn Send>;
 type PrepareAttachFd = fn(&mut Command) -> io::Result<AttachHold>;
 pub static PREPARE_ATTACH_FD: OnceLock<PrepareAttachFd> = OnceLock::new();
 
+/// Host-provided contextual signal, appended to the captured tool envelope.
+/// The subprocess byte streams and its exit status remain unchanged.
+pub type ContextStatusHook = fn(&Path, &[String], &str) -> Option<String>;
+
 /// Credential / secret env vars stripped from every tool subprocess.
 ///
 /// This is a **blocklist**, not a sandbox: PATH, HOME, and everything else
@@ -68,6 +72,7 @@ pub struct GreppyEnv {
     greppy_timeout: Duration,
     max_output_bytes: usize,
     sandbox: SandboxMode,
+    context_status: Option<(String, ContextStatusHook)>,
 }
 
 impl GreppyEnv {
@@ -85,6 +90,7 @@ impl GreppyEnv {
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             sandbox: SandboxMode::Off,
+            context_status: None,
         })
     }
 
@@ -114,6 +120,19 @@ impl GreppyEnv {
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
         self
+    }
+
+    /// Attach the host contextual status engine for this agent session.
+    pub fn with_context_status(mut self, scope: String, hook: ContextStatusHook) -> Self {
+        self.context_status = Some((scope, hook));
+        self
+    }
+
+    /// Keep resumed sessions bound to their saved session identity.
+    pub fn set_context_scope(&mut self, scope: &str) {
+        if let Some((current, _)) = self.context_status.as_mut() {
+            *current = scope.to_owned();
+        }
     }
 
     /// Run the startup self-check through this env's production tool path.
@@ -182,6 +201,10 @@ impl GreppyEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_tool_env(&mut cmd);
+        if let Some((scope, _)) = self.context_status.as_ref() {
+            cmd.env("GREPPY_CONTEXT_SCOPE", scope)
+                .env("GREPPY_CONTEXT_ENVELOPE", "1");
+        }
         // Register attach pre_exec AFTER sandbox::apply so callbacks run
         // sandbox first, then child-local dup2 onto FD 4.
         let attach_hold = if args.first().map(String::as_str) == Some("web") {
@@ -204,13 +227,30 @@ impl GreppyEnv {
 
         match run_capture_held(&mut cmd, Some(timeout), attach_hold) {
             Ok(captured) => {
-                let mut outcome = finalize_outcome(captured, self.max_output_bytes);
+                let actual_success = captured.success && !captured.timed_out;
+                let mut outcome = finalize_outcome(
+                    captured,
+                    self.max_output_bytes,
+                    matches!(args.first().map(String::as_str), Some("search" | "context")),
+                );
                 if args.first().map(String::as_str) == Some("web")
                     && args.get(1).map(String::as_str) == Some("screenshot")
                 {
                     if let Some(data) = extract_png_base64(&outcome.content) {
                         outcome.image_png_base64 = Some(data);
                         outcome.content = "screenshot attached as image for the model".to_owned();
+                    }
+                }
+                if actual_success {
+                    if let Some((scope, hook)) = self.context_status.as_ref() {
+                        if let Some(notice) =
+                            hook(&self.root, &args, scope).filter(|notice| notice.len() <= 1024)
+                        {
+                            if !outcome.content.is_empty() && !outcome.content.ends_with('\n') {
+                                outcome.content.push('\n');
+                            }
+                            outcome.content.push_str(&notice);
+                        }
                     }
                 }
                 outcome
@@ -329,6 +369,7 @@ struct Captured {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     success: bool,
+    exit_code: Option<i32>,
     timed_out: bool,
     timeout: Option<Duration>,
 }
@@ -427,6 +468,7 @@ fn run_capture_held(
         stdout,
         stderr,
         success: status.success(),
+        exit_code: status.code(),
         timed_out,
         timeout,
     })
@@ -476,7 +518,11 @@ fn extract_png_base64(stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome {
+fn finalize_outcome(
+    captured: Captured,
+    max_output_bytes: usize,
+    semantic_query: bool,
+) -> ToolOutcome {
     if captured.timed_out {
         let secs = captured.timeout.map(|d| d.as_secs()).unwrap_or_default();
         // Still surface any partial output so the model has context, then the
@@ -491,23 +537,25 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
     }
 
     let body = merge_stdio(&captured.stdout, &captured.stderr);
-    // Narrow detection of the retryable semantic-index build status greppy
-    // prints on stdout when embeddings are incomplete (exit 1). That status
-    // must never reach the model as an error — the agent should retry soon
-    // and use name/text search meanwhile.
-    //
-    // Emitting site: `embedding_progress_text` in `crates/cli/src/inference.rs`
-    // (also called from search.rs / context.rs / indexing.rs). Stable prefix
-    // is the literal below (em dash U+2014). Match that prefix only — do not
-    // re-derive from JSON fields here (text form is what the tool captures).
-    if is_retryable_semantic_index_building(&body) {
+    // Only a semantic query's exit-1 preparation status is pending. Text
+    // returned by read/rg/bash-smart, a successful query, or a genuine failure
+    // must retain its actual outcome even if it contains this status phrase.
+    if semantic_query
+        && captured.exit_code == Some(1)
+        && is_retryable_semantic_index_building(&body)
+        && String::from_utf8_lossy(&captured.stdout)
+            .lines()
+            .all(|line| line.is_empty() || semantic_preparation_line(line))
+        && semantic_preparation_stderr(&captured.stderr)
+    {
         let mut msg = body;
         if !msg.is_empty() && !msg.ends_with('\n') {
             msg.push('\n');
         }
         msg.push_str(
-            "semantic index still building — not an error. Retry this same command \
-             shortly; meanwhile use search-symbol or search-pattern for name/text matches.",
+            "Pending semantic result: keep this query pending and retry the same command \
+             after the reported ETA. If ETA is measuring, obtain an estimate with index status \
+             before retrying. Index preparation is reused by that retry.",
         );
         let msg = truncate_output(msg, max_output_bytes);
         return ToolOutcome::ok(msg);
@@ -539,16 +587,78 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
 ///
 /// Must match the format string in `crates/cli/src/inference.rs`
 /// (`embedding_progress_text`): `"semantic index building — {completed}/…"`.
+#[cfg(test)]
 const SEMANTIC_INDEX_BUILDING_PREFIX: &str = "semantic index building —";
 
-/// True when tool output is the retryable "semantic index building" status.
-///
-/// Matches the CLI's text form by its stable prefix (em dash U+2014). Exit
-/// code is ignored — the status prints with exit 1, which would otherwise
-/// surface as a tool error. Emitting site: `embedding_progress_text` in
-/// `crates/cli/src/inference.rs`.
+/// Recognize a complete CLI status line, not a substring in source or hints.
 fn is_retryable_semantic_index_building(body: &str) -> bool {
-    body.contains(SEMANTIC_INDEX_BUILDING_PREFIX)
+    body.lines().any(semantic_preparation_line)
+}
+
+fn semantic_preparation_line(line: &str) -> bool {
+    fn number(text: &str) -> Option<u64> {
+        (!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    }
+    let line = line.strip_prefix("semantic-search: ").unwrap_or(line);
+    let Some(rest) = line.strip_prefix("semantic index building — ") else {
+        return false;
+    };
+    let Some((counts, rest)) = rest.split_once(" spans, ETA ") else {
+        return false;
+    };
+    let Some((completed, total)) = counts.split_once('/') else {
+        return false;
+    };
+    let (Some(completed), Some(total)) = (number(completed), number(total)) else {
+        return false;
+    };
+    if completed > total {
+        return false;
+    }
+    let Some((eta, backend)) = rest.rsplit_once(" (backend ") else {
+        return false;
+    };
+    let Some(backend) = backend.strip_suffix(')') else {
+        return false;
+    };
+    if backend.is_empty()
+        || !backend
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return false;
+    }
+    if eta == "measuring" {
+        return true;
+    }
+    let Some(eta) = eta.strip_prefix('~') else {
+        return false;
+    };
+    match eta.split(' ').collect::<Vec<_>>().as_slice() {
+        [seconds] if seconds.ends_with('s') => {
+            number(&seconds[..seconds.len() - 1]).is_some_and(|s| s < 60)
+        }
+        [minutes] if minutes.ends_with('m') => {
+            number(&minutes[..minutes.len() - 1]).is_some_and(|m| m > 0)
+        }
+        [minutes, seconds] if minutes.ends_with('m') && seconds.ends_with('s') => {
+            number(&minutes[..minutes.len() - 1]).is_some_and(|m| m > 0)
+                && number(&seconds[..seconds.len() - 1]).is_some_and(|s| s > 0 && s < 60)
+        }
+        _ => false,
+    }
+}
+
+/// A pending status must never hide a separate fatal diagnostic.
+fn semantic_preparation_stderr(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).lines().all(|line| {
+        line.is_empty()
+            || semantic_preparation_line(line)
+            || line == "greppy: search still running; no detailed progress is available"
+            || line == "greppy: search still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state"
+    })
 }
 
 /// True when tool output looks like a write-sandbox refusal.
@@ -1203,16 +1313,94 @@ exit 2
             "content={}",
             out.content
         );
-        assert!(
-            out.content.contains("search-symbol") || out.content.contains("search-pattern"),
-            "must advise interim name/text search; content={}",
-            out.content
-        );
+        assert!(out.content.contains("Pending semantic result:"));
+        assert!(out.content.contains("reported ETA"));
+        assert!(!out.content.contains("search-symbol"));
+        assert!(!out.content.contains("search-pattern"));
         assert!(
             out.content.to_ascii_lowercase().contains("retry"),
             "must tell the model to retry; content={}",
             out.content
         );
+    }
+
+    #[test]
+    fn missing_progress_recovery_hint_is_nonfatal_but_other_diagnostics_are_not_hidden() {
+        let progress = "greppy: search still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state";
+        assert!(semantic_preparation_stderr(progress.as_bytes()));
+        assert!(!semantic_preparation_stderr(
+            format!("{progress}\nfailed to open index").as_bytes()
+        ));
+        assert!(!semantic_preparation_stderr(
+            format!("{progress} failed").as_bytes()
+        ));
+    }
+
+    #[test]
+    fn semantic_preparation_status_grammar_and_diagnostics() {
+        for line in [
+            "semantic index building — 0/12 spans, ETA measuring (backend metal)",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda)",
+            "semantic-search: semantic index building — 3/12 spans, ETA ~2m (backend metal)",
+            "semantic index building — 3/12 spans, ETA ~86m 23s (backend cuda-q4k)",
+        ] {
+            assert!(semantic_preparation_line(line), "{line}");
+            for stderr in [false, true] {
+                let redirect = if stderr { " >&2" } else { "" };
+                let (mut env, _, _) =
+                    env_with_stub(&format!("printf '%s\n' '{line}'{redirect}\nexit 1"));
+                let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+                assert!(!out.is_error && out.content.contains("Pending semantic result:"));
+            }
+        }
+        for line in [
+            "semantic index building —",
+            "semantic index building — failed to open index",
+            "semantic index building — 3/no spans, ETA ~9s (backend cuda)",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda) failed",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda failed)",
+            "semantic index building — 3/12 spans, ETA ~2m 90s (backend cuda)",
+        ] {
+            assert!(!semantic_preparation_line(line), "{line}");
+            for stderr in [false, true] {
+                let redirect = if stderr { " >&2" } else { "" };
+                let (mut env, _, _) =
+                    env_with_stub(&format!("printf '%s\n' '{line}'{redirect}\nexit 1"));
+                let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+                assert!(out.is_error && !out.content.contains("Pending semantic result:"));
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_status_text_preserves_success_and_other_tool_failures() {
+        let exact = "semantic index building — 3/12 spans, ETA ~9s (backend metal)";
+        for (command, exit, expected_error) in [
+            ("read-file", 1, true),
+            ("bash-smart", 1, true),
+            ("search", 0, false),
+            ("search", 13, true),
+        ] {
+            let stub = format!("printf '%s\n' '{exact}'\nexit {exit}\n");
+            let (mut env, _, _) = env_with_stub(&stub);
+            let out = env.call_tool("greppy", &json!({"args": [command, "target"]}));
+            assert_eq!(out.is_error, expected_error, "{command}: {}", out.content);
+            assert!(!out.content.contains("Pending semantic result:"));
+        }
+    }
+
+    #[test]
+    fn semantic_status_cannot_hide_a_fatal_diagnostic_or_source_substring() {
+        for stub in [
+            "printf 'semantic index building — 3/12 spans, ETA ~9s (backend metal)\n'; printf 'greppy: failed to open index\n' >&2; exit 1",
+            "printf 'source says semantic index building — 3/12 spans\n'; exit 1",
+            "printf 'semantic index building — 3/12 spans, ETA ~9s (backend metal)\nfailed to open index\n'; exit 1",
+        ] {
+            let (mut env, _, _) = env_with_stub(stub);
+            let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+            assert!(out.is_error, "{}", out.content);
+            assert!(!out.content.contains("Pending semantic result:"));
+        }
     }
 
     #[test]

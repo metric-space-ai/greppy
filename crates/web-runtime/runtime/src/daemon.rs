@@ -1,6 +1,6 @@
 //! Unix-socket client/supervisor daemon (guide §6.3, §9).
 
-use crate::artifacts::ArtifactStore;
+use crate::artifacts::{ArtifactStore, ArtifactTransfer};
 use crate::locator_diagnostics::{failure_observation_budget, recovery_for_locator_error, recovery_with_observed_state};
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
@@ -56,8 +56,13 @@ mod network_record_tests {
     }
 }
 
-fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<PathBuf, String> {
-    Ok(std::env::temp_dir()
+fn script_stage_dir(
+    controller_root: &Path,
+    run_id: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Result<PathBuf, String> {
+    Ok(controller_root
         .join("greppy-web-runtime")
         .join(isolated_id(run_id)?)
         .join("sessions")
@@ -66,14 +71,19 @@ fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<
         .join(isolated_id(request_id)?))
 }
 
-fn remove_script_stage(run_id: &str, session_id: &str, request_id: Option<&str>) {
+fn remove_script_stage(
+    controller_root: &Path,
+    run_id: &str,
+    session_id: &str,
+    request_id: Option<&str>,
+) {
     let Ok(run_id) = isolated_id(run_id) else {
         return;
     };
     let Ok(session_id) = isolated_id(session_id) else {
         return;
     };
-    let mut path = std::env::temp_dir()
+    let mut path = controller_root
         .join("greppy-web-runtime")
         .join(run_id)
         .join("sessions")
@@ -89,6 +99,7 @@ fn remove_script_stage(run_id: &str, session_id: &str, request_id: Option<&str>)
 }
 
 struct ScriptStageGuard {
+    controller_root: PathBuf,
     run_id: String,
     session_id: String,
     request_id: String,
@@ -96,7 +107,12 @@ struct ScriptStageGuard {
 
 impl Drop for ScriptStageGuard {
     fn drop(&mut self) {
-        remove_script_stage(&self.run_id, &self.session_id, Some(&self.request_id));
+        remove_script_stage(
+            &self.controller_root,
+            &self.run_id,
+            &self.session_id,
+            Some(&self.request_id),
+        );
     }
 }
 
@@ -153,6 +169,7 @@ fn path_is_within_root(root: &Path, candidate: &Path) -> bool {
     candidate.starts_with(root)
 }
 fn stage_script_for_controller(
+    controller_root: &Path,
     script_file: &str,
     run_id: &str,
     session_id: &str,
@@ -168,7 +185,7 @@ fn stage_script_for_controller(
         .parent()
         .ok_or_else(|| "script file has no parent directory".to_owned())?;
     refuse_unbounded_script_root(root)?;
-    let dest = script_stage_dir(run_id, session_id, request_id)?;
+    let dest = script_stage_dir(controller_root, run_id, session_id, request_id)?;
     if dest.exists() {
         let _ = std::fs::remove_dir_all(&dest);
     }
@@ -208,6 +225,24 @@ fn copy_granted_modules(
     files: &mut u32,
     bytes: &mut u64,
 ) -> Result<(), String> {
+    if !path_is_within_root(root, from) {
+        return Err("script walk escaped granted root".to_owned());
+    }
+    std::fs::create_dir_all(to).map_err(|error| format!("cannot stage script dir: {error}"))?;
+    let staging_root = to
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize staged root: {error}"))?;
+    copy_granted_modules_excluding_destination(root, from, to, &staging_root, files, bytes)
+}
+
+fn copy_granted_modules_excluding_destination(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    staging_root: &Path,
+    files: &mut u32,
+    bytes: &mut u64,
+) -> Result<(), String> {
     const MAX_FILES: u32 = 128;
     const MAX_BYTES: u64 = 4 * 1024 * 1024;
     let from_canon = from
@@ -237,7 +272,16 @@ fn copy_granted_modules(
             return Err("staged path escaped destination directory".to_owned());
         }
         if file_type.is_dir() {
-            copy_granted_modules(root, &entry.path(), &dest, files, bytes)?;
+            let source_dir = entry.path().canonicalize()
+                .map_err(|error| format!("cannot canonicalize script walk: {error}"))?;
+            // TMPDIR can be below the granted script root. Never traverse
+            // this request's output as input, including through its parents.
+            if source_dir == staging_root {
+                continue;
+            }
+            copy_granted_modules_excluding_destination(
+                root, &source_dir, &dest, staging_root, files, bytes,
+            )?;
             continue;
         }
         if !file_type.is_file() {
@@ -275,6 +319,7 @@ fn copy_granted_modules(
 pub struct DaemonConfig {
     pub socket: PathBuf,
     pub run_id: String,
+    pub runtime_image_id: String,
     pub fixture_url: Option<String>,
     pub search_endpoint: Option<String>,
     pub idle_ttl: Duration,
@@ -667,6 +712,7 @@ fn accept_loop(
 struct Daemon {
     socket: PathBuf,
     run_id: String,
+    runtime_image_id: String,
     fixture_url: String,
     search_endpoint: Option<String>,
     ever_had_session: bool,
@@ -794,6 +840,7 @@ impl Daemon {
         Ok(Self {
             socket: config.socket,
             run_id: config.run_id.clone(),
+            runtime_image_id: config.runtime_image_id,
             fixture_url: config.fixture_url.unwrap_or_default(),
             search_endpoint: config.search_endpoint,
             store: ArtifactStore::new(data_root)?,
@@ -1069,6 +1116,7 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
+            "web.structured_dom" => self.web_structured_dom(&request),
             "web.wait" => self.web_wait(&request),
             "web.workflow" => self.web_workflow(&request),
             "web.tab.new" => self.web_tab(&request, "new"),
@@ -1106,18 +1154,21 @@ impl Daemon {
     }
 
     fn handshake(&self, request: &Request) -> Response {
+        let mut handshake = Handshake::runtime_facts();
+        handshake.runtime_build_id = self.runtime_image_id.clone();
         let mut response = Response::ok(
             request,
             serde_json::json!({
                 "label": "experimental web-runtime spike",
             }),
         );
-        response.handshake = Some(Handshake::runtime_facts());
+        response.handshake = Some(handshake);
         response
     }
 
     fn doctor(&self, request: &Request) -> Response {
-        let handshake = Handshake::runtime_facts();
+        let mut handshake = Handshake::runtime_facts();
+        handshake.runtime_build_id = self.runtime_image_id.clone();
         let executable = std::env::current_exe()
             .ok()
             .map(|path| path.display().to_string());
@@ -1163,7 +1214,7 @@ impl Daemon {
             serde_json::json!({
                 "label": "experimental web-runtime spike",
                 "runtime_version": "0.1.0",
-                "runtime_build_id": "web-runtime-0.1.0",
+                "runtime_build_id": self.runtime_image_id.clone(),
                 "playwright_compatibility_version": "1.62.1",
                 "compatibility_coverage_level": "unverified",
                 "process_health": {
@@ -1695,6 +1746,20 @@ impl Daemon {
             .get("script_file")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+        if !self.controller.is_running() {
+            if let Err(error) = self.recover_controller("controller worker exited") {
+                self.finish_session(&session_id);
+                return engine_error(request, error, 33);
+            }
+        }
+        let Some(controller_root) = self.controller.temp_dir().map(Path::to_path_buf) else {
+            self.finish_session(&session_id);
+            return engine_error(
+                request,
+                "controller has no isolated script staging root",
+                33,
+            );
+        };
         let (specifier, mut source) = match (file, source) {
             (Some(path), maybe_text) => {
                 let text = match maybe_text {
@@ -1717,6 +1782,7 @@ impl Daemon {
                     },
                 };
                 match stage_script_for_controller(
+                    &controller_root,
                     &path,
                     &self.run_id,
                     &session_id,
@@ -1764,6 +1830,7 @@ impl Daemon {
         }
         let _stage_guard = if specifier != "greppy:stdin" {
             Some(ScriptStageGuard {
+                controller_root,
                 run_id: self.run_id.clone(),
                 session_id: session_id.clone(),
                 request_id: request.request_id.clone(),
@@ -1771,12 +1838,6 @@ impl Daemon {
         } else {
             None
         };
-        if !self.controller.is_running() {
-            if let Err(error) = self.recover_controller("controller worker exited") {
-                self.finish_session(&session_id);
-                return engine_error(request, error, 33);
-            }
-        }
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
         let content_cpu_baseline_ns = sample_cpu_ns(content_pid);
@@ -1862,7 +1923,9 @@ impl Daemon {
             Err(_) => "run.failed",
         };
         self.journal(&session_id, &request.request_id, run_event, json!({}));
-        remove_script_stage(&self.run_id, &session_id, Some(&request.request_id));
+        if let Some(root) = self.controller.temp_dir() {
+            remove_script_stage(root, &self.run_id, &session_id, Some(&request.request_id));
+        }
         let had_inflight_engine = self
             .sessions
             .get(&session_id)
@@ -2550,6 +2613,7 @@ impl Daemon {
             .map(str::to_owned)
             .ok_or_else(|| "page.content missing html".to_owned())
     }
+
     fn web_search(&mut self, request: &Request) -> Response {
         let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.search requires query");
@@ -3400,6 +3464,45 @@ impl Daemon {
         }
     }
 
+    fn web_structured_dom(&mut self, request: &Request) -> Response {
+        match self.with_session_page(request, "web.structured_dom") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let mut structured = request.payload.clone();
+                if let Some(object) = structured.as_object_mut() { object.remove("session_id"); object.remove("tab_id"); object.remove("agent_id"); }
+                let response = match self.engine_call("page.structuredDom", json!({"page":page,"request":structured})) {
+                    Ok(value) => {
+                        let tagged=value.get("serialized").cloned().unwrap_or(json!(null));
+                        Self::structured_dom_response(request, &session_id, tagged)
+                    }
+                    Err(error) => engine_error(request,error,34),
+                };
+                self.finish_session(&session_id); response
+            }
+        }
+    }
+
+    fn structured_dom_response(
+        request: &Request,
+        session_id: &str,
+        tagged: serde_json::Value,
+    ) -> Response {
+        let value = Self::plain_value(&tagged);
+        let mut response = Response::ok(
+            request,
+            json!({
+                "session_id": session_id,
+                "value": value,
+                "serialized": tagged,
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+            }),
+        );
+        // find/extract historically travel through web.evaluate. Keep that raw
+        // protocol contract while the engine uses a distinct trusted IPC route.
+        response.operation = "web.evaluate".into();
+        response
+    }
+
     fn bind_condition_source(
         &self,
         request: &Request,
@@ -4098,6 +4201,53 @@ impl Daemon {
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
+        let max_transfer_bytes = self
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .limits
+                    .max_artifact_bytes
+                    .saturating_sub(session.artifact_bytes)
+            })
+            .ok_or_else(|| engine_error(request, "session disappeared", 39))?;
+        let transfer_root = self
+            .content
+            .temp_dir()
+            .map(Path::to_owned)
+            .ok_or_else(|| engine_error(request, "content transfer root unavailable", 39))?;
+        let transfer_capability = self.content.capability().to_owned();
+        let transfer = ArtifactTransfer::begin(
+            &transfer_root,
+            &format!("{session_id}:{}", request.request_id),
+        )
+            .map_err(|error| engine_error(request, error.to_string(), 39))?;
+        let transfer_result = self
+            .engine_call(
+                "page.textToFile",
+                json!({
+                    "page": page,
+                    "path": transfer.path(),
+                    "capability": transfer_capability,
+                    "max_bytes": max_transfer_bytes,
+                }),
+            )
+            .map_err(|error| engine_error(request, error, 34))?;
+        let transfer_bytes = transfer_result
+            .get("byte_count")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| engine_error(request, "page.textToFile missing byte_count", 39))?;
+        let transfer_digest = transfer_result
+            .get("digest")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| engine_error(request, "page.textToFile missing digest", 39))?;
+        let rendered_text = transfer
+            .read_verified(transfer_bytes, transfer_digest)
+            .map_err(|error| engine_error(request, error.to_string(), 39))
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| engine_error(request, error.to_string(), 39))
+            })?;
         let recorded = self
             .engine_call("page.requests", json!({ "page": page }))
             .unwrap_or_else(|_| json!({ "requests": [] }));
@@ -4111,11 +4261,7 @@ impl Daemon {
             .iter()
             .rev()
             .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
-        let text = tree
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let text = rendered_text;
         let title = tree
             .get("title")
             .and_then(|v| v.as_str())
@@ -4364,6 +4510,9 @@ impl Daemon {
                 "content worker crashed and was restarted; session pages were reset".into(),
             );
         }
+        self.content
+            .prepare_engine_params(method, &mut params)
+            .map_err(|error| error.to_string())?;
         let request_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         let stale = self.content.discard_stale_engine_results();
         if stale > 0 {
@@ -4662,7 +4811,9 @@ impl Daemon {
     }
 
     fn remove_ephemeral_session_dir(&self, session_id: &str) {
-        remove_script_stage(&self.run_id, session_id, None);
+        if let Some(root) = self.controller.temp_dir() {
+            remove_script_stage(root, &self.run_id, session_id, None);
+        }
         let path = self.store.root().join("sessions").join(session_id);
         let _ = std::fs::remove_dir_all(path);
     }
@@ -4991,6 +5142,12 @@ fn policy_recovery(reason: &str) -> &'static str {
 
 fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -> Response {
     let message = message.into();
+    // Worker-owned transfer/session budget refusals carry the same explicit
+    // prefix as controller relay refusals. Keep that reason instead of turning
+    // an enforced artifact bound into an opaque engine failure.
+    if let Some(reason) = message.strip_prefix("resource_limit: ") {
+        return limit_error(request, reason);
+    }
     if let Some(reason) = message.strip_prefix("policy_denied:") {
         let mut error = ErrorObject::new(
             "policy_denied",
@@ -5425,6 +5582,10 @@ fn cpu_ms_since(pid: u32, baseline_ns: u64) -> u64 {
 }
 
 fn sample_cpu_ns(pid: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Some(ns) = sample_cpu_ns_proc(pid) {
+        return ns;
+    }
     #[cfg(target_os = "macos")]
     {
         if let Some(ns) = sample_cpu_ns_rusage(pid) {
@@ -5440,6 +5601,34 @@ fn sample_cpu_ns(pid: u32) -> u64 {
         return 0;
     };
     parse_ps_time(String::from_utf8_lossy(&output.stdout).trim()).saturating_mul(1_000_000)
+}
+
+// Linux ps time= rounds to whole seconds, hiding short controller work.
+// proc stat reports user and system CPU in scheduler ticks (usually 10ms).
+#[cfg(target_os = "linux")]
+fn proc_stat_cpu_ns(stat: &str, ticks_per_second: u64) -> Option<u64> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+    // comm (field 2) can contain spaces and parentheses. Fields after its
+    // final closing parenthesis begin at state (field 3).
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let user = fields.nth(11)?.parse::<u64>().ok()?;
+    let system = fields.next()?.parse::<u64>().ok()?;
+    let ticks = u128::from(user) + u128::from(system);
+    Some((ticks * 1_000_000_000 / u128::from(ticks_per_second)).min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_cpu_ns_proc(pid: u32) -> Option<u64> {
+    static TICKS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ticks = (*TICKS.get_or_init(|| {
+        let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (value > 0).then_some(value as u64)
+    }))?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    proc_stat_cpu_ns(&stat, ticks)
 }
 
 #[cfg(target_os = "macos")]
@@ -5833,6 +6022,38 @@ mod script_stage_tests {
     }
 
     #[test]
+    fn structured_find_and_extract_preserve_raw_evaluate_envelope() {
+        let serialized = json!({
+            "o": [
+                {"k": "count", "v": {"n": 1.0}},
+                {"k": "nodes", "v": {"a": [{"o": [{"k": "text", "v": {"s": "match"}}]}]}},
+            ]
+        });
+        let expected = json!({
+            "session_id": "strict-csp",
+            "value": {"count": 1.0, "nodes": [{"text": "match"}]},
+            "serialized": serialized,
+            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+        });
+
+        for operation in ["find", "extract"] {
+            let request = super::Request::new(
+                format!("structured-{operation}"),
+                "web.structured_dom",
+                json!({"op": operation}),
+            );
+            let response = super::Daemon::structured_dom_response(
+                &request,
+                "strict-csp",
+                expected["serialized"].clone(),
+            );
+
+            assert_eq!(response.operation, "web.evaluate");
+            assert_eq!(response.result, Some(expected.clone()));
+        }
+    }
+
+    #[test]
     fn trace_overflow_warning_preserves_completed_mutation_outcome() {
         let request = super::Request::new("trace-overflow", "web.click", json!({}));
         let mut mutation_count = 0;
@@ -5903,7 +6124,9 @@ mod script_stage_tests {
         let _ = fs::remove_file(&secret);
         symlink("/etc/passwd", &secret).unwrap();
 
+        let controller_root = unique_root("controller-stage");
         let staged = stage_script_for_controller(
+            &controller_root,
             root.join("entry.mjs").to_str().unwrap(),
             "run_stage",
             "wrs_stage1",
@@ -5911,7 +6134,9 @@ mod script_stage_tests {
         )
         .expect("stage");
         let staged = PathBuf::from(staged);
-        let expected = script_stage_dir("run_stage", "wrs_stage1", "wrq_stage1").unwrap();
+        let expected =
+            script_stage_dir(&controller_root, "run_stage", "wrs_stage1", "wrq_stage1").unwrap();
+        assert!(expected.starts_with(&controller_root));
         assert!(
             path_is_within_root(&expected, &staged.canonicalize().unwrap()),
             "{}",
@@ -5922,8 +6147,31 @@ mod script_stage_tests {
             !expected.join("secret.mjs").exists(),
             "symlink escape must not be staged"
         );
-        remove_script_stage("run_stage", "wrs_stage1", Some("wrq_stage1"));
+        remove_script_stage(
+            &controller_root,
+            "run_stage",
+            "wrs_stage1",
+            Some("wrq_stage1"),
+        );
         assert!(!expected.exists(), "per-request stage must be cleaned up");
+        let _ = fs::remove_dir_all(controller_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_granted_modules_excludes_only_its_nested_output() {
+        let root = unique_root("nested-output");
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::write(root.join("main.mjs"), "import './cache/old.mjs';\n").unwrap();
+        fs::write(root.join("cache/old.mjs"), "export const n = 7;\n").unwrap();
+        let dest = root.join("cache/request/stage");
+        let mut files = 0;
+        let mut bytes = 0;
+        copy_granted_modules(&root, &root, &dest, &mut files, &mut bytes).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(fs::read_to_string(dest.join("cache/old.mjs")).unwrap(), "export const n = 7;\n");
+        assert!(dest.join("main.mjs").is_file());
+        assert!(!dest.join("cache/request/stage").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5972,6 +6220,26 @@ mod script_stage_tests {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn trusted_transfer_limit_preserves_resource_error_and_exit_contract() {
+        let request = super::Request::new("artifact-limit", "web.read", json!({}));
+        let response = super::engine_error(
+            &request, "resource_limit: artifact limit exceeded (100 > 8)", 34,
+        );
+        assert_eq!(response.status, "error");
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "resource_limit");
+        assert_eq!(error.exit_code, 37);
+        assert_eq!(error.message.as_ref(), "artifact limit exceeded (100 > 8)");
+        assert!(!error.retryable);
+        let unrelated = super::engine_error(
+            &request, "page JavaScript raised Error: resource_limit: page data", 34,
+        );
+        let error = unrelated.error.unwrap();
+        assert_eq!(error.code, "engine_error");
+        assert_eq!(error.exit_code, 34);
+    }
 
     #[test]
     fn missing_target_guidance_differs_from_ambiguous_target_guidance() {
@@ -6051,6 +6319,19 @@ mod redirect_chain_tests {
         assert_eq!(super::parse_ps_time("2:26.50"), 146_500);
         assert_eq!(super::parse_ps_time("1:02:03"), 3_723_000);
         assert_eq!(super::parse_ps_time(""), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_cpu_keeps_subsecond_ticks_and_handles_parenthesized_names() {
+        let stat = "123 (controller ) worker) R 1 2 3 4 5 6 7 8 9 10 7 3 99 88";
+        assert_eq!(super::proc_stat_cpu_ns(stat, 100), Some(100_000_000));
+        assert_eq!(super::proc_stat_cpu_ns(stat, 1000), Some(10_000_000));
+        assert_eq!(super::proc_stat_cpu_ns(stat, 0), None);
+        assert_eq!(super::proc_stat_cpu_ns("123 (worker) R 1", 100), None);
+        assert_eq!(super::proc_stat_cpu_ns("123 worker R 1", 100), None);
+        let invalid = stat.replace("7 3 99", "oops 3 99");
+        assert_eq!(super::proc_stat_cpu_ns(&invalid, 100), None);
     }
 
     #[test]
@@ -6391,4 +6672,5 @@ mod redirect_chain_tests {
             "page.content missing html"
         );
     }
+
 }

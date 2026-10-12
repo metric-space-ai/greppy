@@ -105,6 +105,100 @@ fn index_graph(repo: &Path, store: &Path) {
 }
 
 #[test]
+fn scoped_embedding_job_reuses_standalone_linked_graph_without_global_completion() {
+    let (primary, store, _scratch) = fixture("scoped-linked", "pub fn person_record() {}\n");
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&primary, &["init"]);
+    git(&primary, &["add", "lib.rs"]);
+    git(
+        &primary,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = primary.parent().unwrap().join("linked");
+    git(
+        &primary,
+        &["worktree", "add", "-b", "scoped", linked.to_str().unwrap()],
+    );
+    let (code, out, err) = run(
+        &["index", "."],
+        &linked,
+        &store,
+        &[("GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW", "1")],
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    let db = graph_db(&store);
+    let graph = greppy_store::Store::open(&db).unwrap();
+    let generation = graph
+        .get_workspace_state(linked.to_string_lossy().as_ref())
+        .unwrap()
+        .unwrap()
+        .graph_generation;
+    drop(graph);
+    let (code, out, err) = run(
+        &["index", "."],
+        &linked,
+        &store,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_BACKGROUND_EMBED_PATHS", "[\"lib.rs\"]"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW", "0"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(
+        !err.contains("linked worktree uses shared Base"),
+        "scoped embedding must not migrate the Base: {err}"
+    );
+    let graph = greppy_store::Store::open(&db).unwrap();
+    assert_eq!(
+        graph
+            .get_workspace_state(linked.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap()
+            .graph_generation,
+        generation
+    );
+    let stamps: Vec<(String, String)> = graph
+        .conn()
+        .prepare("SELECT key, value FROM schema_meta WHERE key LIKE 'embedding_complete:%'")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "must publish only the scoped completion stamp: {stamps:?}"
+    );
+    assert!(stamps[0].0.ends_with(":scope:[\"lib.rs\"]"), "{stamps:?}");
+    assert!(
+        stamps[0].1.starts_with(&format!("{generation}|")),
+        "{stamps:?}"
+    );
+}
+
+#[test]
 fn search_does_not_report_ownerless_metadata_as_live_embedding_progress() {
     let (repo, store, _scratch) = fixture(
         "building",
@@ -166,6 +260,60 @@ fn search_missing_asset_names_the_unavailable_backend() {
         "pub fn asset_fallback_marker() -> i32 { 11 }\n",
     );
     index_graph(&repo, &store);
+
+    // This tests missing query assets on a published vector snapshot. A cold
+    // graph with inference disabled must fail the owner launch earlier instead.
+    let mut graph = greppy_store::Store::open(&graph_db(&store)).unwrap();
+    let generation = graph
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .unwrap()
+        .graph_generation;
+    let node = graph.list_nodes("repo", "", "", 0, 1).unwrap().remove(0);
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    for (name, value) in [
+        (
+            "embeddinggemma-300M-Q4_K.gguf",
+            env!("GREPPY_EMBEDDED_GGUF_SHA"),
+        ),
+        ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+    ] {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    let model_id = format!("google/embeddinggemma-300m@sha256:{:x}", digest.finalize());
+    graph
+        .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+            project: node.project.clone(),
+            model_id: model_id.clone(),
+            prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
+            task: greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE.into(),
+            node_id: Some(node.id),
+            chunk_idx: 0,
+            qualified_name: node.qualified_name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+            content_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .into(),
+            graph_generation: generation,
+            vector: vec![1.0, 0.0],
+        })
+        .unwrap();
+    graph
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("embedding_complete:{}", node.project),
+                format!("{generation}|{model_id}")
+            ],
+        )
+        .unwrap();
+    drop(graph);
 
     let (code, stdout, stderr) = run(
         &["search", "find asset fallback marker"],

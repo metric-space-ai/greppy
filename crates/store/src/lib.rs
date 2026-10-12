@@ -48,6 +48,7 @@ pub mod project;
 pub mod provider_state;
 pub mod query_cache;
 pub mod raw_edge;
+mod retained_capture;
 pub mod schema;
 pub mod stats;
 pub mod store;

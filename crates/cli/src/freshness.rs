@@ -112,8 +112,26 @@ pub(crate) fn graph_stale_gate_for_edges(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Fresh(_) => {
+            if let Ok(effective_root) = resolve_root(root) {
+                crate::context_status::acknowledge(
+                    &effective_root,
+                    crate::context_status::Capability::Graph,
+                );
+            }
+            Ok(None)
+        }
         FreshnessServe::Refuse(freshness) => {
+            if let (Ok(effective_root), Ok(generation)) =
+                (resolve_root(root), current_graph_generation(store, root))
+            {
+                crate::context_status::invalidate(&effective_root);
+                crate::context_status::restricted(
+                    &effective_root,
+                    generation.saturating_add(1),
+                    crate::context_status::Capability::Graph,
+                );
+            }
             if json {
                 let incomplete_providers =
                     graph_edge_incomplete_provider_json(store, project, edge_types)?;
@@ -146,8 +164,26 @@ pub(crate) fn graph_stale_gate(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Fresh(_) => {
+            if let Ok(effective_root) = resolve_root(root) {
+                crate::context_status::acknowledge(
+                    &effective_root,
+                    crate::context_status::Capability::Graph,
+                );
+            }
+            Ok(None)
+        }
         FreshnessServe::Refuse(freshness) => {
+            if let (Ok(effective_root), Ok(generation)) =
+                (resolve_root(root), current_graph_generation(store, root))
+            {
+                crate::context_status::invalidate(&effective_root);
+                crate::context_status::restricted(
+                    &effective_root,
+                    generation.saturating_add(1),
+                    crate::context_status::Capability::Graph,
+                );
+            }
             if json {
                 graph_stale_skip_json(
                     store,
@@ -376,7 +412,7 @@ pub(crate) fn try_refresh_metadata_only_fingerprint(
     }
     let effective_root = resolve_root(root).ok()?;
     let overrides = discover_overrides_from_env().ok()?;
-    let store_path = workspace_locator::store_path(&effective_root);
+    let store_path = ensured_workspace_store_path(&effective_root).ok()?;
     let _writer = greppy_freshness::try_acquire(&store_path).ok()?;
     let mut store =
         greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::query_writer())
@@ -424,11 +460,12 @@ pub(crate) fn freshness_serve_decision_with_policy(
     } else {
         nav_freshness_json(store, root, project)
     };
+    let freshness = preparation_refusal_diagnostics(freshness, root);
     if freshness_json_is_fresh(&freshness) {
         return FreshnessServe::Fresh(freshness);
     }
     if writer_active {
-        return FreshnessServe::Refuse(refresh_state(freshness, true));
+        return FreshnessServe::Refuse(refresh_state_for_query(root, freshness, true));
     }
     let state = freshness
         .get("state")
@@ -452,7 +489,8 @@ pub(crate) fn freshness_serve_decision_with_policy(
         if allow_auto_reindex && auto_reindex_enabled() && version_drift_is_scope_stable(&freshness)
         {
             let started = spawn_background_index(root, refresh_cause);
-            return FreshnessServe::Refuse(refresh_state(
+            return FreshnessServe::Refuse(refresh_state_for_query(
+                root,
                 freshness,
                 started || workspace_writer_active(root),
             ));
@@ -487,14 +525,16 @@ pub(crate) fn freshness_serve_decision_with_policy(
         } else {
             spawn_background_index(root, refresh_cause)
         };
-        return FreshnessServe::Refuse(refresh_state(
+        return FreshnessServe::Refuse(refresh_state_for_query(
+            root,
             freshness,
             rebuilt || started || writer_active || workspace_writer_active(root),
         ));
     }
     if allow_auto_reindex && auto_reindex_enabled() {
         let started = spawn_background_index(root, refresh_cause);
-        return FreshnessServe::Refuse(refresh_state(
+        return FreshnessServe::Refuse(refresh_state_for_query(
+            root,
             freshness,
             started || workspace_writer_active(root),
         ));
@@ -527,6 +567,15 @@ pub(crate) fn freshness_refusal_exit(freshness: &serde_json::Value) -> i32 {
         .unwrap_or("unknown")
     {
         "refreshing" | "drift" | "unknown" => EXIT_TEMPFAIL as i32,
+        "failed"
+            if freshness
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("admission_deferred") =>
+        {
+            EXIT_TEMPFAIL as i32
+        }
+        "failed" => EXIT_IO as i32,
         _ => 1,
     }
 }
@@ -552,6 +601,9 @@ pub(crate) fn auto_reindex_inline_allowed(
 /// background refresh instead of hiding model loading or a full repository
 /// rebuild inside a navigation command.
 pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
+    if !crate::index_admission::inline_refresh_is_admitted() {
+        return false;
+    }
     let Ok(effective_root) = resolve_root(root) else {
         return false;
     };
@@ -561,7 +613,9 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     let Ok(overrides) = discover_overrides_from_env() else {
         return false;
     };
-    let store_path = workspace_locator::store_path(&effective_root);
+    let Ok(store_path) = ensured_workspace_store_path(&effective_root) else {
+        return false;
+    };
     let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
         &effective_root,
         greppy_core::cache::LockMode::Shared,
@@ -665,7 +719,7 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // indexer wrote from the repo root (instead of opening an empty
     // store under the subdir's hash and exiting 73).
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     // RV-007: tighten the store dir + DB file permissions on every open.
     // This is a no-op when the store doesn't exist yet (read paths before
     // any `greppy index` would have failed to open the store anyway).
@@ -675,15 +729,6 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     recover_missing_query_base(root, &effective_root)?;
     if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment(&effective_root)?
     {
-        greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
-            Error::io(
-                format!(
-                    "create private Delta Store for {}",
-                    effective_root.display()
-                ),
-                error,
-            )
-        })?;
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }
@@ -730,6 +775,11 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if !path.exists() {
         if auto_reindex_enabled() {
             wait_for_first_use_index(root, &effective_root)?;
+            // First publication can establish a linked-worktree Base binding.
+            // Re-enter the normal open path so that binding is attached before
+            // freshness is checked; a bare Delta otherwise looks stale and
+            // starts a second index for the same unchanged workspace.
+            return open_default_store(root);
         } else {
             let shown_root = root.unwrap_or(".");
             eprintln!(
@@ -763,6 +813,17 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
         wait_for_first_use_index(root, &effective_root)?;
         return open_default_store(root);
     }
+    let store = if crate::store_cow::persisted_v7_delta_needs_repair(&store, &effective_root)? {
+        drop(store);
+        crate::store_cow::ensure_persisted_single_store_repaired(
+            &path,
+            &effective_root,
+            &project_for(root)?,
+        )?;
+        greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?
+    } else {
+        store
+    };
     let _ = workspace_locator::ensure_db_mode(&path);
     // Feature B: record that this store was just used to serve a query.
     // A read-only open never bumps graph.db's mtime, so a dedicated
@@ -873,12 +934,44 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
     wait_for_index_publication(root, effective_root, "first-use")
 }
 
-fn wait_for_index_publication(
+fn index_publication_failure(effective_root: &std::path::Path, detail: String) -> Error {
+    // This field is recorded from the admission runner's exit status, not
+    // guessed from arbitrary error text. Match the detail too: a historical
+    // denial record must not classify a different current observation.
+    let deferred = read_background_job(&background_job_path(effective_root)).is_some_and(|job| {
+        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+            && job
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("admission_deferred")
+            && job.get("last_error").and_then(serde_json::Value::as_str) == Some(detail.as_str())
+    });
+    if deferred {
+        Error::AdmissionDeferred {
+            root: effective_root.to_path_buf(),
+            detail,
+        }
+    } else {
+        Error::Index(format!(
+            "structural index failed for {}: {detail}",
+            effective_root.display()
+        ))
+    }
+}
+
+pub(crate) fn wait_for_index_publication(
     root: Option<&str>,
     effective_root: &std::path::Path,
     cause: &str,
 ) -> Result<()> {
     let baseline_generation = published_graph_generation(effective_root);
+    // A rejected launch is also a real capability restriction. Successful
+    // launch repeats this after the initial store directory exists.
+    crate::context_status::restricted(
+        effective_root,
+        baseline_generation.unwrap_or(0).saturating_add(1),
+        crate::context_status::Capability::Graph,
+    );
     let mut launch = spawn_background_job_handle(root, cause, "index", None).ok_or_else(|| {
         let detail = read_background_job(&background_job_path(effective_root))
             .and_then(|job| {
@@ -887,11 +980,13 @@ fn wait_for_index_publication(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "the index process could not be started".into());
-        Error::Index(format!(
-            "structural index failed for {}: {detail}",
-            effective_root.display()
-        ))
+        index_publication_failure(effective_root, detail)
     })?;
+    crate::context_status::restricted(
+        effective_root,
+        baseline_generation.unwrap_or(0).saturating_add(1),
+        crate::context_status::Capability::Graph,
+    );
     loop {
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(
@@ -916,16 +1011,17 @@ fn wait_for_index_publication(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             FirstUseIndexObservation::Published => {
+                crate::context_status::acknowledge(
+                    effective_root,
+                    crate::context_status::Capability::Graph,
+                );
                 if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
                     let _ = child.wait();
                 }
                 return Ok(());
             }
             FirstUseIndexObservation::Failed(detail) => {
-                return Err(Error::Index(format!(
-                    "structural index failed for {}: {detail}",
-                    effective_root.display()
-                )));
+                return Err(index_publication_failure(effective_root, detail));
             }
         }
     }
@@ -940,7 +1036,7 @@ pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<grep
 /// index; their pagination records are not graph-query evidence.
 pub(crate) fn open_default_store_pack_writer(root: Option<&str>) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     if let Some(parent) = path.parent() {
         workspace_locator::ensure_store_dir(parent)
             .map_err(|error| Error::io("create continuation pack store", error))?;
@@ -958,20 +1054,11 @@ fn open_default_store_writer(
     require_existing_index: bool,
 ) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     if require_existing_index {
         recover_missing_query_base(root, &effective_root)?;
     }
     if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
-        greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
-            Error::io(
-                format!(
-                    "create private Delta Store for {}",
-                    effective_root.display()
-                ),
-                error,
-            )
-        })?;
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }
@@ -986,13 +1073,34 @@ fn open_default_store_writer(
         return greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)
             .map_err(Into::into);
     }
-    if require_existing_index && !path.exists() {
+    let needs_first_publication = require_existing_index
+        && (!path.exists()
+            || (auto_reindex_enabled() && {
+                let store =
+                    greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?;
+                store
+                    .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+                    .is_none()
+            }));
+    if needs_first_publication {
         // Reuse the normal query open to trigger the existing first-use
         // auto-index/error path, then reopen writable for the evidence write.
+        // A file handle or continuation pack can already have created the DB
+        // without publishing a graph. It must not suppress first-use indexing.
         drop(open_default_store(root)?);
+        // Publication can establish a linked-worktree Base binding. Re-evaluate
+        // the overlay before reopening writable, just as the reader does.
+        return open_default_store_writer(root, require_existing_index);
     }
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
+    }
+    if require_existing_index && path.exists() {
+        crate::store_cow::ensure_persisted_single_store_repaired(
+            &path,
+            &effective_root,
+            &project_for(root)?,
+        )?;
     }
     let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())?;
     let _ = workspace_locator::ensure_db_mode(&path);

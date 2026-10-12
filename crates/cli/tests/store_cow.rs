@@ -694,7 +694,40 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             .as_str()
             .expect("refreshed Delta path"),
     );
+    // Invalidating only Delta metadata must refresh private sources while
+    // retaining a current immutable Base and its fast visibility proof.
+    {
+        let mut old_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+        for mut workspace in old_delta.list_private_workspace_states().unwrap() {
+            workspace.indexer_version = "greppy-indexer-v6".into();
+            old_delta.upsert_workspace_state(&workspace).unwrap();
+        }
+    }
+    let (delta_upgrade_code, delta_upgrade_out, delta_upgrade_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_STRUCTURAL_FIRST_USE", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        delta_upgrade_code, 0,
+        "private Delta upgrade must reuse the current Base: {delta_upgrade_out}\n{delta_upgrade_err}"
+    );
+    let upgraded_delta_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(
+        upgraded_delta_status["store_cow"]["base_identity"],
+        shared_identity
+    );
+    assert_eq!(
+        upgraded_delta_status["freshness"]["source"], "verified_store_cow_overlay",
+        "upgrading private metadata must preserve a sparse verified overlay"
+    );
     let mut refreshed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+
     let project = greppy_core::project_identity(&first);
     let generation = refreshed_delta
         .get_workspace_state(first.canonicalize().unwrap().to_string_lossy().as_ref())
@@ -769,7 +802,20 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         cold_code, 0,
         "cold structural refresh failed: {cold_out}\n{cold_err}"
     );
+    // Status verifies the complete Base manifest, including summaries. The
+    // missing-summary fixture has served its no-checkout assertion above;
+    // restore that deliberate corruption before checking the healthy binding.
     std::fs::write(&summary_cache, saved_summary_cache).unwrap();
+    let cold_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(
+        cold_status["store_cow"]["base_path"],
+        base_path.to_string_lossy().as_ref(),
+        "a current Base missing only summaries keeps its pinned structural graph"
+    );
+    assert_eq!(
+        cold_status["freshness"]["source"], "verified_store_cow_overlay",
+        "the restored current Base must retain its verified visibility proof"
+    );
 
     // Downgrade the published fixture to a verified v6 Base and remove the
 
@@ -863,6 +909,14 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         })
         .unwrap();
     assert_eq!(v6_vectors, 1, "v6 fixture must contain one valid vector");
+    // `publish_graph_with_summary` publishes the completed database file; it
+    // intentionally does not copy SQLite sidecars. Match the production Base
+    // builder contract by folding this fixture's workspace downgrade and
+    // vector row out of the WAL before publishing it.
+    previous_store
+        .conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
     drop(previous_store);
 
     let previous_layout = greppy_store::BaseStoreLayout::new(&store, &previous_identity).unwrap();
@@ -879,6 +933,30 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             )
             .unwrap();
     }
+    let published_v6 = greppy_store::Store::open_with(
+        &previous_layout.graph,
+        greppy_store::OpenOptions::read_only(),
+    )
+    .unwrap();
+    let published_v6_vectors: i64 = published_v6
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        published_v6_vectors, v6_vectors,
+        "published v6 fixture must contain the vector before migration"
+    );
+    let published_v6_workspaces = published_v6.list_workspace_states().unwrap();
+    assert!(
+        !published_v6_workspaces.is_empty()
+            && published_v6_workspaces
+                .iter()
+                .all(|workspace| workspace.indexer_version == "greppy-indexer-v6"),
+        "published v6 fixture must preserve the downgraded workspace version"
+    );
+    drop(published_v6);
     std::fs::remove_dir_all(base_path.parent().expect("Base graph parent"))
         .expect("remove current v7 Base generation");
     let bound_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
@@ -957,7 +1035,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     assert_ne!(
         structural_status["store_cow"]["base_path"],
         previous_layout.graph.to_string_lossy().as_ref(),
-        "structural first use must publish a v7 Base"
+        "structural first use must replace an incompatible Base with the current extraction"
     );
     let migrated_base = greppy_store::Store::open(Path::new(
         structural_status["store_cow"]["base_path"]
@@ -971,7 +1049,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             .unwrap()
             .len(),
         1,
-        "v7 migration must retain the v6 Base node"
+        "current extraction must recover the older Base source definition"
     );
     let migrated_vectors: i64 = migrated_base
         .conn()
@@ -980,8 +1058,16 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         })
         .unwrap();
     assert_eq!(
-        migrated_vectors, v6_vectors,
-        "v7 migration must retain vectors"
+        migrated_vectors, 0,
+        "v9 re-extraction retires old Base node-bound vectors"
+    );
+    assert!(
+        migrated_base
+            .list_workspace_states()
+            .unwrap()
+            .iter()
+            .all(|workspace| { workspace.indexer_version == greppy_core::INDEXER_VERSION_BASE }),
+        "replacement Base must carry the current extraction identity"
     );
     let migrated_generation = migrated_base
         .list_workspace_states()
@@ -1235,6 +1321,67 @@ fn normal_query_recovers_missing_persisted_base_without_semantic_rebuild() {
     );
     assert_eq!(warm_code, 0, "{warm_out}\n{warm_err}");
     assert!(warm_out.contains("live_caller"), "{warm_out}");
+}
+
+#[test]
+fn first_linked_query_attaches_published_base_without_a_second_index() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let first = scratch.path().join("first");
+    let second = scratch.path().join("second");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/base.rs"),
+        "pub fn shared_first_use_base() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(
+        &primary,
+        &["config", "user.email", "first-query@test.invalid"],
+    );
+    git(&primary, &["config", "user.name", "First Query"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-qm", "base"]);
+    for (name, path) in [("first", &first), ("second", &second)] {
+        git(
+            &primary,
+            &["worktree", "add", "-qb", name, path.to_str().unwrap()],
+        );
+    }
+    // Establish one verified immutable Base, then leave the second worktree
+    // completely cold so its first ordinary query owns Delta publication.
+    index(&first, &store, None);
+    std::fs::write(
+        second.join("src/second.rs"),
+        "pub fn first_use_second_symbol() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(
+        &second,
+        &store,
+        &["search-symbol", "first_use_second_symbol"],
+        None,
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("first_use_second_symbol"));
+    assert!(query_text(
+        &second,
+        &store,
+        &["search-symbol", "shared_first_use_base"],
+        None
+    )
+    .contains("shared_first_use_base"));
+    let (code, out, err) = run(&second, &store, &["index", "status", "--json"], None);
+    assert!([0, 73].contains(&code), "{out} {err}");
+    let status: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["fresh"], true, "{status:#}");
+    assert_eq!(status["store_cow"]["mode"], "overlay", "{status:#}");
+    assert_eq!(
+        status["graph_generation"], 1,
+        "first-use query must publish exactly once: {status:#}"
+    );
 }
 
 #[test]
@@ -1652,8 +1799,12 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
         "pub fn clean_after_status_edit() -> i32 { 31 }\n",
     )
     .unwrap();
-    let (drift_code, drift_out, drift_err) =
-        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    let (drift_code, drift_out, drift_err) = run(
+        &repo,
+        &delta_store,
+        &["index", "status", "--json", "--diagnostics"],
+        overlay,
+    );
     assert_eq!(
         drift_code, 73,
         "dirty overlay status must fail closed\nstdout={drift_out}\nstderr={drift_err}"

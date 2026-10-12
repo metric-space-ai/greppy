@@ -17,11 +17,6 @@ pub(crate) fn inference_device_identity(device: &greppy_embed_native::DevicePref
     device.as_str().to_string()
 }
 
-pub(crate) fn embedding_model_source_exists(source: &EmbeddingModelSource) -> bool {
-    let EmbeddingModelSource::Gguf { gguf, tokenizer } = source;
-    gguf.is_file() && tokenizer.is_file()
-}
-
 pub(crate) fn embedding_backend_plan(cfg: &EmbeddingModelConfig) -> (String, Option<String>) {
     let EmbeddingModelSource::Gguf { gguf, .. } = &cfg.source;
     let model_bytes = std::fs::metadata(gguf)
@@ -64,6 +59,68 @@ pub(crate) fn embedding_generation_complete(
         )
         .ok()
         == Some(format!("{graph_generation}|{model_id}"))
+}
+
+/// Delta-only global preparation is safe only with a complete immutable Base.
+pub(crate) fn base_embedding_generation_complete(
+    store: &greppy_store::Store,
+    project: &str,
+    model_id: &str,
+) -> bool {
+    store.is_overlay()
+        && store
+            .conn()
+            .query_row(
+                "SELECT EXISTS (
+            SELECT 1 FROM greppy_base.workspace_state w, greppy_base.schema_meta m
+            WHERE m.key = ?1 AND m.value = CAST(w.graph_generation AS TEXT) || '|' || ?2
+        )",
+                rusqlite::params![embedding_complete_key(project), model_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+}
+
+pub(crate) fn background_embedding_path_prefixes() -> Result<Vec<String>> {
+    if std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() != Some("embedding") {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(
+        &std::env::var("GREPPY_BACKGROUND_EMBED_PATHS").unwrap_or_else(|_| "[]".into()),
+    )
+    .map_err(|e| Error::Invalid(format!("background embedding path scope: {e}")))
+}
+
+/// Scoped readiness is generation/model-specific and never changes the global stamp.
+pub(crate) fn embedding_scope_complete_key(project: &str, prefixes: &[String]) -> String {
+    let mut prefixes = prefixes.to_vec();
+    prefixes.sort();
+    prefixes.dedup();
+    format!(
+        "{}:scope:{}",
+        embedding_complete_key(project),
+        serde_json::to_string(&prefixes).expect("string paths")
+    )
+}
+
+pub(crate) fn embedding_scope_complete(
+    store: &greppy_store::Store,
+    project: &str,
+    generation: u64,
+    model_id: &str,
+    prefixes: &[String],
+) -> bool {
+    embedding_generation_complete(store, project, generation, model_id)
+        || (!prefixes.is_empty()
+            && store
+                .conn()
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = ?1",
+                    [embedding_scope_complete_key(project, prefixes)],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                == Some(format!("{generation}|{model_id}")))
 }
 
 pub(crate) fn embedding_progress_value(
@@ -468,4 +525,53 @@ pub(crate) fn model_file_digest(path: &std::path::Path) -> std::io::Result<Strin
 
 pub(crate) fn embedding_complete_key(project: &str) -> String {
     format!("embedding_complete:{project}")
+}
+
+#[cfg(test)]
+mod scoped_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn scope_stamp_does_not_claim_global_or_other_generation_readiness() {
+        let store = greppy_store::Store::open_memory().unwrap();
+        let paths = vec!["src/scrape".to_owned(), "src/person".to_owned()];
+        let key = embedding_scope_complete_key("p", &paths);
+        store
+            .conn()
+            .execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, "7|model-a"],
+            )
+            .unwrap();
+        assert!(embedding_scope_complete(&store, "p", 7, "model-a", &paths));
+        let reversed = vec![paths[1].clone(), paths[0].clone(), paths[0].clone()];
+        assert!(embedding_scope_complete(
+            &store, "p", 7, "model-a", &reversed
+        ));
+        assert!(!embedding_generation_complete(&store, "p", 7, "model-a"));
+        assert!(!embedding_scope_complete(&store, "p", 8, "model-a", &paths));
+        assert!(!embedding_scope_complete(&store, "p", 7, "model-b", &paths));
+        assert!(!embedding_scope_complete(
+            &store,
+            "p",
+            7,
+            "model-a",
+            &["src/other".into()]
+        ));
+        assert!(!embedding_scope_complete(&store, "p", 7, "model-a", &[]));
+        store
+            .conn()
+            .execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)",
+                rusqlite::params![embedding_complete_key("p"), "7|model-a"],
+            )
+            .unwrap();
+        assert!(embedding_scope_complete(
+            &store,
+            "p",
+            7,
+            "model-a",
+            &["src/other".into()]
+        ));
+    }
 }

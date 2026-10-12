@@ -105,6 +105,9 @@ impl JobProgress {
     fn read(path: &std::path::Path) -> Option<Self> {
         let value = crate::read_background_job(path)?;
         let progress = Self::from_value(&value)?;
+        if is_terminal_state(&progress.state) {
+            return None;
+        }
         let owner = progress.pid.and_then(|pid| u32::try_from(pid).ok())?;
         crate::process_is_alive(owner).then_some(progress)
     }
@@ -211,6 +214,7 @@ struct ProgressReporter {
     reported_remaining: Option<Duration>,
     stalled: bool,
     missing_reported: bool,
+    diagnostics_command: Option<String>,
 }
 
 impl ProgressReporter {
@@ -226,11 +230,14 @@ impl ProgressReporter {
                 return None;
             }
             self.missing_reported = true;
+            let diagnostics = self
+                .diagnostics_command
+                .as_deref()
+                .unwrap_or("greppy index status --json");
             return Some(format!(
-                "greppy: {command} still running; no detailed progress is available"
+                "greppy: {command} is still running; no live index progress is reported; this does not mean indexing is required; diagnostics: `{diagnostics}`"
             ));
         };
-        self.missing_reported = false;
 
         let reset = self.state.as_deref() != Some(job.state.as_str())
             || self.pid != job.pid
@@ -347,7 +354,14 @@ impl ProgressReporter {
             .unwrap_or_default();
         let workers = job
             .worker_count
-            .map(|workers| format!("; workers {workers}; details: greppy index status --json"))
+            .map(|workers| {
+                format!(
+                    "; workers {workers}; details: {}",
+                    self.diagnostics_command
+                        .as_deref()
+                        .unwrap_or("greppy index status --json")
+                )
+            })
             .unwrap_or_default();
         Some(format!(
             "greppy: {command} — {}: {progress}; {prognosis}{pid}{workers}",
@@ -378,7 +392,10 @@ impl ProgressReporter {
 }
 
 fn is_terminal_state(state: &str) -> bool {
-    matches!(state, "complete" | "completed" | "failed" | "degraded")
+    matches!(
+        state,
+        "complete" | "completed" | "failed" | "degraded" | "cancelled"
+    )
 }
 
 pub(crate) fn for_command(
@@ -393,7 +410,7 @@ pub(crate) fn for_command(
             ..
         } => {
             let operand = match path.as_deref() {
-                Some("status") => None,
+                Some("status") => return None,
                 Some("recover") => recovery_path.as_deref(),
                 path => path,
             };
@@ -414,10 +431,14 @@ pub(crate) fn for_command(
         Command::WhereAmI { .. } => ("where-am-i", configured_root),
         _ => return None,
     };
-    let job_path = crate::resolve_root(root_hint)
-        .ok()
-        .map(|root| crate::background_job_path(&root));
-    let mut reporter = ProgressReporter::default();
+    let effective_root = crate::resolve_root(root_hint).ok();
+    let job_path = effective_root.as_deref().map(crate::background_job_path);
+    let mut reporter = ProgressReporter {
+        diagnostics_command: effective_root
+            .as_deref()
+            .map(crate::index_status_command_for_root),
+        ..ProgressReporter::default()
+    };
     Some(QueryProgress::start(INITIAL_DELAY, move |elapsed| {
         let job = job_path.as_deref().and_then(JobProgress::read);
         if let Some(line) = reporter.observe_at(name, job, elapsed, crate::unix_now_secs_cli()) {
@@ -670,8 +691,41 @@ mod tests {
         let mut reporter = ProgressReporter::default();
         let first = reporter.observe("search", None, Duration::ZERO).unwrap();
         assert!(
-            first.contains("no detailed progress is available"),
+            first.contains("no live index progress is reported"),
             "{first}"
+        );
+        assert!(reporter
+            .observe("search", None, Duration::from_secs(30))
+            .is_none());
+        // An observed snapshot between gaps must not re-arm the fallback.
+        assert!(reporter
+            .observe(
+                "search",
+                Some(job("writing_graph", 1, 2)),
+                Duration::from_secs(31),
+            )
+            .is_some());
+        assert!(reporter
+            .observe("search", None, Duration::from_secs(32))
+            .is_none());
+        assert!(first.contains("greppy index status --json"), "{first}");
+    }
+
+    #[test]
+    fn missing_progress_retains_selected_diagnostics_without_claiming_an_index() {
+        let diagnostics =
+            "GREPPY_STORE_DIR='/selected store' greppy --root '/selected root' index status --json";
+        let mut reporter = ProgressReporter {
+            diagnostics_command: Some(diagnostics.into()),
+            ..ProgressReporter::default()
+        };
+        let message = reporter.observe("search", None, Duration::ZERO).unwrap();
+        assert!(message.contains(diagnostics), "{message}");
+        assert!(message.contains("is still running"), "{message}");
+        assert!(!message.contains("is pending"), "{message}");
+        assert!(
+            message.contains("does not mean indexing is required"),
+            "{message}"
         );
         assert!(reporter
             .observe("search", None, Duration::from_secs(30))
@@ -774,6 +828,14 @@ mod tests {
     }
 
     #[test]
+    fn index_status_does_not_report_itself_as_indexing() {
+        let cli =
+            <crate::Cli as clap::Parser>::try_parse_from(["greppy", "index", "status", "--json"])
+                .unwrap();
+        assert!(for_command(cli.command.as_ref(), None).is_none());
+    }
+
+    #[test]
     fn job_progress_requires_a_live_owner() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("index.job");
@@ -790,6 +852,15 @@ mod tests {
 
         crate::start_background_job_record(&path, &value(std::process::id())).unwrap();
         assert!(JobProgress::read(&path).is_some());
+
+        // A terminal record may retain a still-live owner (or a reused PID).
+        // Neither case means the index job is still running.
+        for state in ["cancelled", "failed", "completed", "degraded"] {
+            let mut terminal = value(std::process::id());
+            terminal["state"] = state.into();
+            crate::start_background_job_record(&path, &terminal).unwrap();
+            assert!(JobProgress::read(&path).is_none(), "{state}");
+        }
 
         // u32::MAX is outside the process-id range supported by our target
         // platforms, so this record cannot identify a live job owner.

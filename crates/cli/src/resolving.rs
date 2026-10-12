@@ -625,6 +625,27 @@ pub(crate) fn resolve_root(root: Option<&str>) -> Result<std::path::PathBuf> {
         // workspace_state". Normalize to the canonical absolute path so
         // every spelling of the same directory is one workspace.
         let explicit = absolutize_path(std::path::Path::new(r));
+        match std::fs::metadata(&explicit) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Error::Invalid(format!(
+                    "--root must name a directory, not a file: {}",
+                    explicit.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Invalid(format!(
+                    "--root directory does not exist: {}; create that directory before retrying",
+                    explicit.display()
+                )));
+            }
+            Err(error) => {
+                return Err(Error::io(
+                    format!("inspect --root directory {}", explicit.display()),
+                    error,
+                ));
+            }
+        }
         return Ok(workspace_locator::resolve_workspace_root(&explicit));
     }
     let cwd = std::env::current_dir()
