@@ -26,8 +26,9 @@ fn bounded_file_span_rejects_selected_encoding_and_reports_actual_eof() {
     assert!(error.to_string().contains("requested lines 1:2"));
     assert!(error.to_string().contains("UTF-8"));
     let mut reader = std::io::Cursor::new(b"alpha\nbeta");
-    let error = read_bounded_file_range(&mut reader, "1:3", "dump").unwrap_err();
-    assert!(error.to_string().contains("file has 2 lines"));
+    let (text, start, end) = read_bounded_file_range(&mut reader, "1:3", "dump").unwrap();
+    assert_eq!(text, "alpha\nbeta");
+    assert_eq!((start, end), (1, 2));
     for raw in ["0:1", "3:1", "1", "a:2"] {
         let mut reader = std::io::Cursor::new(b"alpha\n");
         assert!(read_bounded_file_range(&mut reader, raw, "dump").is_err());
