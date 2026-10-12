@@ -2570,7 +2570,8 @@ fn write_embedding_resume_cursor(
     key: &str,
     cursor: &EmbeddingResumeCursor,
 ) -> Result<()> {
-    let value = serde_json::to_string(cursor)?;
+    let value = serde_json::to_string(cursor)
+        .map_err(|error| Error::Store(format!("serialize embedding resume cursor: {error}")))?;
     store
         .conn()
         .execute(
