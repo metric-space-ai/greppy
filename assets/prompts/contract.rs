@@ -39,15 +39,23 @@ pub const APPROVED_SHA256: &str =
 // task workflow and three mode lines, supplied verbatim in this parent thread.
 // External v3 remains unchanged. The renderer performs only the explicitly
 // ordered exclusions; ACP makes no isolation/proposal promise pending a decision.
+// 2026-10-15: Owner SIGNATURE in the greppy homepage/bench session ("führe die edits im system
+// prompt aus", "ja, setz das so ein", "nicht einfach hier und da was dran hängen"), after the caddy
+// trace analysis (one reasoning phase per tool call). Exactly one sentence added to adapter step 2
+// after "run shell commands as `bash-smart -- CMD`.": "Every call costs a turn: issue steps that do
+// not depend on each other together in one turn, as several greppy calls or one call with
+// {"batch": [[…], […]]} (run in order; a failed edit stops the rest), and pipe a search straight
+// into a read (`search-symbol NAME | read -` inside bash-smart)." Previous adapter d86ef405…;
+// ACP rendering unchanged.
 pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
-    "d86ef405b0fb74c3373e08a5c43e40bf823140819fdde607cd58ccab9d91d4f5";
+    "dd0133ecff891859bbbd3890ffe0c9a3857393e512f2665a8521487cb9d15280";
 
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "edeaa1c109065b42c0438a52a7ebcdca182ffbc6380b791a91723440910324c5",
-        Interactive => "7cd2ccd0d083eebdc55ce4a526dabe9ffdb6819467477ce01e2b733c8d7c3607",
-        Serve => "dd480def31ddda46c2033ad8282b72779664a270e915b4657688b114e7e955b6",
+        OneShot => "887653abb4e7ad51aa543df52611018868f570d937248f71c42e528e1e934fef",
+        Interactive => "2f4449863c6b37c204473069d20f5d246a32484964e9eccbc532b65e4c1d11ee",
+        Serve => "2f93c68ef53008009f27849cae41cc4b87c499ca5d127f88267e64c3be282ed7",
         Acp => "3683b8542fc14de0b9c46a3ebbed630f076dde4d56bb0523f587e93454198b44",
     }
 }
