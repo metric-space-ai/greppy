@@ -357,7 +357,12 @@ impl GreppyEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_tool_env(&mut cmd);
-        prepare_tool_cache_env(&mut cmd, &self.run_scratch);
+        // Only a write-confined child needs its caches inside the sandbox roots. Unconfined, the
+        // tools keep the user's HOME and package caches (Go modules, Cargo, npm, pip, …) like any
+        // shell: redirecting them to an empty scratch forced re-downloads and broke offline builds.
+        if matches!(self.sandbox, SandboxMode::Enforce(_)) {
+            prepare_tool_cache_env(&mut cmd, &self.run_scratch);
+        }
         if let Some((scope, _)) = self.context_status.as_ref() {
             cmd.env("GREPPY_CONTEXT_SCOPE", scope)
                 .env("GREPPY_CONTEXT_ENVELOPE", "1");
@@ -1808,12 +1813,10 @@ exit 2
     }
 
     #[test]
-    fn child_home_and_cache_paths_are_inside_run_scratch() {
+    fn unconfined_child_keeps_user_home_and_caches() {
         let (mut env, _, _) = env_with_stub(
             r#"
-printf '%s\n' "$HOME" "$TMPDIR" "$npm_config_cache" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$GOCACHE" "$GOMODCACHE" "$GRADLE_USER_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
-mkdir -p "$HOME/.npm"
-printf ok > "$HOME/.npm/probe"
+printf '%s\n' "${HOME:-unset}" "${GOMODCACHE:-unset}" "${CARGO_HOME:-unset}" "${PIP_CACHE_DIR:-unset}"
 "#,
         );
         let out = env.call_tool(
@@ -1822,9 +1825,36 @@ printf ok > "$HOME/.npm/probe"
         );
         assert!(!out.is_error, "{}", out.content);
         for line in out.content.lines() {
-            assert!(Path::new(line).starts_with(&env.run_scratch), "{line}");
+            assert!(!Path::new(line).starts_with(&env.run_scratch), "{line}");
         }
-        assert!(env.run_scratch.join("home/.npm/probe").is_file());
+        let home = std::env::var("HOME").unwrap_or_else(|_| "unset".into());
+        assert_eq!(out.content.lines().next(), Some(home.as_str()));
+    }
+
+    #[test]
+    fn confined_child_home_and_cache_paths_are_inside_run_scratch() {
+        // The sandboxed path (`SandboxMode::Enforce`) redirects every writable cache into scratch.
+        let scratch = temp_root();
+        let mut cmd = Command::new("true");
+        prepare_tool_cache_env(&mut cmd, &scratch);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), PathBuf::from(v?))))
+            .collect();
+        for key in [
+            "HOME",
+            "TMPDIR",
+            "npm_config_cache",
+            "PIP_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "GOCACHE",
+            "GOMODCACHE",
+            "GRADLE_USER_HOME",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+        ] {
+            assert!(envs[key].starts_with(&scratch), "{key}: {:?}", envs[key]);
+        }
     }
 
     #[test]
