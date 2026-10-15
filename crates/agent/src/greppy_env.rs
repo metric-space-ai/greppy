@@ -211,7 +211,7 @@ impl GreppyEnv {
     fn greppy_tool_def() -> ToolDefinition {
         ToolDefinition {
             name: "greppy".to_string(),
-            description: "Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
+            description: "Batch independent steps into one call: {\"batch\": [[\"search\", \"...\"], [\"read\", \"A\", \"B\"], [\"replace-text\", \"f\", \"old\", \"new\"]]} runs the commands in order and returns every result; a failed edit stops the rest. Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -219,9 +219,13 @@ impl GreppyEnv {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Argv for the greppy command (subcommand first)."
+                    },
+                    "batch": {
+                        "type": "array",
+                        "items": { "type": "array", "items": { "type": "string" } },
+                        "description": "Instead of args: several argv arrays, run in order in this one call (at most 16)."
                     }
-                },
-                "required": ["args"]
+                }
             }),
         }
     }
@@ -717,9 +721,99 @@ impl ExecutionEnv for GreppyEnv {
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome {
         match name {
+            "greppy" if arguments.get("batch").is_some() => self.call_batch(arguments),
             "greppy" => self.call_greppy(arguments),
             other => ToolOutcome::unknown_tool(other),
         }
+    }
+}
+
+/// Most commands one `batch` call may carry.
+const BATCH_MAX: usize = 16;
+
+/// Commands that change the worktree: a failed one stops the rest of a batch, so later
+/// steps never run against a state the model did not intend.
+fn is_edit_command(args: &[String]) -> bool {
+    let first = args.iter().map(String::as_str).find(|a| *a != "greppy");
+    matches!(
+        first,
+        Some(
+            "replace"
+                | "replace-text"
+                | "replace-lines"
+                | "replace-span"
+                | "insert-lines"
+                | "delete"
+                | "delete-lines"
+                | "write"
+                | "patch"
+                | "rename"
+                | "undo"
+        )
+    )
+}
+
+impl GreppyEnv {
+    /// Several greppy commands in one tool call, run in order: one model turn (and one
+    /// reasoning phase) instead of one per command. Each result carries its own header; a
+    /// failed edit stops the batch and names the commands that did not run.
+    fn call_batch(&self, arguments: &Value) -> ToolOutcome {
+        let Some(items) = arguments.get("batch").and_then(Value::as_array) else {
+            return ToolOutcome::err("field batch must be an array of argv arrays");
+        };
+        if items.is_empty() {
+            return ToolOutcome::err("batch is empty: pass at least one argv array");
+        }
+        if items.len() > BATCH_MAX {
+            return ToolOutcome::err(format!(
+                "batch carries {} commands; at most {BATCH_MAX} per call",
+                items.len()
+            ));
+        }
+        let mut commands = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            match parse_string_array(&json!({ "args": item }), "args") {
+                Ok(args) => commands.push(args),
+                Err(_) => {
+                    return ToolOutcome::err(format!("batch[{i}] must be an array of strings"))
+                }
+            }
+        }
+        let total = commands.len();
+        let mut content = String::new();
+        let mut failed = 0usize;
+        let mut image = None;
+        for (i, args) in commands.iter().enumerate() {
+            let outcome = self.call_greppy(&json!({ "args": args }));
+            content.push_str(&format!(
+                "## [{}/{total}] greppy {}\n",
+                i + 1,
+                args.join(" ")
+            ));
+            content.push_str(outcome.content.trim_end_matches('\n'));
+            content.push_str("\n\n");
+            if outcome.image_png_base64.is_some() {
+                image = outcome.image_png_base64;
+            }
+            if outcome.is_error {
+                failed += 1;
+                if is_edit_command(args) && i + 1 < total {
+                    content.push_str(&format!(
+                        "batch stopped after the failed edit [{}/{total}]; commands {}..{total} did not run\n",
+                        i + 1,
+                        i + 2
+                    ));
+                    break;
+                }
+            }
+        }
+        let mut outcome = if failed == 0 {
+            ToolOutcome::ok(content.trim_end().to_string())
+        } else {
+            ToolOutcome::err(content.trim_end().to_string())
+        };
+        outcome.image_png_base64 = image;
+        outcome
     }
 }
 
@@ -1399,7 +1493,7 @@ mod tests {
         let greppy_schema = &defs[0].input_schema;
         assert_eq!(greppy_schema["type"], "object");
         assert!(greppy_schema["properties"].get("args").is_some());
-        assert_eq!(greppy_schema["required"], json!(["args"]));
+        assert!(greppy_schema["properties"].get("batch").is_some());
         assert!(
             defs[0].description.contains("bash-smart"),
             "description must teach bash-smart: {}",
@@ -1829,6 +1923,68 @@ printf '%s\n' "${HOME:-unset}" "${GOMODCACHE:-unset}" "${CARGO_HOME:-unset}" "${
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "unset".into());
         assert_eq!(out.content.lines().next(), Some(home.as_str()));
+    }
+
+    #[test]
+    fn batch_runs_every_command_in_order_with_headers() {
+        let (mut env, _, _) = env_with_stub(r#"printf 'out:%s\n' "$*""#);
+        let out = env.call_tool(
+            "greppy",
+            &json!({"batch": [["search", "brace nesting"], ["read", "a::b", "c::d"]]}),
+        );
+        assert!(!out.is_error, "{}", out.content);
+        let first = out
+            .content
+            .find("## [1/2] greppy search brace nesting\nout:search brace nesting");
+        let second = out
+            .content
+            .find("## [2/2] greppy read a::b c::d\nout:read a::b c::d");
+        assert!(first.is_some() && second.is_some(), "{}", out.content);
+        assert!(first < second);
+    }
+
+    #[test]
+    fn batch_stops_after_a_failed_edit_but_not_after_a_failed_read() {
+        let (mut env, _, _) = env_with_stub(
+            r#"case "$1" in replace-text) echo "no match" >&2; exit 3;; read) echo "no symbol" >&2; exit 64;; esac
+printf 'ran:%s\n' "$1""#,
+        );
+        let out = env.call_tool(
+            "greppy",
+            &json!({"batch": [["read", "x"], ["where-am-i"], ["replace-text", "f", "a", "b"], ["bash-smart", "--", "true"]]}),
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("ran:where-am-i"), "{}", out.content);
+        assert!(
+            out.content.contains("commands 4..4 did not run"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("ran:bash-smart"), "{}", out.content);
+    }
+
+    #[test]
+    fn batch_rejects_bad_shapes_and_keeps_guards() {
+        let (mut env, _, _) = env_with_stub("printf ok");
+        for bad in [
+            json!({"batch": []}),
+            json!({"batch": "read x"}),
+            json!({"batch": [["read"], [1]]}),
+        ] {
+            assert!(env.call_tool("greppy", &bad).is_error, "{bad}");
+        }
+        let too_many: Vec<_> = (0..17).map(|_| json!(["where-am-i"])).collect();
+        assert!(
+            env.call_tool("greppy", &json!({"batch": too_many}))
+                .is_error
+        );
+        let nested = env.call_tool("greppy", &json!({"batch": [["-p", "hi"]]}));
+        assert!(
+            nested.is_error
+                && nested
+                    .content
+                    .contains("nested agent runs are not supported")
+        );
     }
 
     #[test]
