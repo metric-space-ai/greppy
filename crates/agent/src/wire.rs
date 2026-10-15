@@ -98,10 +98,17 @@ fn map_messages(messages: &[Message]) -> Vec<Value> {
 
 fn map_content(parts: &[ContentPart]) -> Vec<Value> {
     // Anthropic requires tool results before other user content, including images.
-    parts.iter().filter(|part| matches!(part, ContentPart::ToolResult { .. }))
-        .chain(parts.iter().filter(|part| !matches!(part, ContentPart::ToolResult { .. })))
-        .filter(|part| !matches!(part, ContentPart::Thinking { .. })
-            && !matches!(part, ContentPart::SignedThinking { signature, .. } if signature.is_empty()))
+    parts
+        .iter()
+        .filter(|part| matches!(part, ContentPart::ToolResult { .. }))
+        .chain(
+            parts
+                .iter()
+                .filter(|part| !matches!(part, ContentPart::ToolResult { .. })),
+        )
+        // Every reasoning block goes back to the model, signed or not: OpenAI-compatible models behind
+        // a gateway (GLM, Kimi, …) return unsigned reasoning and continue from it on the next turn.
+        // Dropping it made them re-derive the whole task on every turn (several times the output).
         .map(|part| match part {
             ContentPart::Text { text } => json!({
                 "type": "text",
@@ -127,7 +134,14 @@ fn map_content(parts: &[ContentPart]) -> Vec<Value> {
                 "content": content,
                 "is_error": is_error,
             }),
-            ContentPart::Thinking { .. } => unreachable!("unsigned thinking filtered"),
+            ContentPart::Thinking { text } => json!({
+                "type": "thinking",
+                "thinking": text,
+            }),
+            ContentPart::SignedThinking { text, signature } if signature.is_empty() => json!({
+                "type": "thinking",
+                "thinking": text,
+            }),
             ContentPart::SignedThinking { text, signature } => json!({
                 "type": "thinking",
                 "thinking": text,
@@ -987,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_thinking_replays_and_results_precede_images() {
+    fn all_thinking_replays_and_results_precede_images() {
         let parts = map_content(&[
             ContentPart::Image {
                 media_type: "image/png".into(),
@@ -1008,8 +1022,11 @@ mod tests {
         ]);
         assert_eq!(parts[0]["type"], "tool_result");
         assert_eq!(parts[1]["type"], "image");
-        assert_eq!(parts[2]["signature"], "opaque-provider-signature");
-        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[2]["type"], "thinking");
+        assert_eq!(parts[2]["thinking"], "unsigned");
+        assert!(parts[2].get("signature").is_none());
+        assert_eq!(parts[3]["signature"], "opaque-provider-signature");
+        assert_eq!(parts.len(), 4);
     }
 
     #[test]
