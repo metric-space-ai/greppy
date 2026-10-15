@@ -7924,9 +7924,11 @@ fn targets_from_stdin() -> Result<Vec<String>> {
     }
     if out.is_empty() {
         for line in text.lines() {
-            let name = line.split_whitespace().next().unwrap_or("").trim();
-            if !name.is_empty() && !out.iter().any(|kept| kept == name) {
-                out.push(name.to_string());
+            let Some(name) = piped_text_target(line) else {
+                continue;
+            };
+            if !out.iter().any(|kept| *kept == name) {
+                out.push(name);
             }
         }
     }
@@ -7936,6 +7938,29 @@ fn targets_from_stdin() -> Result<Vec<String>> {
         ));
     }
     Ok(out)
+}
+
+/// One target from a text result line. A navigation or search row `file:line  name …` becomes
+/// the file-qualified symbol `file::name`, so `search-symbol X | read -` reads what was found.
+/// Indented hint lines, `status:`-style headers and expand footers carry no target.
+fn piped_text_target(line: &str) -> Option<String> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut fields = line.split_whitespace();
+    let first = fields.next()?.trim();
+    if let Some((path, line_no)) = first.rsplit_once(':') {
+        if !path.is_empty() && !line_no.is_empty() && line_no.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(match fields.next() {
+                Some(name) if !name.starts_with('\u{2014}') => format!("{path}::{name}"),
+                _ => first.to_string(),
+            });
+        }
+    }
+    if first.ends_with(':') {
+        return None;
+    }
+    Some(first.to_string())
 }
 
 fn collect_piped_targets(value: &serde_json::Value, out: &mut Vec<String>) {
@@ -12691,3 +12716,41 @@ fn error_exit_code(error: &Error) -> u8 {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod piped_text_target_tests {
+    use super::piped_text_target;
+
+    #[test]
+    fn result_rows_become_file_qualified_symbols() {
+        assert_eq!(
+            piped_text_target(
+                "caddyconfig/caddyfile/parse.go:741  parser::blockTokens \u{2014} parses tokens"
+            )
+            .as_deref(),
+            Some("caddyconfig/caddyfile/parse.go::parser::blockTokens")
+        );
+        assert_eq!(
+            piped_text_target("cli.py:1  parse_args  function").as_deref(),
+            Some("cli.py::parse_args")
+        );
+        assert_eq!(
+            piped_text_target("src/lib.rs:12").as_deref(),
+            Some("src/lib.rs:12")
+        );
+        assert_eq!(piped_text_target("my_func").as_deref(), Some("my_func"));
+    }
+
+    #[test]
+    fn hints_headers_and_footers_carry_no_target() {
+        for line in [
+            "    parses a caddyfile dispenser",
+            "status: no_match",
+            "Expand: greppy expand 1a2b",
+            "next: retry",
+            "",
+        ] {
+            assert_eq!(piped_text_target(line), None, "{line:?}");
+        }
+    }
+}

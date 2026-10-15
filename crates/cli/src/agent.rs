@@ -2687,6 +2687,30 @@ fn format_tool_start(name: &str, arguments: &serde_json::Value) -> String {
                         .join(" ")
                 })
                 .unwrap_or_default();
+            let joined = if joined.is_empty() {
+                redacted
+                    .get("batch")
+                    .and_then(|v| v.as_array())
+                    .map(|cmds| {
+                        cmds.iter()
+                            .map(|cmd| {
+                                cmd.as_array()
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ; ")
+                    })
+                    .map(|list| format!("batch: {list}"))
+                    .unwrap_or_default()
+            } else {
+                joined
+            };
             format!("→ greppy {}", clip(&joined, TOOL_LINE_MAX))
         }
         other => {
