@@ -211,7 +211,7 @@ impl GreppyEnv {
     fn greppy_tool_def() -> ToolDefinition {
         ToolDefinition {
             name: "greppy".to_string(),
-            description: "Batch independent steps into one call: {\"batch\": [[\"search\", \"...\"], [\"read\", \"A\", \"B\"], [\"replace-text\", \"f\", \"old\", \"new\"]]} runs the commands in order and returns every result; a failed edit stops the rest. Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
+            description: "Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -223,7 +223,7 @@ impl GreppyEnv {
                     "batch": {
                         "type": "array",
                         "items": { "type": "array", "items": { "type": "string" } },
-                        "description": "Instead of args: several argv arrays, run in order in this one call (at most 16)."
+                        "description": "Instead of args: argv arrays, at most 16."
                     }
                 }
             }),
