@@ -541,6 +541,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Update this installation to the newest release (or `--version TAG`) through the verified
+    /// installer; the agent setup stays as it is. Package installs update through the package
+    /// manager.
+    #[command(visible_alias = "upgrade")]
+    Update {
+        /// Release to install, e.g. v0.4.3 (default: the latest release).
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
+    },
     /// End-to-end health check for the active workspace index.
     Doctor {
         /// Emit machine-readable JSON.

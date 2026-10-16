@@ -65,6 +65,7 @@ macro_rules! println {
 }
 
 mod cli_surface;
+mod self_update;
 mod web;
 mod web_attach;
 pub use cli_surface::*;
@@ -2921,6 +2922,7 @@ fn dispatch_subcommand(
         Command::Doctor { json } => {
             dispatch_doctor(json, root, EmbeddingCliArgs { device, no_gpu })
         }
+        Command::Update { version } => Ok(self_update::run(version)),
         Command::Web { command } => web::dispatch(command, root),
         Command::WhoCalls {
             symbols,
