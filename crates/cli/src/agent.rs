@@ -1141,7 +1141,8 @@ fn run_agent(
                 // dies with "worker sandbox: Operation not permitted", and the
                 // agent only ever sees "web-runtime did not create its socket".
                 // Started here, the tool children merely connect.
-                if let Err(error) = crate::web::prestart_unsandboxed() {
+                let worktree_root = workspace.worktree_path().to_string_lossy().into_owned();
+                if let Err(error) = crate::web::prestart_unsandboxed(Some(&worktree_root)) {
                     eprintln!("greppy: browser unavailable to the agent ({error})");
                 }
             }
