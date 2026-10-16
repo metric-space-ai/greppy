@@ -94,6 +94,8 @@ deb_root="$work_root/deb"
 mkdir -p "$deb_root/DEBIAN"
 cp -al "$STAGING_ROOT/." "$deb_root/"
 installed_size_kib=$(du -sk "$STAGING_ROOT" | awk '{print $1}')
+# The linked web runtime loads fontconfig, wayland-client, EGL and mesa's software renderer at start; without them
+# the agent has no browser ("web-runtime did not create its socket").
 cat > "$deb_root/DEBIAN/control" <<EOF
 Package: greppy
 Version: $VERSION
@@ -101,7 +103,7 @@ Section: devel
 Priority: optional
 Architecture: amd64
 Maintainer: Metric Space <opensource@metric-space.ai>
-Depends: fuse3
+Depends: fuse3, libfontconfig1, libwayland-client0, libwayland-egl1, libegl1, libegl-mesa0, libgl1-mesa-dri, libx11-6
 Installed-Size: $installed_size_kib
 Homepage: https://github.com/metric-space-ai/greppy
 Description: Graph-native code navigation and portable CoW agent workspaces
@@ -135,7 +137,7 @@ Release: 1%{?dist}
 Summary: Graph-native code navigation and portable CoW agent workspaces
 License: Apache-2.0
 URL: https://github.com/metric-space-ai/greppy
-Requires: fuse3
+Requires: fuse3, fontconfig, libwayland-client, libwayland-egl, mesa-libEGL, mesa-dri-drivers, libX11
 BuildArch: x86_64
 
 %description
