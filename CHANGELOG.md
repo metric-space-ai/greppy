@@ -4,6 +4,40 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-10-16
+
+### Coding agent (`greppy -p`)
+
+- Tool calls keep your `HOME` and package caches (Go modules, Cargo, npm,
+  pip, …) unless the sandbox confines writes. Before, every call got an
+  empty scratch: builds and tests failed offline and re-downloaded
+  everything online.
+- Reasoning returned without a signature (GLM, Kimi and other
+  OpenAI-compatible models behind a gateway) goes back to the model on every
+  turn. The model no longer re-derives the task each turn, which cut its
+  output per turn by a factor of 1.6–3.
+- One tool call can carry several commands: `{"batch": [[…], […]]}` runs them
+  in order, and a failed edit stops the rest. Text results pipe into the next
+  command (`search-symbol NAME | read -`). The agent prompt asks for both.
+- The browser route lives in the agent's worktree. It used to land in your
+  checkout, where it made `--apply` refuse the finished change.
+
+### CLI
+
+- `greppy update [--version TAG]` (alias `upgrade`) moves an installation to
+  the newest or a named release through the verified installer and leaves
+  your agent setup as it is. A package install updates through the package
+  manager.
+- Opt-in: `GREPPY_EDIT_IMPACT=1` adds dependents and tests to edit receipts,
+  and `GREPPY_READ_RELATED=1` names the same-file callers and callees of what
+  `read` showed.
+
+### Packaging and security
+
+- The .deb and .rpm depend on the libraries the browser runtime loads
+  (fontconfig, wayland-client, EGL, mesa DRI, X11).
+- rustls 0.23.46 in the browser runtime (RUSTSEC-2026-0346 to -0349).
+
 ## [0.4.2] — 2026-10-08
 
 ### Navigation and call graph
