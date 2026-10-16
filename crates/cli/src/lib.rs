@@ -9564,7 +9564,7 @@ pub(crate) fn edit_impact_lines(
     let (Ok(store), Ok(project)) = (open_default_store(root), project_for(root)) else {
         return Vec::new();
     };
-    let mut symbols: Vec<greppy_search::SearchGraphRow> = Vec::new();
+    let mut symbols: Vec<greppy_search::graph::SearchGraphRow> = Vec::new();
     for line in [first, first + (last.saturating_sub(first)) / 2, last] {
         if let Ok(Some(row)) =
             greppy_search::definition_at(&store, Some(&project), file, line as i64)
