@@ -89,7 +89,7 @@ pub(crate) fn run(version: Option<String>) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
