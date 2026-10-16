@@ -9543,6 +9543,81 @@ fn find_repo_root(start: &std::path::Path) -> std::path::PathBuf {
 /// Compute the project identity string for the effective root
 /// (`--root` if given, else the detected repo root). Centralised so
 /// every command uses the same definition (RV-011).
+/// What a published edit reaches, appended to its receipt: for the symbols at the changed lines,
+/// the definitions that reference them within three hops and the tests among those. It replaces
+/// the `impact` call (and the model turn) an agent would otherwise spend to learn which tests to
+/// run. Best effort: without an index or a resolvable symbol the receipt simply has no such line.
+pub(crate) fn edit_impact_lines(
+    files: &[String],
+    span: Option<(usize, usize)>,
+    root_path: &std::path::Path,
+) -> Vec<String> {
+    const MAX_HOPS: usize = 3;
+    const MAX_TESTS_SHOWN: usize = 6;
+    let ([file], Some((first, last))) = (files, span) else {
+        return Vec::new();
+    };
+    if std::env::var_os("GREPPY_EDIT_IMPACT").is_some_and(|value| value == "0") {
+        return Vec::new();
+    }
+    let root = root_path.to_str();
+    let (Ok(store), Ok(project)) = (open_default_store(root), project_for(root)) else {
+        return Vec::new();
+    };
+    let mut symbols: Vec<greppy_search::SearchGraphRow> = Vec::new();
+    for line in [first, first + (last.saturating_sub(first)) / 2, last] {
+        if let Ok(Some(row)) =
+            greppy_search::definition_at(&store, Some(&project), file, line as i64)
+        {
+            if !symbols.iter().any(|kept| kept.id == row.id) {
+                symbols.push(row);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for row in symbols.iter().take(3) {
+        let Ok(reached) = greppy_search::impact_radius_any_edge_type(
+            &store,
+            row.id,
+            greppy_search::ReachDirection::Incoming,
+            greppy_search::REFERENCE_EDGE_TYPES,
+            MAX_HOPS,
+            512,
+        ) else {
+            continue;
+        };
+        let mut dependents = 0usize;
+        let mut tests: Vec<String> = Vec::new();
+        for step in reached.iter().filter(|step| step.node.id != row.id) {
+            match store.get_node(step.node.id) {
+                Ok(Some(node)) if is_test_node(&node) => tests.push(step.node.name.clone()),
+                _ => dependents += 1,
+            }
+        }
+        tests.sort();
+        tests.dedup();
+        let tests_part = if tests.is_empty() {
+            "no test reaches it".to_string()
+        } else {
+            let shown = tests
+                .iter()
+                .take(MAX_TESTS_SHOWN)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            match tests.len().saturating_sub(MAX_TESTS_SHOWN) {
+                0 => format!("tests: {shown}"),
+                more => format!("tests: {shown} (+{more})"),
+            }
+        };
+        out.push(format!(
+            "affects {}: {dependents} dependents within {MAX_HOPS} hops; {tests_part}",
+            row.qualified_name
+        ));
+    }
+    out
+}
+
 fn project_for(root: Option<&str>) -> Result<String> {
     let p = resolve_root(root)?;
     Ok(workspace_locator::project_identity(&p))

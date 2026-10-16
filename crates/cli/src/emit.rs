@@ -388,6 +388,13 @@ pub(crate) fn emit_edit_outcome(
                 // between the sites as changed, which is worse than no echo.
                 if record.published && !record.already_as_sent && record.headline.is_none() {
                     print_landed_span(&record, root_path);
+                    for line in crate::edit_impact_lines(
+                        &record.files,
+                        record.changed_span.or(record.span),
+                        root_path,
+                    ) {
+                        println!("{line}");
+                    }
                 }
                 for note in &record.notes {
                     println!("{note}");
