@@ -7929,7 +7929,7 @@ fn targets_from_stdin() -> Result<Vec<String>> {
             let Some(name) = piped_text_target(line) else {
                 continue;
             };
-            if !out.iter().any(|kept| *kept == name) {
+            if !out.contains(&name) {
                 out.push(name);
             }
         }
