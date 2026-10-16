@@ -1361,12 +1361,15 @@ pub(super) fn rpc_on_response(
 ///
 /// Starting it from the unsandboxed parent avoids that entirely: the tool
 /// children then only connect to a socket that already exists.
-pub fn prestart_unsandboxed() -> std::result::Result<(), String> {
+/// `root` is the directory whose `.greppy/web` holds the runtime route: the agent's worktree, never
+/// the user's checkout. With `None` the route went to the current directory, which for `greppy -p`
+/// is the user's checkout; the stray file then made `--apply` refuse the finished proposal.
+pub fn prestart_unsandboxed(root: Option<&str>) -> std::result::Result<(), String> {
     let spawn = SupervisorSpawn {
         fixture_url: None,
         search_endpoint: None,
     };
-    ensure_supervisor(None, &spawn)
+    ensure_supervisor(root, &spawn)
         .map(|_| ())
         .map_err(|error| error.message.to_string())
 }
