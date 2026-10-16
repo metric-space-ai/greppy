@@ -2684,10 +2684,25 @@ fn parse_index_status_json_and_doctor_json() {
 
 #[test]
 fn removed_stub_names_are_not_public_subcommands() {
-    for name in ["install", "uninstall", "update", "config"] {
+    for name in ["install", "uninstall", "config"] {
         let cli = Cli::try_parse_from(["greppy", name]).unwrap();
         assert!(cli.command.is_none(), "{name} must not be a subcommand");
         assert_eq!(cli.passthrough, vec![name]);
+    }
+}
+
+#[test]
+fn update_and_its_upgrade_alias_are_real_subcommands() {
+    for name in ["update", "upgrade"] {
+        let cli = Cli::try_parse_from(["greppy", name, "--version", "v0.4.3"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Update { version: Some(ref v) }) if v == "v0.4.3"),
+            "{name} must parse as the update command"
+        );
+        assert!(
+            super::SUBCOMMANDS.contains(&name),
+            "{name} must not fall through to grep"
+        );
     }
 }
 
