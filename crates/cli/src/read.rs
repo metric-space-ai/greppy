@@ -1256,6 +1256,7 @@ pub(crate) fn dispatch_read_symbols(
     let mut failed = false;
     let mut printed = false;
     let mut previous_ended_with_newline = true;
+    let mut shown: Vec<(i64, String)> = Vec::new();
     for query in symbols {
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
         let resolved_ids = resolve_symbol_nodes(&store, Some(query))?;
@@ -1304,8 +1305,78 @@ pub(crate) fn dispatch_read_symbols(
         }
         print!("{group}");
         previous_ended_with_newline = group.ends_with('\n');
+        shown.push((definition.node.id, definition.node.file_path.clone()));
+    }
+    if let Some(line) = read_related_line(&store, &shown) {
+        if !previous_ended_with_newline {
+            println!();
+        }
+        println!("{line}");
     }
     Ok(if failed { 1 } else { 0 })
+}
+
+/// One closing line naming the definitions of the same file that what was just read calls or is
+/// called by, and that were not shown. Agents read symbol by symbol and missed half of the fix's
+/// definitions that sat in a file they had already opened (v3 bench, 14 tasks); the names cost a
+/// line, the bodies stay one batched `read` away. `GREPPY_READ_RELATED=0` turns it off.
+fn read_related_line(store: &greppy_store::Store, shown: &[(i64, String)]) -> Option<String> {
+    const MAX: usize = 8;
+    if shown.is_empty() || std::env::var_os("GREPPY_READ_RELATED").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let shown_ids: std::collections::HashSet<i64> = shown.iter().map(|(id, _)| *id).collect();
+    let mut related: Vec<(String, i64, String)> = Vec::new();
+    for (id, file) in shown {
+        for direction in [
+            greppy_search::ReachDirection::Outgoing,
+            greppy_search::ReachDirection::Incoming,
+        ] {
+            let Ok(reached) = greppy_search::impact_radius_any_edge_type(
+                store,
+                *id,
+                direction,
+                &["CALLS"],
+                1,
+                64,
+            ) else {
+                continue;
+            };
+            for step in reached {
+                let node = step.node;
+                if node.file_path != *file
+                    || shown_ids.contains(&node.id)
+                    || related
+                        .iter()
+                        .any(|(_, line, f)| *line == node.start_line && f == file)
+                {
+                    continue;
+                }
+                related.push((node.name.clone(), node.start_line, file.clone()));
+            }
+        }
+    }
+    if related.is_empty() {
+        return None;
+    }
+    related.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)));
+    let more = related.len().saturating_sub(MAX);
+    let names = related
+        .iter()
+        .take(MAX)
+        .map(|(name, line, file)| {
+            format!("{name} {}:{line}", file.rsplit('/').next().unwrap_or(file))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if more > 0 {
+        format!(" (+{more})")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "same file, calls or is called by what you read: {names}{more}"
+    ))
 }
 
 fn read_structural_kind(kind: &str) -> bool {
