@@ -9547,6 +9547,7 @@ fn find_repo_root(start: &std::path::Path) -> std::path::PathBuf {
 /// the definitions that reference them within three hops and the tests among those. It replaces
 /// the `impact` call (and the model turn) an agent would otherwise spend to learn which tests to
 /// run. Best effort: without an index or a resolvable symbol the receipt simply has no such line.
+/// Opt-in (`GREPPY_EDIT_IMPACT=1`): on caddy (10 runs per arm) it did not pay for its tokens.
 pub(crate) fn edit_impact_lines(
     files: &[String],
     span: Option<(usize, usize)>,
@@ -9557,7 +9558,7 @@ pub(crate) fn edit_impact_lines(
     let ([file], Some((first, last))) = (files, span) else {
         return Vec::new();
     };
-    if std::env::var_os("GREPPY_EDIT_IMPACT").is_some_and(|value| value == "0") {
+    if std::env::var_os("GREPPY_EDIT_IMPACT").is_none_or(|value| value != "1") {
         return Vec::new();
     }
     let root = root_path.to_str();

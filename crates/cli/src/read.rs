@@ -1319,10 +1319,11 @@ pub(crate) fn dispatch_read_symbols(
 /// One closing line naming the definitions of the same file that what was just read calls or is
 /// called by, and that were not shown. Agents read symbol by symbol and missed half of the fix's
 /// definitions that sat in a file they had already opened (v3 bench, 14 tasks); the names cost a
-/// line, the bodies stay one batched `read` away. `GREPPY_READ_RELATED=0` turns it off.
+/// line, the bodies stay one batched `read` away. Opt-in (`GREPPY_READ_RELATED=1`): on caddy (10 runs
+/// per arm) it did not pay for its tokens, so it stays off until a wider bench says otherwise.
 fn read_related_line(store: &greppy_store::Store, shown: &[(i64, String)]) -> Option<String> {
     const MAX: usize = 8;
-    if shown.is_empty() || std::env::var_os("GREPPY_READ_RELATED").is_some_and(|v| v == "0") {
+    if shown.is_empty() || std::env::var_os("GREPPY_READ_RELATED").is_none_or(|v| v != "1") {
         return None;
     }
     let shown_ids: std::collections::HashSet<i64> = shown.iter().map(|(id, _)| *id).collect();
