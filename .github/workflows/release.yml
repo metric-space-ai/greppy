@@ -1310,7 +1310,7 @@ jobs:
             --status success \
             --limit 1 \
             --json databaseId,headSha \
-            --jq '.[0] | "\(.databaseId) \(.headSha)"')"
+            --jq '.[0] // empty | "\(.databaseId) \(.headSha)"')"
           run_id="${run_info%% *}"; sq_sha="${run_info##* }"
           if [ -z "$run_id" ]; then
             # Summary-quality evidence is published when a passing run exists
