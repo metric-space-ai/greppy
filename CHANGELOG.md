@@ -4,7 +4,15 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
-## [0.4.3] — 2026-10-16
+## [0.4.4] — 2026-10-18
+
+The first published release of the 0.4.3 line (the v0.4.3 tag was never
+published as a release). Same contents as 0.4.3 below, plus:
+
+- Release workflow: a missing summary-quality run no longer reads as
+  "bound to null"; the release publishes without that evidence, as intended.
+
+## [0.4.3] — 2026-10-16 (tagged, not published)
 
 ### Coding agent (`greppy -p`)
 
