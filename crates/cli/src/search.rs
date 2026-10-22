@@ -201,7 +201,57 @@ fn search_kind_matches(
         return true;
     };
     let lines = nav_file_lines(root_path, &node.file_path);
-    nav_kind_word(lines.as_ref(), node).eq_ignore_ascii_case(kind)
+    let word = nav_kind_word(lines.as_ref(), node);
+    if word.eq_ignore_ascii_case(kind) {
+        return true;
+    }
+    // A type is spelled differently per language: Go writes `type X struct`
+    // (shown as `type`), C# and Java say class, Swift protocol, Go interface.
+    // A kind filter names the concept, so it matches every spelling of it and
+    // every type keyword on the definition line.
+    let line_words: Vec<String> = lines
+        .as_ref()
+        .and_then(|lines| lines.get((node.start_line.max(1) as usize).saturating_sub(1)))
+        .map(|line| {
+            line.split_whitespace()
+                .map(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_ascii_lowercase()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let kind = kind.to_ascii_lowercase();
+    if word == "type" && line_words.iter().any(|w| *w == kind) {
+        return true;
+    }
+    const TYPE_KINDS: &[&str] = &[
+        "type",
+        "struct",
+        "class",
+        "record",
+        "object",
+        "union",
+        "enum",
+        "trait",
+        "interface",
+        "protocol",
+    ];
+    const RECORD_KINDS: &[&str] = &["struct", "class", "record", "object"];
+    const CONTRACT_KINDS: &[&str] = &["trait", "interface", "protocol"];
+    let word = word.to_ascii_lowercase();
+    match kind.as_str() {
+        "type" => TYPE_KINDS.contains(&word.as_str()),
+        "struct" | "class" => {
+            RECORD_KINDS.contains(&word.as_str())
+                || (word == "type"
+                    && line_words
+                        .iter()
+                        .any(|w| RECORD_KINDS.contains(&w.as_str())))
+        }
+        "trait" | "interface" => CONTRACT_KINDS.contains(&word.as_str()),
+        _ => false,
+    }
 }
 
 fn search_name_normalized(name: &str) -> String {
@@ -1125,9 +1175,10 @@ fn print_search_pattern_rows(
     code: bool,
     all: bool,
     query: &str,
-    fixed: bool,
+    mode: PatternMode,
     root_path: &std::path::Path,
 ) {
+    let fixed = mode.fixed;
     const FULL_LIMIT: usize = 25;
     // Five rows made agents re-query for the next page on every larger
     // result (v3 bench: "40 matches; showing 5"); twenty stays compact.
@@ -1166,10 +1217,15 @@ fn print_search_pattern_rows(
     // This regex only positions a display window. grep remains authoritative
     // for ERE matching; unsupported regex dialects retain a head preview.
     let display_regex = if code && !fixed {
-        regex::Regex::new(query).ok()
+        regex::RegexBuilder::new(query)
+            .case_insensitive(mode.ignore_case)
+            .build()
+            .ok()
     } else {
         None
     };
+    let mut context_files: std::collections::HashMap<String, Option<Vec<String>>> =
+        Default::default();
     for (index, row) in rows.iter().skip(start).take(shown).enumerate() {
         let row_start = output_capture_position();
         if let Some(node) = &row.node {
@@ -1184,7 +1240,9 @@ fn print_search_pattern_rows(
             println!("{}:{}", row.hit.file, row.hit.line.max(1));
         }
         if code {
-            let anchor = if fixed {
+            let anchor = if fixed && mode.ignore_case {
+                row.hit.text.to_lowercase().find(&query.to_lowercase())
+            } else if fixed {
                 row.hit.text.find(query)
             } else {
                 display_regex
@@ -1214,8 +1272,35 @@ fn print_search_pattern_rows(
                 println!();
             }
         }
+        if mode.before > 0 || mode.after > 0 {
+            let lines = context_files
+                .entry(row.hit.file.clone())
+                .or_insert_with(|| nav_file_lines(root_path, &row.hit.file));
+            if let Some(lines) = lines {
+                let line = row.hit.line.max(1) as usize;
+                let first = line.saturating_sub(mode.before).max(1);
+                let last = (line + mode.after).min(lines.len());
+                for number in first..=last {
+                    let marker = if number == line { ':' } else { '-' };
+                    println!("{number:>6}{marker} {}", lines[number - 1]);
+                }
+                if index + 1 < shown {
+                    println!("--");
+                }
+            }
+        }
         record_nav_text_row(start + index, row_start);
     }
+}
+
+/// How `search-pattern` matches and how much surrounding source it prints:
+/// the grep flags agents reach for (`-F`, `-i`, `-A/-B/-C N`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PatternMode {
+    pub(crate) fixed: bool,
+    pub(crate) ignore_case: bool,
+    pub(crate) before: usize,
+    pub(crate) after: usize,
 }
 
 #[expect(
@@ -1228,10 +1313,11 @@ pub(crate) fn dispatch_search_code(
     code: bool,
     all: bool,
     json: bool,
-    fixed: bool,
+    mode: PatternMode,
     paths: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
+    let fixed = mode.fixed;
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
         return Err(Error::Invalid(
@@ -1253,6 +1339,7 @@ pub(crate) fn dispatch_search_code(
         q,
         &root_path,
         fixed,
+        mode.ignore_case,
         &path_filters,
         Some(&local_progress),
     )?;
@@ -1312,6 +1399,7 @@ pub(crate) fn dispatch_search_code(
                 "result_status": if rows.is_empty() { "no_matches" } else { "ok" },
                 "query": q,
                 "pattern_mode": if fixed { "fixed" } else { "regex" },
+                "ignore_case": mode.ignore_case,
                 "project": project,
                 "path_filters": path_filters.json_value(),
                 "backend": "live-filesystem",
@@ -1342,13 +1430,17 @@ pub(crate) fn dispatch_search_code(
     }
 
     if rows.is_empty() {
-        let insensitive = search_pattern_case_insensitive_hits(
-            q,
-            &root_path,
-            fixed,
-            &path_filters,
-            Some(&local_progress),
-        )?;
+        let insensitive = if mode.ignore_case {
+            None
+        } else {
+            search_pattern_case_insensitive_hits(
+                q,
+                &root_path,
+                fixed,
+                &path_filters,
+                Some(&local_progress),
+            )?
+        };
         // Finish every source scan before emitting the terminal answer.  A caller
         // may treat `status: no_matches` as completion even though the optional
         // case-insensitive diagnostic can still take substantial time on a large
@@ -1361,7 +1453,7 @@ pub(crate) fn dispatch_search_code(
         // status block above carries the guidance.
         return Ok(1);
     }
-    print_search_pattern_rows(&rows, code, all, q, fixed, &root_path);
+    print_search_pattern_rows(&rows, code, all, q, mode, &root_path);
     Ok(0)
 }
 

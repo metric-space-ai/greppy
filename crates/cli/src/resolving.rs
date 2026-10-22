@@ -399,12 +399,28 @@ pub(crate) fn resolve_symbol_id(
 pub(crate) fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
     let idx = query.find("::")?;
     let head = &query[..idx];
+    // `tg.Client::Method` (Go package), `pkg.mod::f` and `Owner.Inner::m` are
+    // qualified names, not files: a bare head only counts as a file when its
+    // extension is a source-file extension.
     let looks_like_path = head.contains('/')
         || std::path::Path::new(head)
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()));
+            .is_some_and(is_source_file_extension);
     looks_like_path.then(|| (head, &query[idx + 2..]))
+}
+
+fn is_source_file_extension(extension: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "rs", "py", "pyi", "go", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "java",
+        "kt", "kts", "scala", "rb", "php", "c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx", "cs",
+        "fs", "swift", "m", "mm", "lua", "sh", "bash", "zsh", "ex", "exs", "erl", "hs", "ml",
+        "mli", "zig", "dart", "vue", "svelte", "sql", "proto", "toml", "yaml", "yml", "json",
+        "jsonc", "md", "r", "jl", "clj", "groovy", "gradle", "pl", "pm", "nim", "v", "sol", "bzl",
+        "bazel", "nix", "tf", "hcl", "css", "scss", "html", "xml", "graphql", "gql", "astro",
+        "elm", "gleam", "cr", "d", "f90", "ini", "cfg",
+    ];
+    EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
 }
 
 /// Definition labels that a lossless qualified spelling may address directly.

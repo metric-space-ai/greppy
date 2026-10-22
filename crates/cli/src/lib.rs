@@ -1344,7 +1344,16 @@ fn shell_quote_cli(value: &str) -> String {
     }
 }
 
-const SEARCH_KINDS: &[&str] = &["function", "method", "class", "struct", "enum", "trait"];
+const SEARCH_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "interface",
+    "type",
+];
 
 /// A guessed domain kind is still evidence about the query, but not about the
 /// language-neutral index vocabulary. Dropping only the filter preserves the
@@ -1400,14 +1409,14 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "patch" => "greppy patch [DIFF] [--dry-run] [--verify]",
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "search" => {
-            "greppy search WHAT IT DOES [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
+            "greppy search WHAT IT DOES [--kind function|method|class|struct|enum|trait|interface|type] [--code] [--all] [--json] [--root DIR]"
         }
         "context" => "greppy context \"QUERY\" [--root DIR]",
         "search-pattern" => {
-            "greppy search-pattern REGEX [--fixed] [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
+            "greppy search-pattern REGEX [--fixed] [-i] [-A N] [-B N] [-C N] [--kind function|method|class|struct|enum|trait|interface|type] [--path PATH] [--code] [--all] [--json] [--root DIR]"
         }
         "search-symbol" => {
-            "greppy search-symbol NAME [--kind function|method|class|struct|enum|trait] [--code] [--all] [--json] [--root DIR]"
+            "greppy search-symbol NAME [--kind function|method|class|struct|enum|trait|interface|type] [--code] [--all] [--json] [--root DIR]"
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
@@ -2990,6 +2999,10 @@ fn dispatch_subcommand(
             query,
             json,
             fixed,
+            ignore_case,
+            after_context,
+            before_context,
+            context,
             kind,
             code,
             all,
@@ -3002,7 +3015,12 @@ fn dispatch_subcommand(
                 code,
                 all,
                 json,
-                fixed,
+                search::PatternMode {
+                    fixed,
+                    ignore_case,
+                    before: before_context.or(context).unwrap_or(0),
+                    after: after_context.or(context).unwrap_or(0),
+                },
                 &path_opts,
                 root,
             )
@@ -9184,13 +9202,21 @@ fn live_grep_code_hits_pattern(
     root_path: &std::path::Path,
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
-    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default(), None)
+    live_grep_code_hits_pattern_scoped(
+        query,
+        root_path,
+        fixed,
+        false,
+        &QueryPathFilters::default(),
+        None,
+    )
 }
 
 fn live_grep_code_hits_pattern_scoped(
     query: &str,
     root_path: &std::path::Path,
     fixed: bool,
+    ignore_case: bool,
     path_filters: &QueryPathFilters,
     progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
@@ -9209,7 +9235,7 @@ fn live_grep_code_hits_pattern_scoped(
     if let Some(progress) = progress {
         progress.phase("scanning_files", paths.len(), "files");
     }
-    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed, progress)
+    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed, ignore_case, progress)
 }
 
 fn source_code_hits_ranked(
@@ -9240,16 +9266,18 @@ fn live_grep_search_code_paths_pattern(
     root_path: &std::path::Path,
     paths: &[String],
     fixed: bool,
+    ignore_case: bool,
     progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
 
-    let grep_args = if fixed {
-        ["-HnIF", "--", query]
-    } else {
-        ["-HnIE", "--", query]
+    let grep_args = match (fixed, ignore_case) {
+        (true, false) => ["-HnIF", "--", query],
+        (true, true) => ["-HnIFi", "--", query],
+        (false, false) => ["-HnIE", "--", query],
+        (false, true) => ["-HnIEi", "--", query],
     };
     let mut hits = Vec::new();
     let mut completed = 0;
@@ -9261,7 +9289,7 @@ fn live_grep_search_code_paths_pattern(
             .output();
         let out = match out {
             Ok(out) => out,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed && !ignore_case => {
                 return internal_literal_search_code_paths(query, root_path, paths, progress);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
