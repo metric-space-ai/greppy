@@ -222,7 +222,7 @@ fn search_kind_matches(
         })
         .unwrap_or_default();
     let kind = kind.to_ascii_lowercase();
-    if word == "type" && line_words.iter().any(|w| *w == kind) {
+    if word == "type" && line_words.contains(&kind) {
         return true;
     }
     const TYPE_KINDS: &[&str] = &[
