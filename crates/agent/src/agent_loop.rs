@@ -430,7 +430,7 @@ pub fn run_agent_loop_with_history(
             max_tokens: config.max_tokens,
         };
 
-        let turn = match stream_turn_with_retry(model, &req, on_event) {
+        let mut turn = match stream_turn_with_retry(model, &req, on_event) {
             Ok(turn) => turn,
             Err(ClientError::Cancelled) => {
                 last_stop = LoopStop::Cancelled;
@@ -440,6 +440,9 @@ pub fn run_agent_loop_with_history(
         };
         turns += 1;
         total_usage = sum_usage(total_usage, turn.usage);
+        // A degenerate response (thousands of argument-less calls in one
+        // message) is pruned before it is executed or kept in history.
+        let dropped_calls = prune_degenerate_tool_calls(&mut turn.message);
         on_event(LoopEvent::TurnComplete {
             stop_reason: turn.stop_reason.clone(),
             usage: turn.usage,
@@ -586,6 +589,22 @@ verifiable and report the rest."
                     // are recorded as cancelled results so history stays valid.
                     if cancel_requested(config) {
                         cancel_remaining = true;
+                    }
+                }
+
+                if dropped_calls > 0 {
+                    if let Some(ContentPart::ToolResult { content, .. }) = result_parts
+                        .iter_mut()
+                        .rev()
+                        .find(|part| matches!(part, ContentPart::ToolResult { .. }))
+                    {
+                        append_tool_advisory(
+                            content,
+                            &format!(
+                                "{dropped_calls} further tool calls of this response were not run \
+(no arguments, repeated, or over {MAX_TOOL_CALLS_PER_RESPONSE} per response)."
+                            ),
+                        );
                     }
                 }
 
@@ -740,6 +759,44 @@ fn dispatch_tool(
     // `is_error: true` (see [`ToolOutcome::unknown_tool`]); the loop never
     // panics on model misbehavior.
     env.call_tool(name, arguments)
+}
+
+/// Tool calls run from one model response at most. A batch call already
+/// carries up to 16 commands, so a legitimate response stays far below this.
+const MAX_TOOL_CALLS_PER_RESPONSE: usize = 32;
+
+/// Removes the calls of a degenerate response from `message`: every call
+/// without an argument object after the first such call, exact repeats of an
+/// earlier call, and everything past [`MAX_TOOL_CALLS_PER_RESPONSE`]. The
+/// removed calls are neither run nor kept in history, so the next request does
+/// not carry them. Returns how many calls were removed.
+fn prune_degenerate_tool_calls(message: &mut Message) -> usize {
+    let mut kept = 0usize;
+    let mut dropped = 0usize;
+    let mut seen_invalid = false;
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    message.content.retain(|part| {
+        let ContentPart::ToolCall {
+            name, arguments, ..
+        } = part
+        else {
+            return true;
+        };
+        let keep = if kept >= MAX_TOOL_CALLS_PER_RESPONSE {
+            false
+        } else if !arguments.is_object() {
+            !std::mem::replace(&mut seen_invalid, true)
+        } else {
+            seen.insert((name.clone(), arguments.to_string()))
+        };
+        if keep {
+            kept += 1;
+        } else {
+            dropped += 1;
+        }
+        keep
+    });
+    dropped
 }
 
 fn collect_tool_calls(message: &Message) -> Vec<(String, String, serde_json::Value)> {
@@ -1026,6 +1083,70 @@ mod tests {
         assert_eq!(result.messages.len(), 4);
         assert_eq!(result.messages[..2], history);
         assert_eq!(result.final_text, "second answer");
+    }
+
+    #[test]
+    fn degenerate_response_runs_and_keeps_only_the_valid_calls() {
+        // gotd/td 19.10. (glm-5.3-flash): one response carried 9022 calls without
+        // arguments; every one ran and its error went into the next request.
+        let ids: Vec<String> = (0..500).map(|i| format!("empty-{i}")).collect();
+        let mut calls: Vec<(&str, &str, serde_json::Value)> =
+            vec![("ok-1", "echo", json!({"args": ["a"]}))];
+        calls.extend(
+            ids.iter()
+                .map(|id| (id.as_str(), "echo", serde_json::Value::Null)),
+        );
+        calls.push(("dup-1", "echo", json!({"args": ["a"]})));
+        calls.push(("ok-2", "echo", json!({"args": ["b"]})));
+        let mut model = FakeModel::new(vec![
+            tool_turn(None, calls, usage(10, 5)),
+            text_turn("done", usage(10, 5)),
+        ]);
+        let mut env =
+            FakeEnv::new(vec![echo_tool()]).with_outcome("echo", ToolOutcome::ok("echoed"));
+        let config = AgentConfig::default().with_model("mock");
+
+        let (result, _) = run(&mut model, &mut env, &config, "go").expect("loop");
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        // ok-1, the first argument-less call (its error teaches the model), ok-2.
+        assert_eq!(env.calls.len(), 3);
+        let second = &model.requests[1].messages;
+        let assistant_calls = second[1]
+            .content
+            .iter()
+            .filter(|p| matches!(p, ContentPart::ToolCall { .. }))
+            .count();
+        assert_eq!(assistant_calls, 3);
+        let results: Vec<&String> = second[2]
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 3);
+        assert!(results[2].contains("500 further tool calls of this response were not run"));
+    }
+
+    #[test]
+    fn tool_calls_past_the_per_response_limit_are_not_run() {
+        let ids: Vec<String> = (0..40).map(|i| format!("c{i}")).collect();
+        let calls: Vec<(&str, &str, serde_json::Value)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), "echo", json!({"args": [i.to_string()]})))
+            .collect();
+        let mut model = FakeModel::new(vec![
+            tool_turn(None, calls, usage(10, 5)),
+            text_turn("done", usage(10, 5)),
+        ]);
+        let mut env =
+            FakeEnv::new(vec![echo_tool()]).with_outcome("echo", ToolOutcome::ok("echoed"));
+        let config = AgentConfig::default().with_model("mock");
+
+        run(&mut model, &mut env, &config, "go").expect("loop");
+        assert_eq!(env.calls.len(), MAX_TOOL_CALLS_PER_RESPONSE);
     }
 
     #[test]
