@@ -16,6 +16,11 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   (glm-5.3-flash emitted 9,022 empty calls in a second) sent every error
   message back to the model and made the run four times as expensive.
 
+### Security
+
+- Web runtime: rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs
+  1.0.10 (RUSTSEC-2026-0381, -0382, -0383: distrusted emSign intermediates).
+
 ## [0.4.4] — 2026-10-18
 
 The first published release of the 0.4.3 line (the v0.4.3 tag was never
