@@ -4,6 +4,23 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-10-22
+
+### Coding agent (`greppy -p`)
+
+- A model response that carries hundreds of tool calls without arguments, or
+  the same call over and over, no longer runs them all. The agent runs at most
+  32 calls of one response, skips argument-less calls after the first and
+  exact repeats, and tells the model in one line how many it skipped. The
+  skipped calls do not stay in the conversation. Before, one such response
+  (glm-5.3-flash emitted 9,022 empty calls in a second) sent every error
+  message back to the model and made the run four times as expensive.
+
+### Security
+
+- Web runtime: rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs
+  1.0.10 (RUSTSEC-2026-0381, -0382, -0383: distrusted emSign intermediates).
+
 ## [0.4.4] — 2026-10-18
 
 The first published release of the 0.4.3 line (the v0.4.3 tag was never
