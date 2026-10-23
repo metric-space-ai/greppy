@@ -640,7 +640,13 @@ pub fn index_with_options_and_progress(
     // this index generation. The provider table is store-owned so query-time
     // diagnostics can expose partial language providers without depending on
     // parser internals.
-    sync_provider_states(store, project_name, &all_entries, generation)?;
+    sync_provider_states(
+        store,
+        project_name,
+        &all_entries,
+        generation,
+        max_file_size_bytes(),
+    )?;
 
     if rust_reexport_migration {
         let mut migrated_state = store
@@ -7791,10 +7797,20 @@ fn sync_provider_states(
     project: &str,
     entries: &[InventoryEntry],
     generation: u64,
+    max_size: u64,
 ) -> Result<()> {
     let mut by_language: std::collections::BTreeMap<String, ProviderRunSummary> =
         std::collections::BTreeMap::new();
     for entry in entries {
+        // A file over the size cap is skipped by policy (reported as `skipped
+        // oversize`), not a provider failure: two generated api-typedoc.json
+        // files kept every mikro-orm index `unhealthy` forever.
+        let size = entry
+            .size
+            .or_else(|| std::fs::metadata(&entry.abs_path).ok().map(|md| md.len()));
+        if size.is_some_and(|size| size > max_size) {
+            continue;
+        }
         let language = greppy_parser::language_for_path(&entry.abs_path);
         let name = language.name().to_string();
         let summary = by_language
@@ -8807,6 +8823,38 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         assert_eq!(txt.files_seen, 1);
         assert_eq!(txt.files_indexed, 0);
         assert_eq!(txt.files_failed, 1);
+    }
+
+    #[test]
+    fn oversized_files_are_not_provider_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.json");
+        let big = dir.path().join("big.json");
+        std::fs::write(&small, "{\"a\": 1}\n").unwrap();
+        std::fs::write(&big, format!("{{\"a\": \"{}\"}}\n", "x".repeat(200))).unwrap();
+        let entry = |rel: &str, abs: &Path| InventoryEntry {
+            rel_path: rel.into(),
+            abs_path: abs.to_path_buf(),
+            size: std::fs::metadata(abs).ok().map(|md| md.len()),
+            mtime_ns: None,
+            ctime_ns: None,
+            file_id: None,
+        };
+        let entries = vec![entry("small.json", &small), entry("big.json", &big)];
+        let mut store = Store::open_memory().unwrap();
+        sync_provider_states(&mut store, "test", &entries, 1, 100).unwrap();
+        let json = store
+            .get_provider_state("test", "json")
+            .unwrap()
+            .expect("json provider state");
+        assert_eq!(
+            json.files_seen, 1,
+            "the oversized file is a policy skip: {json:?}"
+        );
+        assert_eq!(
+            json.files_failed, 1,
+            "small.json has no file_state yet: {json:?}"
+        );
     }
 
     #[test]

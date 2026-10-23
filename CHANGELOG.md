@@ -14,6 +14,12 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   `process` command, or one marked `required` (Git LFS), still needs the full
   checkout.
 
+### Index
+
+- Files skipped by the size cap (reported as `skipped oversize`) no longer
+  count as provider failures. Two generated `api-typedoc.json` files kept every
+  mikro-orm index `unhealthy` although it was complete and fresh.
+
 ### Navigation
 
 - `--kind struct`, `--kind class` and the new `--kind type` / `--kind
