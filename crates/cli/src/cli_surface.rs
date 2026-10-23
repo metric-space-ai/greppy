@@ -676,6 +676,18 @@ pub enum Command {
         /// Treat REGEX as literal text instead of a regular expression.
         #[arg(long)]
         fixed: bool,
+        /// Match case-insensitively (grep's -i).
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+        /// Print N source lines after each match (grep's -A).
+        #[arg(short = 'A', long = "after-context", value_name = "N")]
+        after_context: Option<usize>,
+        /// Print N source lines before each match (grep's -B).
+        #[arg(short = 'B', long = "before-context", value_name = "N")]
+        before_context: Option<usize>,
+        /// Print N source lines around each match (grep's -C).
+        #[arg(short = 'C', long = "context", value_name = "N")]
+        context: Option<usize>,
         /// Restrict matches by the enclosing definition's kind.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,

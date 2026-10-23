@@ -1034,9 +1034,17 @@ fn preflight_repository_with_observer(
             detail: "unexpected -z output shape".into(),
         });
     }
+    // A `filter=NAME` attribute only converts content when Git has a driver for
+    // NAME (`filter.NAME.clean/smudge/process`) or demands one (`required`).
+    // Without a driver Git treats the path as unfiltered: tailscale declares
+    // `go.mod filter=go-mod` for an optional local tool and was refused here.
+    let drivers = configured_filter_drivers(repository)?;
     for triple in fields.chunks_exact(3) {
         let value = triple[2];
-        if value != b"unspecified" && value != b"unset" {
+        if value != b"unspecified"
+            && value != b"unset"
+            && drivers.contains(String::from_utf8_lossy(value).as_ref())
+        {
             return Err(Error::UnsupportedRepository(format!(
                 "Git filter attribute is active for {}; smudge/process filters (including Git LFS) are not supported by portable CoW",
                 String::from_utf8_lossy(triple[0])
@@ -1044,6 +1052,50 @@ fn preflight_repository_with_observer(
         }
     }
     Ok(())
+}
+
+/// Filter names Git would run or insist on: those with a `clean`, `smudge` or
+/// `process` command, or marked `required`, in any configuration scope.
+fn configured_filter_drivers(repository: &Path) -> Result<BTreeSet<String>> {
+    let output = Command::new("git")
+        .args([
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ])
+        .current_dir(repository)
+        .output()?;
+    // Exit 1: no such keys at all.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(git_error("git config --get-regexp filter", &output));
+    }
+    let mut drivers = BTreeSet::new();
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|e| !e.is_empty())
+    {
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = entry.split_once('\n').unwrap_or((entry.as_ref(), ""));
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((name, field)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        let active = match field {
+            "required" => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1" | ""
+            ),
+            _ => !value.trim().is_empty(),
+        };
+        if active {
+            drivers.insert(name.to_owned());
+        }
+    }
+    Ok(drivers)
 }
 
 fn repository_may_define_filter_attributes(repository: &Path, git_dir: &Path) -> Result<bool> {
@@ -1521,6 +1573,7 @@ mod tests {
         .unwrap();
         git(tracked.path(), &["add", ".gitattributes"]);
         git(tracked.path(), &["commit", "-qm", "add attributes"]);
+        git(tracked.path(), &["config", "filter.custom.smudge", "cat"]);
 
         let store_root = tempfile::tempdir().unwrap();
         let store = ChunkStore::open(store_root.path()).unwrap();
@@ -1537,11 +1590,31 @@ mod tests {
             "*.txt filter=custom\n",
         )
         .unwrap();
+        git(
+            ignored.path(),
+            &["config", "filter.custom.required", "true"],
+        );
 
         let store_root = tempfile::tempdir().unwrap();
         let store = ChunkStore::open(store_root.path()).unwrap();
         let error = capture_repository(ignored.path(), &store).unwrap_err();
         assert!(matches!(error, Error::UnsupportedRepository(_)));
+    }
+
+    #[test]
+    fn accepts_filter_attribute_without_a_configured_driver() {
+        // tailscale: `go.mod filter=go-mod` with no filter.go-mod.* in any
+        // config. Git leaves such paths unfiltered, so the snapshot is exact.
+        let repo = fixture();
+        fs::write(repo.path().join(".gitattributes"), "*.txt filter=go-mod\n").unwrap();
+        git(repo.path(), &["add", ".gitattributes"]);
+        git(
+            repo.path(),
+            &["commit", "-qm", "declare an undefined filter"],
+        );
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        capture_repository(repo.path(), &store).expect("undefined filter is not active");
     }
 
     #[test]

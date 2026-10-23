@@ -4,6 +4,32 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-10-23
+
+### Coding agent (`greppy -p`)
+
+- Repositories whose `.gitattributes` names a filter without a configured
+  driver (tailscale: `go.mod filter=go-mod`) are no longer refused. Git
+  leaves such paths unfiltered; only a filter with a `clean`, `smudge` or
+  `process` command, or one marked `required` (Git LFS), still needs the full
+  checkout.
+
+### Index
+
+- Files skipped by the size cap (reported as `skipped oversize`) no longer
+  count as provider failures. Two generated `api-typedoc.json` files kept every
+  mikro-orm index `unhealthy` although it was complete and fresh.
+
+### Navigation
+
+- `--kind struct`, `--kind class` and the new `--kind type` / `--kind
+  interface` find Go types (`type X struct`, `type Y interface`) and the
+  matching kinds of other languages. Before, `--kind struct` found no Go struct.
+- `read pkg.Type::Method` (Go package-qualified, as `tg.Client::Method`)
+  resolves the method instead of being taken for a file named `pkg.Type`.
+- `search-pattern` takes grep's `-i` (ignore case) and `-A`, `-B`, `-C N`
+  (context lines). They used to be rejected and cost the agent a turn.
+
 ## [0.4.5] — 2026-10-22
 
 ### Coding agent (`greppy -p`)
