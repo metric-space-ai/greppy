@@ -8842,6 +8842,13 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         };
         let entries = vec![entry("small.json", &small), entry("big.json", &big)];
         let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "test".into(),
+                indexed_at: "x".into(),
+                root_path: dir.path().to_string_lossy().into_owned(),
+            })
+            .unwrap();
         sync_provider_states(&mut store, "test", &entries, 1, 100).unwrap();
         let json = store
             .get_provider_state("test", "json")
