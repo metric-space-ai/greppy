@@ -1,5 +1,6 @@
 //! Persistent interactive-agent preferences.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,32 @@ pub struct AgentSettings {
     pub skip_selfcheck: bool,
     pub acceleration: String,
     pub workspace_backend: String,
+    /// Context limits per exact model id. Read by `greppy -p` as well.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelLimits>,
+}
+
+/// Context limits of one model, in tokens of that model's tokenizer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelLimits {
+    /// The model's real context window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Prompt size that triggers a context checkpoint; defaults to 80 % of
+    /// `context_window` and never exceeds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_at_tokens: Option<u64>,
+}
+
+impl ModelLimits {
+    pub fn compaction_threshold(&self) -> Option<u64> {
+        let at = self
+            .compact_at_tokens
+            .or_else(|| self.context_window.map(|window| window / 5 * 4))?;
+        let at = self.context_window.map_or(at, |window| at.min(window));
+        (at > 0).then_some(at)
+    }
 }
 
 impl Default for AgentSettings {
@@ -29,6 +56,7 @@ impl Default for AgentSettings {
             skip_selfcheck: false,
             acceleration: "auto".into(),
             workspace_backend: "auto".into(),
+            models: BTreeMap::new(),
         }
     }
 }
@@ -44,6 +72,14 @@ impl AgentSettings {
 
     pub fn save(&self) -> io::Result<()> {
         save_to(&settings_path(), self)
+    }
+
+    /// Compaction thresholds in tokens for every model with configured limits.
+    pub fn compaction_thresholds(&self) -> BTreeMap<String, u64> {
+        self.models
+            .iter()
+            .filter_map(|(model, limits)| Some((model.clone(), limits.compaction_threshold()?)))
+            .collect()
     }
 }
 
@@ -100,5 +136,27 @@ mod tests {
         let restored: AgentSettings =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(restored, settings);
+    }
+
+    #[test]
+    fn model_limits_parse_and_resolve_thresholds() {
+        let settings: AgentSettings = serde_json::from_str(
+            r#"{"model":"m","models":{
+                "DeepSeek-V4.1-Flash\uff20gpu4-a4500":{"context_window":1000000,"compact_at_tokens":800000},
+                "window-only":{"context_window":200000},
+                "above-window":{"context_window":100000,"compact_at_tokens":150000},
+                "threshold-only":{"compact_at_tokens":64000},
+                "empty":{}}}"#,
+        )
+        .unwrap();
+        let thresholds = settings.compaction_thresholds();
+        assert_eq!(thresholds["DeepSeek-V4.1-Flash\u{ff20}gpu4-a4500"], 800_000);
+        assert_eq!(thresholds["window-only"], 160_000);
+        assert_eq!(thresholds["above-window"], 100_000);
+        assert_eq!(thresholds["threshold-only"], 64_000);
+        assert!(!thresholds.contains_key("empty"));
+        // Settings written before model limits existed still load.
+        let legacy: AgentSettings = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert!(legacy.models.is_empty());
     }
 }

@@ -1059,6 +1059,7 @@ fn run_prompt(
         system: Some(system_prompt_for_mode(BuiltinPromptMode::Acp)),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
+        compact_at_tokens: crate::agent_tui::AgentSettings::load().compaction_thresholds(),
         ..AgentConfig::default()
     };
     let session_id = prepared.session_id.clone();
