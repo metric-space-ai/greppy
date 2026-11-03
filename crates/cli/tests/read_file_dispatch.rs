@@ -840,6 +840,54 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
 }
 
 #[test]
+fn read_wrong_file_qualified_name_resolves_the_symbol_elsewhere() {
+    let (repo, store) = fresh_workspace("misqualified");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/env.rs"), "pub struct Env;\n").unwrap();
+    std::fs::write(
+        repo.join("src/env_values.rs"),
+        "impl Env {\n    pub fn define_value() { let _ = 7; }\n}\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "src/env.rs::Env::define_value"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("src/env_values.rs"),
+        "expected the real file\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("define_value"), "{stdout}");
+    assert!(
+        stdout.contains("not an indexed definition in `src/env.rs`"),
+        "{stdout}"
+    );
+    assert!(!stdout.starts_with("no symbol"), "{stdout}");
+}
+
+#[test]
+fn read_wrong_file_qualified_name_lists_several_matches() {
+    let (repo, store) = fresh_workspace("misqualified-many");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/missing.rs"), "pub struct Missing;\n").unwrap();
+    std::fs::write(
+        repo.join("src/a.rs"),
+        "pub fn define_value() { let _ = 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/b.rs"),
+        "pub fn define_value() { let _ = 2; }\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "src/missing.rs::define_value"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("src/a.rs"), "{stdout}");
+    assert!(stdout.contains("src/b.rs"), "{stdout}");
+    assert!(stdout.contains("none are in `src/missing.rs`"), "{stdout}");
+}
+
+#[test]
 fn read_file_qualified_name_falls_back_to_source() {
     let (repo, store) = fresh_workspace("qualified-fallback");
     std::fs::write(

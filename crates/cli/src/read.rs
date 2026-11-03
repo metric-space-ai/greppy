@@ -664,6 +664,169 @@ fn read_unsupported_definition_coverage(
         .collect())
 }
 
+#[derive(Clone)]
+struct MisqualifiedHit {
+    id: i64,
+    qualified_name: String,
+    file_path: String,
+    start_line: i64,
+}
+
+/// `path::Type::name` missed that path. Look up the trailing name (and the
+/// type, when it selects something) across the whole index.
+///
+/// `None` means this query is not path-qualified or the index has no such
+/// name, so the caller can still fall back to the named file. `Some` means
+/// the answer was printed: a single definition, or the list when several match.
+fn try_misqualified_index_read(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    json: bool,
+    with_handle: bool,
+) -> Result<Option<i32>> {
+    let Some((path, spec)) = split_path_qualified(query) else {
+        return Ok(None);
+    };
+    let name = spec
+        .rsplit("::")
+        .next()
+        .and_then(|part| part.rsplit('.').next())
+        .unwrap_or(spec);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let owner = spec.rsplit("::").nth(1).filter(|part| !part.is_empty());
+    let rows = symbol_candidate_rows(store, Some(name))?;
+    let mut hits = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if !bare_symbol_name_matches(&row.name, name)
+            || !is_addressable_definition_label(&row.label)
+        {
+            continue;
+        }
+        if indexed_path_matches_query(&row.file_path, path) {
+            continue;
+        }
+        if !seen.insert((row.file_path.clone(), row.start_line, row.name.clone())) {
+            continue;
+        }
+        hits.push(MisqualifiedHit {
+            id: row.id,
+            qualified_name: row.qualified_name,
+            file_path: row.file_path,
+            start_line: row.start_line,
+        });
+    }
+    let typed = if let Some(owner) = owner {
+        hits.iter()
+            .filter(|hit| {
+                qname_owner_segment(&hit.qualified_name).is_some_and(|segment| segment == owner)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let chosen = if typed.is_empty() { hits } else { typed };
+    if chosen.is_empty() {
+        return Ok(None);
+    }
+    if chosen.len() == 1 {
+        let hit = &chosen[0];
+        let Some(node) = store.get_node(hit.id)? else {
+            return Ok(None);
+        };
+        let located = format!(
+            "note: `{query}` is not an indexed definition in `{path}`; found {} in {}:{}",
+            hit.qualified_name,
+            hit.file_path,
+            hit.start_line.max(1)
+        );
+        let Some(definition) = read_definition(store, root_path, node)? else {
+            return Ok(None);
+        };
+        if json {
+            let source = read_line_slice(
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": "greppy.read.v1",
+                    "command": "read",
+                    "status": "relocated",
+                    "query": query,
+                    "note": located,
+                    "qualified_name": definition.node.qualified_name,
+                    "path": definition.node.file_path,
+                    "start_line": definition.start_line,
+                    "end_line": definition.end_line,
+                    "source": source,
+                })
+            );
+            return Ok(Some(0));
+        }
+        println!("{located}");
+        for (start_line, end_line) in read_text_segments(&definition, None, None) {
+            print!(
+                "{}",
+                read_render_block(
+                    store,
+                    project,
+                    root_path,
+                    &definition,
+                    start_line,
+                    end_line,
+                    with_handle,
+                )?
+            );
+        }
+        return Ok(Some(0));
+    }
+    if json {
+        let candidates = chosen
+            .iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "qualified_name": hit.qualified_name,
+                    "path": hit.file_path,
+                    "line": hit.start_line.max(1),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": "greppy.read.v1",
+                "command": "read",
+                "status": "ambiguous",
+                "query": query,
+                "note": format!("`{name}` is {} definitions; none are in `{path}`", chosen.len()),
+                "candidates": candidates,
+            })
+        );
+        return Ok(Some(0));
+    }
+    println!(
+        "`{name}` is {} definitions; none are in `{path}`:",
+        chosen.len()
+    );
+    for hit in &chosen {
+        println!(
+            "{}:{}  {}",
+            hit.file_path,
+            hit.start_line.max(1),
+            hit.qualified_name
+        );
+    }
+    Ok(Some(0))
+}
+
 /// `file.ext::Type::method` missed the symbol index. Show the file around the
 /// trailing name instead of stopping at "no symbol".
 ///
@@ -1289,6 +1452,11 @@ pub(crate) fn dispatch_read_symbols(
         let mut nodes = read_real_nodes(&store, &ids)?;
         nodes.retain(|node| path_filters.matches(&node.file_path));
         if nodes.is_empty() {
+            if let Some(code) =
+                try_misqualified_index_read(&store, &project, query, &root_path, json, with_handle)?
+            {
+                return Ok(code);
+            }
             if let Some(shown) = try_qualified_file_fallback(query, &root_path, json)? {
                 return Ok(if shown { 0 } else { 1 });
             }
@@ -1409,23 +1577,44 @@ pub(crate) fn dispatch_read_symbols(
             failed = true;
             continue;
         }
-        let Some(node) = nodes.first().cloned() else {
-            match try_qualified_file_fallback(query, &root_path, json)? {
-                Some(true) => {
+        let node = if let Some(node) = nodes.first().cloned() {
+            node
+        } else {
+            match try_misqualified_index_read(
+                &store,
+                &project,
+                query,
+                &root_path,
+                json,
+                with_handle,
+            )? {
+                Some(0) => {
                     previous_ended_with_newline = true;
                     continue;
                 }
-                Some(false) => {
+                Some(_) => {
                     previous_ended_with_newline = true;
                     failed = true;
                     continue;
                 }
-                None => {}
+                None => match try_qualified_file_fallback(query, &root_path, json)? {
+                    Some(true) => {
+                        previous_ended_with_newline = true;
+                        continue;
+                    }
+                    Some(false) => {
+                        previous_ended_with_newline = true;
+                        failed = true;
+                        continue;
+                    }
+                    None => {
+                        read_report_missing(&store, &project, query, &root_path, &path_filters)?;
+                        previous_ended_with_newline = true;
+                        failed = true;
+                        continue;
+                    }
+                },
             }
-            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
-            previous_ended_with_newline = true;
-            failed = true;
-            continue;
         };
         let Some(definition) = read_definition(&store, &root_path, node)? else {
             read_report_missing(&store, &project, query, &root_path, &path_filters)?;

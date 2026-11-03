@@ -1016,10 +1016,13 @@ fn run_agent(
     }
 
     let prepared_base = if args.in_place {
-        crate::store_cow::configure_private_environment("in-place checkout");
+        // The checkout already has the operator's index (same commit, plus
+        // uncommitted files). A private per-run store would hide it and embed
+        // every span again. Keep the caller's store and drop any overlay mode
+        // so `greppy index` updates that plain snapshot incrementally.
         if !interactive {
             eprintln!(
-                "workspace: in-place {}",
+                "workspace: in-place {} (checkout index)",
                 workspace.worktree_path().display()
             );
         }
@@ -1116,7 +1119,7 @@ fn run_agent(
     if let Some(screen) = bootstrap.as_mut() {
         screen.advance(2, "Starting background services");
     }
-    std::env::set_var("GREPPY_STORE_DIR", &agent_data);
+    configure_index_store(args.in_place, &agent_data);
     if let Some(prepared) = &prepared_base {
         crate::store_cow::configure_overlay_environment(prepared, workspace.base_commit());
     }
@@ -1124,7 +1127,7 @@ fn run_agent(
     // Headless runs still prewarm synchronously. Interactive runs launch and
     // monitor the same index job only after the full TUI is visible.
     if !interactive {
-        ensure_semantic_index(workspace.worktree_path(), args.json);
+        ensure_semantic_index(workspace.worktree_path(), args.json, args.in_place);
     }
     if bootstrap
         .as_ref()
@@ -3274,8 +3277,21 @@ fn home_dir() -> std::path::PathBuf {
 /// `<current_exe> index` (incremental) with credential scrub and no sandbox,
 /// then re-checks doctor. Failure warns with the consequence and continues —
 /// the agent can still work via name/text search while embeddings catch up.
-fn ensure_semantic_index(worktree_path: &Path, json_mode: bool) {
-    if doctor_reports_embedding_complete(worktree_path) {
+/// In-place keeps the process store. Isolated runs point tools at the
+/// private agent data root, which must not see a prewarmed checkout index.
+fn configure_index_store(in_place: bool, agent_data: &Path) {
+    if in_place {
+        crate::store_cow::clear_overlay_environment();
+    } else {
+        std::env::set_var("GREPPY_STORE_DIR", agent_data);
+    }
+}
+
+fn ensure_semantic_index(worktree_path: &Path, json_mode: bool, in_place: bool) {
+    // Isolated runs may skip when their private store is already complete.
+    // In-place always runs `greppy index`: a warm checkout returns "already
+    // current", and a dirty one re-embeds only the changed files.
+    if !in_place && doctor_reports_embedding_complete(worktree_path) {
         return;
     }
 
@@ -3287,7 +3303,11 @@ fn ensure_semantic_index(worktree_path: &Path, json_mode: bool) {
         return;
     };
 
-    eprintln!("indexing the agent worktree (first run for this repository)…");
+    if in_place {
+        eprintln!("indexing the checkout (incremental)…");
+    } else {
+        eprintln!("indexing the agent worktree (first run for this repository)…");
+    }
 
     let mut cmd = Command::new(&bin);
     cmd.arg("index")
@@ -3717,6 +3737,36 @@ mod tests {
     fn parse_no_sandbox_flag() {
         let a = parse(&["do it", "--model", "m", "--no-sandbox"]).expect("parse");
         assert!(a.no_sandbox);
+    }
+
+    #[test]
+    fn in_place_index_environment_keeps_the_prewarmed_store() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_store = std::env::var_os("GREPPY_STORE_DIR");
+        let previous_mode = std::env::var_os(crate::store_cow::ENV_MODE);
+        std::env::set_var("GREPPY_STORE_DIR", "/tmp/prewarmed-checkout-index");
+        std::env::set_var(crate::store_cow::ENV_MODE, crate::store_cow::MODE_PRIVATE);
+        configure_index_store(true, std::path::Path::new("/tmp/fresh-agent-data"));
+        assert_eq!(
+            std::env::var("GREPPY_STORE_DIR").as_deref(),
+            Ok("/tmp/prewarmed-checkout-index")
+        );
+        assert!(std::env::var_os(crate::store_cow::ENV_MODE).is_none());
+        configure_index_store(false, std::path::Path::new("/tmp/fresh-agent-data"));
+        assert_eq!(
+            std::env::var("GREPPY_STORE_DIR").as_deref(),
+            Ok("/tmp/fresh-agent-data")
+        );
+        match previous_store {
+            Some(value) => std::env::set_var("GREPPY_STORE_DIR", value),
+            None => std::env::remove_var("GREPPY_STORE_DIR"),
+        }
+        match previous_mode {
+            Some(value) => std::env::set_var(crate::store_cow::ENV_MODE, value),
+            None => std::env::remove_var(crate::store_cow::ENV_MODE),
+        }
     }
 
     #[test]
