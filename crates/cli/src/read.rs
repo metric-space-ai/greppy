@@ -877,9 +877,9 @@ fn read_json_miss(
 /// whole; longer blocks are folded one level again.
 const READ_SMART_EXPAND_WHOLE_LINES: usize = 150;
 
-/// Files up to this many lines are printed whole by `read-file` and by
-/// `read PATH`; longer indexed sources answer with an outline.
-const READ_SMALL_FILE_LINES: usize = 60;
+/// `read PATH` prints the file in the `read-file` format up to
+/// [`READ_FILE_DEFAULT_WINDOW`] lines. Longer indexed files keep the outline
+/// and name `read-file --lines`.
 
 #[expect(
     clippy::too_many_arguments,
@@ -982,8 +982,8 @@ pub(crate) fn dispatch_read(
         }
     }
 
-    // `read PATH` on one small file: the file is the answer. An outline of a
-    // short file only cost agents a second call (`read-file`) in the v3 bench.
+    // `read PATH` up to the read-file window is the numbered file. An outline
+    // of that file only cost the agent another `read-file --lines` turn.
     if !json && head.is_none() && tail.is_none() {
         if let [subject] = subjects {
             if file_intents.first().copied().unwrap_or(false) {
@@ -991,8 +991,8 @@ pub(crate) fn dispatch_read(
                     read_resolve_file(&file_base, &canonical_root, subject)
                 {
                     if let Ok(text) = std::fs::read_to_string(&canonical) {
-                        let total = text.lines().count();
-                        if (1..=READ_SMALL_FILE_LINES).contains(&total) {
+                        let total = read_line_count(&text);
+                        if (1..=READ_FILE_DEFAULT_WINDOW).contains(&total) {
                             let range = format!("1:{total}");
                             return dispatch_read_line_range(
                                 subjects,
@@ -2213,6 +2213,11 @@ fn read_file_outline_result(
         "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B\n",
         top_level[0].qualified_name
     ));
+    if symbol_read {
+        outline.push_str(&format!(
+            "first {READ_FILE_DEFAULT_WINDOW} lines: greppy read-file {shown} --lines 1:{READ_FILE_DEFAULT_WINDOW}\n"
+        ));
+    }
     Ok(outline)
 }
 
