@@ -37,12 +37,15 @@ calls, send no telemetry, and need no account, so the code-analysis surface
 works offline and air-gapped. The optional `greppy web` beta accesses only the
 URLs an agent explicitly opens, searches, or researches; it never uploads the
 repository. `greppy desktop` drives a local GUI through the accessibility tree
-(macOS AX, Windows UIA, Linux AT-SPI). Web and desktop manuals are not in the
-built-in system prompt until you enable them: `greppy capabilities enable web`,
-`greppy capabilities enable desktop`, or `--enable web,desktop` on `greppy -p`,
-`greppy agent`, and `greppy agent stdio`. Desktop commands stay refused inside
-that agent until then. Model files are downloaded only at build time (release
-packages already contain them).
+(macOS AX, Windows UIA, Linux AT-SPI; each build links only that OS's
+adapter). Web and desktop manuals are not in the built-in system prompt.
+`greppy capabilities enable web` and `greppy capabilities enable desktop`
+return greppy's own manual as the tool result; that result counts as part of
+the system prompt and does not rewrite it. `--enable web,desktop` on
+`greppy -p`, `greppy agent`, and `greppy agent stdio` includes a manual from
+the first turn. Desktop commands stay refused inside that agent until
+`enable desktop` has run in the session. Model files are downloaded only at
+build time (release packages already contain them).
 
 ```bash
 # Standard grep — every command works, unchanged:

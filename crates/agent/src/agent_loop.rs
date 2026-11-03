@@ -619,9 +619,8 @@ verifiable and report the rest."
                     break;
                 }
 
-                // Enabling web or desktop appends its manual. The base prompt stays
-                // the prefix; one insertion refreshes the cache once.
-                crate::prompt::merge_capability_sections(&mut system, &env.capability_sections());
+                // Enabling web or desktop returns the manual as the tool result.
+                // The system prompt stays byte-identical so its cache is kept.
 
                 // Continue the outer loop for the next assistant turn.
                 // After the last action turn, the next request permits only a final report.
@@ -1006,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_a_capability_appends_its_manual_before_the_next_turn() {
+    fn enable_result_does_not_rewrite_the_system_prompt() {
         struct EnablingEnv {
             enabled: bool,
         }
@@ -1016,17 +1015,7 @@ mod tests {
             }
             fn call_tool(&mut self, _name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
                 self.enabled = true;
-                ToolOutcome::ok("enabled web")
-            }
-            fn capability_sections(&self) -> String {
-                if self.enabled {
-                    crate::prompt::capability_sections(crate::prompt::CapabilitySet {
-                        web: true,
-                        desktop: false,
-                    })
-                } else {
-                    String::new()
-                }
+                ToolOutcome::ok(crate::prompt::capability_manual("web", true).unwrap())
             }
         }
         let base = "BASE PROMPT\n";
@@ -1036,15 +1025,22 @@ mod tests {
         ]);
         let mut env = EnablingEnv { enabled: false };
         let config = AgentConfig::default().with_model("mock").with_system(base);
-        run_agent_loop(&mut model, &mut env, &config, "task", &mut |_| {}).unwrap();
+        let result = run_agent_loop(&mut model, &mut env, &config, "task", &mut |_| {}).unwrap();
         assert!(env.enabled);
         assert_eq!(model.requests.len(), 2);
-        let first = model.requests[0].system.as_deref().unwrap();
-        let second = model.requests[1].system.as_deref().unwrap();
-        assert_eq!(first, base);
-        assert!(second.starts_with(base));
-        assert!(second.contains("\nBROWSER:\n"));
-        assert!(!first.contains("\nBROWSER:\n"));
+        assert_eq!(model.requests[0].system.as_deref(), Some(base));
+        assert_eq!(model.requests[1].system.as_deref(), Some(base));
+        let tool_text = result
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|part| match part {
+                crate::protocol::ContentPart::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(tool_text.contains("BROWSER:"));
+        assert!(!tool_text.contains("UNTRUSTED_DESKTOP_CONTENT"));
     }
 
     fn echo_tool() -> ToolDefinition {

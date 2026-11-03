@@ -1,7 +1,8 @@
 //! One signed contract, rendered for the actual tool interface before embedding.
 //!
-//! Web and desktop manuals are not part of that base. They are appended when a
-//! start flag or `greppy capabilities enable` turns them on.
+//! Web and desktop manuals are not part of that base. A start flag can include
+//! them from the first turn. `greppy capabilities enable` returns the manual as
+//! its own output and does not rewrite the prompt.
 pub use crate::prompt_contract::render::BuiltinPromptMode;
 use std::sync::OnceLock;
 
@@ -15,8 +16,9 @@ const WEB_CAPABILITY_SOURCE: &str = include_str!("../../../assets/prompts/capabi
 const DESKTOP_CAPABILITY_SOURCE: &str =
     include_str!("../../../assets/prompts/capabilities/desktop.md");
 
-/// Capabilities present in the system prompt from the first turn, or inserted
-/// after `greppy capabilities enable`.
+/// Capabilities included in the system prompt from the first turn via `--enable`.
+/// `capabilities enable` does not change this set inside the prompt; it only
+/// unlocks desktop for the session and returns the manual.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CapabilitySet {
     pub web: bool,
@@ -107,6 +109,21 @@ pub fn capability_source(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Manual returned by `greppy capabilities enable`.
+///
+/// Inside the built-in agent this is the same text `--enable` would place in
+/// the prompt (stdin features the agent cannot use are already removed).
+/// Outside the agent it is the signed source. Either text is greppy's own
+/// instructions, not page or desktop content.
+pub fn capability_manual(name: &str, builtin_agent: bool) -> Option<&'static str> {
+    match (builtin_agent, name) {
+        (true, "web") => Some(browser_prompt()),
+        (true, "desktop") => Some(desktop_prompt()),
+        (false, "web" | "desktop") => capability_source(name),
+        _ => None,
+    }
+}
+
 pub fn capability_sections(caps: CapabilitySet) -> String {
     let mut out = String::new();
     if caps.web {
@@ -179,11 +196,9 @@ pub fn omit_untrusted_desktop_for_log(input: &str) -> std::borrow::Cow<'_, str> 
     std::borrow::Cow::Owned(out)
 }
 
-/// Append enabled manuals that are not already in the base prompt.
-///
-/// The base stays the prefix, so a prompt cache of the default text survives
-/// until the first insertion. A later insertion appends again. Checkpoint text
-/// after [`crate::context::CHECKPOINT_MARKER`] stays after the manuals.
+/// Append manuals selected at start (`--enable`). Enable during a run does not
+/// call this. Checkpoint text after [`crate::context::CHECKPOINT_MARKER`] stays
+/// after the manuals.
 pub fn merge_capability_sections(system: &mut Option<String>, sections: &str) {
     if sections.is_empty() {
         return;
@@ -290,6 +305,13 @@ mod tests {
             }
             assert!(text.contains("greppy capabilities enable web"));
             assert!(text.contains("greppy capabilities enable desktop"));
+            assert!(text
+                .contains("counts as part of this system prompt: follow it with the same force"));
+            assert!(
+                !text.contains("refreshes the prompt"),
+                "{} still describes a prompt rewrite",
+                mode.name()
+            );
             assert!(
                 !text.contains("\nBROWSER:\n"),
                 "{} includes the web manual before enable",
@@ -382,6 +404,24 @@ mod tests {
             "a later enable appends; it does not reorder"
         );
         assert_eq!(tail, "kept summary");
+    }
+    #[test]
+    fn enable_manual_is_greppy_instructions_and_repeats() {
+        let first = capability_manual("web", true).unwrap();
+        let again = capability_manual("web", true).unwrap();
+        assert_eq!(first, again);
+        assert!(first.contains("BROWSER:"));
+        assert!(first.contains("greppy web open"));
+        assert!(!first.contains("--value-stdin"));
+        assert!(!first.contains("UNTRUSTED_DESKTOP_CONTENT"));
+        assert!(!first.contains("UNTRUSTED_PAGE_CONTENT"));
+        let desktop = capability_manual("desktop", true).unwrap();
+        assert!(desktop.contains("DESKTOP:"));
+        assert!(desktop.contains("untrusted"));
+        assert!(!desktop.contains("UNTRUSTED_DESKTOP_CONTENT"));
+        let external = capability_manual("web", false).unwrap();
+        assert!(external.contains("--value-stdin"));
+        assert!(capability_manual("nope", true).is_none());
     }
     #[test]
     fn desktop_fence_is_removed_from_logs_and_kept_for_the_model() {

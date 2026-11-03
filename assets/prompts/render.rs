@@ -64,8 +64,8 @@ pub fn render_builtin(public: &str, adapter: &str, mode: BuiltinPromptMode) -> S
     if mode == BuiltinPromptMode::Acp {
         // ACP isolation/proposal policy is explicitly still an owner decision.
         // Reuse only the approved role sentence; never make the worktree/PR
-        // promise. Web and desktop manuals are not in this base text; a start
-        // flag or `capabilities enable` appends them later.
+        // promise. Web and desktop manuals are not in this base text. A start
+        // flag can include them; `capabilities enable` returns them as output.
         let role = intro.split_once(". ").expect("approved role sentence").0;
         return format!("{role}.\n\nACP (agent stdio)\n\n{tools}");
     }

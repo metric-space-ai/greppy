@@ -572,6 +572,30 @@ fn the_prompt_is_frozen_byte_for_byte() {
     );
 }
 
+#[test]
+fn capabilities_hint_binds_enable_output_and_does_not_rewrite_the_prompt() {
+    let text = prompt();
+    let start = text
+        .find("CAPABILITIES:\n")
+        .expect("the default prompt names the enable commands");
+    let section = &text[start..];
+    assert!(section.contains("greppy capabilities enable web"));
+    assert!(section.contains("greppy capabilities enable desktop"));
+    assert!(section.contains("counts as part of this system prompt"));
+    assert!(section.contains("same force as these instructions"));
+    assert!(section.contains("does not change"));
+    assert!(
+        !section.contains("refreshes the prompt"),
+        "enable must not be described as a prompt rewrite"
+    );
+    assert!(!section.contains("UNTRUSTED_DESKTOP_CONTENT"));
+    assert!(!section.contains("UNTRUSTED_PAGE_CONTENT"));
+    assert!(
+        !text.contains("\nBROWSER:\n") && !text.contains("\nDESKTOP:\n"),
+        "the default prompt must not embed the manuals"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // BROWSER section guard.
 //

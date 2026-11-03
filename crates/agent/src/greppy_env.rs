@@ -797,10 +797,6 @@ impl ExecutionEnv for GreppyEnv {
             other => ToolOutcome::unknown_tool(other),
         }
     }
-
-    fn capability_sections(&self) -> String {
-        crate::prompt::capability_sections(self.capabilities())
-    }
 }
 
 /// Most commands one `batch` call may carry.
@@ -1607,7 +1603,7 @@ done
     }
 
     #[test]
-    fn enabling_desktop_unlocks_the_child_and_appends_the_manual() {
+    fn enabling_desktop_unlocks_the_session_without_fencing_the_enable_reply() {
         let (mut env, _, _) = env_with_stub(
             r#"
 printf 'cap=%s\n' "${GREPPY_CAPABILITY_DESKTOP:-unset}"
@@ -1622,11 +1618,20 @@ printf '%s\n' "$1"
             &json!({"args": ["capabilities", "enable", "desktop"]}),
         );
         assert!(!enable.is_error, "{}", enable.content);
+        assert!(
+            !enable.content.contains("UNTRUSTED_DESKTOP_CONTENT"),
+            "enable returns greppy instructions, not fenced desktop content: {}",
+            enable.content
+        );
+        assert!(env.capabilities().desktop);
+        let again = env.call_tool(
+            "greppy",
+            &json!({"args": ["capabilities", "enable", "desktop"]}),
+        );
+        assert!(!again.is_error, "{}", again.content);
         assert!(env.capabilities().desktop);
         let after = env.call_tool("greppy", &json!({"args": ["desktop", "status"]}));
         assert!(after.content.contains("cap=1"), "{}", after.content);
-        let manual = env.capability_sections();
-        assert!(manual.contains("\nDESKTOP:\n") || manual.starts_with("DESKTOP:\n"));
         let logged = crate::prompt::omit_untrusted_desktop_for_log(&after.content);
         assert!(!logged.contains("cap=1"));
         assert!(logged.contains("omitted from log"));

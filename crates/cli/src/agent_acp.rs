@@ -1231,10 +1231,6 @@ impl ExecutionEnv for GatingEnv {
         self.inner.tool_definitions()
     }
 
-    fn capability_sections(&self) -> String {
-        self.inner.capability_sections()
-    }
-
     fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome {
         if self.cancel.load(Ordering::Relaxed) {
             return ToolOutcome::err("cancelled before execution");

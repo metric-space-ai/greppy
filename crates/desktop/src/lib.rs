@@ -143,6 +143,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn platform_adapters_are_target_cfg_dependencies_only() {
+        let manifest = include_str!("../Cargo.toml");
+        let unconditional = target_table_after(manifest, "[dependencies]");
+        let code = unconditional
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for foreign in [
+            "agent-desktop-linux",
+            "agent-desktop-macos",
+            "agent-desktop-windows",
+            "zbus",
+            "x11rb",
+            "uiautomation",
+        ] {
+            assert!(
+                !code.contains(foreign),
+                "{foreign} must not be an unconditional dependency"
+            );
+        }
+        assert!(code.contains("agent-desktop-core"));
+        let linux = target_table(manifest, "linux");
+        let macos = target_table(manifest, "macos");
+        let windows = target_table(manifest, "windows");
+        assert!(linux.contains("agent-desktop-linux"));
+        assert!(!linux.contains("agent-desktop-macos"));
+        assert!(!linux.contains("agent-desktop-windows"));
+        assert!(macos.contains("agent-desktop-macos"));
+        assert!(!macos.contains("agent-desktop-linux"));
+        assert!(windows.contains("agent-desktop-windows"));
+        assert!(!windows.contains("agent-desktop-linux"));
+    }
+
+    fn target_table(manifest: &str, os: &str) -> String {
+        let header = format!("[target.'cfg(target_os = \"{os}\")'.dependencies]");
+        target_table_after(manifest, &header)
+    }
+
+    fn target_table_after(manifest: &str, header: &str) -> String {
+        let rest = manifest
+            .split_once(header)
+            .unwrap_or_else(|| panic!("missing {header}"))
+            .1;
+        rest.split("\n[").next().unwrap_or(rest).to_owned()
+    }
+
     fn metadata(toml: &str, key: &str) -> String {
         let prefix = format!("{key} = ");
         toml.lines()

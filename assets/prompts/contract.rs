@@ -33,10 +33,11 @@ pub mod render;
 // analysis." v4: 12,900 bytes, SHA256 below. Adapter unchanged.
 // 2026-11-03: owner request to keep web and desktop manuals out of the default
 // system prompt. AGENTS.md keeps a short CAPABILITIES hint. The manuals live in
-// assets/prompts/capabilities/ and are appended only after enable or --enable.
-// Adapter unchanged. Previous public hash 12bb2db4… (12,900 bytes).
+// assets/prompts/capabilities/. `--enable` may include them from the first
+// turn. `capabilities enable` returns the manual and does not rewrite the
+// prompt. Adapter unchanged. Previous public hash 12bb2db4… (12,900 bytes).
 pub const APPROVED_SHA256: &str =
-    "f8c64a387ed5376a8ec80442d465aa11e0e1d31027323f95c8fd020d7414989d";
+    "cbc854763d4ddbcf349d60f038aeb61e971e5987a0a8bb202b512f4123d1fd80";
 pub const APPROVED_WEB_CAPABILITY_SHA256: &str =
     "47b03e776795bf61101cb74e3522e0d57a0c01d184ff0f485a853f8aec5ef1bb";
 pub const APPROVED_DESKTOP_CAPABILITY_SHA256: &str =
@@ -61,10 +62,10 @@ pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "8ba987a5999ababd70224411d9955ebd30cedbfcca1d9b9cab8761b749cc20d2",
-        Interactive => "96e8243460fbb4ed678748e97f4cf14317e9afaa3700a503954825d95435f433",
-        Serve => "493214359b6d8dda1010e22ac7c19c474c2199f5fd43fd66e47924d63a175f5a",
-        Acp => "09298dfee60ab60ef275bbf699bf22bb6aefc9274ab106edee8c9235d3678774",
+        OneShot => "8d4eac5f57ef71b0f118f98bb619cc41255eb8297372bdc511ee372c8d1ed4ac",
+        Interactive => "b1a6760221db89cf0f4f38b220577163e9d58f29a10dc6b38148e251ca7af839",
+        Serve => "aa28c9e9d82fdf90c8c08ec8469e7e7bd68c6f1e790860055036803847e9d025",
+        Acp => "d9d5fa63fa9c9ad05584d534d9800a3d00ee9c480412bc4e8a40f40b7a39df1b",
     }
 }
 

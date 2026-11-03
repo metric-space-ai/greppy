@@ -1,16 +1,18 @@
 //! Turn web or desktop manuals on for the built-in agent.
 //!
-//! Outside the agent this command only prints a receipt or the manual. Inside
-//! the agent the parent records the capability and appends the manual to the
-//! system prompt before the next turn.
+//! `enable` prints greppy's own manual. The parent agent keeps that text as
+//! the tool result and does not rewrite the system prompt. A successful
+//! `enable desktop` also unlocks `greppy desktop` for the rest of the session.
+//! Calling enable again prints the same manual.
 
 use clap::Subcommand;
-use greppy_agent::capability_source;
+use greppy_agent::{capability_manual, capability_source, AGENT_RUN_ENV};
 use greppy_core::error::{Error, Result};
 
 #[derive(Debug, Subcommand)]
 pub enum CapabilitiesVerb {
-    /// Enable web or desktop. The built-in agent inserts the manual next turn.
+    /// Return the web or desktop manual. Inside the built-in agent this also
+    /// unlocks desktop for the session. It does not change the system prompt.
     Enable {
         /// `web` or `desktop`.
         name: String,
@@ -22,14 +24,13 @@ pub enum CapabilitiesVerb {
 pub fn dispatch(command: CapabilitiesVerb) -> Result<i32> {
     match command {
         CapabilitiesVerb::Enable { name } => {
-            if capability_source(&name).is_none() {
+            let builtin = std::env::var_os(AGENT_RUN_ENV).is_some();
+            let Some(text) = capability_manual(&name, builtin) else {
                 return Err(Error::Invalid(format!(
                     "unknown capability '{name}'; expected web or desktop"
                 )));
-            }
-            println!(
-                "enabled {name}; a built-in agent inserts the manual into the system prompt on the next turn"
-            );
+            };
+            print_manual(text);
             Ok(0)
         }
         CapabilitiesVerb::Show { name } => {
@@ -38,12 +39,16 @@ pub fn dispatch(command: CapabilitiesVerb) -> Result<i32> {
                     "unknown capability '{name}'; expected web or desktop"
                 )));
             };
-            print!("{text}");
-            if !text.ends_with('\n') {
-                println!();
-            }
+            print_manual(text);
             Ok(0)
         }
+    }
+}
+
+fn print_manual(text: &str) {
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
     }
 }
 

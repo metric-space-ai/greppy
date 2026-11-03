@@ -161,6 +161,17 @@ all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
 - Adapter: `crates/desktop` is the only crate that calls agent-desktop. Its
   public types are greppy's. Upstream types do not appear in `greppy` or
   `greppy-agent`.
+- Per-OS compile: `agent-desktop-linux`, `agent-desktop-macos`, and
+  `agent-desktop-windows` are `[target.'cfg(target_os = ...)'.dependencies]`.
+  A macOS build compiles only the macOS adapter, a Linux build only the Linux
+  adapter, a Windows build only the Windows adapter. `zbus` and `x11rb` are
+  Linux-only transitive dependencies; they are not in the macOS or Windows
+  graph. `Cargo.lock` still lists all three adapters so the pin is the same
+  on every machine; those crates are not compiled into the other OS binary.
+  `agent-desktop-core` is shared and does not link a platform bus. Check with
+  `cargo tree -p greppy-desktop --target <triple>`. The test
+  `platform_adapters_are_target_cfg_dependencies_only` refuses an
+  unconditional platform dependency.
 
 #### Updating the pin
 

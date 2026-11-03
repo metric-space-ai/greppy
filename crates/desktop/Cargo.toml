@@ -19,8 +19,12 @@ agent-desktop-commit = "d3dc190afbf34cd2377252398ddd5c30efbd093a"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# Shared command core. It does not link a platform accessibility bus.
 agent-desktop-core = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
 
+# One adapter per target OS. Cargo activates only the matching table, so a
+# macOS build does not compile agent-desktop-linux or its zbus/x11rb stack,
+# and a Linux build does not compile the macOS or Windows adapters.
 [target.'cfg(target_os = "linux")'.dependencies]
 agent-desktop-linux = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
 

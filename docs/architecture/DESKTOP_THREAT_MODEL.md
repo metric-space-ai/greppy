@@ -39,18 +39,31 @@ a machine whose UI is sensitive.
 
 ## Activation
 
-The default system prompt contains a short hint and the enable command. It does
-not contain the web or desktop manuals. `greppy capabilities enable desktop`
-records the capability in the agent process; the next model turn appends the
-manual. The base prompt stays the prefix, so the cache miss is the insertion.
+The default system prompt names `greppy capabilities enable web` and
+`enable desktop`, and says their output is greppy's own manual and counts as
+part of the system prompt. Enable prints that manual as the tool result. The
+system prompt is not rewritten, so its cache stays valid. Calling enable again
+in the same session prints the same manual.
+
+The enable result is not desktop or page content. It is not wrapped in
+`UNTRUSTED_DESKTOP_CONTENT`. Snapshots, window names, and screenshots from
+later `greppy desktop` commands stay fenced and are omitted from the session log.
 
 `--enable desktop` (and `web`, including `web,desktop`) on `greppy -p`,
 `greppy agent`, `greppy agent serve`, and `greppy agent stdio` includes the
-manual from the first turn.
+manual in the prompt from the first turn and unlocks desktop immediately.
 
 Inside a built-in agent (`GREPPY_AGENT_RUN`), `greppy desktop` exits 40 with
-`desktop_disabled` until `GREPPY_CAPABILITY_DESKTOP` is set. A desktop command
-typed at a normal shell is not gated: the operator already has the GUI.
+`desktop_disabled` until that session's `enable desktop` has succeeded
+(`GREPPY_CAPABILITY_DESKTOP`). The unlock lasts for the agent process. A
+desktop command typed at a normal shell is not gated: the operator already
+has the GUI.
+
+A build compiles one platform adapter. Linux links `agent-desktop-linux`
+(AT-SPI, and therefore zbus and x11rb). macOS links `agent-desktop-macos`.
+Windows links `agent-desktop-windows`. The other adapters are target-cfg
+dependencies and are not compiled into that binary. `agent-desktop-core` is
+shared and does not open a platform bus.
 
 Web commands are unchanged aside from this prompt gate. They still run when
 the manual is absent.
