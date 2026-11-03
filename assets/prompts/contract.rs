@@ -47,15 +47,23 @@ pub const APPROVED_SHA256: &str =
 // {"batch": [[…], […]]} (run in order; a failed edit stops the rest), and pipe a search straight
 // into a read (`search-symbol NAME | read -` inside bash-smart)." Previous adapter d86ef405…;
 // ACP rendering unchanged.
+// 2026-11-03: Michael approved the quality text as the new signed reference.
+// Exactly two wording changes in the adapter, applied to every built-in mode
+// that includes the introduction: the opening sentence now starts "When working
+// on a code base, never work in the user's checkout", and HOW A TASK RUNS step 1
+// says the worktree "should have been created". AGENTS.md is unchanged. ACP
+// still uses only the first sentence, so its rendered hash is unchanged.
+// Previous adapter dd0133ec…; previous one-shot 887653ab…, interactive 2f444986…,
+// serve 2f93c68e….
 pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
-    "dd0133ecff891859bbbd3890ffe0c9a3857393e512f2665a8521487cb9d15280";
+    "9facb78aa2986b0f88aaa5e2e2bf8da25fcece6238a22066684d55302ebb0bcb";
 
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "887653abb4e7ad51aa543df52611018868f570d937248f71c42e528e1e934fef",
-        Interactive => "2f4449863c6b37c204473069d20f5d246a32484964e9eccbc532b65e4c1d11ee",
-        Serve => "2f93c68ef53008009f27849cae41cc4b87c499ca5d127f88267e64c3be282ed7",
+        OneShot => "d3eb31ba10f75e71824d3e64a3a6398cc83801ce12dd4adf1b25749e5ef3e0c5",
+        Interactive => "6dc6747749e3b60653162c00bea90e203272fd25937f5fa193effe50bea6b9fe",
+        Serve => "117dde23bfd6bc6be6a15b0c544ab1c7c46c9e5c98b9fafb99f3d017aa20f927",
         Acp => "3683b8542fc14de0b9c46a3ebbed630f076dde4d56bb0523f587e93454198b44",
     }
 }

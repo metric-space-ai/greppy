@@ -87,11 +87,11 @@ IN-PLACE RUN: edit the current checkout directly. Ignore later instructions that
 const PERFORMANCE_EDITS: &[(&str, &str)] = &[
     (
         "DONE means the pull request can be merged as it is: the task is fully implemented, the relevant tests pass, new behaviour has a test, and the diff contains nothing else (smallest change, in the style of the surrounding code). Do not stop at an analysis. If you are blocked, name the missing dependency; never claim a result you have not seen.",
-        "DONE means the task is implemented and works. Do not stop at an analysis. If you are blocked, name the missing dependency; never claim a result you have not seen.",
+        "DONE means the task is done on the shortest path to success without any extra dev steps that are not necessary to get the job done.",
     ),
     (
         "FINAL ANSWER is the pull request's description: a one-line title; Status: done, partial or blocked; what changed and why (file:line); how it was verified (commands and results); what is open.",
-        "FINAL ANSWER: at most 5-8 short lines: what you changed and whether it works.",
+        "FINAL ANSWER is 1 to 3 sentences. No one wants to read text when it is done. Do not give in-between feedback before the job is done.",
     ),
 ];
 
@@ -208,7 +208,7 @@ mod tests {
             }
             if mode != BuiltinPromptMode::Acp {
                 assert!(text.starts_with(
-                    "You are greppy, a coding agent. You never work in the user's checkout:"
+                    "You are greppy, a coding agent. When working on a code base, never work in the user's checkout:"
                 ));
                 let mode_count = text
                     .lines()
@@ -304,13 +304,22 @@ mod tests {
         let quality_in_place = compose_one_shot_prompt(AgentPromptStyle::Quality, true, true);
         assert!(in_place.starts_with(IN_PLACE_NOTICE));
         assert!(quality_in_place.starts_with(IN_PLACE_NOTICE));
-        assert!(with_browser
-            .contains("DONE means the task is implemented and works. Do not stop at an analysis."));
         assert!(with_browser.contains(
-            "FINAL ANSWER: at most 5-8 short lines: what you changed and whether it works."
+            "DONE means the task is done on the shortest path to success without any extra dev steps that are not necessary to get the job done."
+        ));
+        assert!(!with_browser.contains("Do not stop at an analysis."));
+        assert!(!with_browser.contains("name the missing dependency"));
+        assert!(with_browser.contains(
+            "FINAL ANSWER is 1 to 3 sentences. No one wants to read text when it is done. Do not give in-between feedback before the job is done."
         ));
         assert!(!with_browser.contains("pull request can be merged"));
         assert!(!with_browser.contains("pull request's description"));
+        let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false);
+        assert!(quality.contains(
+            "You are greppy, a coding agent. When working on a code base, never work in the user's checkout:"
+        ));
+        assert!(quality.contains("your worktree should have been created as"));
+        assert!(quality.contains("Do not stop at an analysis."));
     }
 
     #[test]
