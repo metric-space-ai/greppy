@@ -890,22 +890,28 @@ fn leading_environment_assignments_are_applied_to_the_child() {
 }
 
 #[test]
-fn unquoted_shell_syntax_is_rejected_with_actionable_guidance() {
+fn unquoted_shell_syntax_runs_as_one_command() {
     let workspace = fresh_workspace("unquoted-shell");
+    std::fs::create_dir(workspace.repo.join("sub")).unwrap();
     let output = run(
         &workspace,
-        &["bash-smart", "--", "cd", "repo", "&&", "printf", "ok"],
+        &[
+            "bash-smart",
+            "--",
+            "cd",
+            "sub",
+            "&&",
+            "printf",
+            "ok",
+            ">",
+            "out.txt",
+        ],
     );
-    let stderr = text(&output.stderr);
-
-    assert_eq!(output.status.code(), Some(64));
-    assert!(
-        stderr.contains("received unquoted shell syntax"),
-        "stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("complete shell expression"),
-        "stderr={stderr}"
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "stdout={stdout}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.repo.join("sub/out.txt")).unwrap(),
+        "ok"
     );
 }
 

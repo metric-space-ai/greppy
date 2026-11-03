@@ -144,7 +144,10 @@ pub(crate) fn read_span_with_meta(
     })
 }
 
-const READ_FILE_PAGE_LINES: usize = 400;
+/// Implicit `read-file` page and `expand` continuation, in lines.
+const READ_FILE_PAGE_LINES: usize = 250;
+/// Same window: `read-file` without `--lines` shows this many lines.
+const READ_FILE_DEFAULT_WINDOW: usize = READ_FILE_PAGE_LINES;
 const READ_FILE_PAGE_BYTES: usize = 64 * 1024;
 
 // Probe only one byte beyond the preview budget. UTF-8 errors inside the
@@ -661,6 +664,133 @@ fn read_unsupported_definition_coverage(
         .collect())
 }
 
+/// `file.ext::Type::method` missed the symbol index. Show the file around the
+/// trailing name instead of stopping at "no symbol".
+///
+/// `Some(true)` printed a source window. `Some(false)` was path-qualified but
+/// the file was missing. `None` is not a file-qualified query.
+fn try_qualified_file_fallback(
+    query: &str,
+    root_path: &std::path::Path,
+    json: bool,
+) -> Result<Option<bool>> {
+    let Some((path, spec)) = split_path_qualified(query) else {
+        return Ok(None);
+    };
+    let name = spec
+        .rsplit("::")
+        .next()
+        .and_then(|part| part.rsplit('.').next())
+        .unwrap_or(spec);
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+    let Some((shown, canonical)) = read_resolve_file(root_path, &canonical_root, path) else {
+        let message = format!("no symbol `{query}`\nfile not found: {path}");
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": "greppy.read.v1",
+                    "command": "read",
+                    "status": "not-found",
+                    "query": query,
+                    "file": path,
+                })
+            );
+        } else {
+            println!("{message}");
+        }
+        return Ok(Some(false));
+    };
+    let text = std::fs::read_to_string(&canonical).unwrap_or_default();
+    let (start, end, found) = qualified_name_window(&text, name);
+    let body = read_line_slice(&text, start, end);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": "greppy.read.v1",
+                "command": "read",
+                "status": "file-fallback",
+                "query": query,
+                "path": shown,
+                "name": name,
+                "name_found": found,
+                "start_line": start,
+                "end_line": end,
+                "source": body,
+            })
+        );
+        return Ok(Some(true));
+    }
+    println!(
+        "note: no indexed symbol `{query}`; showing {shown}:{start}-{end}{}",
+        if found {
+            format!(" around `{name}`")
+        } else {
+            format!(" (`{name}` not found; first lines)")
+        }
+    );
+    print!("{}", read_numbered_lines(&body, start));
+    if !body.ends_with('\n') {
+        println!();
+    }
+    Ok(Some(true))
+}
+
+fn qualified_name_window(text: &str, name: &str) -> (usize, usize, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return (1, 1, false);
+    }
+    let definition = lines
+        .iter()
+        .position(|line| line_mentions_name(line, name) && looks_like_definition_line(line));
+    let mention = lines.iter().position(|line| line_mentions_name(line, name));
+    let found_at = definition.or(mention);
+    let from = found_at.map(|index| index.saturating_sub(5)).unwrap_or(0);
+    let to = (from + READ_FILE_DEFAULT_WINDOW).min(lines.len());
+    (from + 1, to.max(from + 1), found_at.is_some())
+}
+
+fn looks_like_definition_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.contains("fn ")
+        || trimmed.contains("func ")
+        || trimmed.contains("def ")
+        || trimmed.contains("function ")
+        || trimmed.contains("class ")
+        || trimmed.contains("struct ")
+        || trimmed.contains("impl ")
+        || trimmed.starts_with("type ")
+}
+
+fn line_mentions_name(line: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let needle = name.as_bytes();
+    let mut index = 0;
+    while index + needle.len() <= bytes.len() {
+        if &bytes[index..index + needle.len()] == needle {
+            let before_ok = index == 0 || !is_ident_byte(bytes[index - 1]);
+            let after = index + needle.len();
+            let after_ok = after == bytes.len() || !is_ident_byte(bytes[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn read_report_missing(
     store: &greppy_store::Store,
     project: &str,
@@ -1159,6 +1289,9 @@ pub(crate) fn dispatch_read_symbols(
         let mut nodes = read_real_nodes(&store, &ids)?;
         nodes.retain(|node| path_filters.matches(&node.file_path));
         if nodes.is_empty() {
+            if let Some(shown) = try_qualified_file_fallback(query, &root_path, json)? {
+                return Ok(if shown { 0 } else { 1 });
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&read_json_miss(
@@ -1277,6 +1410,18 @@ pub(crate) fn dispatch_read_symbols(
             continue;
         }
         let Some(node) = nodes.first().cloned() else {
+            match try_qualified_file_fallback(query, &root_path, json)? {
+                Some(true) => {
+                    previous_ended_with_newline = true;
+                    continue;
+                }
+                Some(false) => {
+                    previous_ended_with_newline = true;
+                    failed = true;
+                    continue;
+                }
+                None => {}
+            }
             read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
@@ -2320,38 +2465,13 @@ pub(crate) fn dispatch_read_files(
             previous_ended_with_newline = true;
             continue;
         }
-        if lines.is_none() && !all && line_count > READ_SMALL_FILE_LINES {
-            if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
-                if json_output {
-                    json_files.push(serde_json::json!({
-                        "path": shown,
-                        "kind": "outline",
-                        "content": outline,
-                        "handle": serde_json::Value::Null,
-                        "handle_unavailable": with_handle.then_some(
-                            "outlines cannot produce an edit handle; request an explicit --lines A:B span"
-                        ),
-                    }));
-                    continue;
-                }
-                read_begin_group(&mut printed, &mut previous_ended_with_newline);
-                print!("{outline}");
-                if with_handle {
-                    println!(
-                        "note: for a handle, choose a symbol or an explicit --lines A:B span first"
-                    );
-                }
-                previous_ended_with_newline = true;
-                continue;
-            }
-        }
         let (start_line, end_line, continuation) = if let Some(raw) = lines {
             let (start, end) = read_parse_file_range(raw, line_count)?;
             (start, end, None)
-        } else if all || line_count <= READ_FILE_PAGE_LINES {
+        } else if all || line_count <= READ_FILE_DEFAULT_WINDOW {
             (1, line_count, None)
         } else {
-            let end = READ_FILE_PAGE_LINES;
+            let end = READ_FILE_DEFAULT_WINDOW;
             if project.is_none() {
                 project = Some(workspace_locator::project_identity(&root_path));
             }
@@ -2743,4 +2863,23 @@ pub(crate) fn read_last_used_unix_secs(dir: &std::path::Path) -> u64 {
                 .map(|age| age.as_secs())
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod qualified_fallback_tests {
+    use super::qualified_name_window;
+
+    #[test]
+    fn file_qualified_miss_windows_on_the_trailing_name() {
+        let text = format!(
+            "intro\n{}\nfn FindString() {{\n    return\n}}\n",
+            "pad\n".repeat(20)
+        );
+        let (start, end, found) = qualified_name_window(&text, "FindString");
+        assert!(found);
+        assert!(start > 1);
+        assert!(end >= start);
+        let slice = super::read_line_slice(&text, start, end);
+        assert!(slice.contains("fn FindString"));
+    }
 }

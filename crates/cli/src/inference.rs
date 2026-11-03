@@ -532,11 +532,12 @@ fn enforce_product_gpu(
         not(feature = "cpu-only")
     ))]
     if preference == greppy_embed_native::DevicePreference::Cpu {
-        return Err(Error::Invalid(
-            "CPU inference is disabled in product builds; use the platform GPU by removing \
-             --device cpu or --no-gpu and unsetting GREPPY_DEVICE=cpu or GREPPY_NO_GPU"
-                .into(),
-        ));
+        // Explicit CPU is a supported product path (no GPU, or a benchmark
+        // container). `auto` still selects the platform GPU and does not hide
+        // a missing device behind a silent CPU fallback. The kernels are the
+        // ones already compiled into the GPU binary, so this does not change
+        // a machine that has a GPU and leaves the selector on auto.
+        warn_cpu_inference_once();
     }
     // Reject a backend the host cannot load before the native loader starts.
     // `auto` stays legal and picks Metal on macOS, CUDA on Linux.
@@ -553,6 +554,23 @@ fn enforce_product_gpu(
         )));
     }
     Ok(preference)
+}
+
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    not(feature = "cpu-only")
+))]
+fn warn_cpu_inference_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "greppy: CPU inference is enabled for EmbeddingGemma and Qwen3.5 \
+             (--device cpu, --no-gpu, GREPPY_DEVICE=cpu, or GREPPY_NO_GPU). \
+             It is much slower than the platform GPU. auto still uses the GPU \
+             when one is available and does not fall back silently."
+        );
+    });
 }
 
 /// Cache key for query embeddings: logical model id + prompt/task contract +

@@ -63,6 +63,10 @@ pub struct AgentConfig {
     /// after a tool returns. A running tool is never interrupted, so an
     /// in-flight edit cannot be left half-applied. Default: `None`.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// History size, in estimated tokens, that triggers compaction.
+    /// `None` uses [`compaction_token_limit`] for [`Self::model`] at
+    /// [`DEFAULT_COMPACT_RATIO`] of that model's context window.
+    pub compaction_token_limit: Option<usize>,
 }
 
 impl PartialEq for AgentConfig {
@@ -77,6 +81,7 @@ impl PartialEq for AgentConfig {
             && self.consecutive_failure_stop == other.consecutive_failure_stop
             && self.deadline == other.deadline
             && self.deadline_total == other.deadline_total
+            && self.compaction_token_limit == other.compaction_token_limit
     }
 }
 
@@ -96,6 +101,7 @@ impl Default for AgentConfig {
             deadline: None,
             deadline_total: None,
             cancel: None,
+            compaction_token_limit: None,
         }
     }
 }
@@ -116,6 +122,12 @@ impl AgentConfig {
     /// Builder: set model tag.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    /// Builder: pin the compaction threshold in estimated tokens.
+    pub fn with_compaction_token_limit(mut self, tokens: usize) -> Self {
+        self.compaction_token_limit = Some(tokens);
         self
     }
 
@@ -306,7 +318,14 @@ pub fn run_agent_loop_with_history(
 
     let mut total_usage = Usage::default();
     let mut turns: usize = 0;
-    let mut compaction_threshold = COMPACTION_BYTES;
+    // Compaction rewrites the cached prefix, so the budget is a fraction of
+    // the model window measured in estimated tokens (bytes/4), not a fixed
+    // byte cap. A failed attempt waits for more tokens before retrying.
+    let token_limit = config
+        .compaction_token_limit
+        .unwrap_or_else(|| compaction_token_limit(&config.model, None, DEFAULT_COMPACT_RATIO));
+    let base_bytes = token_budget_bytes(token_limit);
+    let mut compaction_threshold = base_bytes;
     // Every exit from the loop below sets this before `break`.
     let mut last_stop: LoopStop;
     let mut final_text = String::new();
@@ -351,7 +370,7 @@ pub fn run_agent_loop_with_history(
                 &mut messages,
                 &mut system,
                 &template,
-                COMPACTION_BYTES,
+                base_bytes,
             );
             if let Err(first) = &outcome {
                 if !matches!(first.source, Some(ClientError::Cancelled)) {
@@ -363,14 +382,14 @@ pub fn run_agent_loop_with_history(
                         &mut messages,
                         &mut system,
                         &template,
-                        COMPACTION_BYTES,
+                        base_bytes,
                     );
                 }
             }
             match outcome {
                 Ok(Some(usage)) => {
                     total_usage = sum_usage(total_usage, usage);
-                    compaction_threshold = COMPACTION_BYTES;
+                    compaction_threshold = base_bytes;
                     on_event(LoopEvent::ContextCompacted {
                         archive,
                         messages: messages.clone(),
@@ -388,7 +407,7 @@ pub fn run_agent_loop_with_history(
                         total_usage = sum_usage(total_usage, usage);
                     }
                     compaction_threshold = crate::context::history_bytes(&messages)
-                        .saturating_add(COMPACTION_RETRY_GROWTH_BYTES);
+                        .saturating_add(token_budget_bytes(COMPACTION_RETRY_GROWTH_TOKENS));
                 }
             }
         }
@@ -824,11 +843,75 @@ fn extract_text(message: &Message) -> String {
     out
 }
 
-/// History size that triggers a context checkpoint.
-const COMPACTION_BYTES: usize = 256 * 1024;
-/// After a failed checkpoint, wait for this much more history before retrying,
-/// instead of re-asking on every turn.
-const COMPACTION_RETRY_GROWTH_BYTES: usize = 64 * 1024;
+/// Estimated bytes per token. The same divisor converts the token budget into
+/// the byte threshold [`crate::context::compaction_due`] already compares.
+const BYTES_PER_ESTIMATED_TOKEN: usize = 4;
+/// Default share of the model context window that may be live history before
+/// a checkpoint. High enough that a 262k or 1M window is not compacted at
+/// ~50k tokens, which is what busts the prompt cache mid-task.
+pub const DEFAULT_COMPACT_RATIO: f64 = 0.65;
+/// After a failed checkpoint, wait for this many more estimated tokens before
+/// retrying, instead of re-asking on every turn.
+const COMPACTION_RETRY_GROWTH_TOKENS: usize = 16_384;
+
+/// Context window for `model`, in tokens.
+///
+/// Kimi k3 is 262_144, or 1_048_576 when the id says 1M. Unknown models use
+/// 200_000 so a missing table entry does not fall back to a tiny byte cap.
+pub fn model_context_window_tokens(model: &str) -> u64 {
+    let id = model.to_ascii_lowercase();
+    let million = id.contains("1m")
+        || id.contains("1000k")
+        || id.contains("1048576")
+        || id.contains("1000000");
+    if id.contains("kimi") || id.contains("moonshot") {
+        return if million { 1_048_576 } else { 262_144 };
+    }
+    if id.contains("claude") {
+        return if million { 1_000_000 } else { 200_000 };
+    }
+    if id.contains("gemini") {
+        return 1_048_576;
+    }
+    if id.contains("gpt-4.1") || id.contains("gpt-5") {
+        return if million { 1_048_576 } else { 1_047_576 };
+    }
+    if id.contains("gpt-4") {
+        return 128_000;
+    }
+    200_000
+}
+
+/// Token threshold for compaction: `ratio` of the context window, or of
+/// `context_tokens` when the caller overrides the window.
+pub fn compaction_token_limit(model: &str, context_tokens: Option<u64>, ratio: f64) -> usize {
+    let window = context_tokens.unwrap_or_else(|| model_context_window_tokens(model));
+    let ratio = if ratio.is_finite() {
+        ratio
+    } else {
+        DEFAULT_COMPACT_RATIO
+    };
+    let tokens = (window as f64 * ratio).floor().max(1.0);
+    tokens as usize
+}
+
+/// Parse `GREPPY_COMPACT_RATIO` / `--compact-ratio`. Empty means the default.
+pub fn parse_compact_ratio(raw: Option<&str>) -> Result<f64, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_COMPACT_RATIO);
+    };
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("compact ratio `{raw}` is not a number"))?;
+    if !(0.05..=0.95).contains(&value) {
+        return Err(format!("compact ratio {value} is outside 0.05..=0.95"));
+    }
+    Ok(value)
+}
+
+fn token_budget_bytes(tokens: usize) -> usize {
+    tokens.saturating_mul(BYTES_PER_ESTIMATED_TOKEN)
+}
 
 fn sum_usage(a: Usage, b: Usage) -> Usage {
     Usage {
@@ -1273,7 +1356,12 @@ mod tests {
         };
         let mut env = FakeEnv::new(vec![echo_tool()])
             .with_outcome("echo", ToolOutcome::ok("evidence ".repeat(1200)));
-        let config = AgentConfig::default().with_model("fixture");
+        // Pin the historical 256 KiB budget (65_536 estimated tokens) so this
+        // test still exercises a failed checkpoint. The production default is
+        // a fraction of the model window and would not compact this fixture.
+        let config = AgentConfig::default()
+            .with_model("fixture")
+            .with_compaction_token_limit(65_536);
         let (result, events) = run(&mut model, &mut env, &config, "Fix clamp").unwrap();
         assert_eq!(result.stop, LoopStop::EndTurn);
         assert_eq!(result.final_text, "done");
@@ -1343,7 +1431,8 @@ mod tests {
         );
         let config = AgentConfig::default()
             .with_model("fixture")
-            .with_system("Signed one-shot role");
+            .with_system("Signed one-shot role")
+            .with_compaction_token_limit(65_536);
         let (result, events) = run(
             &mut model,
             &mut env,
@@ -2402,5 +2491,33 @@ mod tests {
         let contents = tool_result_contents(&result);
         assert_eq!(contents.len(), 1);
         assert!(contents[0].1.starts_with("tool finished fully"));
+    }
+
+    #[test]
+    fn kimi_window_does_not_compact_at_the_old_byte_cap() {
+        assert_eq!(model_context_window_tokens("kimi-k3"), 262_144);
+        assert_eq!(
+            model_context_window_tokens("moonshot/kimi-k3-1m"),
+            1_048_576
+        );
+        assert_eq!(parse_compact_ratio(None).unwrap(), DEFAULT_COMPACT_RATIO);
+        assert!(parse_compact_ratio(Some("0.7")).is_ok());
+        assert!(parse_compact_ratio(Some("2")).is_err());
+        let limit = compaction_token_limit("kimi-k3", None, DEFAULT_COMPACT_RATIO);
+        assert_eq!(limit, (262_144.0 * 0.65) as usize);
+        let override_limit = compaction_token_limit("kimi-k3", Some(1_048_576), 0.65);
+        assert!(override_limit > limit);
+
+        // A history that used to cross 256 KiB stays under 65% of 262k tokens.
+        let bulky = "x".repeat(300 * 1024);
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentPart::Text { text: bulky }],
+        }];
+        let byte_budget = limit.saturating_mul(4);
+        assert!(
+            !crate::context::compaction_due(&messages, byte_budget),
+            "300 KiB must not compact inside a Kimi k3 window"
+        );
     }
 }

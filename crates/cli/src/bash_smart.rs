@@ -1691,10 +1691,27 @@ fn command_for_argv(argv: &[String]) -> Result<std::process::Command> {
         ));
     }
     if command_argv[0] == "cd" || command_argv.iter().any(|arg| is_shell_operator(arg)) {
-        return Err(Error::Invalid(
-            "bash-smart received unquoted shell syntax; pass the complete shell expression as one quoted argument, for example `greppy bash-smart -- \"cd DIR && COMMAND\"`"
-                .into(),
-        ));
+        // Models often pass `cd DIR && cmd` as separate argv elements. Join
+        // them into one shell command instead of spending a turn on the
+        // rejection. Operators stay bare; every other argument is quoted.
+        #[cfg(windows)]
+        {
+            return Err(Error::Invalid(
+                "bash-smart received shell syntax; pass the complete shell expression as one quoted argument, for example `greppy bash-smart -- \"cd DIR && COMMAND\"`"
+                    .into(),
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            let script = shell_join(command_argv);
+            let mut command = std::process::Command::new("bash");
+            command.args(["-o", "pipefail", "-c"]).arg(script);
+            for assignment in &argv[..assignment_count] {
+                let (name, value) = env_assignment(assignment).expect("counted assignment");
+                command.env(name, value);
+            }
+            return Ok(command);
+        }
     }
 
     let mut command = std::process::Command::new(&command_argv[0]);
@@ -1720,6 +1737,37 @@ fn env_assignment(arg: &str) -> Option<(&str, &str)> {
 
 fn is_shell_operator(arg: &str) -> bool {
     matches!(arg, "&&" | "||" | "|" | ";" | "<" | ">" | ">>") || arg.starts_with("2>")
+}
+
+#[cfg(not(windows))]
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if is_shell_operator(arg) {
+                arg.clone()
+            } else {
+                shell_quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(not(windows))]
+fn shell_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".into();
+    }
+    if arg.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '_' | '-' | '.' | '/' | ':' | ',' | '=' | '@' | '%' | '+'
+            )
+    }) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 #[cfg(unix)]

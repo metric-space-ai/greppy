@@ -85,6 +85,7 @@ pub struct GreppyEnv {
     run_scratch: PathBuf,
     sandbox: SandboxMode,
     context_status: Option<(String, ContextStatusHook)>,
+    git_identity: Option<GitIdentity>,
 }
 
 impl GreppyEnv {
@@ -116,6 +117,7 @@ impl GreppyEnv {
             run_scratch,
             sandbox: SandboxMode::Off,
             context_status: None,
+            git_identity: None,
         })
     }
 
@@ -159,6 +161,13 @@ impl GreppyEnv {
     /// Override the combined-output byte cap.
     pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    /// Author name and email passed to tool subprocesses when the sandbox
+    /// hides `HOME`, or when no identity was configured.
+    pub fn with_git_identity(mut self, identity: GitIdentity) -> Self {
+        self.git_identity = Some(identity);
         self
     }
 
@@ -366,6 +375,9 @@ impl GreppyEnv {
         // shell: redirecting them to an empty scratch forced re-downloads and broke offline builds.
         if matches!(self.sandbox, SandboxMode::Enforce(_)) {
             prepare_tool_cache_env(&mut cmd, &self.run_scratch);
+        }
+        if let Some(identity) = &self.git_identity {
+            apply_git_identity(&mut cmd, identity, &self.sandbox);
         }
         if let Some((scope, _)) = self.context_status.as_ref() {
             cmd.env("GREPPY_CONTEXT_SCOPE", scope)
@@ -645,6 +657,76 @@ pub fn expand_agent_output(root: &Path, id: &str, offset: usize, max_bytes: usiz
         ));
     }
     ToolOutcome::ok(page)
+}
+
+/// Git author captured before any `HOME` rewrite.
+///
+/// `preset` is true when neither the environment nor git config had both a
+/// name and an email. The fallback is process-local; it does not write git config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+    pub preset: bool,
+}
+
+/// Read the identity `git commit` would use, or the greppy-agent fallback.
+pub fn resolve_git_identity() -> GitIdentity {
+    if let (Ok(name), Ok(email)) = (
+        std::env::var("GIT_AUTHOR_NAME"),
+        std::env::var("GIT_AUTHOR_EMAIL"),
+    ) {
+        let name = name.trim().to_string();
+        let email = email.trim().to_string();
+        if !name.is_empty() && !email.is_empty() {
+            return GitIdentity {
+                name,
+                email,
+                preset: false,
+            };
+        }
+    }
+    let name = git_config_value("user.name");
+    let email = git_config_value("user.email");
+    match (name, email) {
+        (Some(name), Some(email)) => GitIdentity {
+            name,
+            email,
+            preset: false,
+        },
+        (name, email) => GitIdentity {
+            name: name.unwrap_or_else(|| "greppy-agent".into()),
+            email: email.unwrap_or_else(|| "greppy-agent@localhost".into()),
+            preset: true,
+        },
+    }
+}
+
+fn git_config_value(key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Sandboxed children cannot see `~/.gitconfig` after `HOME` moves. Pass the
+/// captured identity through. An unconfined child keeps the user's config
+/// unless we had to preset one.
+fn apply_git_identity(cmd: &mut Command, identity: &GitIdentity, sandbox: &SandboxMode) {
+    let hide_home = matches!(sandbox, SandboxMode::Enforce(_));
+    if hide_home || identity.preset {
+        cmd.env("GIT_AUTHOR_NAME", &identity.name)
+            .env("GIT_AUTHOR_EMAIL", &identity.email)
+            .env("GIT_COMMITTER_NAME", &identity.name)
+            .env("GIT_COMMITTER_EMAIL", &identity.email);
+    }
 }
 
 /// Prepare a tool subprocess environment: strip credential env vars and mark
@@ -1440,8 +1522,10 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Write an executable `#!/bin/sh` stub into temp_dir; returns its path.
     fn write_stub(body: &str) -> PathBuf {
@@ -1923,6 +2007,76 @@ printf '%s\n' "${HOME:-unset}" "${GOMODCACHE:-unset}" "${CARGO_HOME:-unset}" "${
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "unset".into());
         assert_eq!(out.content.lines().next(), Some(home.as_str()));
+    }
+
+    #[test]
+    fn preset_git_identity_reaches_an_unconfined_child() {
+        let (env, _, _) = env_with_stub(
+            r#"printf '%s %s\n' "${GIT_AUTHOR_NAME:-unset}" "${GIT_AUTHOR_EMAIL:-unset}""#,
+        );
+        let mut env = env.with_git_identity(GitIdentity {
+            name: "greppy-agent".into(),
+            email: "greppy-agent@localhost".into(),
+            preset: true,
+        });
+        let out = env.call_tool("greppy", &json!({"args": ["bash-smart", "--", "id"]}));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("greppy-agent greppy-agent@localhost"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn configured_identity_is_not_forced_onto_an_unconfined_child() {
+        let (env, _, _) = env_with_stub(r#"printf '%s\n' "${GIT_AUTHOR_NAME:-unset}""#);
+        let mut env = env.with_git_identity(GitIdentity {
+            name: "should-not-appear".into(),
+            email: "nope@example.test".into(),
+            preset: false,
+        });
+        let out = env.call_tool("greppy", &json!({"args": ["bash-smart", "--", "id"]}));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("unset"), "{}", out.content);
+    }
+
+    #[test]
+    fn missing_git_identity_is_preset_without_writing_config() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let prev = [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+        ]
+        .map(|key| (key, std::env::var_os(key)));
+        let empty = std::env::temp_dir().join(format!(
+            "greppy-empty-gitconfig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&empty, "").unwrap();
+        std::env::remove_var("GIT_AUTHOR_NAME");
+        std::env::remove_var("GIT_AUTHOR_EMAIL");
+        std::env::set_var("GIT_CONFIG_GLOBAL", &empty);
+        std::env::set_var("GIT_CONFIG_SYSTEM", &empty);
+        let identity = resolve_git_identity();
+        assert!(identity.preset, "{identity:?}");
+        assert_eq!(identity.name, "greppy-agent");
+        assert_eq!(identity.email, "greppy-agent@localhost");
+        for (key, value) in prev {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_file(empty);
     }
 
     #[test]

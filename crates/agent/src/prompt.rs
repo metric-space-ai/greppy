@@ -31,6 +31,113 @@ pub fn system_prompt() -> String {
     system_prompt_for_mode(BuiltinPromptMode::OneShot)
 }
 
+/// `greppy -p` prompt style. Quality is the default and keeps the signed
+/// one-shot contract. Performance is the short bench/headless prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPromptStyle {
+    Quality,
+    Performance,
+}
+
+/// One-shot system prompt for a run.
+///
+/// Quality keeps the signed contract, including the merge bar and the
+/// pull-request report. Its browser section is omitted only when the browser
+/// is unavailable. Performance is a short operating note: a 5–8 line report,
+/// no pull-request requirement, and the browser verbs only when they work.
+/// `in_place` is independent of the style and only adds the checkout notice.
+pub fn compose_one_shot_prompt(
+    style: AgentPromptStyle,
+    browser_available: bool,
+    in_place: bool,
+) -> String {
+    let body = match style {
+        AgentPromptStyle::Quality => {
+            let text = system_prompt_for_mode(BuiltinPromptMode::OneShot);
+            if browser_available {
+                text
+            } else {
+                strip_browser_block(&text)
+            }
+        }
+        AgentPromptStyle::Performance => performance_prompt(browser_available),
+    };
+    let mut out = String::new();
+    if in_place {
+        out.push_str(IN_PLACE_NOTICE);
+    }
+    out.push_str(&body);
+    out
+}
+
+const IN_PLACE_NOTICE: &str = "\
+IN-PLACE RUN: edit the current checkout directly. Ignore later instructions that say you work in a temporary worktree or that the result is a pull request copied back later. Files you write here are the task result. Absolute paths inside this repository are writable. /tmp is usable. HOME, GOPATH and TMPDIR stay as this process found them. Git author identity is unchanged when user.name and user.email are already set; otherwise this process uses greppy-agent <greppy-agent@localhost> for commits it makes.
+
+";
+
+fn performance_prompt(browser_available: bool) -> String {
+    let mut text = String::from(
+        "\
+You are greppy, a coding agent in performance mode. Finish the task. Decide details yourself; nobody can answer questions.
+
+WORK
+One tool: greppy, called with an argv array. Example: [\"search-symbol\", \"NAME\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"].
+Batch independent steps in one call: {\"batch\": [[\"search-symbol\", \"NAME\"], [\"read\", \"NAME\"]]}. A failed edit stops the rest of that batch.
+Do not run greppy index unless a result says the index is stale. --root is rejected; the tool already runs in the repository.
+
+FIND
+search-symbol NAME, search \"what it does\", who-calls NAME, callees NAME, brief NAME, impact NAME. Ask the graph before rg.
+
+READ
+read SYMBOL prints the definition. read path/file.ext::Type::method falls back to that file and the trailing name when the symbol index misses.
+read-file PATH prints about 250 lines. Continue with read-file PATH --lines A:B.
+
+EDIT
+replace, replace-text, replace-lines, write, patch, insert-lines, delete-lines. The new text is the last argument. Trust the edit receipt.
+
+SHELL
+bash-smart -- CMD. cd, &&, |, ; and redirects may be separate argv elements; they run as one shell command.
+
+DONE
+Make the change. Run the project's relevant test when one exists. Stop when the task is done or you are blocked on something you cannot change.
+
+FINAL ANSWER
+5 to 8 lines: what changed, the command that verified it and its result, and anything still open. Do not write a pull-request description.
+",
+    );
+    if browser_available {
+        text.push_str(
+            "\
+BROWSER
+The browser is available. greppy web open URL, then greppy web observe, greppy web click TARGET, greppy web fill TARGET VALUE. Chain known steps with :: . If a call says the browser is unavailable, stop using it.
+",
+        );
+    }
+    text
+}
+
+/// Drop the signed `BROWSER` … `END BROWSER` section. The rest of the contract
+/// stays byte-for-byte, including the following sections.
+pub fn strip_browser_block(text: &str) -> String {
+    let Some(start) = text.find("\nBROWSER:\n") else {
+        return text.to_string();
+    };
+    let after = &text[start + 1..];
+    let Some(end_rel) = after.find("END BROWSER") else {
+        return text.to_string();
+    };
+    let end = start + 1 + end_rel + "END BROWSER".len();
+    let mut out = String::new();
+    out.push_str(text[..start].trim_end());
+    out.push('\n');
+    let rest = text[end..].trim_start_matches('\n');
+    if !rest.is_empty() {
+        out.push('\n');
+        out.push_str(rest);
+    }
+    out
+}
+
 pub fn export_prompt(external: bool) -> String {
     if external {
         format!("greppy {}\n\n{PUBLIC_PROMPT}", env!("CARGO_PKG_VERSION"))
@@ -136,6 +243,38 @@ mod tests {
         );
         assert_eq!(system_prompt(), SYSTEM_PROMPT);
     }
+    #[test]
+    fn quality_keeps_the_contract_and_drops_the_browser_only_when_unavailable() {
+        let with_browser = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false);
+        assert!(with_browser.contains(browser_prompt()));
+        assert!(with_browser.contains("DONE means"));
+        assert!(with_browser.contains("FINAL ANSWER is the pull request"));
+        let without = compose_one_shot_prompt(AgentPromptStyle::Quality, false, false);
+        assert!(!without.contains("\nBROWSER:\n"));
+        assert!(!without.contains("greppy web open"));
+        assert!(without.contains("DONE means"));
+        assert!(without.contains("SEARCH:"));
+    }
+
+    #[test]
+    fn performance_prompt_is_short_and_skips_the_pull_request_report() {
+        let text = compose_one_shot_prompt(AgentPromptStyle::Performance, false, false);
+        assert!(text.contains("5 to 8 lines"));
+        assert!(!text.contains("pull request's description"));
+        assert!(!text.contains("greppy web"));
+        assert!(
+            text.len() / 4 < 2_000,
+            "performance prompt tokens ~= {}",
+            text.len() / 4
+        );
+        let with_browser = compose_one_shot_prompt(AgentPromptStyle::Performance, true, false);
+        assert!(with_browser.contains("greppy web open"));
+        assert!(with_browser.len() / 4 < 2_000);
+        let in_place = compose_one_shot_prompt(AgentPromptStyle::Performance, false, true);
+        assert!(in_place.starts_with("IN-PLACE RUN:"));
+        assert!(in_place.contains("5 to 8 lines"));
+    }
+
     #[test]
     fn changed_rendered_prompt_is_refused() {
         let mut text = system_prompt();

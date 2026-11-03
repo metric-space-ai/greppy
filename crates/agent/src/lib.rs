@@ -29,6 +29,7 @@ pub mod client;
 pub mod context;
 pub mod env;
 pub mod greppy_env;
+pub mod in_place;
 pub mod model;
 pub mod prompt;
 pub mod protocol;
@@ -38,20 +39,24 @@ pub mod wire;
 pub mod workspace;
 
 pub use agent_loop::{
-    run_agent_loop, run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult,
-    LoopStop,
+    compaction_token_limit, model_context_window_tokens, parse_compact_ratio, run_agent_loop,
+    run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult, LoopStop,
+    DEFAULT_COMPACT_RATIO,
 };
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
 pub use greppy_env::{
-    parse_where_am_i_file_count, run_startup_self_check, GreppyEnv, SelfCheckError, SelfCheckOk,
+    parse_where_am_i_file_count, resolve_git_identity, run_startup_self_check, GitIdentity,
+    GreppyEnv, SelfCheckError, SelfCheckOk,
 };
 pub use model::ModelStream;
 #[path = "../../../assets/prompts/contract.rs"]
 pub mod prompt_contract;
+pub use in_place::InPlaceWorkspace;
 pub use prompt::{
-    browser_prompt, export_prompt, prompt_metadata, prompt_metadata_for_mode, system_prompt,
-    system_prompt_for_mode, BuiltinPromptMode, PUBLIC_PROMPT, SYSTEM_PROMPT,
+    browser_prompt, compose_one_shot_prompt, export_prompt, prompt_metadata,
+    prompt_metadata_for_mode, system_prompt, system_prompt_for_mode, AgentPromptStyle,
+    BuiltinPromptMode, PUBLIC_PROMPT, SYSTEM_PROMPT,
 };
 pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,

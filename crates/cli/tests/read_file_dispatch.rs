@@ -299,14 +299,14 @@ fn read_file_json_keeps_multi_file_errors_and_structured_page_metadata() {
     assert_eq!(code, 1, "{out}\n{err}");
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["files"][0]["start_line"], 1);
-    assert_eq!(value["files"][0]["end_line"], 400);
+    assert_eq!(value["files"][0]["end_line"], 250);
     assert!(value["files"][0].get("rendered").is_none(), "{value}");
     assert!(value["files"][0]["handle"]
         .as_str()
         .unwrap()
         .starts_with("geh2:"));
-    assert_eq!(value["files"][0]["continuation"]["next_line"], 401);
-    assert_eq!(value["files"][0]["continuation"]["remaining_lines"], 1);
+    assert_eq!(value["files"][0]["continuation"]["next_line"], 251);
+    assert_eq!(value["files"][0]["continuation"]["remaining_lines"], 151);
     assert_eq!(value["files"][1]["path"], "missing.txt");
     assert_eq!(value["files"][1]["error"], "no such file");
     assert!(
@@ -762,34 +762,27 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
     index(&repo, &store);
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
+    // Files up to the default window are the source, not an outline.
+    assert!(stdout.contains("731"), "{stdout}");
+    assert!(stdout.contains("private source content"), "{stdout}");
+    assert!(!stdout.contains("Source outline"), "{stdout}");
+
+    let long = format!(
+        "pub fn target() -> i32 {{ 731 }}\n{}",
+        "// private source content, not an outline\n".repeat(400)
+    );
+    std::fs::write(repo.join("lib.rs"), &long).unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("731"), "{stdout}");
+    assert!(!stdout.starts_with("Source outline"), "{stdout}");
     assert!(
-        stdout
-            .starts_with("Source outline for `lib.rs` — fingerprint-verified indexed definitions:"),
-        "{stdout}"
+        stdout.contains("lib.rs:1-250"),
+        "default window should be 250 lines\n{stdout}"
     );
-    assert!(!stdout.contains("731"), "{stdout}");
-    assert!(!stdout.contains("--all"), "{stdout}");
-    assert!(!stdout.contains("private source content"), "{stdout}");
-    assert!(
-        !stdout.lines().any(|line| line.starts_with("handle: ")),
-        "{stdout}"
-    );
-    let selector = stdout
-        .lines()
-        .nth(1)
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap();
-    let (code, stdout, stderr) = run(&repo, &store, &["read", selector]);
-    assert_eq!(
-        code, 0,
-        "outline selector does not resolve: {stdout}\n{stderr}"
-    );
-    assert!(
-        stdout.contains("pub fn target() -> i32 { 731 }"),
-        "{stdout}"
-    );
+    std::fs::write(repo.join("lib.rs"), &source).unwrap();
+    index(&repo, &store);
 
     let (code, stdout, stderr) = run(
         &repo,
@@ -820,6 +813,21 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
         std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
         source
     );
+}
+
+#[test]
+fn read_file_qualified_name_falls_back_to_source() {
+    let (repo, store) = fresh_workspace("qualified-fallback");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn target() -> i32 { 1 }\n// needle_token_zz sits in a comment\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "lib.rs::Missing::needle_token_zz"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("needle_token_zz"), "{stdout}");
+    assert!(stdout.contains("no indexed symbol"), "{stdout}\n{stderr}");
 }
 
 #[test]
@@ -1477,14 +1485,14 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.starts_with("long.txt:1-400\n  1\tline 1\n"),
+        stdout.starts_with("long.txt:1-250\n  1\tline 1\n"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("400\tline 400\n405 more lines — greppy expand "),
+        stdout.contains("250\tline 250\n555 more lines — greppy expand "),
         "{stdout}"
     );
-    assert!(stdout.ends_with(" continues at 401\n"), "{stdout}");
+    assert!(stdout.ends_with(" continues at 251\n"), "{stdout}");
     let id = stdout
         .lines()
         .last()
@@ -1495,14 +1503,14 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
     assert!(
-        expanded.starts_with("long.txt:401-800\n401\tline 401\n"),
+        expanded.starts_with("long.txt:251-500\n251\tline 251\n"),
         "{expanded}"
     );
     assert!(
-        expanded.contains("5 more lines — greppy expand "),
+        expanded.contains("305 more lines — greppy expand "),
         "{expanded}"
     );
-    assert!(expanded.ends_with(" continues at 801\n"), "{expanded}");
+    assert!(expanded.ends_with(" continues at 501\n"), "{expanded}");
 }
 
 #[test]
@@ -1541,11 +1549,11 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with("long.txt:1-400\n  1\tline 1\n"),
+        stdout.starts_with("long.txt:1-250\n  1\tline 1\n"),
         "{stdout}"
     );
-    assert!(stdout.contains("400\tline 400\nhandle: geh2:"), "{stdout}");
-    assert!(!stdout.contains("line 401\n"), "{stdout}");
+    assert!(stdout.contains("250\tline 250\nhandle: geh2:"), "{stdout}");
+    assert!(!stdout.contains("line 251\n"), "{stdout}");
     let id = stdout
         .lines()
         .find_map(|line| line.split("greppy expand ").nth(1))
@@ -1555,11 +1563,11 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
     let (expand_code, expanded, expand_err) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "{expanded}\n{expand_err}");
     assert!(
-        expanded.starts_with("long.txt:401-800\n401\tline 401\n"),
+        expanded.starts_with("long.txt:251-500\n251\tline 251\n"),
         "{expanded}"
     );
-    assert!(!expanded.contains("line 400\n"), "{expanded}");
-    assert!(!expanded.contains("line 801\n"), "{expanded}");
+    assert!(!expanded.contains("line 250\n"), "{expanded}");
+    assert!(!expanded.contains("line 501\n"), "{expanded}");
 
     let (range_code, range_out, range_err) = run(
         &repo,
@@ -1937,10 +1945,10 @@ fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
     );
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with("etc/long.txt:1-400\n  1\tsubdir line 1\n"),
+        stdout.starts_with("etc/long.txt:1-250\n  1\tsubdir line 1\n"),
         "{stdout}"
     );
-    assert!(stdout.contains("subdir line 400\n"), "{stdout}");
+    assert!(stdout.contains("subdir line 250\n"), "{stdout}");
     assert!(!stdout.contains("repo line"), "{stdout}");
     let id = stdout
         .lines()
@@ -1951,7 +1959,7 @@ fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "{expanded}\n{expand_stderr}");
     assert!(
-        expanded.starts_with("etc/long.txt:401-800\n401\tsubdir line 401\n"),
+        expanded.starts_with("etc/long.txt:251-500\n251\tsubdir line 251\n"),
         "{expanded}"
     );
     assert!(!expanded.contains("repo line"), "{expanded}");
