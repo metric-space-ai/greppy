@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, system_prompt_for_mode, AgentConfig, BuiltinPromptMode, Client,
+    run_agent_loop_with_history, system_prompt_with_models, AgentConfig, BuiltinPromptMode, Client,
     ClientError, ExecutionEnv, GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest,
     ModelStream, StreamEvent, ToolOutcome, TurnResult,
 };
@@ -1056,7 +1056,10 @@ fn run_prompt(
     };
     let agent_config = AgentConfig {
         max_turns: config.max_turns,
-        system: Some(system_prompt_for_mode(BuiltinPromptMode::Acp)),
+        system: Some(system_prompt_with_models(
+            BuiltinPromptMode::Acp,
+            crate::agent::current_model_prompt(),
+        )),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
         ..AgentConfig::default()

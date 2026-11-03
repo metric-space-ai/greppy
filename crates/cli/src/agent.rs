@@ -12,14 +12,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use greppy_agent::BuiltinPromptMode;
 use greppy_agent::{
     compaction_token_limit, compose_one_shot_prompt, model_context_window_tokens,
     parse_compact_ratio, resolve_git_identity, run_agent_loop_with_history,
-    sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv, InPlaceWorkspace,
-    LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
-    StreamEvent, Usage, WorkspaceError,
+    sandbox as agent_sandbox, system_prompt_with_models, AgentConfig, AgentWorkspace, Client,
+    GreppyEnv, InPlaceWorkspace, LoopEvent, LoopStop, ModelPrompt, ProbeError, RunOutcome,
+    SandboxError, SandboxMode, StopReason, StreamEvent, Usage, WorkspaceError,
 };
-use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 
 use crate::agent_control::{socket_path_for, ControlServer};
 use crate::agent_tui::{
@@ -736,6 +736,16 @@ impl ActiveWorkspace {
     }
 }
 
+pub(crate) fn current_model_prompt() -> ModelPrompt {
+    match greppy_web_client::max_ram::RamBudget::from_env() {
+        Some(budget) => ModelPrompt {
+            embeddings: !budget.embeddings_off(),
+            summaries: !budget.summaries_off(),
+        },
+        None => ModelPrompt::ALL,
+    }
+}
+
 fn run_agent(
     mut args: AgentArgs,
     interactive: bool,
@@ -1273,12 +1283,15 @@ fn run_agent(
         context_summary: headless_session
             .as_ref()
             .and_then(|(record, _)| record.context_summary.clone()),
-        system: Some(if serve {
-            system_prompt_for_mode(BuiltinPromptMode::Serve)
-        } else if interactive {
-            system_prompt_for_mode(BuiltinPromptMode::Interactive)
-        } else {
-            compose_one_shot_prompt(args.mode.style(), false, args.in_place)
+        system: Some({
+            let models = current_model_prompt();
+            if serve {
+                system_prompt_with_models(BuiltinPromptMode::Serve, models)
+            } else if interactive {
+                system_prompt_with_models(BuiltinPromptMode::Interactive, models)
+            } else {
+                compose_one_shot_prompt(args.mode.style(), false, args.in_place, models)
+            }
         }),
         model: model.clone(),
         deadline,
@@ -1374,6 +1387,7 @@ fn run_agent(
                         args.mode.style(),
                         true,
                         args.in_place,
+                        current_model_prompt(),
                     ));
                 }
             }

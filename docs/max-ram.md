@@ -82,8 +82,9 @@ bereits implementiert: `inference_daemon.rs` setzt `model = None`, sobald
 | `greppy search` | Exit 1, Status „embeddings are off“, plus die bestehenden lexikalischen Folgekommandos (`search-symbol`, `search-pattern`/`grep`). Es wird kein Embedding-Daemon gestartet. | neu, neben `emit_semantic_backend_unavailable` |
 | `brief` | Doc-Kommentar, sonst kein generierter Satz. Die Skizze bleibt Graph und Parser. | `BriefRender::sentence` |
 | Purpose-Zeilen der Suche | entfallen, weil `qwen_summary_config_optional` `None` liefert | `semantic_vector_purposes` |
-| Triage | Fail-open: jeder Span `read: true`. Außerhalb von `summarize_daemon.rs` gibt es keinen Aufrufer. | `triage_spans_via_daemon` |
+| Triage | Fail-open: jeder Span `read: true`. Außerhalb von `summarize_daemon.rs` gibt es keinen Aufrufer. Im Agent-Prompt kommt Triage nicht vor. | `triage_spans_via_daemon` |
 | Gecachte Summaries | werden bei abgeschaltetem Summarizer nicht gelesen, damit kein Modellschlüssel und kein Daemon entsteht | bewusste Grenze |
+| Agent-Prompt | Die signierten Dateien `AGENTS.md` und `assets/prompts/agent-adapter.md` bleiben byte-identisch. `apply_model_prompt_edits` streicht modellabhängige Stellen erst beim Rendern, analog zum Browser-Block. Modelle an ist der signierte Prompt. | `crates/agent/src/prompt.rs` |
 
 Lazy heißt: der Vordergrund-Index bleibt strukturell, die Vektoren entstehen
 beim nächsten `search`. `prewarm_summary_daemon` startet unter einem Budget
@@ -99,6 +100,26 @@ neben dieser Rechnung. Ohne `--max-ram` ändert sich am GPU-Release nichts.
 Kleinere Modelldateien gibt es im Baum nicht. `MODEL_ASSETS.json` kennt nur
 `embeddinggemma-300M-Q4_K` und `Qwen3.5-0.8B-MTP-Q4_K_M`. Quantisierung ist
 bereits Q4. Eine weitere Stufe „kleineres Modell“ ist kein Codepfad.
+
+
+## Agent-Prompt, wenn ein Modell aus ist
+
+Nur der gerenderte System-Prompt ändert sich. Der Contract-Hash prüft die ungekürzten Quellen.
+
+Embeddings aus (`1g`, `2g`):
+
+- `, plus a meaning index over its source` fällt weg.
+- Beide Zeilen `greppy search "WHAT IT DOES"` (Routing und SEARCH) fallen weg.
+- Der Absatz zur Concept-Discovery (`one search` / `search-pattern fallback`) fällt weg. `Do NOT run grep/find/read loops.` bleibt.
+- `greppy plus` verliert das Wort `meaning`.
+- `Indexing and embedding preparation are one-time work` wird zu `Indexing is one-time work`.
+
+Summarizer aus (`1g`, `2g`, `3g`):
+
+- `Text after an em dash is a generated hint, not source.` fällt weg.
+- `purpose, signature and body sketched` wird zu `signature and body sketched`.
+
+`greppy brief`, `search-symbol` und `search-pattern` bleiben. Triage steht im Prompt nicht. Bei 4 GiB und ohne `--max-ram` ist der Prompt byte-gleich mit dem signierten One-Shot-Text.
 
 ## Web
 

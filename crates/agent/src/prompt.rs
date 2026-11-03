@@ -45,14 +45,17 @@ pub enum AgentPromptStyle {
 /// Quality is the signed one-shot contract. Its browser section is omitted
 /// only when the browser is unavailable. Performance is that same string
 /// after [`apply_performance_edits`]: the merge bar and the pull-request
-/// report are the only wording changes. Tool sections stay byte-for-byte.
-/// `in_place` prepends the same checkout notice in both styles.
+/// report are the only wording changes. Tool sections stay byte-for-byte
+/// unless [`ModelPrompt`] drops a model-only passage. `in_place` prepends
+/// the same checkout notice in both styles.
 pub fn compose_one_shot_prompt(
     style: AgentPromptStyle,
     browser_available: bool,
     in_place: bool,
+    models: ModelPrompt,
 ) -> String {
-    let quality = quality_body(browser_available);
+    let quality = apply_model_prompt_edits(&quality_body(browser_available), models)
+        .unwrap_or_else(|error| panic!("model prompt edit failed: {error}"));
     let body = match style {
         AgentPromptStyle::Quality => quality,
         AgentPromptStyle::Performance => apply_performance_edits(&quality)
@@ -64,6 +67,96 @@ pub fn compose_one_shot_prompt(
     }
     out.push_str(&body);
     out
+}
+
+/// Which built-in models the rendered agent prompt may mention.
+///
+/// `ALL` is the signed prompt. A false flag removes only the passages that
+/// require that model. The contract files themselves are not rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelPrompt {
+    pub embeddings: bool,
+    pub summaries: bool,
+}
+
+impl ModelPrompt {
+    pub const ALL: Self = Self {
+        embeddings: true,
+        summaries: true,
+    };
+}
+
+/// Render one built-in mode, then drop model-only passages when a model is off.
+pub fn system_prompt_with_models(mode: BuiltinPromptMode, models: ModelPrompt) -> String {
+    apply_model_prompt_edits(&system_prompt_for_mode(mode), models)
+        .unwrap_or_else(|error| panic!("model prompt edit failed: {error}"))
+}
+
+/// Exact passages that exist only because a model is available.
+///
+/// Each source must occur once. A drifted contract fails the edit instead of
+/// leaving a model command in a prompt that can no longer run it.
+const EMBEDDING_OFF_EDITS: &[(&str, &str)] = &[
+    (", plus a meaning index over its source", ""),
+    (
+        "  greppy search \"WHAT IT DOES\"       concept-to-code discovery\n",
+        "",
+    ),
+    (
+        "  greppy search \"WHAT IT DOES\"       definitions matching the described behavior\n",
+        "",
+    ),
+    (
+        " For concept discovery, choose the best match from one search; do not rephrase\nand search again. Only an explicit no-match permits one search-pattern fallback for\na concrete term.",
+        "",
+    ),
+    (
+        "ranked text, name, meaning and graph-neighbour hits",
+        "ranked text, name and graph-neighbour hits",
+    ),
+    (
+        "Indexing and embedding preparation are one-time work",
+        "Indexing is one-time work",
+    ),
+];
+
+const SUMMARY_OFF_EDITS: &[(&str, &str)] = &[
+    (
+        " Text after an em dash is a generated hint, not source.",
+        "",
+    ),
+    (
+        "purpose, signature and body sketched step by step",
+        "signature and body sketched step by step",
+    ),
+];
+
+pub fn apply_model_prompt_edits(text: &str, models: ModelPrompt) -> Result<String, String> {
+    if models.embeddings && models.summaries {
+        return Ok(text.to_string());
+    }
+    let mut edited = text.to_string();
+    if !models.embeddings {
+        edited = apply_unique_edits(&edited, EMBEDDING_OFF_EDITS)?;
+    }
+    if !models.summaries {
+        edited = apply_unique_edits(&edited, SUMMARY_OFF_EDITS)?;
+    }
+    Ok(edited)
+}
+
+fn apply_unique_edits(text: &str, edits: &[(&str, &str)]) -> Result<String, String> {
+    let mut text = text.to_string();
+    for (from, to) in edits {
+        let count = text.matches(from).count();
+        if count != 1 {
+            return Err(format!(
+                "model prompt edit requires exactly one occurrence of `{from}`, found {count}"
+            ));
+        }
+        text = text.replacen(from, to, 1);
+    }
+    Ok(text)
 }
 
 fn quality_body(browser_available: bool) -> String {
@@ -242,11 +335,13 @@ mod tests {
     }
     #[test]
     fn quality_keeps_the_contract_and_drops_the_browser_only_when_unavailable() {
-        let with_browser = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false);
+        let with_browser =
+            compose_one_shot_prompt(AgentPromptStyle::Quality, true, false, ModelPrompt::ALL);
         assert!(with_browser.contains(browser_prompt()));
         assert!(with_browser.contains("DONE means"));
         assert!(with_browser.contains("FINAL ANSWER is the pull request"));
-        let without = compose_one_shot_prompt(AgentPromptStyle::Quality, false, false);
+        let without =
+            compose_one_shot_prompt(AgentPromptStyle::Quality, false, false, ModelPrompt::ALL);
         assert!(!without.contains("\nBROWSER:\n"));
         assert!(!without.contains("greppy web open"));
         assert!(without.contains("DONE means"));
@@ -257,9 +352,18 @@ mod tests {
     fn performance_is_quality_with_only_the_allowed_edits() {
         for browser in [true, false] {
             for in_place in [true, false] {
-                let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, browser, in_place);
-                let performance =
-                    compose_one_shot_prompt(AgentPromptStyle::Performance, browser, in_place);
+                let quality = compose_one_shot_prompt(
+                    AgentPromptStyle::Quality,
+                    browser,
+                    in_place,
+                    ModelPrompt::ALL,
+                );
+                let performance = compose_one_shot_prompt(
+                    AgentPromptStyle::Performance,
+                    browser,
+                    in_place,
+                    ModelPrompt::ALL,
+                );
                 let delta = differing_lines(&quality, &performance);
                 assert_eq!(
                     delta,
@@ -277,8 +381,14 @@ mod tests {
                 }
             }
         }
-        let with_browser = compose_one_shot_prompt(AgentPromptStyle::Performance, true, false);
-        let without = compose_one_shot_prompt(AgentPromptStyle::Performance, false, false);
+        let with_browser =
+            compose_one_shot_prompt(AgentPromptStyle::Performance, true, false, ModelPrompt::ALL);
+        let without = compose_one_shot_prompt(
+            AgentPromptStyle::Performance,
+            false,
+            false,
+            ModelPrompt::ALL,
+        );
         assert!(with_browser.contains(browser_prompt()));
         assert!(with_browser.contains("greppy web open"));
         assert!(!without.contains("\nBROWSER:\n"));
@@ -300,8 +410,10 @@ mod tests {
                 "missing {heading} without browser"
             );
         }
-        let in_place = compose_one_shot_prompt(AgentPromptStyle::Performance, true, true);
-        let quality_in_place = compose_one_shot_prompt(AgentPromptStyle::Quality, true, true);
+        let in_place =
+            compose_one_shot_prompt(AgentPromptStyle::Performance, true, true, ModelPrompt::ALL);
+        let quality_in_place =
+            compose_one_shot_prompt(AgentPromptStyle::Quality, true, true, ModelPrompt::ALL);
         assert!(in_place.starts_with(IN_PLACE_NOTICE));
         assert!(quality_in_place.starts_with(IN_PLACE_NOTICE));
         assert!(with_browser.contains(
@@ -324,7 +436,8 @@ mod tests {
 
     #[test]
     fn performance_edit_fails_when_a_source_sentence_is_missing() {
-        let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false);
+        let quality =
+            compose_one_shot_prompt(AgentPromptStyle::Quality, true, false, ModelPrompt::ALL);
         for (from, _) in PERFORMANCE_EDITS {
             let broken = quality.replacen(from, "rewritten", 1);
             let error = apply_performance_edits(&broken).unwrap_err();
@@ -347,6 +460,83 @@ mod tests {
             .filter(|(before, after)| before != after)
             .map(|(before, after)| ((*before).to_string(), after.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn models_on_matches_the_signed_prompt_and_models_off_drops_model_commands() {
+        let on = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false, ModelPrompt::ALL);
+        assert_eq!(on, SYSTEM_PROMPT);
+        let both_off = ModelPrompt {
+            embeddings: false,
+            summaries: false,
+        };
+        let off = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false, both_off);
+        for forbidden in [
+            "greppy search \"WHAT IT DOES\"",
+            "meaning index",
+            "concept-to-code",
+            "concept discovery",
+            "embedding preparation",
+            "generated hint",
+            "purpose, signature",
+            "triage",
+        ] {
+            assert!(
+                !off.contains(forbidden),
+                "models-off prompt still contains {forbidden}"
+            );
+        }
+        assert!(off.contains("greppy search-symbol"));
+        assert!(off.contains("greppy search-pattern"));
+        assert!(off.contains("  greppy brief S"));
+        assert!(off.contains("signature and body sketched step by step"));
+        assert!(off.contains("ranked text, name and graph-neighbour hits"));
+        assert!(off.contains("\nBROWSER:\n"));
+        assert!(off.contains("DONE means the pull request can be merged"));
+        assert!(on.contains("greppy search \"WHAT IT DOES\""));
+        assert!(on.contains("generated hint"));
+        assert!(on.contains("meaning index"));
+
+        let summaries_off = compose_one_shot_prompt(
+            AgentPromptStyle::Quality,
+            true,
+            false,
+            ModelPrompt {
+                embeddings: true,
+                summaries: false,
+            },
+        );
+        assert!(summaries_off.contains("greppy search \"WHAT IT DOES\""));
+        assert!(summaries_off.contains("meaning index"));
+        assert!(!summaries_off.contains("generated hint"));
+        assert!(!summaries_off.contains("purpose, signature"));
+
+        let embeddings_off = compose_one_shot_prompt(
+            AgentPromptStyle::Quality,
+            true,
+            false,
+            ModelPrompt {
+                embeddings: false,
+                summaries: true,
+            },
+        );
+        assert!(!embeddings_off.contains("greppy search \"WHAT IT DOES\""));
+        assert!(!embeddings_off.contains("meaning index"));
+        assert!(embeddings_off.contains("generated hint"));
+        assert!(embeddings_off.contains("purpose, signature"));
+
+        for mode in crate::prompt_contract::render::BUILTIN_MODES {
+            let signed = system_prompt_for_mode(mode);
+            assert_eq!(system_prompt_with_models(mode, ModelPrompt::ALL), signed);
+            let stripped = system_prompt_with_models(mode, both_off);
+            assert!(
+                !stripped.contains("greppy search \"WHAT IT DOES\""),
+                "{} still advertises semantic search",
+                mode.name()
+            );
+            assert!(!stripped.contains("generated hint"), "{}", mode.name());
+            assert!(!stripped.contains("triage"), "{}", mode.name());
+        }
     }
 
     #[test]
