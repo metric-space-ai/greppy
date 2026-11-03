@@ -426,7 +426,7 @@ mod tests {
         ));
         assert!(!with_browser.contains("pull request can be merged"));
         assert!(!with_browser.contains("pull request's description"));
-        let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false);
+        let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false, ModelPrompt::ALL);
         assert!(quality.contains(
             "You are greppy, a coding agent. When working on a code base, never work in the user's checkout:"
         ));

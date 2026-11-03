@@ -48,8 +48,8 @@ beschrieben. Das ist die alte Rechnung, nicht mehr die Semantik.
 
 CPU-Inferenz kopiert die quantisierten Gewichte aus dem mmap in den Prozess
 (`CpuEmbeddingModel::from_gguf`, `CpuQwen35Model::load`). Das mmap selbst wird
-danach fallengelassen. **CPU-RSS ist nicht gemessen.** Die Planung nimmt deshalb
-die Workspace-Konstanten, die über der gemessenen CUDA-Host-RSS liegen.
+danach fallengelassen. Die Planung benutzt weiterhin die Workspace-Konstanten.
+Die Debug-CPU-RSS steht in „Messung“, nicht in dieser Tabelle.
 
 Ein Modell wird nur eingeplant, wenn `Rest` sein Budget deckt. Summaries kommen
 erst dazu, wenn `Rest` Embedding und Summary zusammen deckt. Eine zweite
@@ -181,22 +181,105 @@ Der Content-Worker startet mit `env_clear` und einer Allowlist
 Den startet die CLI ohne `env_clear`, er erbt die Variable. Ein schon
 laufender Supervisor übernimmt ein später gesetztes Budget nicht.
 
-## Offene Punkte, die eine Messung auf Ubuntu brauchen
+## Messung (Debug-CPU, 3. November 2026)
 
-1. CPU-RSS von Embedding-Daemon und Summarize-Daemon auf einer Maschine ohne
-   GPU, kalt und warm, plus RSS nachdem `model_ttl` das Modell verworfen hat.
-   Die CUDA-Zahlen oben sind eine Untergrenze nur für den Host-Anteil mit
-   Gewichten auf der GPU.
-2. RSS des Content-Prozesses mit null, einer und zwei echten Seiten, headless,
-   Software-Rendering 1280×720. Der 1,25-GiB-Kommentar hat keine
-   Linux-Messreihe. Eine schwere Seite kann einen 1-GiB-Rechner auch ohne
-   Modelle sprengen. Das Budget kann Servo nicht kleiner machen.
-3. Ob `page.close` den Speicher des WebView im Servo-Prozess wirklich
-   zurückgibt oder nur den Rust-Handle droppt.
-4. Ein Wiederherstellungsversuch auf einer Seite mit HttpOnly-Cookie,
-   `localStorage`, Scroll und History: was nach Swap noch stimmt.
-5. Ob zwei gleichzeitig residente Daemons auf 4 GiB (Plan 3578 MiB inklusive
-   Ubuntu, Browser-Reserve, Browser-Slack und beider Modelle) vom OOM-Killer
-   getroffen werden. Ein harter Cross-Daemon-Lock ist nicht eingebaut; es gibt
-   nur kurze TTLs und kein Summary-Prewarm während der Suche.
-6. zram oder Swap auf dem Host. Das ist Betriebssystem, kein greppy-Schalter.
+Gemessen auf dieser Maschine, nicht auf einem 1-GiB-Server. Host: Linux 6.12, x86_64, 4 Kerne, etwa 15 GiB RAM, Swap des Hosts war 0, bis für die Swap-Variante eine 2-GiB-Swapdatei angelegt wurde. Grenze: cgroup v2, `memory.max` hart, `memory.swap.max` 0 außer in der Swap-Zeile. `systemd-run` ging nicht, weil PID 1 kein systemd ist. Docker war nicht da.
+
+Binary: `target/debug/greppy` 0.4.6, `cargo build -p greppy --features cpu-only`. Das ist kein Release. Ein Release mit `cpu-only` verweigert der Build (`crates/cli/src/lib.rs`, `crates/cli/build.rs`): Produkt-Releases verlangen Metal oder CUDA/nvcc. Auf dieser Maschine gibt es kein `nvcc`, deshalb gibt es hier kein GPU-Release und kein CPU-Release. Die RSS unten ist die Debug-RSS. Eine kleinere Release-RSS ist nicht gemessen.
+
+Korpus: lokaler Klon dieses Repos, 938 indexierte Dateien, 26842 Knoten. Jede RAM-Stufe hatte ein eigenes `GREPPY_STORE_DIR`. `--max-ram` und `--device cpu` standen auf der Kommandozeile. Die cgroup enthält nur die greppy-Prozesse, nicht Ubuntu. Eine Extra-Zeile setzt `memory.max` auf 2 GiB minus 250 MiB, damit die Ubuntu-Reserve nicht nur im Flag, sondern auch in der harten Grenze steckt.
+
+„Cgroup“ ist `memory.peak` nach neu angelegter Gruppe. „HWM“ ist `VmHWM` des genannten Prozesses. Wo die beiden auseinanderlaufen, stehen beide Zahlen. Ein OOM ist `memory.events` `oom_kill` oder Exit 137.
+
+### Coding, Swap aus
+
+| Stufe | Aufgabe | Exit | OOM | Dauer | Cgroup-Peak | Prozess-HWM | Ergebnis |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 GiB | `index` | 137 | 1 | 30,6 s | 1024 MiB, die Kappe | greppy 1060 MiB, anon 1021 MiB | Abbruch bei `extracting_files` 448/938. Meldung: Embeddings aus, Graph wäre der Index. |
+| 1 GiB | `search-symbol` | 73 | 1 | 53,2 s | 1024 MiB | greppy 1070 MiB | Startet den Index neu, der bricht wieder ab. Kein veröffentlichter Graph. |
+| 1 GiB | `search` | 1 | 0 | 1,1 s | 7,0 MiB | greppy 16,5 MiB | „embeddings are off“. Kein Embedding-Daemon. |
+| 1 GiB | `brief` | 73 | 1 | 52,1 s | 1024 MiB | — | Versucht den fehlenden Index und stirbt dort. |
+| 1 GiB | `search-pattern` eine Datei | 0 | 0 | 1,2 s | 9,1 MiB | greppy 34,7 MiB | Treffer auf `OS_RESERVE_BYTES`. Braucht den vollen Index dieses Laufs nicht. |
+| 1 GiB | `replace-text` | 0 | 0 | 1,1 s | 6,7 MiB | greppy 29,1 MiB | Eine Doc-Zeile wurde wirklich geändert und danach im Klon zurückgesetzt. |
+| 2 GiB | `index` | 0 | 0 | 72,5 s | 1877 MiB | greppy 1744 MiB, anon 1683 MiB | 938 Dateien, 26842 Knoten. Embeddings aus. |
+| 2 GiB | `search-symbol` | 0 | 0 | 1,7 s | 51 MiB | greppy 81 MiB | `RamBudget` gefunden. |
+| 2 GiB | `search` | 1 | 0 | 1,0 s | 7,0 MiB | — | Wie bei 1 GiB: Ablehnung, kein Daemon. |
+| 2 GiB | `brief` | 0 | 0 | 1,5 s | 15,5 MiB | greppy 44 MiB | Struktur, kein Summary-Satz. |
+| 2 GiB minus 250 MiB | `index` | 0 | 0 | 70,0 s | 1798 MiB, gleich der Kappe | greppy 1735 MiB, anon 1674 MiB | Fertig, `oom_kill` 0. Die Kappe ist 2 GiB abzüglich der Ubuntu-Reserve. Der Zähler lag auf der Kappe. |
+| 3 GiB | `index` | 0 | 0 | 66,3 s | 1703 MiB | greppy 1595 MiB | „embeddings stay unloaded until the next semantic search“. |
+| 3 GiB | `search-symbol` | 0 | 0 | 1,7 s | 51 MiB | greppy 81 MiB | Wie bei 2 GiB. |
+| 4 GiB | `index` | 0 | 0 | 64,5 s | 1859 MiB | greppy 1726 MiB | Modelle bleiben bis zur Suche ausgeladen. |
+
+Der Index bei 2, 3 und 4 GiB schwankt zwischen etwa 1700 und 1877 MiB Cgroup. Das ist Lauf-zu-Lauf, nicht eine höhere Stufe.
+
+### CPU-Daemons
+
+| Lauf | Exit | OOM | Dauer | Cgroup-Peak | Daemon-HWM | Was passiert ist |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3 GiB, `search` über das ganze Repo | −9, Abbruch nach 600 s | 0 | 675 s inklusive 70 s Nachlauf | 1466 MiB | Embedding 738 MiB, davon anon bis 578 MiB, file bis 252 MiB. Danach RSS um 570–620 MiB. Kind-`index` 443 MiB. | Log blieb bei 0/15312 Spans. Worker-Threads liefen auf der CPU (`wchan` 0). Kein OOM. |
+| 4 GiB, dieselbe Suche | −9 nach 600 s | 0 | 675 s | 1482 MiB | Embedding 738 MiB, anon bis 593 MiB | Dasselbe Bild. |
+| 3 GiB, `search --path` auf `max_ram.rs` (26 Spans) | −9 nach 240 s | 0 | 365 s | 1134 MiB | Embedding 738 MiB | Auch 26 Spans kamen in 240 s nicht als Fortschritt im Log an. Die ETA von 26 s war die Schätzung bei 0, nicht eine gemessene Rate. |
+| 4 GiB, `brief` auf `RamBudget` | 0 | 0 | 146 s | 1800 MiB, Peak zu Beginn 0 | Summarize 1740 MiB, anon bis 1249 MiB, file bis 533 MiB. greppy 48 MiB. | Der Daemon lief mit `--device cpu`. Der Client meldete `daemon request failed after restart` und erzeugte keinen Satz. `CLIENT_READ_TIMEOUT` im Code ist 60 s. Ein OOM war es nicht. Die Ursache hinter `Failed` ist nicht weiter isoliert. |
+| 4 GiB, Suche und `brief` überlappend | 1 | 0 | 188 s | 2441 MiB, Peak zu Beginn 0 | Embedding 738 MiB und Summarize 1740 MiB, beide in diesem Lauf gesehen | Die Summe der beiden HWM ist 2478 MiB und liegt über dem Cgroup-Peak. Die beiden Maxima waren also nicht derselbe Augenblick. 2441 MiB ist die gemessene gemeinsame Ladung. Kein Browser, kein Ubuntu in der Gruppe. Der Summary-Satz fehlte wieder. Die Suche war nicht fertig. |
+
+Nach dem Abbruch der 26-Span-Suche liefen Index-Kind und Embedding-Daemon weiter. Ein direkter Kill nur der Clients ließ den Daemon rechnen: `utime` stieg über 60 s, RSS blieb bei etwa 607–618 MiB, HWM 738 MiB. `model_ttl` von 60 s hat in diesem Fenster nichts freigegeben, weil die Anfrage im Daemon noch lief. RSS nach einem echten Idle-Unload ist nicht gemessen.
+
+### Swap
+
+Host-Swapdatei 2 GiB. Cgroup `memory.max` wie die Stufe, `memory.swap.max` 2 GiB.
+
+| Stufe | Aufgabe | Exit | OOM | Dauer | RAM-Peak | Swap-Peak | HWM |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 GiB | `index`, kalt | 0 | 0 | 102,7 s | 1024 MiB, die Kappe | 875 MiB (`memory.swap.peak`) | greppy 1077 MiB |
+| 2 GiB | `index` | 0 | 0 | 64,3 s | 1824 MiB | nicht aufgezeichnet, der Lauf passt in RAM | 1690 MiB |
+| 3 GiB | `index` | 0 | 0 | 64,3 s | 1381 MiB | nicht aufgezeichnet | 1249 MiB |
+| 4 GiB | `index` | 0 | 0 | 63,7 s | 1399 MiB | 0 | 1268 MiB |
+
+Ohne Swap stirbt derselbe Index bei 1 GiB. Mit 2 GiB Swap wird er fertig und benutzt 875 MiB Swap. Die kleineren Peaks bei 3 und 4 GiB sind die Schwankung des Index, nicht ein Effekt des Swaps.
+
+### Was nicht gemessen ist
+
+- Web. `greppy web doctor` endet mit Exit 31, „web-runtime distributable is not installed“. Die Release-Assets von v0.4.5 enthalten kein `web-runtime`. Der Vendored-Servo-Baum ist ein Patch, kein ganzer Browser. `libfontconfig-dev`, `libfreetype-dev` und `libclang-dev` fehlen hier. Es gibt keine Zahl für Content-RSS, für `page.close` und für den Tab-Swap. Die 1,25 GiB im Code bleiben der Kommentar, keine neue Messung.
+- Agent-Läufe. In dieser Umgebung liegt kein API-Key. `greppy -p` wurde nicht aufgerufen.
+- Release-RSS und GPU-RSS. Nur Debug-CPU.
+- Ob `model_ttl` den RSS senkt, nachdem keine Anfrage mehr im Daemon liegt.
+
+### Empfehlung
+
+Nur aus den Zeilen oben, nicht aus der Planungsformel.
+
+- Coding ohne Modelle, dieser Korpus, Debug-Binary: 2 GiB ist die kleinste harte Kappe, unter der `index` ohne Swap fertig wurde. 1 GiB ohne Swap reicht nicht. `search-pattern` auf eine Datei und `replace-text` gehen bei 1 GiB, der Index und alles, was ihn nachzieht, nicht. Zieht man die 250 MiB Ubuntu von der 2-GiB-Kappe ab, wurde der Index in diesem Lauf noch fertig, der Cgroup-Zähler lag aber auf der Kappe. Reserve nach oben ist in dieser Messung nicht da.
+- Coding mit Swap: 1 GiB RAM plus 2 GiB Swap hat den Index fertiggestellt und 875 MiB Swap benutzt.
+- Semantische Suche: bei 1 und 2 GiB gemessen abgeschaltet, Exit 1, kein Daemon. Bei 3 GiB passt der Embedding-Daemon (HWM 738 MiB) in die Kappe, die Suche über 15312 Spans und auch die über 26 Spans war nach dem Zeitlimit nicht fertig.
+- Summaries: der Daemon wurde bei 4 GiB 1740 MiB groß und hat keinen Satz geliefert. OOM war es nicht. 3 GiB lässt Summaries aus, das ist die Stufe, nicht eine neue Messung eines fehlgeschlagenen Starts.
+- Beide Modelle ohne Browser und ohne Ubuntu in der Gruppe: Cgroup-Peak 2441 MiB bei 4 GiB Kappe, kein OOM.
+- Web, und Web zusammen mit Coding: keine gemessene Mindestgröße. Rechnung, keine Messung: 2441 MiB gemessene Modell-Überlappung plus die unveränderte 1,25-GiB-Browser-Reserve liegen über 4 GiB, bevor Ubuntu dazukommt. Ob eine echte Seite diese Reserve braucht, ist hier nicht geprüft.
+
+## Auf einer frischen Ubuntu-Box
+
+`greppy -p` spricht nur Klartext-HTTP mit einem lokalen Gateway (`crates/agent/src/client.rs`). `https://api.minimax.io` kann nicht `GREPPY_ENDPOINT` sein. MiniMax selbst, laut den API-Docs vom 3. November 2026:
+
+- Anthropic-kompatible Basis: `https://api.minimax.io/anthropic`
+- Modell-ID: `MiniMax-M3.1-Flash`
+- Schlüssel: `MINIMAX_API_KEY` als Bearer gegen diese Basis
+
+Das Gateway auf der Box muss diese Basis mit TLS aufrufen. greppy sieht nur das Gateway. Standard im Produkt ist CLIProxyAPI auf `http://127.0.0.1:8317`. Der Schlüssel, den greppy schickt, ist `GREPPY_API_KEY` (`x-api-key` und `Authorization: Bearer`), nicht eine eigene MiniMax-Variable. Das Skript kopiert `MINIMAX_API_KEY` nach `GREPPY_API_KEY`, wenn letztere leer ist. Das hilft nur, wenn das lokale Gateway genau diesen Schlüssel erwartet.
+
+Modellfenster: die MiniMax-Docs nennen 1 000 000 Tokens. greppy leitet das aus dem Namen `MiniMax-M3.1-Flash` nicht ab. `--context-tokens 1000000` setzen.
+
+```
+export GREPPY_ENDPOINT=http://127.0.0.1:8317
+export GREPPY_MODEL=MiniMax-M3.1-Flash
+export GREPPY_API_KEY="$MINIMAX_API_KEY"
+python3 bench/max_ram_box.py --bin /usr/bin/greppy --repo /pfad/zum/repo --out /tmp/max-ram.jsonl
+```
+
+Das Skript fährt 1, 2, 3 und 4 GiB mit `--max-ram` und `--device cpu`. Zuerst `systemd-run --scope` mit `MemoryMax`. Ohne systemd legt es eine cgroup v2 an. Web-Aufgaben laufen nur, wenn `greppy web doctor` den Stack findet. Die Agent-Aufgabe läuft nur, wenn `GREPPY_ENDPOINT` antwortet. Jede Zeile auf stdout ist ein JSON-Objekt mit Exit, OOM, Dauer, Cgroup-Peak und HWM je Prozess.
+
+Ein CPU-only-Release liegt diesem Stand nicht bei. `cargo build --release -p greppy --features cpu-only` bricht ab, solange `GREPPY_ALLOW_CPU_ONLY_RELEASE` nicht existiert: der Schalter ist absichtlich nicht eingebaut, damit ein normales Release GPU bleibt. Debug auf einer Maschine ohne nvcc:
+
+```
+cargo build -p greppy --features cpu-only
+```
+
+Der Webstack ist ein zweites Binary, `crates/web-runtime`, Feature `content-runtime`. Er ist nicht im deb von v0.4.5. Bauen heißt Servo übersetzen und danach `crates/web-runtime/scripts/package-web-runtime.sh` in ein Verzeichnis legen, das `GREPPY_WEB_RUNTIME` oder `GREPPY_WEB_RUNTIME_DIST` zeigt.
