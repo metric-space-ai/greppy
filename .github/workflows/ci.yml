@@ -36,14 +36,20 @@ env:
 
 jobs:
   check:
+    # Branch protection consumes this published name. ubuntu-latest moved to
+    # Ubuntu 26.04, whose NVIDIA network repo carries no CUDA 12.5 packages;
+    # the Linux leg runs on ubuntu-24.04 under its stable ubuntu-latest name.
     name: build / test / lint (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     env:
       GIT_LFS_SKIP_SMUDGE: "1"
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            runner: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -223,9 +229,10 @@ jobs:
   real-assets-link:
     # Branch protection consumes this published name. Keep the Windows context
     # stable when pinning its runner for WDK compatibility; the real build and
-    # inference gates below still execute on windows-2022.
+    # inference gates below still execute on windows-2022. The Linux leg is
+    # pinned to ubuntu-24.04 for CUDA 12.5, as in the check job above.
     name: real embedded assets (${{ matrix.check_name || matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     env:
       EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
       EMBED_NATIVE_TOKENIZER: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
@@ -234,6 +241,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-2022]
         include:
+          - os: ubuntu-latest
+            runner: ubuntu-24.04
           - os: windows-2022
             check_name: windows-latest
     steps:
