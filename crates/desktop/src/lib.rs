@@ -230,6 +230,31 @@ mod tests {
     }
 
     #[test]
+    fn human_list_apps_and_windows_include_the_rows() {
+        let limits = Limits {
+            json: false,
+            max_bytes: None,
+        };
+        let apps = run_fake(
+            &Command::ListApps { app: None },
+            &FakeDesktop::fixture(),
+            &limits,
+        );
+        assert!(apps.body.contains("Editor"), "{}", apps.body);
+        assert!(apps.body.contains("4242"), "{}", apps.body);
+        assert!(apps.body.contains("app.editor"), "{}", apps.body);
+        assert!(apps.body.contains("UNTRUSTED_DESKTOP_CONTENT"));
+        let windows = run_fake(
+            &Command::ListWindows { app: None },
+            &FakeDesktop::fixture(),
+            &limits,
+        );
+        assert!(windows.body.contains("w1"), "{}", windows.body);
+        assert!(windows.body.contains("Notes"), "{}", windows.body);
+        assert!(windows.body.contains("Editor"), "{}", windows.body);
+    }
+
+    #[test]
     fn list_apps_projects_a_stable_document() {
         let value = doc(&Command::ListApps { app: None });
         assert_envelope(&value, "list-apps", true);
