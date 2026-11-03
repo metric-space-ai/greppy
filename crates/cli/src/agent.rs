@@ -109,7 +109,8 @@ Flags:
                       Default remains an isolated worktree plus sandbox.
   --mode MODE         quality (default) or performance (env GREPPY_AGENT_MODE).
                       quality keeps the merge bar and the pull-request report.
-                      performance asks for a 5-8 line report and a short prompt.
+                      performance is that same prompt with only the DONE and
+                      FINAL ANSWER lines shortened.
   --context-tokens N  Model context window in tokens (env GREPPY_CONTEXT_TOKENS).
                       Kimi k3 defaults to 262144, or 1048576 when the model id
                       says 1M. Compaction starts at --compact-ratio of this window.

@@ -32,7 +32,8 @@ pub fn system_prompt() -> String {
 }
 
 /// `greppy -p` prompt style. Quality is the default and keeps the signed
-/// one-shot contract. Performance is the short bench/headless prompt.
+/// one-shot contract. Performance is that same text with the DONE and
+/// FINAL ANSWER lines shortened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentPromptStyle {
     Quality,
@@ -41,26 +42,21 @@ pub enum AgentPromptStyle {
 
 /// One-shot system prompt for a run.
 ///
-/// Quality keeps the signed contract, including the merge bar and the
-/// pull-request report. Its browser section is omitted only when the browser
-/// is unavailable. Performance is a short operating note: a 5–8 line report,
-/// no pull-request requirement, and the browser verbs only when they work.
-/// `in_place` is independent of the style and only adds the checkout notice.
+/// Quality is the signed one-shot contract. Its browser section is omitted
+/// only when the browser is unavailable. Performance is that same string
+/// after [`apply_performance_edits`]: the merge bar and the pull-request
+/// report are the only wording changes. Tool sections stay byte-for-byte.
+/// `in_place` prepends the same checkout notice in both styles.
 pub fn compose_one_shot_prompt(
     style: AgentPromptStyle,
     browser_available: bool,
     in_place: bool,
 ) -> String {
+    let quality = quality_body(browser_available);
     let body = match style {
-        AgentPromptStyle::Quality => {
-            let text = system_prompt_for_mode(BuiltinPromptMode::OneShot);
-            if browser_available {
-                text
-            } else {
-                strip_browser_block(&text)
-            }
-        }
-        AgentPromptStyle::Performance => performance_prompt(browser_available),
+        AgentPromptStyle::Quality => quality,
+        AgentPromptStyle::Performance => apply_performance_edits(&quality)
+            .unwrap_or_else(|error| panic!("performance prompt edit failed: {error}")),
     };
     let mut out = String::new();
     if in_place {
@@ -70,50 +66,51 @@ pub fn compose_one_shot_prompt(
     out
 }
 
+fn quality_body(browser_available: bool) -> String {
+    let text = system_prompt_for_mode(BuiltinPromptMode::OneShot);
+    if browser_available {
+        text
+    } else {
+        strip_browser_block(&text)
+    }
+}
+
 const IN_PLACE_NOTICE: &str = "\
 IN-PLACE RUN: edit the current checkout directly. Ignore later instructions that say you work in a temporary worktree or that the result is a pull request copied back later. Files you write here are the task result. Absolute paths inside this repository are writable. /tmp is usable. HOME, GOPATH and TMPDIR stay as this process found them. Git author identity is unchanged when user.name and user.email are already set; otherwise this process uses greppy-agent <greppy-agent@localhost> for commits it makes.
 
 ";
 
-fn performance_prompt(browser_available: bool) -> String {
-    let mut text = String::from(
-        "\
-You are greppy, a coding agent in performance mode. Finish the task. Decide details yourself; nobody can answer questions.
+/// Exact quality sentences replaced in the performance prompt, and nothing else.
+///
+/// HOW A TASK RUNS is left unchanged: every sentence there also states the
+/// worktree or snapshot lifecycle, so none is only a pull-request requirement.
+const PERFORMANCE_EDITS: &[(&str, &str)] = &[
+    (
+        "DONE means the pull request can be merged as it is: the task is fully implemented, the relevant tests pass, new behaviour has a test, and the diff contains nothing else (smallest change, in the style of the surrounding code). Do not stop at an analysis. If you are blocked, name the missing dependency; never claim a result you have not seen.",
+        "DONE means the task is implemented and works. Do not stop at an analysis. If you are blocked, name the missing dependency; never claim a result you have not seen.",
+    ),
+    (
+        "FINAL ANSWER is the pull request's description: a one-line title; Status: done, partial or blocked; what changed and why (file:line); how it was verified (commands and results); what is open.",
+        "FINAL ANSWER: at most 5-8 short lines: what you changed and whether it works.",
+    ),
+];
 
-WORK
-One tool: greppy, called with an argv array. Example: [\"search-symbol\", \"NAME\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"].
-Batch independent steps in one call: {\"batch\": [[\"search-symbol\", \"NAME\"], [\"read\", \"NAME\"]]}. A failed edit stops the rest of that batch.
-Do not run greppy index unless a result says the index is stale. --root is rejected; the tool already runs in the repository.
-
-FIND
-search-symbol NAME, search \"what it does\", who-calls NAME, callees NAME, brief NAME, impact NAME. Ask the graph before rg.
-
-READ
-read SYMBOL prints the definition. read path/file.ext::Type::method falls back to that file and the trailing name when the symbol index misses.
-read-file PATH prints about 250 lines. Continue with read-file PATH --lines A:B.
-
-EDIT
-replace, replace-text, replace-lines, write, patch, insert-lines, delete-lines. The new text is the last argument. Trust the edit receipt.
-
-SHELL
-bash-smart -- CMD. cd, &&, |, ; and redirects may be separate argv elements; they run as one shell command.
-
-DONE
-Make the change. Run the project's relevant test when one exists. Stop when the task is done or you are blocked on something you cannot change.
-
-FINAL ANSWER
-5 to 8 lines: what changed, the command that verified it and its result, and anything still open. Do not write a pull-request description.
-",
-    );
-    if browser_available {
-        text.push_str(
-            "\
-BROWSER
-The browser is available. greppy web open URL, then greppy web observe, greppy web click TARGET, greppy web fill TARGET VALUE. Chain known steps with :: . If a call says the browser is unavailable, stop using it.
-",
-        );
+/// Apply the performance edits to a quality prompt.
+///
+/// Fails when a source sentence is missing or no longer unique, so a drifted
+/// quality text cannot silently produce a performance prompt.
+pub fn apply_performance_edits(quality: &str) -> Result<String, String> {
+    let mut text = quality.to_string();
+    for (from, to) in PERFORMANCE_EDITS {
+        let count = text.matches(from).count();
+        if count != 1 {
+            return Err(format!(
+                "performance edit requires exactly one occurrence of `{from}`, found {count}"
+            ));
+        }
+        text = text.replacen(from, to, 1);
     }
-    text
+    Ok(text)
 }
 
 /// Drop the signed `BROWSER` … `END BROWSER` section. The rest of the contract
@@ -257,22 +254,90 @@ mod tests {
     }
 
     #[test]
-    fn performance_prompt_is_short_and_skips_the_pull_request_report() {
-        let text = compose_one_shot_prompt(AgentPromptStyle::Performance, false, false);
-        assert!(text.contains("5 to 8 lines"));
-        assert!(!text.contains("pull request's description"));
-        assert!(!text.contains("greppy web"));
-        assert!(
-            text.len() / 4 < 2_000,
-            "performance prompt tokens ~= {}",
-            text.len() / 4
-        );
+    fn performance_is_quality_with_only_the_allowed_edits() {
+        for browser in [true, false] {
+            for in_place in [true, false] {
+                let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, browser, in_place);
+                let performance =
+                    compose_one_shot_prompt(AgentPromptStyle::Performance, browser, in_place);
+                let delta = differing_lines(&quality, &performance);
+                assert_eq!(
+                    delta,
+                    PERFORMANCE_EDITS
+                        .iter()
+                        .map(|(from, to)| (from.to_string(), to.to_string()))
+                        .collect::<Vec<_>>(),
+                    "browser={browser} in_place={in_place}\n{delta:#?}"
+                );
+                for line in quality.lines().filter(|line| line.contains("greppy ")) {
+                    assert!(
+                        performance.contains(line),
+                        "missing tool line with browser={browser}: {line}"
+                    );
+                }
+            }
+        }
         let with_browser = compose_one_shot_prompt(AgentPromptStyle::Performance, true, false);
+        let without = compose_one_shot_prompt(AgentPromptStyle::Performance, false, false);
+        assert!(with_browser.contains(browser_prompt()));
         assert!(with_browser.contains("greppy web open"));
-        assert!(with_browser.len() / 4 < 2_000);
-        let in_place = compose_one_shot_prompt(AgentPromptStyle::Performance, false, true);
-        assert!(in_place.starts_with("IN-PLACE RUN:"));
-        assert!(in_place.contains("5 to 8 lines"));
+        assert!(!without.contains("\nBROWSER:\n"));
+        assert!(!without.contains("greppy web open"));
+        for heading in [
+            "ROUTING:",
+            "TERMS:",
+            "SEARCH:",
+            "NAVIGATE:",
+            "READING CODE:",
+            "EDIT:",
+            "OUTPUT AND SCOPE:",
+            "HOW A TASK RUNS",
+            "bash-smart -- CMD",
+        ] {
+            assert!(with_browser.contains(heading), "missing {heading}");
+            assert!(
+                without.contains(heading),
+                "missing {heading} without browser"
+            );
+        }
+        let in_place = compose_one_shot_prompt(AgentPromptStyle::Performance, true, true);
+        let quality_in_place = compose_one_shot_prompt(AgentPromptStyle::Quality, true, true);
+        assert!(in_place.starts_with(IN_PLACE_NOTICE));
+        assert!(quality_in_place.starts_with(IN_PLACE_NOTICE));
+        assert!(with_browser
+            .contains("DONE means the task is implemented and works. Do not stop at an analysis."));
+        assert!(with_browser.contains(
+            "FINAL ANSWER: at most 5-8 short lines: what you changed and whether it works."
+        ));
+        assert!(!with_browser.contains("pull request can be merged"));
+        assert!(!with_browser.contains("pull request's description"));
+    }
+
+    #[test]
+    fn performance_edit_fails_when_a_source_sentence_is_missing() {
+        let quality = compose_one_shot_prompt(AgentPromptStyle::Quality, true, false);
+        for (from, _) in PERFORMANCE_EDITS {
+            let broken = quality.replacen(from, "rewritten", 1);
+            let error = apply_performance_edits(&broken).unwrap_err();
+            assert!(error.contains("exactly one occurrence"), "{error}");
+            assert!(error.contains(&from[..40]), "{error}");
+        }
+        assert!(apply_performance_edits("no sentences here").is_err());
+    }
+
+    fn differing_lines(left: &str, right: &str) -> Vec<(String, String)> {
+        let left: Vec<_> = left.lines().collect();
+        let right: Vec<_> = right.lines().collect();
+        assert_eq!(
+            left.len(),
+            right.len(),
+            "performance changed the line count"
+        );
+        left.into_iter()
+            .zip(right)
+            .filter(|(before, after)| before != after)
+            .map(|(before, after)| ((*before).to_string(), after.to_string()))
+            .collect()
     }
 
     #[test]
