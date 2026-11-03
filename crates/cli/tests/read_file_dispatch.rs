@@ -1359,11 +1359,16 @@ fn read_accepts_emitted_and_simplified_path_qualified_rust_variables() {
         &store,
         &["read", "missing/gateway.rs::EMAIL_RUNTIME_ENV_KEYS"],
     );
-    assert_ne!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        !stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"),
-        "a missing path must not fall back to the real declaration: {stdout}"
+        stdout.contains("not an indexed definition in `missing/gateway.rs`"),
+        "{stdout}"
     );
+    assert!(
+        stdout.contains("src/core/gateway.rs"),
+        "a mistyped path is resolved by symbol name: {stdout}"
+    );
+    assert!(stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"), "{stdout}");
 }
 
 #[test]
