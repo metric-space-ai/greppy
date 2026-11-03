@@ -1,9 +1,11 @@
 # RAM-Budget für headless Ubuntu (1–4 GiB)
 
-`--max-ram` (Umgebung: `GREPPY_MAX_RAM`) setzt das Host-RAM, in dem greppy
-bleiben soll. Es gibt kein einzelnes Minimal-Flag. Ist nichts gesetzt, bleibt
-das Produktverhalten: `--device auto` wählt die GPU, beide Modelle dürfen
-laden, der Web-Daemon hat kein globales Sitzungs- oder Tab-Limit.
+`--max-ram` (Umgebung: `GREPPY_MAX_RAM`) ist die gesamte Host-RAM-Größe des
+Servers, zum Beispiel `2g` auf einer Maschine mit 2 GiB. Es ist nicht das
+Budget, das nach dem Betriebssystem übrig bleibt. Es gibt kein einzelnes
+Minimal-Flag. Ist nichts gesetzt, bleibt das Produktverhalten: `--device auto`
+wählt die GPU, beide Modelle dürfen laden, der Web-Daemon hat kein globales
+Sitzungs- oder Tab-Limit.
 
 Der Webstack (Servo + deno_core) wird nie abgeschaltet. Er bleibt bei jedem
 Budget benutzbar. Die harten Hebel sitzen bei EmbeddingGemma und dem
@@ -13,19 +15,30 @@ Disk mit späterem Wiederherstellen.
 
 ## Formel
 
-Alles in GiB, 1024-basiert. `Rest` ist das, was die Modelle bekommen dürfen:
+Alles in GiB, 1024-basiert. `--max-ram` ist der ganze Rechner. `Rest` ist das,
+was die Modelle bekommen dürfen, nachdem Ubuntu, die Browser-Reserve und der
+Browser-Slack abgezogen sind:
 
 ```
-Rest = Budget − Browser-Reserve − Slack
+Rest = Host-RAM − Ubuntu − Browser-Reserve − Browser-Slack
+Host-RAM        = --max-ram
+Ubuntu          = 250 MiB
 Browser-Reserve = 1,25 GiB
-Slack           = 256 MiB
+Browser-Slack   = 256 MiB
 ```
+
+Ubuntu und Browser-Slack sind zwei verschiedene Posten. Der Slack ist Puffer
+neben der Browser-Reserve (greppy-Prozess, Seitenrauschen). Er ist nicht das
+Betriebssystem. Vorher steckte das OS nur in diesem ungemessenen 256-MiB-Slack,
+und der Rest bei 2 GiB wurde in dieser Datei noch einmal als OS-Marge
+beschrieben. Das ist die alte Rechnung, nicht mehr die Semantik.
 
 | Konstante | Wert | Herkunft |
 | --- | --- | --- |
 | Browser-Reserve | 1,25 GiB | **Im Code belegt** als Kommentar in `crates/web-runtime/runtime/src/limits.rs`: eine gespiegelte Nachrichtenseite brauchte 1,25 GB Content-RSS. Die Zahl ist die Prozess-RSS, deshalb wird das Runtime-Image nicht noch einmal addiert. Plattform und Messprotokoll stehen im Kommentar nicht. |
 | Runtime-Image | ~400 MiB | **Im Code belegt** als Kommentar in `crates/web-runtime/runtime/Cargo.toml` und in `daemon.rs` („400MB image“). Das ist die Image-Größe beim Start, nicht die RSS einer Seite. |
-| Slack | 256 MiB | **Planungswert, nicht gemessen.** Platz für den greppy-Prozess und den Kernel. |
+| Ubuntu minimal | 250 MiB | **Gemessen von Michael** auf einem headless Ubuntu, idle, etwa 250 MB. Steht nicht im greppy-Quelltext. Wird als `OS_RESERVE_BYTES` vor Browser-Reserve und Browser-Slack abgezogen. |
+| Browser-Slack | 256 MiB | **Planungswert, nicht gemessen.** Puffer neben der Browser-Reserve für den greppy-Prozess und Seitenrauschen. Nicht das Betriebssystem. |
 | Embedding-Budget | 768 MiB | **Im Code belegt:** `estimated_gpu_memory` addiert für EmbeddingGemma einen Workspace von 768 MiB (`crates/embed-native/src/backend.rs`). |
 | Summary-Budget | 1024 MiB | **Im Code belegt:** derselbe Helper, Workspace 1024 MiB für Qwen3.5. |
 | Embedding-RSS, CUDA | 702 910 464 B (670 MiB) | **Gemessen**, nicht CPU: `bench/evidence/runtime-footprint-linux-x86_64-cuda-a4500.json`, Daemon `embedding`, `state: ready`, während der semantischen Suche. Gewichte lagen auf der GPU. |
@@ -46,26 +59,26 @@ schwere Seite und beide Modelle passen in dieser Rechnung nicht gleichzeitig.
 
 ## Stufen
 
-| Budget | Rest | Embedding | Summary | Lebende Tabs (global) | Sessions (global) | Tab-Swap |
+| Budget | Rest nach Ubuntu, Browser und Slack | Embedding | Summary | Lebende Tabs (global) | Sessions (global) | Tab-Swap |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 GiB (`1g`, alles unter 2 GiB, z. B. `1536m`) | 0 | aus | aus | 1 | 1 | ja |
-| 2 GiB | 512 MiB | aus | aus | 1 | 1 | ja |
-| 3 GiB | 1536 MiB | lazy, CPU, Modell-TTL 60 s, Prozess-TTL 180 s | aus | 1 | 1 | ja |
-| 4 GiB und darüber | 2560 MiB | lazy, CPU, TTL 30 s / 120 s | lazy, CPU, TTL 30 s / 120 s | 1 | 2 | ja |
+| 2 GiB | 262 MiB | aus | aus | 1 | 1 | ja |
+| 3 GiB | 1286 MiB | lazy, CPU, Modell-TTL 60 s, Prozess-TTL 180 s | aus | 1 | 1 | ja |
+| 4 GiB und darüber | 2310 MiB | lazy, CPU, TTL 30 s / 120 s | lazy, CPU, TTL 30 s / 120 s | 1 | 2 | ja |
 
-1 GiB und 2 GiB treffen dieselbe Modellentscheidung. 512 MiB Rest liegen unter
-dem 768-MiB-Embedding-Workspace. Der Unterschied ist die Marge: bei 2 GiB
-bleiben 512 MiB für OS und Seitenrauschen, ohne ein Modell zu starten. Eine
-eigene „2-GiB-lädt-trotzdem-ein-Modell“-Stufe würde die Reserve unterlaufen.
+1 GiB und 2 GiB treffen dieselbe Modellentscheidung. 262 MiB Rest liegen unter
+dem 768-MiB-Embedding-Workspace. Ubuntu ist in dieser Zahl schon abgezogen.
+Der Unterschied zur 1-GiB-Stufe ist die verbleibende Marge für Seitenrauschen,
+nicht ein zweites Modell und nicht noch einmal das Betriebssystem.
 
 Geschätzte Spitze, Planung, nicht gemessen:
 
-| Stufe | Browser | Embedding | Summary | Summe der Planung |
-| --- | --- | --- | --- | --- |
-| 1 GiB | 1,25 GiB Reserve, real oft der ganze Rechner | 0 | 0 | über dem Rechner, siehe offene Punkte |
-| 2 GiB | 1,25 GiB | 0 | 0 | 1,25 GiB + Slack 0,25 GiB = 1,5 GiB, etwa 0,5 GiB Puffer |
-| 3 GiB | 1,25 GiB | 0,75 GiB | 0 | 2,25 GiB + Slack |
-| 4 GiB | 1,25 GiB | 0,75 GiB | 1,0 GiB | 3,25 GiB + Slack, wenn beide Modelle gleichzeitig resident sind |
+| Stufe | Ubuntu | Browser | Browser-Slack | Embedding | Summary | Summe der Planung |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 GiB | 250 MiB | 1,25 GiB, real oft der ganze Rest | 256 MiB | 0 | 0 | über dem Rechner, siehe offene Punkte |
+| 2 GiB | 250 MiB | 1,25 GiB | 256 MiB | 0 | 0 | 1786 MiB belegt, 262 MiB Rest |
+| 3 GiB | 250 MiB | 1,25 GiB | 256 MiB | 768 MiB | 0 | 2554 MiB belegt, 518 MiB Rest |
+| 4 GiB | 250 MiB | 1,25 GiB | 256 MiB | 768 MiB | 1024 MiB | 3578 MiB belegt, 518 MiB Rest, wenn beide Modelle gleichzeitig resident sind |
 
 Die Default-TTLs ohne Budget bleiben 300 s Modell und 1800 s Prozess
 (`GREPPY_EMBED_DAEMON_MODEL_TTL_S`, `GREPPY_SUMMARIZE_DAEMON_*`). Das Budget
@@ -182,8 +195,8 @@ laufender Supervisor übernimmt ein später gesetztes Budget nicht.
    zurückgibt oder nur den Rust-Handle droppt.
 4. Ein Wiederherstellungsversuch auf einer Seite mit HttpOnly-Cookie,
    `localStorage`, Scroll und History: was nach Swap noch stimmt.
-5. Ob zwei gleichzeitig residente Daemons auf 4 GiB (Plan 3,25 GiB plus Slack
-   und OS) vom OOM-Killer getroffen werden. Ein harter Cross-Daemon-Lock ist
-   nicht eingebaut; es gibt nur kurze TTLs und kein Summary-Prewarm während
-   der Suche.
+5. Ob zwei gleichzeitig residente Daemons auf 4 GiB (Plan 3578 MiB inklusive
+   Ubuntu, Browser-Reserve, Browser-Slack und beider Modelle) vom OOM-Killer
+   getroffen werden. Ein harter Cross-Daemon-Lock ist nicht eingebaut; es gibt
+   nur kurze TTLs und kein Summary-Prewarm während der Suche.
 6. zram oder Swap auf dem Host. Das ist Betriebssystem, kein greppy-Schalter.

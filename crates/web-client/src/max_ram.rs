@@ -1,7 +1,8 @@
 //! Host RAM budget for headless machines.
 //!
-//! The browser is reserved first. Embedding and summary models are loaded
-//! only from what remains, or not at all. Unset means the product default:
+//! `--max-ram` is the whole host. Ubuntu minimal is subtracted first, then
+//! the browser reserve and a separate browser slack. Models are loaded only
+//! from what remains, or not at all. Unset means the product default:
 //! GPU `auto`, both models, no global web cap. See `docs/max-ram.md`.
 
 use std::fmt::Write as _;
@@ -14,8 +15,15 @@ pub const ENV_MAX_RAM: &str = "GREPPY_MAX_RAM";
 /// again. It is a planning reserve, not a new measurement.
 pub const BROWSER_RESERVE_BYTES: u64 = 1280 * 1024 * 1024;
 
-/// Room for the greppy process and the OS page cache. Not measured.
-pub const PROCESS_SLACK_BYTES: u64 = 256 * 1024 * 1024;
+/// Headroom beside the browser reserve for the greppy process and page noise.
+/// This is not the operating system. Not measured.
+pub const BROWSER_SLACK_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Ubuntu minimal, idle, about 250 MiB. Michael measured this on a headless
+/// server. `--max-ram` is the whole machine, so this reserve is subtracted
+/// before the browser reserve and the browser slack. It is not a figure from
+/// the greppy source.
+pub const OS_RESERVE_BYTES: u64 = 250 * 1024 * 1024;
 
 /// `estimated_gpu_memory` workspace for EmbeddingGemma. The Linux CUDA
 /// footprint file recorded 702_910_464 host RSS with weights on the GPU;
@@ -119,9 +127,7 @@ impl RamBudget {
         } else {
             Stage::AtLeast4GiB
         };
-        let remainder = bytes
-            .saturating_sub(BROWSER_RESERVE_BYTES)
-            .saturating_sub(PROCESS_SLACK_BYTES);
+        let remainder = remainder_bytes(bytes);
         let embeddings = if remainder >= EMBED_HOST_BUDGET_BYTES {
             ModelSlot::Lazy
         } else {
@@ -288,8 +294,9 @@ pub fn parse_quantity(raw: &str) -> Result<u64, String> {
 
 pub fn remainder_bytes(bytes: u64) -> u64 {
     bytes
+        .saturating_sub(OS_RESERVE_BYTES)
         .saturating_sub(BROWSER_RESERVE_BYTES)
-        .saturating_sub(PROCESS_SLACK_BYTES)
+        .saturating_sub(BROWSER_SLACK_BYTES)
 }
 
 /// One-line description used by tests and the design table.
@@ -328,6 +335,20 @@ mod tests {
         assert!(parse_quantity("1.5g").is_err());
         assert!(parse_quantity("many").is_err());
         assert!(parse_quantity("").is_err());
+    }
+
+    #[test]
+    fn host_size_subtracts_ubuntu_before_the_browser_slack() {
+        assert_eq!(OS_RESERVE_BYTES, 250 * 1024 * 1024);
+        assert_ne!(OS_RESERVE_BYTES, BROWSER_SLACK_BYTES);
+        assert_eq!(
+            remainder_bytes(2 * GIB),
+            (2 * GIB) - OS_RESERVE_BYTES - BROWSER_RESERVE_BYTES - BROWSER_SLACK_BYTES
+        );
+        assert_eq!(remainder_bytes(GIB), 0);
+        assert_eq!(remainder_bytes(2 * GIB), 262 * 1024 * 1024);
+        assert_eq!(remainder_bytes(3 * GIB), 1286 * 1024 * 1024);
+        assert_eq!(remainder_bytes(4 * GIB), 2310 * 1024 * 1024);
     }
 
     #[test]

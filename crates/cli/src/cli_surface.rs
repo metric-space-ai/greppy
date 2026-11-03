@@ -42,9 +42,10 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with = "device")]
     pub no_gpu: bool,
 
-    /// Host RAM this process and the daemons it starts must fit in.
-    /// `1g`, `2g`, `3g` and `4g` select the staged budget in docs/max-ram.md.
-    /// `GREPPY_MAX_RAM` is the same value. Unset keeps product defaults.
+    /// Total RAM of this host, for example `2g` on a 2 GiB server.
+    /// The budget subtracts Ubuntu minimal (250 MiB) first, then the browser
+    /// reserve and a separate browser slack. `GREPPY_MAX_RAM` is the same
+    /// value. Unset keeps product defaults. See docs/max-ram.md.
     #[arg(long, global = true, value_name = "SIZE")]
     pub max_ram: Option<String>,
 
