@@ -254,7 +254,10 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
         let workspace = InPlaceWorkspace::create(&repo, "run-1").unwrap();
-        assert_eq!(workspace.worktree_path(), repo.as_path());
+        assert_eq!(
+            workspace.worktree_path(),
+            fs::canonicalize(&repo).unwrap().as_path()
+        );
         fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
         fs::write(repo.join("fresh.txt"), "new\n").unwrap();
         let outcome = workspace.finish("report").unwrap();
