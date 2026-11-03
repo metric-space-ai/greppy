@@ -64,4 +64,12 @@ pub trait ExecutionEnv {
     /// [`ToolOutcome::unknown_tool`]); the loop relies on this instead of
     /// panicking.
     fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome;
+
+    /// Manuals the host wants appended to the system prompt before the next turn.
+    ///
+    /// Default is empty. The built-in agent returns the web and desktop sections
+    /// after they are enabled. The loop appends only headings that are absent.
+    fn capability_sections(&self) -> String {
+        String::new()
+    }
 }

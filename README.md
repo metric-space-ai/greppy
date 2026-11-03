@@ -36,8 +36,13 @@ and summaries are computed locally by the embedded models. They make no network
 calls, send no telemetry, and need no account, so the code-analysis surface
 works offline and air-gapped. The optional `greppy web` beta accesses only the
 URLs an agent explicitly opens, searches, or researches; it never uploads the
-repository. Model files are downloaded only at build time (release packages
-already contain them).
+repository. `greppy desktop` drives a local GUI through the accessibility tree
+(macOS AX, Windows UIA, Linux AT-SPI). Web and desktop manuals are not in the
+built-in system prompt until you enable them: `greppy capabilities enable web`,
+`greppy capabilities enable desktop`, or `--enable web,desktop` on `greppy -p`,
+`greppy agent`, and `greppy agent stdio`. Desktop commands stay refused inside
+that agent until then. Model files are downloaded only at build time (release
+packages already contain them).
 
 ```bash
 # Standard grep — every command works, unchanged:

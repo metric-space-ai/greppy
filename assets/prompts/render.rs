@@ -64,10 +64,10 @@ pub fn render_builtin(public: &str, adapter: &str, mode: BuiltinPromptMode) -> S
     if mode == BuiltinPromptMode::Acp {
         // ACP isolation/proposal policy is explicitly still an owner decision.
         // Reuse only the approved role sentence; never make the worktree/PR
-        // promise or expose browser commands unavailable in ACP.
+        // promise. Web and desktop manuals are not in this base text; a start
+        // flag or `capabilities enable` appends them later.
         let role = intro.split_once(". ").expect("approved role sentence").0;
-        let browser = tools.find("\nBROWSER:\n").expect("signed browser section");
-        return format!("{role}.\n\nACP (agent stdio)\n\n{}", &tools[..browser]);
+        return format!("{role}.\n\nACP (agent stdio)\n\n{tools}");
     }
     let prefix = match mode {
         BuiltinPromptMode::OneShot => "-p:",
@@ -80,4 +80,21 @@ pub fn render_builtin(public: &str, adapter: &str, mode: BuiltinPromptMode) -> S
         .find(|line| line.starts_with(prefix))
         .expect("signed mode line");
     format!("{}{line}\n\n{tools}", intro)
+}
+
+/// Builtin insertion of a capability manual. Same exclusions the shared
+/// contract applies to the base prompt: `web match` is not offered, and
+/// `--value-stdin` is not offered because a built-in tool call has no stdin.
+#[allow(dead_code)] // used by the agent library; the build script only renders modes
+pub fn prepare_capability(source: &str) -> String {
+    let mut text = source
+        .lines()
+        .filter(|line| !line.starts_with("  greppy web match "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text = text.replace(" or --value-stdin", "");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }

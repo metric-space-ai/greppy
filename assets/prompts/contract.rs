@@ -31,8 +31,16 @@ pub mod render;
 // (b) new sentence after the opening paragraph: "The task is a change to
 // deliver: make the edits with greppy and verify them; do not stop at an
 // analysis." v4: 12,900 bytes, SHA256 below. Adapter unchanged.
+// 2026-11-03: owner request to keep web and desktop manuals out of the default
+// system prompt. AGENTS.md keeps a short CAPABILITIES hint. The manuals live in
+// assets/prompts/capabilities/ and are appended only after enable or --enable.
+// Adapter unchanged. Previous public hash 12bb2db4… (12,900 bytes).
 pub const APPROVED_SHA256: &str =
-    "12bb2db4bce1ab2603279913aeb676f7b68115143a42170091f5842a6cf0d84f";
+    "f8c64a387ed5376a8ec80442d465aa11e0e1d31027323f95c8fd020d7414989d";
+pub const APPROVED_WEB_CAPABILITY_SHA256: &str =
+    "47b03e776795bf61101cb74e3522e0d57a0c01d184ff0f485a853f8aec5ef1bb";
+pub const APPROVED_DESKTOP_CAPABILITY_SHA256: &str =
+    "9a396328ae2393b7f771cda55936cd2f240bde0c23a7748413fe9fd1cf4dbbe6";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // 2026-10-06 consolidated owner order A: exact coding-agent introduction,
@@ -53,10 +61,10 @@ pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "887653abb4e7ad51aa543df52611018868f570d937248f71c42e528e1e934fef",
-        Interactive => "2f4449863c6b37c204473069d20f5d246a32484964e9eccbc532b65e4c1d11ee",
-        Serve => "2f93c68ef53008009f27849cae41cc4b87c499ca5d127f88267e64c3be282ed7",
-        Acp => "3683b8542fc14de0b9c46a3ebbed630f076dde4d56bb0523f587e93454198b44",
+        OneShot => "8ba987a5999ababd70224411d9955ebd30cedbfcca1d9b9cab8761b749cc20d2",
+        Interactive => "96e8243460fbb4ed678748e97f4cf14317e9afaa3700a503954825d95435f433",
+        Serve => "493214359b6d8dda1010e22ac7c19c474c2199f5fd43fd66e47924d63a175f5a",
+        Acp => "09298dfee60ab60ef275bbf699bf22bb6aefc9274ab106edee8c9235d3678774",
     }
 }
 
@@ -88,6 +96,14 @@ pub fn verify_repository(root: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let adapter = read(
         "assets/prompts/agent-adapter.md",
         APPROVED_AGENT_ADAPTER_SHA256,
+    )?;
+    let _web = read(
+        "assets/prompts/capabilities/web.md",
+        APPROVED_WEB_CAPABILITY_SHA256,
+    )?;
+    let _desktop = read(
+        "assets/prompts/capabilities/desktop.md",
+        APPROVED_DESKTOP_CAPABILITY_SHA256,
     )?;
     println!(
         "cargo:rerun-if-changed={}",

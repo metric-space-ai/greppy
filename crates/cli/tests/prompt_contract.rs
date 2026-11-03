@@ -28,7 +28,12 @@ fn owner_approved_reading_guidance_is_preserved() {
 
 #[test]
 fn documented_command_rows_use_the_same_executable_prefix() {
-    let text = prompt();
+    let text = format!(
+        "{}\n{}\n{}",
+        prompt(),
+        capability_file("web.md"),
+        capability_file("desktop.md")
+    );
     let headings = [
         "ROUTING:",
         "SEARCH:",
@@ -39,7 +44,9 @@ fn documented_command_rows_use_the_same_executable_prefix() {
         "INDEX:",
         "AGENT:",
         "CHAIN:",
+        "CAPABILITIES:",
         "BROWSER:",
+        "DESKTOP:",
     ];
     let mut sections = std::collections::BTreeSet::new();
     let mut rows = 0;
@@ -62,6 +69,13 @@ fn documented_command_rows_use_the_same_executable_prefix() {
         rows >= 60,
         "guard must cover code and browser commands: {rows}"
     );
+}
+
+fn capability_file(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/prompts/capabilities")
+        .join(name);
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {name}: {error}"))
 }
 
 fn prompt() -> String {
@@ -755,7 +769,7 @@ fn delimited_browser_block(text: &str) -> Option<&str> {
 
 #[test]
 fn builtin_browser_prompt_removes_only_unavailable_stdin_features() {
-    let public = prompt();
+    let public = capability_file("web.md");
     let beta = beta_web_prompt().expect("canonical browser prompt must ship");
     let expected = delimited_browser_block(&public)
         .unwrap()
@@ -770,7 +784,7 @@ fn builtin_browser_prompt_removes_only_unavailable_stdin_features() {
 
 #[test]
 fn browser_section_is_delimited_so_edits_are_visible() {
-    let text = prompt();
+    let text = capability_file("web.md");
     if !text.contains("BROWSER:") {
         return;
     }
@@ -783,7 +797,7 @@ fn browser_section_is_delimited_so_edits_are_visible() {
 
 #[test]
 fn browser_section_marks_page_text_as_untrusted() {
-    let text = prompt();
+    let text = capability_file("web.md");
     if !text.contains("BROWSER:") {
         return;
     }

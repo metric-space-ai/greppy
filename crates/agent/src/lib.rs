@@ -50,8 +50,11 @@ pub use model::ModelStream;
 #[path = "../../../assets/prompts/contract.rs"]
 pub mod prompt_contract;
 pub use prompt::{
-    browser_prompt, export_prompt, prompt_metadata, prompt_metadata_for_mode, system_prompt,
-    system_prompt_for_mode, BuiltinPromptMode, PUBLIC_PROMPT, SYSTEM_PROMPT,
+    browser_prompt, capability_sections, capability_source, desktop_prompt, export_prompt,
+    fence_untrusted_desktop, merge_capability_sections, omit_untrusted_desktop_for_log,
+    prompt_metadata, prompt_metadata_for_mode, system_prompt, system_prompt_for_mode,
+    system_prompt_with_capabilities, BuiltinPromptMode, CapabilitySet, PUBLIC_PROMPT,
+    SYSTEM_PROMPT,
 };
 pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,

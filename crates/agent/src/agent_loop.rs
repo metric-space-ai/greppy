@@ -619,6 +619,10 @@ verifiable and report the rest."
                     break;
                 }
 
+                // Enabling web or desktop appends its manual. The base prompt stays
+                // the prefix; one insertion refreshes the cache once.
+                crate::prompt::merge_capability_sections(&mut system, &env.capability_sections());
+
                 // Continue the outer loop for the next assistant turn.
                 // After the last action turn, the next request permits only a final report.
                 continue;
@@ -999,6 +1003,48 @@ mod tests {
             description: "run a command".to_string(),
             input_schema: json!({"type": "object"}),
         }
+    }
+
+    #[test]
+    fn enabling_a_capability_appends_its_manual_before_the_next_turn() {
+        struct EnablingEnv {
+            enabled: bool,
+        }
+        impl ExecutionEnv for EnablingEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![echo_tool()]
+            }
+            fn call_tool(&mut self, _name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.enabled = true;
+                ToolOutcome::ok("enabled web")
+            }
+            fn capability_sections(&self) -> String {
+                if self.enabled {
+                    crate::prompt::capability_sections(crate::prompt::CapabilitySet {
+                        web: true,
+                        desktop: false,
+                    })
+                } else {
+                    String::new()
+                }
+            }
+        }
+        let base = "BASE PROMPT\n";
+        let mut model = FakeModel::new(vec![
+            tool_turn(None, vec![("1", "echo", json!({}))], usage(1, 1)),
+            text_turn("done", usage(1, 1)),
+        ]);
+        let mut env = EnablingEnv { enabled: false };
+        let config = AgentConfig::default().with_model("mock").with_system(base);
+        run_agent_loop(&mut model, &mut env, &config, "task", &mut |_| {}).unwrap();
+        assert!(env.enabled);
+        assert_eq!(model.requests.len(), 2);
+        let first = model.requests[0].system.as_deref().unwrap();
+        let second = model.requests[1].system.as_deref().unwrap();
+        assert_eq!(first, base);
+        assert!(second.starts_with(base));
+        assert!(second.contains("\nBROWSER:\n"));
+        assert!(!first.contains("\nBROWSER:\n"));
     }
 
     fn echo_tool() -> ToolDefinition {

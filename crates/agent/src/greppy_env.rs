@@ -85,6 +85,9 @@ pub struct GreppyEnv {
     run_scratch: PathBuf,
     sandbox: SandboxMode,
     context_status: Option<(String, ContextStatusHook)>,
+    /// Web and desktop manuals enabled for this run. Shared so `&self` tool
+    /// calls (including a batch) can record `capabilities enable`.
+    capabilities: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl GreppyEnv {
@@ -116,6 +119,7 @@ impl GreppyEnv {
             run_scratch,
             sandbox: SandboxMode::Off,
             context_status: None,
+            capabilities: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 
@@ -170,6 +174,16 @@ impl GreppyEnv {
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
         self
+    }
+
+    /// Manuals included from the first turn (`--enable`), before any tool call.
+    pub fn with_capabilities(self, caps: crate::prompt::CapabilitySet) -> Self {
+        self.capabilities.fetch_or(caps.bits(), Ordering::Relaxed);
+        self
+    }
+
+    pub fn capabilities(&self) -> crate::prompt::CapabilitySet {
+        crate::prompt::CapabilitySet::from_bits(self.capabilities.load(Ordering::Relaxed))
     }
 
     /// Attach the host contextual status engine for this agent session.
@@ -371,6 +385,19 @@ impl GreppyEnv {
             cmd.env("GREPPY_CONTEXT_SCOPE", scope)
                 .env("GREPPY_CONTEXT_ENVELOPE", "1");
         }
+        let caps = self.capabilities.load(Ordering::Relaxed);
+        if caps & crate::prompt::CapabilitySet::WEB != 0 {
+            cmd.env("GREPPY_CAPABILITY_WEB", "1");
+        }
+        if caps & crate::prompt::CapabilitySet::DESKTOP != 0 {
+            cmd.env("GREPPY_CAPABILITY_DESKTOP", "1");
+        }
+        if args.first().map(String::as_str) == Some("desktop") {
+            // Upstream traces at debug can include tree text. Keep the child
+            // quiet so that text cannot land on stderr and then in the log.
+            cmd.env("GREPPY_LOG", "error");
+            cmd.env("RUST_LOG", "error");
+        }
         // Register attach pre_exec AFTER sandbox::apply so callbacks run
         // sandbox first, then child-local dup2 onto FD 4.
         let attach_hold = if args.first().map(String::as_str) == Some("web") {
@@ -416,10 +443,14 @@ impl GreppyEnv {
                                 .lines()
                                 .next()
                                 .is_some_and(|line| line.starts_with("FAILED — exit "))));
+                let desktop_screenshot = args.first().map(String::as_str) == Some("desktop")
+                    && args.get(1).map(String::as_str) == Some("screenshot");
                 let screenshot = if args.first().map(String::as_str) == Some("web")
                     && args.get(1).map(String::as_str) == Some("screenshot")
                 {
                     extract_png_base64(&merge_stdio(&captured.stdout, &captured.stderr))
+                } else if desktop_screenshot {
+                    extract_png_base64(&String::from_utf8_lossy(&captured.stdout))
                 } else {
                     None
                 };
@@ -436,8 +467,32 @@ impl GreppyEnv {
                 if let Some(data) = screenshot {
                     outcome.image_png_base64 = Some(data);
                     outcome.content = "screenshot attached as image for the model".to_owned();
+                } else if args.first().map(String::as_str) == Some("desktop") {
+                    outcome.content = crate::prompt::fence_untrusted_desktop(&outcome.content);
                 }
-                outcome.content = self.fold_output(outcome.content, &raw_stdout, &raw_stderr);
+                if args.first().map(String::as_str) == Some("desktop") {
+                    // Do not keep a second raw copy. The model still sees the
+                    // fenced body; session logs strip that fence.
+                    let omitted = crate::prompt::omit_untrusted_desktop_for_log(&outcome.content)
+                        .into_owned();
+                    outcome.content = self.fold_output(
+                        std::mem::take(&mut outcome.content),
+                        omitted.as_bytes(),
+                        b"",
+                    );
+                } else {
+                    outcome.content = self.fold_output(outcome.content, &raw_stdout, &raw_stderr);
+                }
+                if actual_success {
+                    if let Some(name) = capability_enable_name(&args) {
+                        let bit = match name {
+                            "web" => crate::prompt::CapabilitySet::WEB,
+                            "desktop" => crate::prompt::CapabilitySet::DESKTOP,
+                            _ => 0,
+                        };
+                        self.capabilities.fetch_or(bit, Ordering::Relaxed);
+                    }
+                }
                 if actual_success {
                     if let Some((scope, hook)) = self.context_status.as_ref() {
                         if let Some(notice) =
@@ -696,6 +751,15 @@ fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
     ] {
         cmd.env(variable, scratch.join(directory));
     }
+    // Desktop state must stay inside the scratch grant. An inherited
+    // AGENT_DESKTOP_HOME outside that grant cannot be written under Landlock
+    // or Seatbelt, and widening the sandbox to follow it would let a tool
+    // write the operator's real home. The default `$HOME/.agent-desktop` would
+    // also land in the redirected HOME, which is already under scratch; pinning
+    // the variable makes that location explicit and ignores an outside override.
+    let desktop_state = agent_desktop_state_dir(scratch);
+    let _ = std::fs::create_dir_all(&desktop_state);
+    cmd.env("AGENT_DESKTOP_HOME", &desktop_state);
     let maven = format!(
         "{} -Dmaven.repo.local={}",
         std::env::var("MAVEN_OPTS").unwrap_or_default(),
@@ -705,6 +769,13 @@ fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
         .env("CARGO_BUILD_JOBS", "2")
         .env("RUST_TEST_THREADS", "2")
         .env("CMAKE_BUILD_PARALLEL_LEVEL", "2");
+}
+
+/// Desktop state directory for a sandboxed tool child. It is under `scratch`,
+/// which is already a writable sandbox root, so Landlock and Seatbelt do not
+/// need another grant.
+pub fn agent_desktop_state_dir(scratch: &Path) -> PathBuf {
+    scratch.join("agent-desktop")
 }
 
 /// Strip credential / secret env vars from a tool `Command`.
@@ -725,6 +796,10 @@ impl ExecutionEnv for GreppyEnv {
             "greppy" => self.call_greppy(arguments),
             other => ToolOutcome::unknown_tool(other),
         }
+    }
+
+    fn capability_sections(&self) -> String {
+        crate::prompt::capability_sections(self.capabilities())
     }
 }
 
@@ -1022,6 +1097,18 @@ unsafe fn libc_kill_pg(pgid: i32, sig: i32) -> i32 {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
     unsafe { killpg(pgid, sig) }
+}
+
+fn capability_enable_name(args: &[String]) -> Option<&'static str> {
+    let mut parts = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "greppy");
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("capabilities"), Some("enable"), Some("web"), None) => Some("web"),
+        (Some("capabilities"), Some("enable"), Some("desktop"), None) => Some("desktop"),
+        _ => None,
+    }
 }
 
 fn extract_png_base64(stdout: &str) -> Option<String> {
@@ -1517,6 +1604,40 @@ done
         );
         assert!(!out.is_error, "content={}", out.content);
         assert_eq!(out.content, "who-calls\nmy_func\n--code\n");
+    }
+
+    #[test]
+    fn enabling_desktop_unlocks_the_child_and_appends_the_manual() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'cap=%s\n' "${GREPPY_CAPABILITY_DESKTOP:-unset}"
+printf '%s\n' "$1"
+"#,
+        );
+        let before = env.call_tool("greppy", &json!({"args": ["desktop", "status"]}));
+        assert!(before.content.contains("cap=unset"), "{}", before.content);
+        assert!(before.content.contains("UNTRUSTED_DESKTOP_CONTENT"));
+        let enable = env.call_tool(
+            "greppy",
+            &json!({"args": ["capabilities", "enable", "desktop"]}),
+        );
+        assert!(!enable.is_error, "{}", enable.content);
+        assert!(env.capabilities().desktop);
+        let after = env.call_tool("greppy", &json!({"args": ["desktop", "status"]}));
+        assert!(after.content.contains("cap=1"), "{}", after.content);
+        let manual = env.capability_sections();
+        assert!(manual.contains("\nDESKTOP:\n") || manual.starts_with("DESKTOP:\n"));
+        let logged = crate::prompt::omit_untrusted_desktop_for_log(&after.content);
+        assert!(!logged.contains("cap=1"));
+        assert!(logged.contains("omitted from log"));
+    }
+
+    #[test]
+    fn sandboxed_desktop_state_stays_under_the_scratch_grant() {
+        let scratch = std::path::Path::new("/tmp/greppy-agent-scratch");
+        let state = agent_desktop_state_dir(scratch);
+        assert!(state.starts_with(scratch));
+        assert_eq!(state.file_name().unwrap(), "agent-desktop");
     }
 
     #[test]
