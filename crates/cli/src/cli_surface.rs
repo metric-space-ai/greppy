@@ -42,6 +42,12 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with = "device")]
     pub no_gpu: bool,
 
+    /// Host RAM this process and the daemons it starts must fit in.
+    /// `1g`, `2g`, `3g` and `4g` select the staged budget in docs/max-ram.md.
+    /// `GREPPY_MAX_RAM` is the same value. Unset keeps product defaults.
+    #[arg(long, global = true, value_name = "SIZE")]
+    pub max_ram: Option<String>,
+
     /// Cap the number of rows returned by navigation and search commands.
     /// `--max` is an alias; `--all` lifts default caps but preserves an explicit --limit.
     #[arg(long, alias = "max", global = true, value_name = "N")]

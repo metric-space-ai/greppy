@@ -3335,7 +3335,13 @@ fn ensure_semantic_index(worktree_path: &Path, json_mode: bool, in_place: bool) 
 
     match status {
         Ok(status) if status.success() => {
-            if !doctor_reports_embedding_complete(worktree_path) {
+            if greppy_web_client::max_ram::RamBudget::from_env()
+                .is_some_and(|budget| budget.embeddings_off())
+            {
+                eprintln!(
+                    "greppy -p: RAM budget leaves semantic embeddings off; name and text search still work"
+                );
+            } else if !doctor_reports_embedding_complete(worktree_path) {
                 eprintln!(
                     "greppy -p: index finished but doctor reports not complete — continuing; \
                      semantic search may report building until the index finishes"

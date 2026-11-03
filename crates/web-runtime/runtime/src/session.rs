@@ -63,6 +63,8 @@ pub struct Session {
     pub persistent_profile: Option<String>,
     pub owner: Option<String>,
     pub trace: Option<crate::playwright_trace::TraceRecorder>,
+    /// Tabs closed to satisfy the RAM budget. They are not live WebViews.
+    pub swapped_tabs: Vec<String>,
 }
 
 impl Session {
@@ -96,6 +98,7 @@ impl Session {
             persistent_profile: None,
             owner: None,
             trace: None,
+            swapped_tabs: Vec::new(),
         }
     }
 

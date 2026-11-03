@@ -1831,13 +1831,14 @@ fn first_structured_verb(argv: &[std::ffi::OsString]) -> Option<&std::ffi::OsStr
     let mut i = 1;
     while i < argv.len() {
         let token = &argv[i];
-        if token == "--root" || token == "--device" {
+        if token == "--root" || token == "--device" || token == "--max-ram" {
             i += 2;
             continue;
         }
         let token_lossy = token.to_string_lossy();
         if token_lossy.starts_with("--root=")
             || token_lossy.starts_with("--device=")
+            || token_lossy.starts_with("--max-ram=")
             || token == "--no-gpu"
         {
             i += 1;
@@ -1857,13 +1858,14 @@ fn is_web_doctor_invocation(argv: &[std::ffi::OsString]) -> bool {
     let mut seen_web = false;
     while i < argv.len() {
         let token = &argv[i];
-        if token == "--root" || token == "--device" {
+        if token == "--root" || token == "--device" || token == "--max-ram" {
             i += 2;
             continue;
         }
         let token_lossy = token.to_string_lossy();
         if token_lossy.starts_with("--root=")
             || token_lossy.starts_with("--device=")
+            || token_lossy.starts_with("--max-ram=")
             || token == "--no-gpu"
             || token_lossy.starts_with("--")
         {
@@ -1912,6 +1914,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
             continue;
         }
         if tok == "--device"
+            || tok == "--max-ram"
             || tok == "--limit"
             || tok == "--max"
             || tok == "--max-bytes"
@@ -1922,6 +1925,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
         }
         let token_lossy = tok.to_string_lossy();
         if token_lossy.starts_with("--device=")
+            || token_lossy.starts_with("--max-ram=")
             || token_lossy.starts_with("--limit=")
             || token_lossy.starts_with("--max=")
             || token_lossy.starts_with("--max-bytes=")
@@ -1959,8 +1963,38 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     // The global `--root` (RV-006) is threaded down to every command so
     // index and the query subcommands share one root-resolution path.
     let root = cli.root.clone();
-    let device = cli.device.clone();
+    let ram_budget = match greppy_web_client::max_ram::RamBudget::resolve(cli.max_ram.as_deref()) {
+        Ok(budget) => budget,
+        Err(error) => return Err(Error::Invalid(error)),
+    };
+    if let Some(budget) = &ram_budget {
+        budget.install_process_env();
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("{}", budget.announce_line());
+        }
+    }
+    let mut device = cli.device.clone();
     let no_gpu = cli.no_gpu;
+    if ram_budget
+        .as_ref()
+        .is_some_and(|budget| budget.cpu_if_unspecified)
+        && !no_gpu
+    {
+        let named = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
+        let explicit_accelerator = named
+            .as_deref()
+            .is_some_and(|value| value != "auto" && value != "cpu");
+        if explicit_accelerator {
+            eprintln!(
+                "greppy: RAM budget keeps explicit device {}; the host plan assumes CPU weights",
+                named.unwrap_or_default()
+            );
+        } else {
+            device = Some("cpu".to_string());
+            std::env::set_var(ENV_DEVICE, "cpu");
+        }
+    }
     if cli.limit == Some(0) {
         return Err(Error::Invalid("--limit/--max must be at least 1".into()));
     }
@@ -6930,6 +6964,11 @@ fn cap_summary_inference_source(source: &str) -> String {
 /// Deterministic nav commands must never hold a summary model in memory.
 #[cfg(any(unix, windows))]
 pub(crate) fn prewarm_summary_daemon() {
+    if greppy_web_client::max_ram::RamBudget::from_env()
+        .is_some_and(|budget| budget.suppress_summary_prewarm)
+    {
+        return;
+    }
     if let Ok(Some(cfg)) = qwen_summary_config_optional() {
         summarize_daemon::prewarm_from_env(&cfg);
     }

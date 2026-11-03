@@ -140,6 +140,21 @@ pub(super) fn triage_spans_via_daemon(
     if spans.is_empty() || spans.len() > MAX_TRIAGE_SPANS {
         return None;
     }
+    if greppy_web_client::max_ram::RamBudget::from_env()
+        .is_some_and(|budget| budget.summaries_off())
+    {
+        return Some(
+            spans
+                .iter()
+                .map(|span| TriageVerdict {
+                    loc: span.loc.clone(),
+                    read: true,
+                    reason: "summary model is off under the RAM budget; failing open to read"
+                        .to_string(),
+                })
+                .collect(),
+        );
+    }
     let endpoint = endpoint(model_key)?;
     match request_triage(&endpoint, model_key, query, spans) {
         RequestOutcome::Response(verdicts) => return Some(verdicts),

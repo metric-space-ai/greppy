@@ -3,6 +3,7 @@
 //! This crate must not depend on `deno_core` or `servo`.
 
 mod frame;
+pub mod max_ram;
 mod observation_scope;
 mod protocol;
 pub mod record_query;
