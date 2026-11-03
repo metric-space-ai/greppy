@@ -42,8 +42,10 @@ jobs:
       GIT_LFS_SKIP_SMUDGE: "1"
     strategy:
       fail-fast: false
+      # ubuntu-latest is 26.04. Its NVIDIA repo has no cuda-nvcc-12-5.
+      # The product pin stays 12.5, so this Linux job stays on 24.04.
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
 
     steps:
       - name: Checkout
@@ -232,7 +234,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-2022]
+        # 24.04, not ubuntu-latest: CUDA 12.5 packages are not in the 26.04 repo.
+        os: [ubuntu-24.04, macos-latest, windows-2022]
         include:
           - os: windows-2022
             check_name: windows-latest
