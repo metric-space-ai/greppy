@@ -32,8 +32,8 @@ pub fn system_prompt() -> String {
 }
 
 /// `greppy -p` prompt style. Quality is the default and keeps the signed
-/// one-shot contract. Performance is that same text with the DONE and
-/// FINAL ANSWER lines shortened.
+/// one-shot contract. Performance is that same text with the DONE line, the FINAL ANSWER
+/// line, and the verify sentence changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentPromptStyle {
     Quality,
@@ -44,8 +44,8 @@ pub enum AgentPromptStyle {
 ///
 /// Quality is the signed one-shot contract. Its browser section is omitted
 /// only when the browser is unavailable. Performance is that same string
-/// after [`apply_performance_edits`]: the merge bar and the pull-request
-/// report are the only wording changes. Tool sections stay byte-for-byte.
+/// after [`apply_performance_edits`]: the DONE line, the pull-request
+/// report, and the verify sentence are the only wording changes. Tool sections stay byte-for-byte.
 /// `in_place` prepends the same checkout notice in both styles.
 pub fn compose_one_shot_prompt(
     style: AgentPromptStyle,
@@ -87,11 +87,15 @@ IN-PLACE RUN: edit the current checkout directly. Ignore later instructions that
 const PERFORMANCE_EDITS: &[(&str, &str)] = &[
     (
         "DONE means the pull request can be merged as it is: the task is fully implemented, the relevant tests pass, new behaviour has a test, and the diff contains nothing else (smallest change, in the style of the surrounding code). Do not stop at an analysis. If you are blocked, name the missing dependency; never claim a result you have not seen.",
-        "DONE means the task is done on the shortest path to success without any extra dev steps that are not necessary to get the job done.",
+        "DONE means the task is done on the shortest path to success without any extra dev steps that are not necessary to get the job done. After the relevant tests pass, stop. Do not run extra race, vet or baseline checks.",
     ),
     (
         "FINAL ANSWER is the pull request's description: a one-line title; Status: done, partial or blocked; what changed and why (file:line); how it was verified (commands and results); what is open.",
         "FINAL ANSWER is 1 to 3 sentences. No one wants to read text when it is done. Do not give in-between feedback before the job is done.",
+    ),
+    (
+        "The task is a change to deliver: make the edits with greppy and verify them; do not",
+        "The task is a change to deliver: make the edits with greppy and run the relevant test once if one exists; do not",
     ),
 ];
 
@@ -270,6 +274,9 @@ mod tests {
                     "browser={browser} in_place={in_place}\n{delta:#?}"
                 );
                 for line in quality.lines().filter(|line| line.contains("greppy ")) {
+                    if PERFORMANCE_EDITS.iter().any(|(from, _)| line == *from) {
+                        continue;
+                    }
                     assert!(
                         performance.contains(line),
                         "missing tool line with browser={browser}: {line}"
@@ -305,7 +312,7 @@ mod tests {
         assert!(in_place.starts_with(IN_PLACE_NOTICE));
         assert!(quality_in_place.starts_with(IN_PLACE_NOTICE));
         assert!(with_browser.contains(
-            "DONE means the task is done on the shortest path to success without any extra dev steps that are not necessary to get the job done."
+            "DONE means the task is done on the shortest path to success without any extra dev steps that are not necessary to get the job done. After the relevant tests pass, stop. Do not run extra race, vet or baseline checks."
         ));
         assert!(!with_browser.contains("Do not stop at an analysis."));
         assert!(!with_browser.contains("name the missing dependency"));
@@ -320,6 +327,16 @@ mod tests {
         ));
         assert!(quality.contains("your worktree should have been created as"));
         assert!(quality.contains("Do not stop at an analysis."));
+        assert!(quality.contains("make the edits with greppy and verify them"));
+        assert!(with_browser
+            .contains("make the edits with greppy and run the relevant test once if one exists"));
+        assert!(!with_browser.contains("make the edits with greppy and verify them"));
+        assert!(!with_browser.contains("never claim a result you have not seen"));
+        let restriction = "bash-smart is only for running builds, tests, git and other commands greppy has no command for. Never use grep, rg, find, cat, sed, head or tail in bash-smart to search, read or edit source files; use search, search-symbol, read and the replace-* commands instead.";
+        assert!(quality.contains(restriction));
+        assert!(with_browser.contains(restriction));
+        assert!(!quality.contains("pipe a search straight into a read"));
+        assert!(!with_browser.contains("pipe a search straight into a read"));
     }
 
     #[test]

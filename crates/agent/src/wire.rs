@@ -3,7 +3,9 @@
 //! Builds the `POST /v1/messages` JSON body and incrementally parses the
 //! server-sent event stream into provider-neutral [`StreamEvent`]s.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -78,6 +80,91 @@ pub fn to_messages_request_body(req: &ModelRequest) -> Value {
     };
 
     body
+}
+
+/// Sampling fields of a request body as they are about to be sent.
+///
+/// Keys the body does not contain stay JSON null. Nothing here is invented:
+/// temperature is null unless the body has that key, and max_tokens is null
+/// when the posted body omits it.
+pub fn sent_request_facts(body: &Value) -> Value {
+    json!({
+        "first_user_message": first_sent_user_message(body),
+        "temperature": body.get("temperature").cloned().unwrap_or(Value::Null),
+        "max_tokens": body.get("max_tokens").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn first_sent_user_message(body: &Value) -> Value {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Value::Null;
+    };
+    let Some(message) = messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return Value::Null;
+    };
+    match message.get("content") {
+        Some(Value::String(text)) => Value::String(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(piece) = part.get("text").and_then(Value::as_str) {
+                        text.push_str(piece);
+                    }
+                }
+            }
+            Value::String(text)
+        }
+        _ => Value::Null,
+    }
+}
+
+thread_local! {
+    static SENT_REQUEST_LOGGED: Cell<bool> = const { Cell::new(false) };
+    static SENT_REQUEST_FACTS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static SENT_REQUEST_HOOK: RefCell<Option<Arc<dyn Fn(&Value) + Send + Sync>>> =
+        const { RefCell::new(None) };
+}
+
+/// Facts logged for the first posted request on this thread, if any.
+pub fn logged_sent_request_facts() -> Option<Value> {
+    SENT_REQUEST_FACTS.with(|slot| slot.borrow().clone())
+}
+
+/// Install a hook invoked once, with the facts of the first posted request.
+pub fn install_sent_request_hook(hook: Arc<dyn Fn(&Value) + Send + Sync>) {
+    SENT_REQUEST_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    SENT_REQUEST_LOGGED.with(|flag| flag.set(false));
+    SENT_REQUEST_FACTS.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Drop the hook installed by [`install_sent_request_hook`].
+pub fn clear_sent_request_hook() {
+    SENT_REQUEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Log the first request body on this thread. Does not change the body.
+pub(crate) fn log_first_sent_model_request(body: &Value) {
+    let already = SENT_REQUEST_LOGGED.with(|flag| {
+        let already = flag.get();
+        if !already {
+            flag.set(true);
+        }
+        already
+    });
+    if already {
+        return;
+    }
+    let facts = sent_request_facts(body);
+    SENT_REQUEST_FACTS.with(|slot| *slot.borrow_mut() = Some(facts.clone()));
+    eprintln!("greppy: sent model request {facts}");
+    let hook = SENT_REQUEST_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook(&facts);
+    }
 }
 
 fn map_messages(messages: &[Message]) -> Vec<Value> {
@@ -998,6 +1085,27 @@ mod tests {
         let body = to_messages_request_body(&req);
         assert!(body.get("max_tokens").is_none());
         assert!(!body.to_string().contains("cache_control"));
+        let facts = sent_request_facts(&body);
+        assert_eq!(facts["first_user_message"], "list files");
+        assert!(facts["temperature"].is_null());
+        assert!(facts["max_tokens"].is_null());
+    }
+
+    #[test]
+    fn sent_request_facts_copy_posted_sampling_fields() {
+        let body = to_messages_request_body(&sample_request());
+        let facts = sent_request_facts(&body);
+        assert_eq!(facts["first_user_message"], "list files");
+        assert!(facts["temperature"].is_null());
+        assert_eq!(facts["max_tokens"], 1024);
+        let mut with_temperature = body.clone();
+        with_temperature["temperature"] = json!(0.2);
+        let facts = sent_request_facts(&with_temperature);
+        assert_eq!(facts["temperature"], 0.2);
+        assert!(sent_request_facts(&json!({}))
+            .get("first_user_message")
+            .unwrap()
+            .is_null());
     }
 
     #[test]

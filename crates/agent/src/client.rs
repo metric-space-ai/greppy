@@ -281,6 +281,7 @@ impl Client {
     ) -> Result<TurnResult, ClientError> {
         let url = self.messages_url();
         let body = self.request_body(req);
+        crate::wire::log_first_sent_model_request(&body);
         let body_str = serde_json::to_string(&body)
             .map_err(|e| ClientError::Transport(format!("serialize model request: {e}")))?;
 

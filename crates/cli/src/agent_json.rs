@@ -1,6 +1,8 @@
 //! Newline-delimited JSON events for `greppy -p --json`.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use greppy_agent::Usage;
 use serde_json::{json, Value};
@@ -38,14 +40,25 @@ pub struct JsonResult {
     pub final_answer: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct JsonEmitter {
-    session_emitted: bool,
+    session_emitted: Arc<AtomicBool>,
     result_emitted: bool,
     /// Turns and usage already reported in `turn_complete` events, so an error
     /// result still carries what the run consumed.
     turns: u64,
     usage: Usage,
+}
+
+impl Default for JsonEmitter {
+    fn default() -> Self {
+        Self {
+            session_emitted: Arc::new(AtomicBool::new(false)),
+            result_emitted: false,
+            turns: 0,
+            usage: Usage::default(),
+        }
+    }
 }
 
 impl JsonEmitter {
@@ -54,21 +67,20 @@ impl JsonEmitter {
     }
 
     pub fn session(&mut self, session: &JsonSession) {
-        if self.session_emitted {
-            return;
-        }
-        self.session_emitted = true;
-        write_line(&session_event(session));
+        emit_session_once(&self.session_emitted, session, None);
+    }
+
+    pub(crate) fn session_gate(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.session_emitted)
     }
 
     // Only the socket host emits these, and it is Unix-only.
     #[allow(dead_code)]
     pub fn serve_session(&mut self, session: &JsonSession, socket: &str) {
-        if self.session_emitted {
+        if self.session_emitted.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.session_emitted = true;
-        let mut event = session_event(session);
+        let mut event = session_event(session, None);
         if let Some(object) = event.as_object_mut() {
             object.insert("socket".to_string(), Value::String(socket.to_string()));
             object.insert("mode".to_string(), Value::String("serve".to_string()));
@@ -138,7 +150,18 @@ impl JsonEmitter {
     }
 }
 
-pub(crate) fn session_event(session: &JsonSession) -> Value {
+pub(crate) fn emit_session_once(gate: &AtomicBool, session: &JsonSession, sent: Option<&Value>) {
+    if gate.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    write_line(&session_event(session, sent));
+}
+
+pub(crate) fn session_event(session: &JsonSession, sent: Option<&Value>) -> Value {
+    let sent = sent
+        .cloned()
+        .or_else(greppy_agent::logged_sent_request_facts)
+        .unwrap_or_else(|| json!({}));
     json!({
         "type": "session",
         "session_id": session.session_id,
@@ -151,6 +174,9 @@ pub(crate) fn session_event(session: &JsonSession) -> Value {
         "endpoint": session.endpoint,
         "sandbox": session.sandbox,
         "resumed": session.resumed,
+        "first_user_message": sent.get("first_user_message").cloned().unwrap_or(Value::Null),
+        "temperature": sent.get("temperature").cloned().unwrap_or(Value::Null),
+        "max_tokens": sent.get("max_tokens").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -345,5 +371,34 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn session_event_records_the_sent_request() {
+        let session = JsonSession {
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            project: "demo".into(),
+            worktree: "/tmp/wt".into(),
+            branch: "main".into(),
+            model: "m".into(),
+            endpoint: "http://127.0.0.1:8317".into(),
+            sandbox: "confined".into(),
+            resumed: false,
+        };
+        let bare = session_event(&session, Some(&json!({})));
+        assert!(bare["first_user_message"].is_null());
+        assert!(bare["temperature"].is_null());
+        assert!(bare["max_tokens"].is_null());
+        let sent = json!({
+            "first_user_message": "fix the bug",
+            "temperature": Value::Null,
+            "max_tokens": 4096,
+        });
+        let event = session_event(&session, Some(&sent));
+        assert_eq!(event["first_user_message"], "fix the bug");
+        assert!(event["temperature"].is_null());
+        assert_eq!(event["max_tokens"], 4096);
+        assert_eq!(event["type"], "session");
     }
 }

@@ -13,11 +13,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use greppy_agent::{
-    compaction_token_limit, compose_one_shot_prompt, model_context_window_tokens,
-    parse_compact_ratio, resolve_git_identity, run_agent_loop_with_history,
-    sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv, InPlaceWorkspace,
-    LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
-    StreamEvent, Usage, WorkspaceError,
+    clear_sent_request_hook, compaction_token_limit, compose_one_shot_prompt,
+    install_sent_request_hook, model_context_window_tokens, parse_compact_ratio,
+    resolve_git_identity, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
+    AgentWorkspace, Client, GreppyEnv, InPlaceWorkspace, LoopEvent, LoopStop, ProbeError,
+    RunOutcome, SandboxError, SandboxMode, StopReason, StreamEvent, Usage, WorkspaceError,
 };
 use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 
@@ -109,8 +109,8 @@ Flags:
                       Default remains an isolated worktree plus sandbox.
   --mode MODE         quality (default) or performance (env GREPPY_AGENT_MODE).
                       quality keeps the merge bar and the pull-request report.
-                      performance is that same prompt with only the DONE and
-                      FINAL ANSWER lines shortened.
+                      performance is that same prompt with the DONE line, the
+                      FINAL ANSWER line, and the verify sentence changed.
   --context-tokens N  Model context window in tokens (env GREPPY_CONTEXT_TOKENS).
                       Kimi k3 defaults to 262144, or 1048576 when the model id
                       says 1M. Compaction starts at --compact-ratio of this window.
@@ -1993,9 +1993,21 @@ fn run_headless_session(
     if let Err(error) = store.append_turn_start(&record.id, "headless", task) {
         eprintln!("greppy -p: session save failed: {error}");
     }
-    if let Some(emitter) = json.as_mut() {
-        emitter.session(json_session);
+    // The session line is written from the first posted request so its user
+    // message, temperature and max_tokens are the values actually sent.
+    if let Some(gate) = json.as_ref().map(|emitter| emitter.session_gate()) {
+        let session = json_session.clone();
+        install_sent_request_hook(Arc::new(move |facts| {
+            crate::agent_json::emit_session_once(&gate, &session, Some(facts));
+        }));
     }
+    struct ClearSentRequestHook;
+    impl Drop for ClearSentRequestHook {
+        fn drop(&mut self) {
+            clear_sent_request_hook();
+        }
+    }
+    let _clear_sent_request_hook = ClearSentRequestHook;
 
     let json_mode = json.is_some();
     let mut stdout = io::stdout();
@@ -2094,6 +2106,9 @@ fn run_headless_session(
         }
         let message = format!("context checkpoint save failed: {error}");
         persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+        if let Some(emitter) = json.as_mut() {
+            emitter.session(json_session);
+        }
         return Err(message);
     }
 
@@ -2148,11 +2163,17 @@ fn run_headless_session(
             );
             summary.final_answer = result.final_text;
             summary.last_stop = Some(result.stop);
+            if let Some(emitter) = json.as_mut() {
+                emitter.session(json_session);
+            }
             Ok(summary)
         }
         Err(error) => {
             let message = error.to_string();
             persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+            if let Some(emitter) = json.as_mut() {
+                emitter.session(json_session);
+            }
             if config
                 .cancel
                 .as_ref()

@@ -55,15 +55,23 @@ pub const APPROVED_SHA256: &str =
 // still uses only the first sentence, so its rendered hash is unchanged.
 // Previous adapter dd0133ec…; previous one-shot 887653ab…, interactive 2f444986…,
 // serve 2f93c68e….
+// 2026-11-04: Michael approved the next quality wording. HOW A TASK RUNS step 2
+// no longer tells the agent to pipe a search into a read inside bash-smart.
+// After the bash-smart sentence, both modes say bash-smart is only for builds,
+// tests, git and other commands greppy has no command for, and never for
+// grep, rg, find, cat, sed, head or tail on source files. AGENTS.md is
+// unchanged. ACP still uses only the first sentence, so its rendered hash
+// is unchanged. Previous adapter 9facb78a…; previous one-shot d3eb31ba…,
+// interactive 6dc67477…, serve 117dde23….
 pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
-    "9facb78aa2986b0f88aaa5e2e2bf8da25fcece6238a22066684d55302ebb0bcb";
+    "2494fd281878fe2de692b647bcb3c39dd6b22c86b8332026494ac71dd5aaec61";
 
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "d3eb31ba10f75e71824d3e64a3a6398cc83801ce12dd4adf1b25749e5ef3e0c5",
-        Interactive => "6dc6747749e3b60653162c00bea90e203272fd25937f5fa193effe50bea6b9fe",
-        Serve => "117dde23bfd6bc6be6a15b0c544ab1c7c46c9e5c98b9fafb99f3d017aa20f927",
+        OneShot => "931009d769441b0e6739016d4fe81cf18d04f0d7453316ddf665e112b0239916",
+        Interactive => "33a0ff9e4d81c85f80191dade56acc3e32b69de2aaa40ce8b1eaba1aea50c79d",
+        Serve => "af84fffe6167fed83b04e18a30d982be1ba2d4070531067491c3915bf31d00cc",
         Acp => "3683b8542fc14de0b9c46a3ebbed630f076dde4d56bb0523f587e93454198b44",
     }
 }
