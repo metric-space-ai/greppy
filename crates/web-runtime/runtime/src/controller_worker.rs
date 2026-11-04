@@ -497,6 +497,12 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                             return;
                         }
                     }
+                    Err(error) if greppy_web_client::socket_timeout(&error) => {
+                        // macOS reports a socket timeout as EAGAIN (os error 35).
+                        // Retry instead of failing the controller worker.
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                     Err(error) => {
                         let _ = control_tx.send(Err(error));
                         return;

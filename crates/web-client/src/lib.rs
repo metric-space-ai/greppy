@@ -24,7 +24,9 @@ pub const DESCRIBE_NODE_JS: &str = concat!(
     ";\n})()",
 );
 
-pub use frame::{read_frame, write_frame, FrameError, MAX_FRAME_BYTES};
+pub use frame::{
+    read_frame, read_frame_until, socket_timeout, write_frame, FrameError, MAX_FRAME_BYTES,
+};
 pub use protocol::{
     new_request_id, new_session_id, runtime_image_id, ErrorObject, Handshake, Metrics, Request,
     Response, SCHEMA,

@@ -256,6 +256,10 @@ enum WakePoll {
     TimedOut,
 }
 const ANIMATION_FRAME_BUDGET: Duration = Duration::from_millis(16);
+/// One Servo evaluation that only deletes a wait slot. Longer than the old
+/// 80ms fallback, which returned before the delete ran under CI load, and
+/// still bounded so a timeout does not become an unbounded spin.
+const WAIT_SLOT_CLEANUP: Duration = Duration::from_millis(500);
 
 fn animation_frame_budget(remaining: Duration) -> Duration {
     remaining.min(ANIMATION_FRAME_BUDGET)
@@ -1570,6 +1574,54 @@ impl ContentEngine {
         }
     }
 
+    /// `LoadStatus::Complete` is already true before `go_back` / `go_forward`
+    /// starts, so waiting for that status returns the previous URL. The
+    /// back-forward index also lags the URL by a turn, which makes
+    /// `can_go_forward` false immediately after a back traversal that has
+    /// already changed `location`.
+    fn traverse_history(
+        &self,
+        webview: &WebView,
+        timeout: Duration,
+        can_move: impl Fn(&WebView) -> bool,
+        move_by: impl Fn(&WebView),
+    ) -> io::Result<serde_json::Value> {
+        let current_url = |view: &WebView| view.url().map(|url| url.to_string()).unwrap_or_default();
+        let before = current_url(webview);
+        let settle_for = timeout.min(Duration::from_millis(300));
+        let settle_until = Instant::now() + settle_for;
+        while !can_move(webview) {
+            if Instant::now() >= settle_until {
+                return Ok(json!({ "ok": false, "url": before }));
+            }
+            self.spin_all_event_loops();
+            thread::sleep(Duration::from_millis(5));
+        }
+        move_by(webview);
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.spin_all_event_loops();
+            let url = current_url(webview);
+            if url != before && webview.load_status() == LoadStatus::Complete {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for history traversal",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Let the session-history index catch the URL before the next call.
+        self.spin_all_event_loops();
+        webview.paint();
+        Ok(json!({
+            "ok": true,
+            "url": current_url(webview),
+        }))
+    }
+
     fn spin_until_loaded(
         &self,
         webview: &WebView,
@@ -2279,10 +2331,11 @@ impl ContentEngine {
                 &webview,
                 delegate,
                 &token,
-                document_generation,
-                Some(deadline),
-                strict_boolean,
-            )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                 return result;
             }
             if delegate.document_generation.get() == document_generation
@@ -2304,9 +2357,10 @@ impl ContentEngine {
                 // Reinstall on the new Document with the ORIGINAL deadline.
                 // The old nonce must not certify this new document, even if
                 // an old console completion was already in the delegate.
+                // Drop it before the early timeout return: reassigning the
+                // token first leaked the previous window slot.
+                self.drop_wait_slot(&webview, &token, io_deadline);
                 delegate.clear_wait_notice(&token);
-                token = alloc_wait_nonce()?;
-                document_generation = delegate.document_generation.get();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining < Duration::from_millis(1) {
                     return Err(io::Error::new(
@@ -2314,6 +2368,8 @@ impl ContentEngine {
                         "timeout: waitForFunction",
                     ));
                 }
+                token = alloc_wait_nonce()?;
+                document_generation = delegate.document_generation.get();
                 let waiter = wait_for_function_waiter_script(
                     source,
                     &token,
@@ -2333,10 +2389,11 @@ impl ContentEngine {
                         &webview,
                         delegate,
                         &token,
-                        document_generation,
-                        Some(deadline),
-                        strict_boolean,
-                    )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                         return result;
                     }
                     if delegate.document_generation.get() == document_generation
@@ -2355,10 +2412,11 @@ impl ContentEngine {
                 &webview,
                 delegate,
                 &token,
-                document_generation,
-                Some(deadline),
-                strict_boolean,
-            )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2393,10 +2451,11 @@ impl ContentEngine {
                         &webview,
                         delegate,
                         &token,
-                        document_generation,
-                        Some(deadline),
-                        strict_boolean,
-                    )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                         return result;
                     }
                     if delegate.document_generation.get() != document_generation {
@@ -2421,19 +2480,31 @@ impl ContentEngine {
     }
 
     fn drop_wait_slot(&self, webview: &WebView, token: &str, deadline: Option<Instant>) {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
-        if budget.is_zero() {
-            // The installed JS deadline still cancels observers/frames. Do not
-            // start another synchronous evaluation after the caller's budget.
-            return;
-        }
+        // Predicate sampling stops at the caller deadline. Removing the slot
+        // is separate: the next script sees a leftover __greppyWait_* as a
+        // failed wait. An expired strict deadline used to skip this
+        // evaluation, and the public path's 80ms fallback often ended before
+        // Servo ran the delete on a busy runner. One bounded cleanup is not
+        // extra predicate time.
+        let budget = crate::wait_contract::wait_io_budget(deadline, WAIT_SLOT_CLEANUP);
+        let budget = if budget.is_zero() {
+            WAIT_SLOT_CLEANUP
+        } else {
+            budget
+        };
         let Ok(key_js) = serde_json::to_string(&Self::wait_slot_key(token)) else {
             return;
         };
-        let mut script = String::from("(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return 0; })(");
+        let mut script = String::from("(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return Object.prototype.hasOwnProperty.call(window, key) ? 0 : 1; })(");
         script.push_str(&key_js);
         script.push_str(")");
-        let _ = self.evaluate_until(webview.clone(), &script, budget);
+        for _ in 0..2 {
+            match self.evaluate_until(webview.clone(), &script, budget) {
+                Ok(JSValue::Number(value)) if value != 0.0 => return,
+                Ok(JSValue::Boolean(true)) => return,
+                _ => {}
+            }
+        }
     }
 
     fn take_completed_wait_slot(
@@ -2484,17 +2555,29 @@ impl ContentEngine {
         token: &str,
         document_generation: u64,
         deadline: Option<Instant>,
+        cleanup_deadline: Option<Instant>,
         strict_budget: bool,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = take_wait_completion_in_document(
+        let completed = match take_wait_completion_in_document(
             &delegate.document_generation,
             document_generation,
             || self.take_completed_wait_slot(webview, token, deadline),
-        )?
-        else {
+        ) {
+            Ok(completed) => completed,
+            Err(error) => {
+                // A zero completion budget returns TimedOut without reading
+                // the slot. Propagating that error used to skip drop_wait_slot,
+                // so window.__greppyWait_* was still there when the caller
+                // inspected the page.
+                delegate.clear_wait_notice(token);
+                self.drop_wait_slot(webview, token, cleanup_deadline);
+                return Err(error);
+            }
+        };
+        let Some((status, value)) = completed else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
@@ -4462,34 +4545,26 @@ impl ContentEngine {
             "page.goBack" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                let ok = webview.can_go_back();
-                if ok {
-                    webview.go_back(1);
-                    let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
-                    webview.paint();
-                    self.spin_all_event_loops();
-                }
-                Ok(json!({
-                    "ok": ok,
-                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
-                }))
+                self.traverse_history(
+                    &webview,
+                    call_timeout(&params),
+                    |view| view.can_go_back(),
+                    |view| {
+                        view.go_back(1);
+                    },
+                )
             }
             "page.goForward" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                let ok = webview.can_go_forward();
-                if ok {
-                    webview.go_forward(1);
-                    let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
-                    webview.paint();
-                    self.spin_all_event_loops();
-                }
-                Ok(json!({
-                    "ok": ok,
-                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
-                }))
+                self.traverse_history(
+                    &webview,
+                    call_timeout(&params),
+                    |view| view.can_go_forward(),
+                    |view| {
+                        view.go_forward(1);
+                    },
+                )
             }
             "page.addCookies" => {
                 let page_id = required_str(&params, "page")?;
@@ -4842,6 +4917,7 @@ impl ContentEngine {
         let mut last = String::from("failed_check=stable");
         let mut stable: Option<ResolvedNode> = None;
         let mut stable_since: Option<Instant> = None;
+        let mut sampled_once = false;
         let timeout_err = |last: &str| {
             let detail = if last.contains("failed_check=") {
                 last.to_owned()
@@ -4857,17 +4933,30 @@ impl ContentEngine {
             if self.parent_dead() {
                 return Err(Self::parent_gone());
             }
-            if Instant::now() >= deadline {
+            if sampled_once && Instant::now() >= deadline {
                 return Err(timeout_err(&last));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let sampled = match self.evaluate_until(webview.clone(), &script, remaining) {
+            // A 100ms action timeout is shorter than one Servo evaluation when
+            // the runner is busy. The first sample classifies strict mode
+            // (no match / several matches) and must be allowed to finish;
+            // later samples still stop at the caller's deadline.
+            let sample_budget = if sampled_once {
+                if remaining.is_zero() {
+                    return Err(timeout_err(&last));
+                }
+                remaining
+            } else {
+                remaining.max(Duration::from_millis(400))
+            };
+            let sampled = match self.evaluate_until(webview.clone(), &script, sample_budget) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     return Err(timeout_err(&last));
                 }
                 Err(error) => return Err(error),
             };
+            sampled_once = true;
             match sampled {
                 JSValue::Object(values) => {
                     if bool_field(&values, "staleRef").unwrap_or(false) {
@@ -6748,6 +6837,13 @@ pub fn run() -> io::Result<()> {
                         if tx.send(Ok(message)).is_err() {
                             return;
                         }
+                    }
+                    Err(error) if greppy_web_client::socket_timeout(&error) => {
+                        // macOS can surface a transient EAGAIN (os error 35)
+                        // on a blocking socket. That is not parent EOF and
+                        // must not tear the worker down.
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
                     }
                     Err(error) => {
                         parent_for_reader.store(false, Ordering::Relaxed);

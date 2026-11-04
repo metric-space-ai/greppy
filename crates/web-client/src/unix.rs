@@ -36,10 +36,7 @@ impl UnixClientError {
 fn is_timeout_like(error: &io::Error) -> bool {
     // macOS SO_RCVTIMEO expiry surfaces as EAGAIN -> ErrorKind::WouldBlock
     // (os error 35), not TimedOut. Map both so callers see a timeout.
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
+    crate::frame::socket_timeout(error)
 }
 
 fn map_socket_timeout(error: io::Error, timeout: Duration) -> io::Error {

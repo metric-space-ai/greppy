@@ -2204,12 +2204,47 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut request = [0_u8; 1024];
-                    stream.read(&mut request).unwrap();
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\narmed").unwrap();
+                    // macOS reports SO_RCVTIMEO as EAGAIN (os error 35), not
+                    // TimedOut. A connection that has not sent its request
+                    // yet must not panic the fixture; keep reading until the
+                    // arming deadline.
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    let mut saw_request = false;
+                    while Instant::now() < deadline && request.len() < 8192 {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                request.extend_from_slice(&buf[..n]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n")
+                                    || request.contains(&b'\n')
+                                {
+                                    saw_request = true;
+                                    break;
+                                }
+                            }
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::Interrupted
+                                    || error.kind() == std::io::ErrorKind::WouldBlock
+                                    || error.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !saw_request {
+                        continue;
+                    }
+                    if stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\narmed",
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
                     let _ = armed_tx.send(());
                     return;
                 }

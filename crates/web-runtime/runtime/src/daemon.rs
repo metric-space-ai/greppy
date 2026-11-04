@@ -7,7 +7,8 @@ use crate::protocol::{Message, WorkerKind};
 use crate::session::{LocatorSnapshot, Session, SessionState};
 use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
-    new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
+    new_session_id, socket_timeout, write_frame, ErrorObject, FrameError, Handshake, Request,
+    Response, SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -700,6 +701,87 @@ fn bind_socket_healing_stale(path: &Path) -> io::Result<UnixListener> {
     }
 }
 
+fn poll_readable(fd: i32, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out reading web runtime frame",
+            ));
+        }
+        let ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+        if n > 0 {
+            let revents = fds[0].revents;
+            if revents & libc::POLLIN != 0 {
+                return Ok(());
+            }
+            if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            return Ok(());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out reading web runtime frame",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn read_exact_polled(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut filled = 0;
+    while filled < buf.len() {
+        poll_readable(stream.as_raw_fd(), deadline)?;
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted || socket_timeout(&error) => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_request_frame(stream: &mut UnixStream, deadline: Instant) -> Result<Request, FrameError> {
+    let mut header = [0_u8; 4];
+    read_exact_polled(stream, &mut header, deadline)?;
+    let payload_len = u32::from_be_bytes(header) as usize;
+    if payload_len == 0 {
+        return Err(FrameError::Empty);
+    }
+    if payload_len > greppy_web_client::MAX_FRAME_BYTES {
+        return Err(FrameError::Oversize { len: payload_len });
+    }
+    let mut payload = vec![0_u8; payload_len];
+    read_exact_polled(stream, &mut payload, deadline)?;
+    let text = std::str::from_utf8(&payload).map_err(FrameError::Utf8)?;
+    serde_json::from_str(text).map_err(FrameError::Json)
+}
+
 fn accept_loop(
     listener: UnixListener,
     tx: mpsc::Sender<(UnixStream, Request)>,
@@ -712,9 +794,11 @@ fn accept_loop(
             Ok(stream) => stream,
             Err(_) => continue,
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-        let request: Request = match read_frame(&mut stream) {
+        // Do not use SO_RCVTIMEO here. On macOS the expiry is EAGAIN and can
+        // stick, so later reads never observe a frame that is already buffered
+        // and this thread stops answering web.status.
+        let request: Request = match read_request_frame(&mut stream, Instant::now() + Duration::from_secs(30))
+        {
             Ok(request) => request,
             Err(_) => continue,
         };
