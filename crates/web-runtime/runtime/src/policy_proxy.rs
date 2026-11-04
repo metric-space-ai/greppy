@@ -407,7 +407,7 @@ fn rewrite_request_line(head: &str, path: &str) -> String {
     let _target = parts.next();
     let version = parts.next().unwrap_or("HTTP/1.1");
     let mut out = format!("{method} {path} {version}\r\n");
-    for line in lines {
+    for line in lines.take_while(|line| !line.is_empty()) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("proxy-connection:") {
             continue;
@@ -415,9 +415,9 @@ fn rewrite_request_line(head: &str, path: &str) -> String {
         out.push_str(line);
         out.push_str("\r\n");
     }
-    if !out.ends_with("\r\n\r\n") {
-        out.push_str("\r\n");
-    }
+    // One empty line ends the headers. Copying split()'s trailing empty
+    // entries inserted another CRLF before every forwarded request body.
+    out.push_str("\r\n");
     out
 }
 
@@ -655,6 +655,50 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             writer.join().unwrap();
         }
+    }
+
+    #[test]
+    fn proxy_preserves_post_body_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = b"abc123xyz";
+        let origin = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (header, _) = read_headers(&mut stream).unwrap();
+            assert!(header.starts_with("POST /submit HTTP/1.1\r\n"));
+            assert!(!header.to_ascii_lowercase().contains("proxy-connection:"));
+            let mut received = vec![0; body.len()];
+            stream.read_exact(&mut received).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        received.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(&received).unwrap();
+            received
+        });
+        let proxy = PolicyProxy::spawn(SharedProfile::new(NetworkProfile::Project)).unwrap();
+        let mut client = TcpStream::connect(proxy.addr()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(format!(
+                "POST http://{address}/submit HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n", body.len()
+            ).as_bytes())
+            .unwrap();
+        client.write_all(body).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(origin.join().unwrap(), body);
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1.as_bytes(), body);
     }
 
     #[test]
