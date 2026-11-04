@@ -36,14 +36,24 @@ env:
 
 jobs:
   check:
+    # The published name stays `build / test / lint (ubuntu-latest)`. Branch
+    # protection matches that context, so the Linux image is selected separately.
+    # ubuntu-latest is 26.04; NVIDIA's ubuntu2604 repo has no CUDA 12.5 packages
+    # (cuda-nvcc-12-5 and the matching cudart/cublas packages). This job needs
+    # that exact toolkit — the same pin as release.yml — to compile vendored
+    # ggml-cuda. ubuntu-24.04 still ships it. No GPU is required, only nvcc.
     name: build / test / lint (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     env:
       GIT_LFS_SKIP_SMUDGE: "1"
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            runner: ubuntu-24.04
+          - os: macos-latest
+            runner: macos-latest
 
     steps:
       - name: Checkout
@@ -223,7 +233,9 @@ jobs:
   real-assets-link:
     # Branch protection consumes this published name. Keep the Windows context
     # stable when pinning its runner for WDK compatibility; the real build and
-    # inference gates below still execute on windows-2022.
+    # inference gates below still execute on windows-2022. Linux is the same
+    # kind of split: the check stays `ubuntu-latest`, the image is ubuntu-24.04,
+    # because CUDA 12.5.0 is not published for ubuntu-latest's 26.04.
     name: real embedded assets (${{ matrix.check_name || matrix.os }})
     runs-on: ${{ matrix.os }}
     env:
@@ -232,8 +244,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-2022]
+        os: [ubuntu-24.04, macos-latest, windows-2022]
         include:
+          - os: ubuntu-24.04
+            check_name: ubuntu-latest
           - os: windows-2022
             check_name: windows-latest
     steps:
