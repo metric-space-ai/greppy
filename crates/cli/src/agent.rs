@@ -13,9 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
-    GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
-    StreamEvent, Usage, WorkspaceError,
+    run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, ApiFormat,
+    ApiFormatSetting, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
+    SandboxMode, StopReason, StreamEvent, Usage, WorkspaceError,
 };
 use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 
@@ -60,23 +60,40 @@ scratch dir (TMPDIR), the worktree's greppy store + lock namespace, and
 (or GREPPY_NO_SANDBOX=1) to disable. Repositories with submodules are not
 supported yet (the agent worktree cannot reset them safely).
 
-Localhost contract: greppy -p talks to an Anthropic-Messages-compatible
-gateway at GREPPY_ENDPOINT (default http://127.0.0.1:8317). The client has
-no TLS stack — only plain-HTTP endpoints (localhost gateways) are reachable;
-https is impossible. The standard is CLIProxyAPI, which translates all major
-chat formats/providers to that wire. GREPPY_MODEL / --model is the model id
-passed through unchanged. If the gateway requires an API key (CLIProxyAPI
-usually does), set GREPPY_API_KEY; it is sent as x-api-key and
-Authorization: Bearer. There is no key flag on purpose — keys do not belong
-on the command line.
+Localhost contract: greppy -p talks to a model gateway at GREPPY_ENDPOINT
+(default http://127.0.0.1:8317). The wire format is GREPPY_API_FORMAT /
+--api-format: anthropic (Anthropic Messages, POST /v1/messages) or openai
+(Chat Completions, POST /v1/chat/completions). The default is auto, which
+stays on anthropic unless the endpoint path is exactly /v1/messages or
+/v1/chat/completions, so an existing CLIProxyAPI gateway does not change.
+The client has no TLS stack — only plain-HTTP endpoints are reachable;
+https is impossible. OpenAI and OpenRouter need a local TLS-terminating
+proxy (CLIProxyAPI is the standard, and it can also translate those
+providers onto the anthropic wire). vLLM, llama.cpp, Ollama, and LM Studio
+can be used directly when they listen on http:// under /v1.
+
+Examples:
+  GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:11434/v1 \
+    GREPPY_MODEL=qwen2.5-coder greppy -p \"TASK\"
+  GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:1234/v1 \
+    GREPPY_MODEL=local-model greppy agent
+  GREPPY_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions \
+    GREPPY_MODEL=local greppy -p \"TASK\"
+
+GREPPY_MODEL / --model is the model id passed through unchanged. If the
+gateway requires an API key, set GREPPY_API_KEY. anthropic sends it as
+x-api-key and Authorization: Bearer; openai sends Authorization: Bearer
+only. There is no key flag on purpose — keys do not belong on the command
+line.
 
 Leading `-p` is reserved for the agent; to grep for the literal pattern `-p`,
 use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy agent [\"INITIAL TASK\"]
-  greppy agent stdio [--model M] [--endpoint URL]
-  greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
+  greppy agent stdio [--model M] [--endpoint URL] [--api-format FORMAT]
+  greppy -p \"TASK\" [--model M] [--endpoint URL] [--api-format FORMAT]
+                   [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
                    [--continue | --resume ID] [--json]
@@ -87,6 +104,9 @@ Flags:
                       and persist this through /setup)
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
+  --api-format FORMAT anthropic, openai, or auto (env GREPPY_API_FORMAT;
+                      default auto, which stays anthropic unless the
+                      endpoint path is /v1/messages or /v1/chat/completions)
   --max-turns N       Optional cap on action turns, followed by one tool-free
                       report turn (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
@@ -128,6 +148,25 @@ Exit codes:
   5  incomplete (explicit turn limit or deadline reached; proposal saved)
 ";
 
+/// `--api-format` / `GREPPY_API_FORMAT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum ApiFormatFlag {
+    #[default]
+    Auto,
+    Anthropic,
+    Openai,
+}
+
+impl ApiFormatFlag {
+    fn setting(self) -> ApiFormatSetting {
+        match self {
+            Self::Auto => ApiFormatSetting::Auto,
+            Self::Anthropic => ApiFormatSetting::Explicit(ApiFormat::Anthropic),
+            Self::Openai => ApiFormatSetting::Explicit(ApiFormat::OpenAi),
+        }
+    }
+}
+
 /// Parsed `greppy -p` arguments (everything after the leading `-p` token).
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(
@@ -144,9 +183,20 @@ pub struct AgentArgs {
     #[arg(long, env = "GREPPY_MODEL")]
     pub model: Option<String>,
 
-    /// Anthropic-Messages gateway base URL.
+    /// Gateway base URL (Anthropic Messages or OpenAI Chat Completions).
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
+
+    /// Chat protocol. `auto` stays on Anthropic unless the endpoint path is
+    /// exactly `/v1/messages` or `/v1/chat/completions`.
+    #[arg(
+        long,
+        env = "GREPPY_API_FORMAT",
+        value_enum,
+        default_value = "auto",
+        value_name = "FORMAT"
+    )]
+    pub api_format: ApiFormatFlag,
 
     /// Maximum assistant turns.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
@@ -228,6 +278,14 @@ struct ServeArgs {
     model: Option<String>,
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    #[arg(
+        long,
+        env = "GREPPY_API_FORMAT",
+        value_enum,
+        default_value = "auto",
+        value_name = "FORMAT"
+    )]
+    api_format: ApiFormatFlag,
     #[arg(long = "continue")]
     continue_session: bool,
     #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
@@ -347,6 +405,7 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             task: serve.task,
             model: serve.model,
             endpoint: serve.endpoint,
+            api_format: serve.api_format,
             max_turns: serve.max_turns,
             deadline_secs: None,
             apply: false,
@@ -760,7 +819,8 @@ fn run_agent(
         screen.advance(1, "Preparing persistent data store");
     }
 
-    let mut client = Client::new(&endpoint, &model);
+    let api_format = args.api_format.setting();
+    let mut client = Client::new(&endpoint, &model).with_api_format(api_format);
     if let Ok(key) = std::env::var("GREPPY_API_KEY") {
         client = client.with_api_key(key);
     }
@@ -802,7 +862,7 @@ fn run_agent(
     } else if model.is_empty() {
         model = "auto".into();
         json_session.model = model.clone();
-        client = Client::new(&endpoint, &model);
+        client = Client::new(&endpoint, &model).with_api_format(api_format);
         if let Ok(key) = std::env::var("GREPPY_API_KEY") {
             client = client.with_api_key(key);
         }
@@ -1942,7 +2002,6 @@ pub(crate) fn spawn_session_worker(
     let record_for_handle = record.clone();
     let session_id_for_handle = record.id.clone();
     let mut session_id = record.id;
-    let gateway_api_key = std::env::var("GREPPY_API_KEY").ok();
     let (start, wait_for_start) = if start_paused {
         let (tx, rx) = mpsc::sync_channel(0);
         (Some(tx), Some(rx))
@@ -1989,11 +2048,7 @@ pub(crate) fn spawn_session_worker(
                                 "session save failed: {error}"
                             )));
                         }
-                        client = client_for_endpoint(
-                            &current_endpoint,
-                            &config.model,
-                            gateway_api_key.as_deref(),
-                        );
+                        client = client.rebound(&current_endpoint, &config.model);
                     }
                     worker_bridge.send_discrete(SessionEvent::Configuration {
                         endpoint: current_endpoint.clone(),
@@ -2042,11 +2097,7 @@ pub(crate) fn spawn_session_worker(
                         }
                     }
                     SessionCommand::SetEndpoint(endpoint) => {
-                        let candidate = client_for_endpoint(
-                            &endpoint,
-                            &config.model,
-                            gateway_api_key.as_deref(),
-                        );
+                        let mut candidate = client.rebound(&endpoint, &config.model);
                         match candidate.list_models() {
                             Ok(models) if !models.is_empty() => {
                                 current_endpoint = endpoint;
@@ -2054,12 +2105,9 @@ pub(crate) fn spawn_session_worker(
                                     || !models.iter().any(|model| model == &config.model)
                                 {
                                     config.model = models[0].clone();
+                                    candidate = candidate.rebound(&current_endpoint, &config.model);
                                 }
-                                client = client_for_endpoint(
-                                    &current_endpoint,
-                                    &config.model,
-                                    gateway_api_key.as_deref(),
-                                );
+                                client = candidate;
                                 worker_bridge.send_discrete(SessionEvent::Configuration {
                                     endpoint: current_endpoint.clone(),
                                     model: config.model.clone(),
@@ -3092,14 +3140,6 @@ fn start_semantic_index(worktree_path: &Path) -> Option<crate::BackgroundJobLaun
     crate::spawn_agent_background_index(Some(&root), "agent-startup")
 }
 
-fn client_for_endpoint(endpoint: &str, model: &str, api_key: Option<&str>) -> Client {
-    let client = Client::new(endpoint, model);
-    match api_key {
-        Some(key) => client.with_api_key(key),
-        None => client,
-    }
-}
-
 fn monitor_index_startup(
     launch: crate::BackgroundJobLaunch,
     worktree_path: &Path,
@@ -3486,6 +3526,7 @@ mod tests {
             task: Some("hi".into()),
             model: None,
             endpoint: DEFAULT_ENDPOINT.into(),
+            api_format: ApiFormatFlag::Auto,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3507,6 +3548,7 @@ mod tests {
             task: Some("   ".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            api_format: ApiFormatFlag::Auto,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3788,6 +3830,7 @@ mod tests {
             task: Some("t".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            api_format: ApiFormatFlag::Auto,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3824,6 +3867,7 @@ mod tests {
             task: Some("t".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            api_format: ApiFormatFlag::Auto,
             max_turns: 40,
             deadline_secs: None,
             apply: false,

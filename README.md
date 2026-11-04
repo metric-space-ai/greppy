@@ -438,6 +438,38 @@ cannot grow memory without bound. Ctrl+C cancels at a safe tool boundary (it
 never interrupts an in-flight edit); a second Ctrl+C exits after the terminal
 is restored.
 
+### Model gateway
+
+`greppy agent` and `greppy -p` call a local HTTP gateway. The default wire is
+Anthropic Messages (`POST /v1/messages`) at `GREPPY_ENDPOINT` (default
+`http://127.0.0.1:8317`, CLIProxyAPI). Set `GREPPY_API_FORMAT=openai` or
+`--api-format openai` for Chat Completions (`POST /v1/chat/completions`).
+`auto` (the default) selects `openai` only when the endpoint path is
+`/v1/chat/completions`, and `anthropic` when it is `/v1/messages`. Every other
+URL stays on the Anthropic wire, so an existing gateway does not change.
+
+The client has no TLS stack. OpenAI and OpenRouter need a local
+TLS-terminating HTTP proxy. vLLM, llama.cpp, Ollama, and LM Studio can be
+used directly on `http://…/v1`.
+
+```bash
+# Ollama
+GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:11434/v1 \
+  GREPPY_MODEL=qwen2.5-coder greppy -p "TASK"
+
+# LM Studio
+GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:1234/v1 \
+  GREPPY_MODEL=local-model greppy agent
+
+# llama.cpp or vLLM; the path selects openai when the format is auto
+GREPPY_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions \
+  GREPPY_MODEL=local greppy -p "TASK"
+```
+
+`GREPPY_API_KEY` is sent as `Authorization: Bearer` for `openai`, and as both
+`x-api-key` and `Authorization: Bearer` for `anthropic`. There is no key flag.
+Set the variable in the environment; do not put it on the command line.
+
 Slash commands: `/help`, `/clear`, `/model`, `/usage`, `/tools`, `/copy`,
 `/sessions`, `/name TITLE`, `/compact`, `/exit`. `/compact` keeps recent
 messages and an extractive summary of earlier turns. Sessions are append-only

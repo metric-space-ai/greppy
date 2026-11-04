@@ -31,8 +31,11 @@ pub mod render;
 // (b) new sentence after the opening paragraph: "The task is a change to
 // deliver: make the edits with greppy and verify them; do not stop at an
 // analysis." v4: 12,900 bytes, SHA256 below. Adapter unchanged.
+// 2026-11-04: AGENT section only (excluded from every rendered builtin prompt
+// by without_section AGENT..CHAIN). Documents GREPPY_API_FORMAT openai|anthropic
+// for the plain-HTTP gateway. Rendered mode hashes are unchanged. 13,343 bytes.
 pub const APPROVED_SHA256: &str =
-    "12bb2db4bce1ab2603279913aeb676f7b68115143a42170091f5842a6cf0d84f";
+    "8db91a60e3ccdf3bb9eaf06f40274d203a8381783583e8d7cf9f426a28c7e79f";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // 2026-10-06 consolidated owner order A: exact coding-agent introduction,

@@ -118,10 +118,16 @@ full Greppy functionality; do not retain a temporary fallback to basic text tool
 If preparation fails or exceeds its estimate, inspect and report the concrete issue.
 
 AGENT:
-  greppy -p "TASK" [--model M]       isolated coding task, delivered as refs/greppy/agent/<id>
+  greppy -p "TASK" [--model M] [--api-format anthropic|openai]
+                                     isolated coding task, delivered as refs/greppy/agent/<id>
 
 The task does not edit the working checkout. Review with git show <ref>, apply with
-git cherry-pick -n <ref>. greppy -p --help describes gateway setup.
+git cherry-pick -n <ref>. greppy -p --help describes gateway setup. The gateway is
+GREPPY_ENDPOINT (default http://127.0.0.1:8317, plain HTTP, no TLS).
+GREPPY_API_FORMAT=anthropic|openai selects Anthropic Messages or OpenAI Chat
+Completions; auto (the default) stays anthropic unless the endpoint path is
+/v1/chat/completions or /v1/messages. GREPPY_MODEL / --model is the model id.
+GREPPY_API_KEY is a bearer token for openai and is never a flag.
 
 CHAIN:
   greppy search-symbol NAME --json | greppy read -

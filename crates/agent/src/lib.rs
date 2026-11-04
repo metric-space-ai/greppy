@@ -4,8 +4,11 @@
 //! - [`protocol`] — model-agnostic request/response and stream event types.
 //! - [`wire`] — Anthropic Messages API request-body adapter and incremental
 //!   SSE parser (`/v1/messages`, `stream: true`).
-//! - [`client`] — blocking HTTP client aimed at a localhost gateway
-//!   (CLIProxyAPI-style, default `http://127.0.0.1:8317`).
+//! - [`openai`] — OpenAI Chat Completions adapter (`/v1/chat/completions`,
+//!   SSE `data:` chunks, tool results as `role: tool`).
+//! - [`client`] — blocking plain-HTTP client (no TLS) aimed at a gateway
+//!   (CLIProxyAPI-style, default `http://127.0.0.1:8317`). `GREPPY_API_FORMAT`
+//!   selects `anthropic` or `openai`; the default stays Anthropic.
 //! - [`model`] — [`ModelStream`] trait so the loop is testable without network.
 //! - [`env`] — [`ExecutionEnv`] tool boundary (agent proposes, host executes).
 //! - [`greppy_env`] — production [`GreppyEnv`]: single `greppy` tool over self-invocation.
@@ -25,11 +28,13 @@
 pub const AGENT_RUN_ENV: &str = "GREPPY_AGENT_RUN";
 
 pub mod agent_loop;
+pub mod api_format;
 pub mod client;
 pub mod context;
 pub mod env;
 pub mod greppy_env;
 pub mod model;
+pub(crate) mod openai;
 pub mod prompt;
 pub mod protocol;
 pub mod sandbox;
@@ -41,6 +46,7 @@ pub use agent_loop::{
     run_agent_loop, run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult,
     LoopStop,
 };
+pub use api_format::{ApiFormat, ApiFormatSetting};
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
 pub use greppy_env::{

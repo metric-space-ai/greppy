@@ -9,11 +9,16 @@ worktree folder in `session/new` or `session/load`.
 greppy agent stdio --endpoint http://127.0.0.1:8317 --model MODEL_ID
 ```
 
-`--max-turns N` bounds one prompt to N assistant turns; without it a prompt has no turn cap (default 0) and is bounded by the run deadline. The endpoint is an
-Anthropic Messages-compatible gateway. Authentication reuses `GREPPY_API_KEY`
-from the agent process; ACP clients do not transmit or persist a secret. Model
+`--max-turns N` bounds one prompt to N assistant turns; without it a prompt has no turn cap (default 0) and is bounded by the run deadline. The endpoint is a
+plain-HTTP gateway (no TLS). `GREPPY_API_FORMAT` / `--api-format` selects
+`anthropic` (Anthropic Messages, the default) or `openai` (Chat Completions);
+`auto` changes that only when the endpoint path is `/v1/messages` or
+`/v1/chat/completions`. Authentication reuses `GREPPY_API_KEY`
+from the agent process (`Authorization: Bearer`, and also `x-api-key` for
+`anthropic`); ACP clients do not transmit or persist a secret. Model
 selection can be supplied with `--model`, `session/set_model`, or the `model`
-option in `session/set_config_option`.
+option in `session/set_config_option`. HTTPS providers need a local
+TLS-terminating proxy.
 
 The host controls the working folder. ACP tools execute in that folder after
 client permission; the host should supply its intended isolated worktree when
