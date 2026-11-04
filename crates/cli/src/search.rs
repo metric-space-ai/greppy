@@ -1554,6 +1554,19 @@ pub(crate) fn dispatch_semantic(
             "search requires a plain-English query".into(),
         ));
     }
+    if greppy_web_client::max_ram::RamBudget::from_env()
+        .is_some_and(|budget| budget.embeddings_off())
+    {
+        emit_semantic_ram_disabled(
+            &project_for(root).unwrap_or_else(|_| "unknown".to_string()),
+            q,
+            paths,
+            root,
+            json,
+            "the graph index is still available; semantic embeddings are not loaded under this RAM budget",
+        )?;
+        return Ok(1);
+    }
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
     let mut prefixes = path_filters.repo_prefixes();
     if !path_filters.is_empty() && prefixes.is_empty() {

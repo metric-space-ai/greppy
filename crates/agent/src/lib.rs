@@ -54,9 +54,10 @@ pub use model::ModelStream;
 pub mod prompt_contract;
 pub use in_place::InPlaceWorkspace;
 pub use prompt::{
-    browser_prompt, compose_one_shot_prompt, export_prompt, prompt_metadata,
-    prompt_metadata_for_mode, system_prompt, system_prompt_for_mode, AgentPromptStyle,
-    BuiltinPromptMode, PUBLIC_PROMPT, SYSTEM_PROMPT,
+    apply_model_prompt_edits, browser_prompt, compose_one_shot_prompt, export_prompt,
+    prompt_metadata, prompt_metadata_for_mode, system_prompt, system_prompt_for_mode,
+    system_prompt_with_models, AgentPromptStyle, BuiltinPromptMode, ModelPrompt, PUBLIC_PROMPT,
+    SYSTEM_PROMPT,
 };
 pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,

@@ -322,6 +322,18 @@ pub(crate) fn embedding_asset_missing_error(error: &Error) -> bool {
 pub(crate) fn embedding_config_for_index(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<Option<EmbeddingModelConfig>> {
+    if let Some(budget) = greppy_web_client::max_ram::RamBudget::from_env() {
+        if budget.embeddings_off() {
+            return Ok(None);
+        }
+        // Lazy: the foreground index publishes the graph. The background
+        // embedding child is the one that may load the model.
+        let background =
+            std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() == Some("embedding");
+        if !background {
+            return Ok(None);
+        }
+    }
     if test_inference_skipped() && !test_embedding_completion_forced() {
         return Ok(None);
     }
@@ -331,6 +343,13 @@ pub(crate) fn embedding_config_for_index(
 pub(crate) fn embedding_config_for_required_use(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<EmbeddingModelConfig> {
+    if greppy_web_client::max_ram::RamBudget::from_env()
+        .is_some_and(|budget| budget.embeddings_off())
+    {
+        return Err(Error::Config(
+            "embeddings are off under the RAM budget".into(),
+        ));
+    }
     embedding_config_required(args)
 }
 
@@ -339,6 +358,11 @@ pub(crate) fn embedding_config_for_required_use(
 pub(crate) fn embedding_config_optional(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<Option<EmbeddingModelConfig>> {
+    if greppy_web_client::max_ram::RamBudget::from_env()
+        .is_some_and(|budget| budget.embeddings_off())
+    {
+        return Ok(None);
+    }
     if test_inference_skipped() {
         return Ok(None);
     }
@@ -363,6 +387,11 @@ pub(crate) fn embedding_config_for_daemon_probe(
 }
 
 pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>> {
+    if greppy_web_client::max_ram::RamBudget::from_env()
+        .is_some_and(|budget| budget.summaries_off())
+    {
+        return Ok(None);
+    }
     if test_inference_skipped() {
         return Ok(None);
     }
@@ -660,5 +689,76 @@ mod scoped_readiness_tests {
             "model-a",
             &["src/other".into()]
         ));
+    }
+}
+
+#[cfg(test)]
+mod ram_budget_tests {
+    use super::*;
+
+    struct EnvGuard {
+        max_ram: Option<std::ffi::OsString>,
+        background: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(max_ram: &str) -> Self {
+            let guard = Self {
+                max_ram: std::env::var_os("GREPPY_MAX_RAM"),
+                background: std::env::var_os("GREPPY_BACKGROUND_KIND"),
+            };
+            std::env::set_var("GREPPY_MAX_RAM", max_ram);
+            std::env::remove_var("GREPPY_BACKGROUND_KIND");
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            restore("GREPPY_MAX_RAM", self.max_ram.take());
+            restore("GREPPY_BACKGROUND_KIND", self.background.take());
+        }
+    }
+
+    fn restore(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    #[test]
+    fn one_gib_budget_skips_embedding_and_summary_config() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _guard = EnvGuard::set("1g");
+        let embedding = embedding_config_for_index(EmbeddingCliArgs {
+            device: None,
+            no_gpu: false,
+        })
+        .unwrap();
+        assert!(embedding.is_none());
+        assert!(qwen_summary_config_optional().unwrap().is_none());
+    }
+
+    #[test]
+    fn four_gib_budget_defers_foreground_embeddings_and_keeps_summaries() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _guard = EnvGuard::set("4g");
+        let embedding = embedding_config_for_index(EmbeddingCliArgs {
+            device: None,
+            no_gpu: true,
+        })
+        .unwrap();
+        assert!(embedding.is_none());
+        let budget = greppy_web_client::max_ram::RamBudget::from_env().unwrap();
+        assert!(!budget.embeddings_off());
+        assert!(!budget.summaries_off());
+        // ci-test-assets skips inference after the budget gate, so the
+        // summarizer is not materialized here. The budget still allows it.
+        assert!(qwen_summary_config_optional().unwrap().is_none());
     }
 }

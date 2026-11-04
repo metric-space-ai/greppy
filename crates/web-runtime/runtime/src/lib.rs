@@ -18,6 +18,7 @@ pub mod playwright_trace;
 pub mod protocol;
 mod rendering_backend;
 pub mod session;
+mod tab_swap;
 pub mod supervisor;
 #[cfg(feature = "content-runtime")]
 pub mod web_api_shims;

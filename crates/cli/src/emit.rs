@@ -293,6 +293,46 @@ pub(crate) fn emit_semantic_backend_unavailable(
     Ok(())
 }
 
+pub(crate) fn emit_semantic_ram_disabled(
+    project: &str,
+    query: &str,
+    paths: &[String],
+    root: Option<&str>,
+    json: bool,
+    detail: &str,
+) -> Result<()> {
+    let next = semantic_fallback_commands(query, paths, root);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
+                "command": "search",
+                "mode": "vector",
+                "status": "backend_unavailable",
+                "project": project,
+                "query": query,
+                "reason": "max_ram",
+                "detail": detail,
+                "retryable": false,
+                "query_tokens": semantic_fallback_tokens(query),
+                "next": next,
+                "total_exact": 0,
+                "shown": 0,
+                "omitted": 0,
+                "truncated": false,
+                "hits": [],
+            }))
+            .map_err(|error| { Error::Invalid(format!("serialize semantic RAM JSON: {error}")) })?
+        );
+    } else {
+        println!("semantic index unavailable — embeddings are off for this RAM budget");
+        println!("{detail}");
+        print_semantic_fallback_commands(query, paths, root);
+    }
+    Ok(())
+}
+
 /// Print the `--code` source span for a single resolved node, using the
 /// shared cap and the standard skip-on-failure semantics. Emitted
 /// indented under the node's `file:line` line so the structure stays

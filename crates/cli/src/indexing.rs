@@ -1893,6 +1893,7 @@ pub(crate) fn dispatch_index(
         }
         embedding_config_for_index(embedding_args)?
     };
+    note_ram_embedding_policy(embedding_config.as_ref());
     let embedding_job =
         std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() == Some("embedding");
     let had_overlay_binding = embedding_job
@@ -2922,5 +2923,24 @@ mod progress_status_tests {
             120
         );
         assert_eq!(progress_stall_threshold_seconds(None), 120);
+    }
+}
+
+fn note_ram_embedding_policy(config: Option<&EmbeddingModelConfig>) {
+    let Some(budget) = greppy_web_client::max_ram::RamBudget::from_env() else {
+        return;
+    };
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if budget.embeddings_off() {
+        eprintln!(
+            "greppy index: embeddings are off under the RAM budget; the graph index is published. search-symbol, search-pattern and grep stay available."
+        );
+    } else if config.is_none() {
+        eprintln!(
+            "greppy index: embeddings stay unloaded until the next semantic search (RAM budget)."
+        );
     }
 }
