@@ -2489,25 +2489,37 @@ impl ContentEngine {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = take_wait_completion_in_document(
+        let completed = match take_wait_completion_in_document(
             &delegate.document_generation,
             document_generation,
             || self.take_completed_wait_slot(webview, token, deadline),
-        )?
-        else {
-            // The page timeout path deletes its slot in the same turn as the
-            // console signal. The notice is still the outcome; do not forget
-            // it and keep polling a waiter that has already finished.
+        ) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                // The completion read can refuse once the caller deadline is
+                // gone. That refusal must still remove the slot: the page
+                // scan runs as soon as this timeout returns.
+                self.drop_wait_slot(webview, token, deadline);
+                delegate.clear_wait_notice(token);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((status, value)) = completed else {
+            if delegate.document_generation.get() != document_generation {
+                // A new document has to reinstall the waiter. An old notice
+                // must not finish that new document as a timeout.
+                delegate.clear_wait_notice(token);
+                return Ok(None);
+            }
             delegate.clear_wait_notice(token);
-            if notice == "timeout" || notice == "error" {
+            if notice == "timeout" {
+                // The page timeout path deletes its slot in the same turn as
+                // the console signal. The notice is still the outcome.
                 self.drop_wait_slot(webview, token, deadline);
                 return Ok(Some(self.finish_wait_outcome(
                     webview,
-                    if notice == "timeout" {
-                        WaitOutcome::Timeout
-                    } else {
-                        WaitOutcome::Error(notice)
-                    },
+                    WaitOutcome::Timeout,
                     strict_budget,
                 )));
             }
