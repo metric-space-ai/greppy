@@ -949,14 +949,57 @@ exit 0;
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn unix_bin(name: &str) -> std::path::PathBuf {
-        for candidate in [format!("/bin/{name}"), format!("/usr/bin/{name}")] {
-            let path = std::path::PathBuf::from(&candidate);
-            if path.is_file() {
-                return path;
-            }
-        }
-        panic!("missing {name}");
+    fn write_private_elf(dir: &std::path::Path, name: &str, source: &str) -> std::path::PathBuf {
+        let src = dir.join(format!("{name}.rs"));
+        let out = dir.join(name);
+        std::fs::write(&src, source).unwrap_or_else(|error| panic!("write {name} source: {error}"));
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let status = std::process::Command::new(&rustc)
+            .arg("--edition=2021")
+            .arg("-C")
+            .arg("opt-level=0")
+            .arg("--crate-name")
+            .arg(name)
+            .arg("-o")
+            .arg(&out)
+            .arg(&src)
+            .status()
+            .unwrap_or_else(|error| panic!("spawn rustc for {name}: {error}"));
+        assert!(
+            status.success(),
+            "rustc failed to build private ELF {name} (status {status})"
+        );
+        out
+    }
+
+    /// Host `sleep` / `true` are the wrong fexecve subjects on current Ubuntu.
+    /// 26.04 ships them as one uutils multicall binary, which exits 1 when
+    /// argv0 is not the utility name (uutils reports the pinned FD number as the
+    /// requested utility). These probes are ordinary ELFs: one blocks, one returns
+    /// immediately, and neither inspects argv0.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn private_exec_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let sleeper = write_private_elf(
+            dir,
+            "sleeper",
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }\n",
+        );
+        let exiter = write_private_elf(dir, "exiter", "fn main() {}\n");
+        (sleeper, exiter)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn private_probe_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-fexecve-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[cfg(unix)]
@@ -1038,19 +1081,10 @@ exit 0;
     #[test]
     fn linux_spawn_uses_fd_backed_exec() {
         use std::process::{Command, Stdio};
-        let sleep = unix_bin("sleep");
-        let true_bin = unix_bin("true");
-        let root = std::env::temp_dir().join(format!(
-            "greppy-fexecve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = private_probe_dir("pinned");
+        let (sleeper, exiter) = private_exec_pair(&root);
         let probe = root.join("probe");
-        std::fs::copy(&sleep, &probe).unwrap();
+        std::fs::copy(&sleeper, &probe).unwrap();
         let image = PinnedSupervisorImage::open_path(&probe).unwrap();
         assert_eq!(image.exec_kind(), ImageExecKind::Fexecve);
         assert!(image.is_fd_backed());
@@ -1058,11 +1092,10 @@ exit 0;
         // to `probe` would truncate and rewrite the already pinned inode, which
         // is not a path-lookup TOCTOU and necessarily changes what the FD sees.
         let replacement = root.join("replacement");
-        std::fs::copy(&true_bin, &replacement).unwrap();
+        std::fs::copy(&exiter, &replacement).unwrap();
         std::fs::rename(&replacement, &probe).unwrap();
         let mut command = Command::new(&probe);
         command
-            .arg("30")
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1073,7 +1106,7 @@ exit 0;
         let early_status = child.try_wait().unwrap();
         assert!(
             early_status.is_none(),
-            "fexecve must run the pinned sleep image, not the replaced true path; status={early_status:?}"
+            "fexecve must run the pinned sleeper image, not the replaced exiter path; status={early_status:?}"
         );
         image.prove_child(child.id()).unwrap();
         let _ = child.kill();
@@ -1089,7 +1122,12 @@ exit 0;
         use std::process::Command;
 
         const CHILD_ENV: &str = "GREPPY_TEST_FEXECVE_RESERVED_FDS";
+        const EXITER_ENV: &str = "GREPPY_TEST_FEXECVE_EXITER";
         if std::env::var_os(CHILD_ENV).is_none() {
+            // Compile before the isolated re-exec. rustc opens FDs of its own,
+            // which would spoil the assertion that the image occupies FD 3.
+            let root = private_probe_dir("reserved-fds");
+            let exiter = write_private_elf(&root, "exiter", "fn main() {}\n");
             // Give the isolated test process a deterministic low-FD layout.
             // Closing these in the shell cannot disturb this test runner.
             let output = Command::new("/bin/sh")
@@ -1102,8 +1140,10 @@ exit 0;
                     "--test-threads=1",
                 ])
                 .env(CHILD_ENV, "1")
+                .env(EXITER_ENV, &exiter)
                 .output()
                 .unwrap();
+            let _ = std::fs::remove_dir_all(&root);
             assert!(
                 output.status.success(),
                 "stdout={}\nstderr={}",
@@ -1113,8 +1153,8 @@ exit 0;
             return;
         }
 
-        let true_bin = unix_bin("true");
-        let image = PinnedSupervisorImage::open_path(&true_bin).unwrap();
+        let exiter = std::path::PathBuf::from(std::env::var(EXITER_ENV).expect("exiter path"));
+        let image = PinnedSupervisorImage::open_path(&exiter).unwrap();
         assert_eq!(image.as_raw_fd(), 3, "isolated image must occupy FD 3");
         let null = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(null.as_raw_fd(), 4, "FD 4 must be free for the exec pin");
@@ -1127,7 +1167,7 @@ exit 0;
         // duplicate, bind_command chooses FD 4, overwritten by the first hook.
         for _ in 0..2 {
             let channel_fd = channel.as_raw_fd();
-            let mut command = Command::new(&true_bin);
+            let mut command = Command::new(&exiter);
             unsafe {
                 command.pre_exec(move || {
                     for fd in [
@@ -1154,28 +1194,28 @@ exit 0;
     #[test]
     fn linux_identity_mismatch_kills_child() {
         use std::process::{Command, Stdio};
-        let sleep = unix_bin("sleep");
-        let true_bin = unix_bin("true");
-        let sleep_img = PinnedSupervisorImage::open_path(&sleep).unwrap();
-        let true_img = PinnedSupervisorImage::open_path(&true_bin).unwrap();
+        let root = private_probe_dir("identity");
+        let (sleeper, exiter) = private_exec_pair(&root);
+        let sleep_img = PinnedSupervisorImage::open_path(&sleeper).unwrap();
+        let exit_img = PinnedSupervisorImage::open_path(&exiter).unwrap();
         assert_ne!(
             sleep_img.dev_ino().unwrap(),
-            true_img.dev_ino().unwrap(),
-            "sleep and true must be distinct inodes"
+            exit_img.dev_ino().unwrap(),
+            "sleeper and exiter must be distinct inodes"
         );
-        let mut command = Command::new(&sleep);
+        let mut command = Command::new(&sleeper);
         command
-            .arg("30")
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         sleep_img.bind_command(&mut command).unwrap();
-        let mut child = command.spawn().expect("sleep spawn");
-        let error = true_img.prove_child_or_kill(&mut child).unwrap_err();
+        let mut child = command.spawn().expect("sleeper spawn");
+        let error = exit_img.prove_child_or_kill(&mut child).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"), "{error}");
         let status = child.wait().unwrap();
         assert!(!status.success(), "mismatch must kill the child");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
