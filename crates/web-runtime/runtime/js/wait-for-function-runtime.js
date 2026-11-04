@@ -66,18 +66,19 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
     } catch (_e) {}
     cleanup();
     signal(status);
-    if (strictBoolean) {
+    if (status === "timeout") {
+      // A timeout has no value to preserve. Delete in this turn so a caller
+      // that resumes as soon as the timeout is reported cannot observe the
+      // slot, whether or not the host still runs its own cleanup.
+      try { delete window[key]; } catch (_e) {}
+    } else if (strictBoolean) {
       // The caller may run out of budget before its final slot-read. Do not
       // retain completed predicate values forever in that case. This expiry
       // only drops bookkeeping; it never reevaluates the page or adds time.
-      if (status === "timeout") {
+      expirationId = window.setTimeout(function () {
+        expirationId = 0;
         try { delete window[key]; } catch (_e) {}
-      } else {
-        expirationId = window.setTimeout(function () {
-          expirationId = 0;
-          try { delete window[key]; } catch (_e) {}
-        }, Math.max(0, expiresAt - Date.now()));
-      }
+      }, Math.max(0, expiresAt - Date.now()));
     }
   }
 

@@ -2304,8 +2304,9 @@ impl ContentEngine {
                 // Reinstall on the new Document with the ORIGINAL deadline.
                 // The old nonce must not certify this new document, even if
                 // an old console completion was already in the delegate.
-                delegate.clear_wait_notice(&token);
-                token = alloc_wait_nonce()?;
+                let stale = std::mem::replace(&mut token, alloc_wait_nonce()?);
+                self.drop_wait_slot(&webview, &stale, io_deadline);
+                delegate.clear_wait_notice(&stale);
                 document_generation = delegate.document_generation.get();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining < Duration::from_millis(1) {
@@ -2421,12 +2422,11 @@ impl ContentEngine {
     }
 
     fn drop_wait_slot(&self, webview: &WebView, token: &str, deadline: Option<Instant>) {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
-        if budget.is_zero() {
-            // The installed JS deadline still cancels observers/frames. Do not
-            // start another synchronous evaluation after the caller's budget.
-            return;
-        }
+        // Removing the slot is not extra wait time. An exhausted predicate
+        // deadline must not skip it: the page timeout may not have run yet,
+        // and the caller inspects window as soon as the timeout returns.
+        let _ = deadline;
+        let budget = Duration::from_millis(80);
         let Ok(key_js) = serde_json::to_string(&Self::wait_slot_key(token)) else {
             return;
         };
@@ -2495,7 +2495,22 @@ impl ContentEngine {
             || self.take_completed_wait_slot(webview, token, deadline),
         )?
         else {
+            // The page timeout path deletes its slot in the same turn as the
+            // console signal. The notice is still the outcome; do not forget
+            // it and keep polling a waiter that has already finished.
             delegate.clear_wait_notice(token);
+            if notice == "timeout" || notice == "error" {
+                self.drop_wait_slot(webview, token, deadline);
+                return Ok(Some(self.finish_wait_outcome(
+                    webview,
+                    if notice == "timeout" {
+                        WaitOutcome::Timeout
+                    } else {
+                        WaitOutcome::Error(notice)
+                    },
+                    strict_budget,
+                )));
+            }
             return Ok(None);
         };
         let status = if status.is_empty() { notice } else { status };
