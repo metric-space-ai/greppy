@@ -45,6 +45,17 @@ pub fn navigation_content_cpu(cores: u32) -> Duration {
     }
 }
 
+/// Extra Stylo threads beside the main thread. One core keeps selector
+/// matching on the main thread (`layout.threads` <= 1). More cores keep
+/// Servo's default of 3.
+pub fn style_threads_for_host(cores: u32) -> Option<i64> {
+    if cores <= 1 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 /// `cpu.max` quota/period. `max` means the cgroup is not capping cores.
 pub fn cores_from_cpu_max(text: &str) -> Option<u32> {
     let mut parts = text.split_whitespace();
@@ -198,7 +209,7 @@ impl SessionLimits {
         let next = used.saturating_add(additional);
         if next > self.max_network_bytes {
             Err(format!(
-                "network limit exceeded ({next} > {})",
+                "network limit exceeded for this navigation ({next} > {}); the next navigation starts a new budget",
                 self.max_network_bytes
             ))
         } else {
@@ -479,6 +490,8 @@ mod tests {
             super::parse_byte_size("4096M"),
             Some(4 * 1024 * 1024 * 1024)
         );
+        assert_eq!(super::style_threads_for_host(1), Some(1));
+        assert_eq!(super::style_threads_for_host(4), None);
         assert_eq!(super::host_live_pages(1, None, 16), 1);
         assert_eq!(
             super::host_live_pages(4, Some(4 * 1024 * 1024 * 1024), 16),

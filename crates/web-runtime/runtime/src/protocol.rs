@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Shared with the supervisor sender and `greppy_web_client::MAX_FRAME_BYTES`.
+/// A Wikipedia observe/read reply is a few megabytes; 1 MiB rejected those
+/// pages. 8 MiB covers that reply with room for the protocol envelope.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -362,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_frames_larger_than_one_mebibyte_before_reading_payload() {
+    fn rejects_frames_larger_than_eight_mebibytes_before_reading_payload() {
         let oversized = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
         let error = read_message(&mut Cursor::new(oversized)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

@@ -2,7 +2,7 @@
 
 use crate::limits::SessionLimits;
 use crate::policy::NetworkProfile;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -61,6 +61,12 @@ pub struct Session {
     /// must not exhaust the next page's budget.
     pub navigation_content_cpu_ns: u64,
     pub navigation_controller_cpu_ns: u64,
+    /// Response bytes since the last navigation. `network_bytes` keeps the
+    /// session total for metrics; the limit uses this counter.
+    pub navigation_network_bytes: u64,
+    /// Response ids already charged, so a page that retains its log does not
+    /// bill those bytes again on the next navigation.
+    seen_response_ids: HashSet<String>,
     pub started: Instant,
     pub inflight_engine_request_id: Option<u64>,
     pub inflight_engine_method: Option<String>,
@@ -100,6 +106,8 @@ impl Session {
             controller_cpu_used_ns: 0,
             navigation_content_cpu_ns: 0,
             navigation_controller_cpu_ns: 0,
+            navigation_network_bytes: 0,
+            seen_response_ids: HashSet::new(),
             started: Instant::now(),
             inflight_engine_request_id: None,
             inflight_engine_method: None,
@@ -110,11 +118,38 @@ impl Session {
         }
     }
 
-    /// Drop the CPU charged to the page that is being replaced. The session
-    /// totals stay, so a worker restart still cannot underflow them.
+    /// Drop the CPU and network bytes charged to the page being replaced.
+    /// The session totals stay, so a worker restart still cannot underflow them.
     pub fn begin_navigation(&mut self) {
         self.navigation_content_cpu_ns = 0;
         self.navigation_controller_cpu_ns = 0;
+        self.navigation_network_bytes = 0;
+    }
+
+    pub(crate) fn charge_new_responses(&mut self, rows: &[serde_json::Value]) -> u64 {
+        let mut current_ids = HashSet::new();
+        let mut added = 0u64;
+        for row in rows {
+            let Some(id) = row
+                .get("requestId")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            current_ids.insert(id.to_owned());
+            if self.seen_response_ids.insert(id.to_owned()) {
+                added = added.saturating_add(
+                    row.get("byteLength")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0),
+                );
+            }
+        }
+        self.seen_response_ids.retain(|id| current_ids.contains(id));
+        self.navigation_network_bytes = self.navigation_network_bytes.saturating_add(added);
+        self.network_bytes = self.network_bytes.saturating_add(added);
+        added
     }
 
     pub fn transition(&mut self, next: SessionState) -> Result<(), String> {

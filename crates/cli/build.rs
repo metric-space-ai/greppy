@@ -52,7 +52,42 @@ const CI_QWEN_TOK_SHA: &str = "8a3b4f437b9ee58c2190c1e409e24c5b31c0b697041f22925
 #[path = "../../assets/prompts/contract.rs"]
 mod prompt_contract;
 
+fn git_commit() -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if text.is_empty() {
+                "unknown".to_string()
+            } else {
+                text
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+fn export_git_commit() {
+    println!("cargo:rustc-env=GREPPY_GIT_COMMIT={}", git_commit());
+    let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !dir.is_empty() {
+        println!("cargo:rerun-if-changed={dir}/HEAD");
+    }
+}
+
 fn main() {
+    export_git_commit();
     let prompt_root =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .join("../..");
@@ -69,7 +104,9 @@ fn main() {
     {
         panic!(
             "cpu-only is restricted to Cargo's debug profile; Greppy product builds require \
-             Metal on macOS or CUDA/nvcc on Linux x86_64"
+             Metal on macOS or CUDA/nvcc on Linux x86_64. A release binary still accepts \
+             --device cpu at runtime; that flag selects the CPU kernels compiled into the \
+             product binary and does not enable this cargo feature"
         );
     }
 

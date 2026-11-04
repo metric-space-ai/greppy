@@ -184,8 +184,18 @@ fn fs_allow_list(
         grants.push(FsPathGrant::persistent_write_tree(path, true));
     }
     extend_dns_grants(&mut grants, Path::new("/etc/resolv.conf"));
+    if let Some(path) = std::env::var_os("GREPPY_WEB_SHADER_CACHE") {
+        extend_shader_cache_grant(&mut grants, Path::new(&path));
+    }
 
     Ok(grants)
+}
+
+fn extend_shader_cache_grant(grants: &mut Vec<FsPathGrant>, cache: &Path) {
+    if cache.as_os_str().is_empty() || is_filesystem_root(cache) {
+        return;
+    }
+    grants.push(FsPathGrant::write_tree(cache, false));
 }
 
 /// `/etc` is already readable, but Ubuntu makes `/etc/resolv.conf` a symlink
@@ -760,6 +770,22 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shader_cache_dir_is_a_write_grant_and_not_the_filesystem_root() {
+        let mut grants = Vec::new();
+        extend_shader_cache_grant(&mut grants, Path::new("/var/lib/greppy/mesa-shader-cache"));
+        assert_eq!(
+            grants[0].path,
+            Path::new("/var/lib/greppy/mesa-shader-cache")
+        );
+        assert!(grants[0].is_write_tree());
+        assert!(!grants[0].required);
+        let before = grants.len();
+        extend_shader_cache_grant(&mut grants, Path::new("/"));
+        extend_shader_cache_grant(&mut grants, Path::new(""));
+        assert_eq!(grants.len(), before);
     }
 
     #[test]

@@ -527,17 +527,10 @@ pub(crate) fn embedding_device_preference(
 fn enforce_product_gpu(
     preference: greppy_embed_native::DevicePreference,
 ) -> Result<greppy_embed_native::DevicePreference> {
-    #[cfg(all(
-        any(target_os = "macos", target_os = "linux"),
-        not(feature = "cpu-only")
-    ))]
-    if preference == greppy_embed_native::DevicePreference::Cpu {
-        return Err(Error::Invalid(
-            "CPU inference is disabled in product builds; use the platform GPU by removing \
-             --device cpu or --no-gpu and unsetting GREPPY_DEVICE=cpu or GREPPY_NO_GPU"
-                .into(),
-        ));
-    }
+    // Explicit `cpu` is legal on a product binary: both models ship CPU
+    // kernels next to Metal/CUDA. `auto` does not use those kernels; the
+    // native loader keeps it on the platform GPU. The `cpu-only` cargo
+    // feature stays debug-only and is not required for `--device cpu`.
     // Reject a backend the host cannot load before the native loader starts.
     // `auto` stays legal and picks Metal on macOS, CUDA on Linux.
     let unavailable = match preference {

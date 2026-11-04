@@ -930,6 +930,14 @@ impl Drop for OwnedTempDir {
     }
 }
 
+fn mesa_shader_cache_dir() -> PathBuf {
+    let root = std::env::var_os("GREPPY_STORE_DIR")
+        .or_else(|| std::env::var_os("GREPPY_RUNTIME_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("greppy-web-runtime"));
+    root.join("mesa-shader-cache")
+}
+
 fn inherited_worker_env() -> Vec<(OsString, OsString)> {
     const ALLOW: &[&str] = &[
         "PATH",
@@ -1094,6 +1102,14 @@ fn spawn_unix(
             .stderr(Stdio::inherit());
         if let Some(dir) = content_config_dir.as_ref() {
             command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
+        }
+        if worker == WorkerKind::Content {
+            let cache = mesa_shader_cache_dir();
+            if fs::create_dir_all(&cache).is_ok() {
+                command.env("GREPPY_WEB_SHADER_CACHE", &cache);
+                command.env("MESA_SHADER_CACHE_DIR", &cache);
+                command.env("MESA_GLSL_CACHE_DIR", &cache);
+            }
         }
         if let Some(dir) = persistent_profiles.as_ref() {
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
@@ -1300,6 +1316,12 @@ fn macos_sandbox_profile(
     let persistent_profiles = persistent_profiles
         .map(sbpl_subpath)
         .unwrap_or_default();
+    let shader_cache = std::env::var_os("GREPPY_WEB_SHADER_CACHE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .and_then(|path| path.canonicalize().ok())
+        .map(|path| sbpl_subpath(&path))
+        .unwrap_or_default();
     format!(
         r#"(version 1)
 (deny default)
@@ -1319,6 +1341,7 @@ fn macos_sandbox_profile(
   {exe_dir}
   {tmp}
   {persistent_profiles}
+  {shader_cache}
   (subpath "/private/var/folders")
   (subpath "/private/tmp")
   (subpath "/tmp")
@@ -1330,6 +1353,7 @@ fn macos_sandbox_profile(
 (allow file-write*
   {tmp}
   {persistent_profiles}
+  {shader_cache}
 )
 (allow sysctl-read)
 (allow mach-lookup)
@@ -1349,6 +1373,7 @@ fn macos_sandbox_profile(
         exe_dir = sbpl_subpath(exe_dir),
         tmp = sbpl_subpath(tmp),
         persistent_profiles = persistent_profiles,
+        shader_cache = shader_cache,
     )
 }
 

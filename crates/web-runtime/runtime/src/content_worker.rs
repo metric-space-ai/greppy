@@ -5302,6 +5302,11 @@ fn engine_preferences(proxy_uri: &str) -> Preferences {
     // until Servo ships a constant-time backend; getRandomValues/randomUUID
     // remain available on `crypto`.
     preferences.dom_crypto_subtle_enabled = false;
+    if let Some(threads) =
+        crate::limits::style_threads_for_host(crate::limits::effective_cpu_count())
+    {
+        preferences.layout_threads = threads;
+    }
     preferences
 }
 
@@ -5804,6 +5809,11 @@ mod serialize_tests {
             !preferences.dom_crypto_subtle_enabled,
             "Servo's vulnerable RSA-OAEP implementation must not be script-reachable"
         );
+        if crate::limits::effective_cpu_count() <= 1 {
+            assert_eq!(preferences.layout_threads, 1);
+        } else {
+            assert_eq!(preferences.layout_threads, 3);
+        }
     }
 
     #[test]

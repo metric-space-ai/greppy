@@ -14,6 +14,7 @@ const EDIT_VERIFY_HELP: &str = "Verification: --verify runs local syntax/build c
     name = "greppy",
     bin_name = "greppy",
     version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GREPPY_GIT_COMMIT"), ")"),
     about = "Code navigation for coding agents, with byte-exact real-grep passthrough for ordinary grep invocations.",
     long_about = None,
     after_help = "Agent modes:\n  greppy agent [\"INITIAL TASK\"] --model MODEL   Interactive TUI\n  greppy -p \"TASK\" --model MODEL                Headless one-shot",
@@ -35,6 +36,9 @@ pub struct Cli {
     pub root: Option<String>,
 
     /// Native inference backend for both embedded models.
+    /// `auto` uses the platform GPU and does not fall back to CPU.
+    /// `cpu` runs the built-in CPU kernels on a product binary; `--features cpu-only`
+    /// is a debug-only build and is not required for this flag.
     #[arg(long, global = true, value_name = "auto|cpu|metal|cuda[:INDEX]")]
     pub device: Option<String>,
 

@@ -1100,6 +1100,13 @@ impl Daemon {
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .or_else(|| request.session_id.clone());
+        if touches_page {
+            if let Some(id) = session_id.as_deref() {
+                if let Some(session) = self.sessions.get_mut(id) {
+                    session.begin_navigation();
+                }
+            }
+        }
         let network_scope = session_id.as_ref().map(|session_id| {
             let page = request
                 .payload
@@ -1222,7 +1229,7 @@ impl Daemon {
             }
             if let Some(session_id) = session_id.as_deref() {
                 if let Some(session) = self.sessions.get_mut(session_id) {
-                    let _ = session.transition(SessionState::Failed);
+                    release_navigation_budget(session);
                 }
             }
         }
@@ -1856,7 +1863,7 @@ impl Daemon {
                     )
                 })
             {
-                let _ = session.transition(SessionState::Failed);
+                release_navigation_budget(session);
                 return limit_error(request, message);
             }
             if let Err(message) = session.begin_operation(&request.request_id) {
@@ -4183,15 +4190,13 @@ impl Daemon {
                 session.limits.content_cpu_time,
                 "content",
             ) {
-                let _ = session.transition(SessionState::Failed);
-                Some(("limit", message))
+                Some(("budget", message))
             } else if let Err(message) = session.limits.check_cpu_time(
                 Duration::from_nanos(session.navigation_controller_cpu_ns),
                 session.limits.controller_cpu_time,
                 "controller",
             ) {
-                let _ = session.transition(SessionState::Failed);
-                Some(("limit", message))
+                Some(("budget", message))
             } else {
                 None
             }
@@ -4202,6 +4207,12 @@ impl Daemon {
                 // A session's elapsed-time quota says nothing about shared
                 // worker health, regardless of which operation discovers it.
                 // Refuse the expired session without destroying live tabs.
+                return Err(limit_error(request, message));
+            }
+            Some(("budget", message)) => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    release_navigation_budget(session);
+                }
                 return Err(limit_error(request, message));
             }
             Some(("limit", message)) => {
@@ -4336,6 +4347,7 @@ impl Daemon {
             });
         }
         if let Some(session) = self.sessions.get_mut(session_id) {
+            session.begin_navigation();
             if let Err(message) = session
                 .limits
                 .check_requests(session.requests.saturating_add(1))
@@ -4344,12 +4356,11 @@ impl Daemon {
             }
             if let Err(message) = session
                 .limits
-                .check_network_bytes(session.network_bytes, 4096)
+                .check_network_bytes(session.navigation_network_bytes, 4096)
             {
                 return Err(limit_error(request, message));
             }
             session.requests = session.requests.saturating_add(1);
-            session.network_bytes = session.network_bytes.saturating_add(4096);
         }
         self.engine_call("page.goto", json!({ "page": page, "url": url }))
             .map_err(|error| engine_error(request, error, 34))?;
@@ -4680,10 +4691,13 @@ impl Daemon {
             &Message::engine_call(request_id, method.to_owned(), params),
             timeout,
         ) {
-            if recover_worker {
-                let _ = self.recover_content(&format!("content send failed: {error}"));
+            let message = error.to_string();
+            // Refused before any byte is written, so the worker protocol is
+            // still aligned. Restarting here would drop the live page.
+            if recover_worker && !message.contains("encoded frame length") {
+                let _ = self.recover_content(&format!("content send failed: {message}"));
             }
-            return Err(error.to_string());
+            return Err(message);
         }
         // Diagnostic reads spend one bounded budget across send and receive.
         // Preserve the existing ordinary-call contract in this scoped change.
@@ -5374,6 +5388,13 @@ fn locator_error(request: &Request, message: impl Into<String>) -> Response {
     )
 }
 
+fn release_navigation_budget(session: &mut Session) {
+    session.begin_navigation();
+    if matches!(session.state, SessionState::Busy | SessionState::Failed) {
+        let _ = session.transition(SessionState::Ready);
+    }
+}
+
 fn limit_error(request: &Request, message: impl Into<String>) -> Response {
     Response::error(
         request,
@@ -5946,9 +5967,8 @@ fn gate_session_engine(
                 .check_requests(session.requests.saturating_add(1))?;
             session
                 .limits
-                .check_network_bytes(session.network_bytes, 4096)?;
+                .check_network_bytes(session.navigation_network_bytes, 4096)?;
             session.requests = session.requests.saturating_add(1);
-            session.network_bytes = session.network_bytes.saturating_add(4096);
         }
         _ => {}
     }
@@ -6083,15 +6103,11 @@ fn apply_record_limits(
     session.limits.check_download_bytes(0, download_bytes)?;
     session.console_bytes = console_bytes;
     session.download_bytes = download_bytes;
-    let recorded_network = records
-        .get("responses")
-        .and_then(|value| value.as_array())
-        .map(|rows| sum_byte_lengths(rows))
-        .unwrap_or(0);
-    if recorded_network > 0 {
-        let accounted = session.network_bytes.max(recorded_network);
-        session.limits.check_network_bytes(0, accounted)?;
-        session.network_bytes = accounted;
+    if let Some(rows) = records.get("responses").and_then(|value| value.as_array()) {
+        session.charge_new_responses(rows);
+        session
+            .limits
+            .check_network_bytes(0, session.navigation_network_bytes)?;
     }
     Ok(())
 }
@@ -6650,6 +6666,51 @@ mod redirect_chain_tests {
                 "content",
             )
             .is_ok());
+    }
+
+    #[test]
+    fn a_new_navigation_resets_the_network_budget_without_rebilling_old_responses() {
+        let mut sessions = std::collections::HashMap::new();
+        let mut session = super::Session::new("nav", "run", super::NetworkProfile::Research);
+        session.limits.max_network_bytes = 100;
+        session.transition(super::SessionState::Ready).unwrap();
+        sessions.insert("nav".to_owned(), session);
+        let first = json!({"responses":[{"requestId":"a","byteLength":80}]});
+        super::apply_record_limits(&mut sessions, "nav", &first).unwrap();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 80);
+        assert_eq!(sessions["nav"].network_bytes, 80);
+        let grown = json!({"responses":[
+            {"requestId":"a","byteLength":80},
+            {"requestId":"b","byteLength":40}
+        ]});
+        let exceeded = super::apply_record_limits(&mut sessions, "nav", &grown).unwrap_err();
+        assert!(exceeded.contains("network limit"), "{exceeded}");
+        assert_eq!(sessions["nav"].state, super::SessionState::Ready);
+        sessions.get_mut("nav").unwrap().begin_navigation();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 0);
+        assert_eq!(sessions["nav"].network_bytes, 120);
+        super::apply_record_limits(&mut sessions, "nav", &grown).unwrap();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 0);
+        let next = json!({"responses":[{"requestId":"c","byteLength":60}]});
+        super::apply_record_limits(&mut sessions, "nav", &next).unwrap();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 60);
+        assert_eq!(sessions["nav"].network_bytes, 180);
+        assert_ne!(sessions["nav"].state, super::SessionState::Failed);
+    }
+
+    #[test]
+    fn a_budget_failure_returns_the_session_to_ready() {
+        let mut session = super::Session::new("nav", "run", super::NetworkProfile::Research);
+        session.transition(super::SessionState::Ready).unwrap();
+        session.begin_operation("op").unwrap();
+        session.navigation_content_cpu_ns = 99;
+        session.navigation_network_bytes = 50;
+        session.transition(super::SessionState::Failed).unwrap();
+        super::release_navigation_budget(&mut session);
+        assert_eq!(session.state, super::SessionState::Ready);
+        assert_eq!(session.navigation_content_cpu_ns, 0);
+        assert_eq!(session.navigation_network_bytes, 0);
+        assert_eq!(session.content_cpu_used_ns, 0);
     }
 
     #[test]
