@@ -60,28 +60,24 @@ scratch dir (TMPDIR), the worktree's greppy store + lock namespace, and
 (or GREPPY_NO_SANDBOX=1) to disable. Repositories with submodules are not
 supported yet (the agent worktree cannot reset them safely).
 
-Localhost contract: greppy -p talks to a model gateway at GREPPY_ENDPOINT
-(default http://127.0.0.1:8317). The wire format is GREPPY_API_FORMAT /
---api-format: anthropic (Anthropic Messages, POST /v1/messages) or openai
-(Chat Completions, POST /v1/chat/completions). The default is auto, which
-stays on anthropic unless the endpoint path is exactly /v1/messages or
-/v1/chat/completions, so an existing CLIProxyAPI gateway does not change.
-The client has no TLS stack — only plain-HTTP endpoints are reachable;
-https is impossible. OpenAI and OpenRouter need a local TLS-terminating
-proxy (CLIProxyAPI is the standard, and it can also translate those
-providers onto the anthropic wire). vLLM, llama.cpp, Ollama, and LM Studio
-can be used directly when they listen on http:// under /v1.
+Localhost contract: greppy -p talks only to a local router over plain HTTP
+at GREPPY_ENDPOINT (default http://127.0.0.1:8317, CLIProxyAPI). The client
+has no TLS stack — https is impossible, and there is no direct cloud
+endpoint. The wire format is GREPPY_API_FORMAT / --api-format: anthropic
+(Anthropic Messages, POST /v1/messages) or openai (OpenAI Responses,
+POST /v1/responses). The default is auto, which stays on anthropic unless
+the endpoint path is exactly /v1/messages or /v1/responses, so an existing
+CLIProxyAPI gateway does not change. The router, not greppy, reaches whatever
+model sits behind it.
 
 Examples:
-  GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:11434/v1 \
-    GREPPY_MODEL=qwen2.5-coder greppy -p \"TASK\"
-  GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:1234/v1 \
-    GREPPY_MODEL=local-model greppy agent
-  GREPPY_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions \
-    GREPPY_MODEL=local greppy -p \"TASK\"
+  GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:8317/v1 \
+    GREPPY_MODEL=model-behind-router greppy -p \"TASK\"
+  GREPPY_ENDPOINT=http://127.0.0.1:8317/v1/responses \
+    GREPPY_MODEL=model-behind-router greppy agent
 
 GREPPY_MODEL / --model is the model id passed through unchanged. If the
-gateway requires an API key, set GREPPY_API_KEY. anthropic sends it as
+router requires an API key, set GREPPY_API_KEY. anthropic sends it as
 x-api-key and Authorization: Bearer; openai sends Authorization: Bearer
 only. There is no key flag on purpose — keys do not belong on the command
 line.
@@ -106,7 +102,7 @@ Flags:
                       http://127.0.0.1:8317)
   --api-format FORMAT anthropic, openai, or auto (env GREPPY_API_FORMAT;
                       default auto, which stays anthropic unless the
-                      endpoint path is /v1/messages or /v1/chat/completions)
+                      endpoint path is /v1/messages or /v1/responses)
   --max-turns N       Optional cap on action turns, followed by one tool-free
                       report turn (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
@@ -183,12 +179,12 @@ pub struct AgentArgs {
     #[arg(long, env = "GREPPY_MODEL")]
     pub model: Option<String>,
 
-    /// Gateway base URL (Anthropic Messages or OpenAI Chat Completions).
+    /// Local router base URL (Anthropic Messages or OpenAI Responses).
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
 
     /// Chat protocol. `auto` stays on Anthropic unless the endpoint path is
-    /// exactly `/v1/messages` or `/v1/chat/completions`.
+    /// exactly `/v1/messages` or `/v1/responses`.
     #[arg(
         long,
         env = "GREPPY_API_FORMAT",

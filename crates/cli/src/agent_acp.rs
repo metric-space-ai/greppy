@@ -94,14 +94,14 @@ impl Default for AcpConfig {
 #[derive(Parser, Debug)]
 #[command(
     name = "greppy agent stdio",
-    about = "Speak the Agent Client Protocol on stdin/stdout. The gateway is GREPPY_ENDPOINT / GREPPY_MODEL / GREPPY_API_KEY / GREPPY_API_FORMAT, the same plain-HTTP contract as greppy -p (anthropic or openai; no TLS).",
+    about = "Speak the Agent Client Protocol on stdin/stdout. The gateway is a local plain-HTTP router (GREPPY_ENDPOINT / GREPPY_MODEL / GREPPY_API_KEY / GREPPY_API_FORMAT; anthropic or openai Responses; no TLS).",
     disable_version_flag = true
 )]
 struct StdioArgs {
     /// Initial model id. `session/set_model` can replace it.
     #[arg(long, env = "GREPPY_MODEL")]
     model: Option<String>,
-    /// Gateway base URL (Anthropic Messages or OpenAI Chat Completions).
+    /// Local router base URL (Anthropic Messages or OpenAI Responses).
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
     /// `anthropic`, `openai`, or `auto` (default). See `greppy -p --help`.

@@ -1,7 +1,7 @@
 //! Blocking chat client for a plain-HTTP gateway.
 //!
-//! Speaks either Anthropic Messages or OpenAI Chat Completions. There is no
-//! TLS stack: the default base is `http://127.0.0.1:8317` (CLIProxyAPI).
+//! Speaks either Anthropic Messages or the OpenAI Responses API. There is no
+//! TLS stack: the default base is `http://127.0.0.1:8317` (a local router).
 //! Streaming is assembled into a single assistant [`Message`] plus stop
 //! reason and usage. The agent loop does not branch on the wire format.
 
@@ -144,10 +144,10 @@ impl Client {
         }
     }
 
-    /// Select Anthropic Messages, OpenAI Chat Completions, or path-based auto.
+    /// Select Anthropic Messages, the OpenAI Responses API, or path-based auto.
     ///
     /// `auto` stays on Anthropic unless the endpoint path is `/v1/messages` or
-    /// `/chat/completions`. That is the default, so existing gateways do not
+    /// `/v1/responses`. That is the default, so existing gateways do not
     /// change protocol.
     pub fn with_api_format(mut self, format: ApiFormatSetting) -> Self {
         self.api_format = format;
@@ -172,8 +172,8 @@ impl Client {
         next
     }
 
-    /// Attach a gateway API key, sent as both `x-api-key` and
-    /// `Authorization: Bearer` on every request (gateways accept either).
+    /// Attach a gateway API key. Anthropic sends `x-api-key` and
+    /// `Authorization: Bearer`. OpenAI Responses sends only the bearer token.
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         let key = key.into();
         self.api_key = if key.is_empty() { None } else { Some(key) };
@@ -190,7 +190,7 @@ impl Client {
     /// Apply the configured auth headers, if any, to a request.
     ///
     /// Anthropic gateways receive both `x-api-key` and `Authorization: Bearer`.
-    /// OpenAI Chat Completions receives only the bearer token. The key is never
+    /// OpenAI Responses receives only the bearer token. The key is never
     /// written into the body or into `Debug` output.
     fn authed(&self, req: ureq::Request) -> ureq::Request {
         match (&self.api_key, self.resolved_format()) {
@@ -237,7 +237,7 @@ impl Client {
         let mut body = match self.resolved_format() {
             ApiFormat::Anthropic => to_messages_request_body(req),
             ApiFormat::OpenAi => {
-                openai::to_chat_completions_body(req, self.openai_vision.load(Ordering::Relaxed))
+                openai::to_responses_body(req, self.openai_vision.load(Ordering::Relaxed))
             }
         };
         if req.max_tokens != u64::MAX {
@@ -268,7 +268,10 @@ impl Client {
             }
         };
         if let Some(limit) = limit {
-            body["max_tokens"] = serde_json::json!(limit);
+            match self.resolved_format() {
+                ApiFormat::Anthropic => body["max_tokens"] = serde_json::json!(limit),
+                ApiFormat::OpenAi => body["max_output_tokens"] = serde_json::json!(limit),
+            }
         }
         body
     }
@@ -1387,7 +1390,7 @@ mod tests {
             .with_api_key("sekrit-key");
         assert_eq!(
             client.completion_url(),
-            "http://127.0.0.1:11434/v1/chat/completions"
+            "http://127.0.0.1:11434/v1/responses"
         );
         assert_eq!(client.models_url(), "http://127.0.0.1:11434/v1/models");
         let debug = format!("{client:?}");

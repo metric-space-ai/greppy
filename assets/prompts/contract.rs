@@ -32,10 +32,11 @@ pub mod render;
 // deliver: make the edits with greppy and verify them; do not stop at an
 // analysis." v4: 12,900 bytes, SHA256 below. Adapter unchanged.
 // 2026-11-04: AGENT section only (excluded from every rendered builtin prompt
-// by without_section AGENT..CHAIN). Documents GREPPY_API_FORMAT openai|anthropic
-// for the plain-HTTP gateway. Rendered mode hashes are unchanged. 13,343 bytes.
+// by without_section AGENT..CHAIN). Documents the local plain-HTTP router and
+// GREPPY_API_FORMAT openai as the Responses API (POST /v1/responses). Rendered
+// mode hashes are unchanged. 13,372 bytes.
 pub const APPROVED_SHA256: &str =
-    "8db91a60e3ccdf3bb9eaf06f40274d203a8381783583e8d7cf9f426a28c7e79f";
+    "b8ef0c483a6534767daac9a04be27c1505e7e78e554af19f4ec4bd8c12e8255b";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // 2026-10-06 consolidated owner order A: exact coding-agent introduction,

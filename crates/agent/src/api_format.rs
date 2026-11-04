@@ -1,9 +1,9 @@
 //! Which chat protocol a gateway speaks.
 //!
 //! `auto` keeps today's Anthropic Messages default. A path selects a format
-//! only when it is exactly the Anthropic or OpenAI completion route; every
-//! other URL, including the historical `http://127.0.0.1:8317` gateway, stays
-//! on Anthropic so an existing endpoint does not change behavior.
+//! only when it is exactly `/v1/messages` or `/v1/responses`. Every other URL,
+//! including the historical `http://127.0.0.1:8317` gateway, stays on Anthropic
+//! so an existing endpoint does not change behavior.
 
 use crate::client::normalize_base_url;
 
@@ -13,7 +13,7 @@ pub enum ApiFormat {
     /// Anthropic Messages: `POST /v1/messages`.
     #[default]
     Anthropic,
-    /// OpenAI Chat Completions: `POST /v1/chat/completions`.
+    /// OpenAI Responses API: `POST /v1/responses`.
     OpenAi,
 }
 
@@ -55,9 +55,9 @@ pub struct ResolvedEndpoint {
 
 /// Resolve the completion and model-list URLs.
 ///
-/// A trailing `/v1`, `/v1/messages`, or `/v1/chat/completions` is the API
-/// suffix, not part of the origin. `http://127.0.0.1:11434/v1` therefore
-/// lists models at `/v1/models` rather than `/v1/v1/models`.
+/// A trailing `/v1`, `/v1/messages`, or `/v1/responses` is the API suffix,
+/// not part of the origin. `http://127.0.0.1:8317/v1` therefore lists models
+/// at `/v1/models` rather than `/v1/v1/models`.
 pub fn resolve_endpoint(base: &str, setting: ApiFormatSetting) -> ResolvedEndpoint {
     let base = normalize_base_url(base);
     let (without_query, _query) = split_query(&base);
@@ -69,7 +69,7 @@ pub fn resolve_endpoint(base: &str, setting: ApiFormatSetting) -> ResolvedEndpoi
     let origin = strip_api_suffix(without_query);
     let completion_path = match format {
         ApiFormat::Anthropic => "/v1/messages",
-        ApiFormat::OpenAi => "/v1/chat/completions",
+        ApiFormat::OpenAi => "/v1/responses",
     };
     ResolvedEndpoint {
         format,
@@ -91,8 +91,7 @@ pub fn plain_http_refusal(url: &str) -> Option<String> {
     } else if url.starts_with("https://") {
         Some(
             "plain HTTP only (no TLS stack): https endpoints are not reachable. \
-             Point GREPPY_ENDPOINT at an http:// gateway, or put the provider behind \
-             a local TLS-terminating proxy such as CLIProxyAPI."
+             GREPPY_ENDPOINT must be an http:// local router such as CLIProxyAPI."
                 .to_string(),
         )
     } else {
@@ -121,9 +120,10 @@ fn split_query(url: &str) -> (&str, &str) {
 }
 
 /// Unambiguous completion routes only. `/v1` alone is both protocols.
+/// OpenAI is selected only for the exact `/v1/responses` suffix.
 fn path_format_hint(url: &str) -> Option<ApiFormat> {
     let path = url_path(url).trim_end_matches('/');
-    if path.ends_with("/chat/completions") {
+    if path.ends_with("/v1/responses") {
         Some(ApiFormat::OpenAi)
     } else if path.ends_with("/v1/messages") {
         Some(ApiFormat::Anthropic)
@@ -134,15 +134,10 @@ fn path_format_hint(url: &str) -> Option<ApiFormat> {
 
 fn strip_api_suffix(url: &str) -> String {
     let path = url_path(url).trim_end_matches('/');
-    let stripped = [
-        "/v1/chat/completions",
-        "/chat/completions",
-        "/v1/messages",
-        "/v1",
-    ]
-    .iter()
-    .find_map(|suffix| path.strip_suffix(suffix))
-    .unwrap_or(path);
+    let stripped = ["/v1/responses", "/v1/messages", "/v1"]
+        .iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(path);
     let host = url_host(url);
     format!("{host}{stripped}")
 }
@@ -193,17 +188,20 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_path_selects_openai_only_when_auto() {
+    fn responses_path_selects_openai_only_when_auto() {
+        let got = resolved("http://127.0.0.1:8317/v1/responses", ApiFormatSetting::Auto);
+        assert_eq!(got.format, ApiFormat::OpenAi);
+        assert_eq!(got.completion_url, "http://127.0.0.1:8317/v1/responses");
+        assert_eq!(got.models_url, "http://127.0.0.1:8317/v1/models");
+    }
+
+    #[test]
+    fn chat_completions_path_does_not_select_openai() {
         let got = resolved(
             "http://127.0.0.1:8080/v1/chat/completions",
             ApiFormatSetting::Auto,
         );
-        assert_eq!(got.format, ApiFormat::OpenAi);
-        assert_eq!(
-            got.completion_url,
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
-        assert_eq!(got.models_url, "http://127.0.0.1:8080/v1/models");
+        assert_eq!(got.format, ApiFormat::Anthropic);
     }
 
     #[test]
@@ -223,10 +221,7 @@ mod tests {
             ApiFormatSetting::Explicit(ApiFormat::OpenAi),
         );
         assert_eq!(got.format, ApiFormat::OpenAi);
-        assert_eq!(
-            got.completion_url,
-            "http://127.0.0.1:8317/v1/chat/completions"
-        );
+        assert_eq!(got.completion_url, "http://127.0.0.1:8317/v1/responses");
     }
 
     #[test]
@@ -238,7 +233,7 @@ mod tests {
         assert_eq!(got.origin, "http://127.0.0.1:8317/openai");
         assert_eq!(
             got.completion_url,
-            "http://127.0.0.1:8317/openai/v1/chat/completions"
+            "http://127.0.0.1:8317/openai/v1/responses"
         );
         assert_eq!(got.models_url, "http://127.0.0.1:8317/openai/v1/models");
     }

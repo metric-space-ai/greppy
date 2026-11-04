@@ -4,8 +4,8 @@
 //! - [`protocol`] — model-agnostic request/response and stream event types.
 //! - [`wire`] — Anthropic Messages API request-body adapter and incremental
 //!   SSE parser (`/v1/messages`, `stream: true`).
-//! - [`openai`] — OpenAI Chat Completions adapter (`/v1/chat/completions`,
-//!   SSE `data:` chunks, tool results as `role: tool`).
+//! - [`openai`] — OpenAI Responses adapter (`/v1/responses`, named SSE
+//!   events, function calls as `function_call` / `function_call_output`).
 //! - [`client`] — blocking plain-HTTP client (no TLS) aimed at a gateway
 //!   (CLIProxyAPI-style, default `http://127.0.0.1:8317`). `GREPPY_API_FORMAT`
 //!   selects `anthropic` or `openai`; the default stays Anthropic.

@@ -1,4 +1,4 @@
-//! In-process OpenAI Chat Completions gateway. No external network.
+//! In-process OpenAI Responses gateway. No external network.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -138,44 +138,63 @@ fn openai_client(base: &str) -> Client {
 }
 
 const TOOL_SSE: &str = concat!(
-    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
-    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"greppy\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
-    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"args\\\":[\\\"who-calls\\\",\\\"clamp\\\"]}\"}}]},\"finish_reason\":null}]}\n\n",
-    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"greppy\",\"arguments\":\"{\\\"args\\\":[\\\"brief\\\",\\\"clamp\\\"]}\"}}]},\"finish_reason\":null}]}\n\n",
-    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
-    "data: [DONE]\n\n",
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"model\":\"fixture-model\"}}\n\n",
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
+    "event: response.output_item.added\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"greppy\",\"arguments\":\"\"}}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"args\\\":[\\\"who-calls\\\",\\\"clamp\\\"]}\"}\n\n",
+    "event: response.output_item.added\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"name\":\"greppy\",\"arguments\":\"\"}}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"args\\\":[\\\"brief\\\",\\\"clamp\\\"]}\"}\n\n",
+    "event: response.output_item.done\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\"}}\n\n",
+    "event: response.output_item.done\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\"}}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":3}}}}\n\n",
 );
 
 #[test]
-fn chat_completions_round_trip_builds_tools_and_parses_parallel_calls() {
+fn responses_round_trip_builds_tools_and_parses_parallel_calls() {
     let (base, server) = spawn(vec![("200 OK", "text/event-stream", TOOL_SSE)]);
     let client = openai_client(&base);
     let mut events = Vec::new();
     let turn = client
         .stream_turn(&request(), &mut |event| events.push(event))
-        .unwrap();
+        .unwrap_or_else(|error| panic!("stream failed: {error}\nevents={events:#?}"));
     let captured = server.join().unwrap();
     assert_eq!(captured.len(), 1);
     let got = &captured[0];
-    assert_eq!(got.path, "/v1/chat/completions");
+    assert_eq!(got.path, "/v1/responses");
     assert_eq!(got.authorization, "Bearer sekrit-key");
     assert!(got.x_api_key.is_empty(), "openai must not send x-api-key");
     let rendered = got.body.to_string();
     assert!(!rendered.contains("sekrit-key"));
     assert_eq!(got.body["model"], "fixture-model");
+    assert_eq!(got.body["instructions"], "be brief");
     assert_eq!(got.body["stream"], true);
-    assert_eq!(got.body["max_tokens"], 32);
+    assert_eq!(got.body["store"], false);
+    assert_eq!(got.body["max_output_tokens"], 32);
+    assert!(got.body.get("max_tokens").is_none());
+    assert!(got.body.get("messages").is_none());
     assert_eq!(got.body["tool_choice"], "auto");
-    assert_eq!(got.body["tools"][0]["function"]["name"], "greppy");
-    let messages = got.body["messages"].as_array().unwrap();
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[2]["role"], "assistant");
-    assert_eq!(messages[2]["tool_calls"][0]["id"], "call_prev");
-    assert_eq!(messages[3]["role"], "tool");
-    assert_eq!(messages[3]["tool_call_id"], "call_prev");
-    assert_eq!(messages[3]["content"], "screenshot attached");
+    assert_eq!(got.body["tools"][0]["type"], "function");
+    assert_eq!(got.body["tools"][0]["name"], "greppy");
+    let input = got.body["input"].as_array().unwrap();
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"][0]["type"], "input_text");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_prev");
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_prev");
+    assert_eq!(input[2]["output"], "screenshot attached");
+    assert_eq!(input[3]["content"][1]["type"], "input_image");
     assert_eq!(
-        messages[4]["content"][1]["image_url"]["url"],
+        input[3]["content"][1]["image_url"],
         "data:image/png;base64,AAAA"
     );
 
@@ -209,8 +228,10 @@ fn chat_completions_round_trip_builds_tools_and_parses_parallel_calls() {
 fn error_json_is_an_http_failure_and_vision_rejection_retries_without_images() {
     let error = r#"{"error":{"message":"model does not support image input","type":"invalid_request_error"}}"#;
     let ok = concat!(
-        "data: {\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n",
-        "data: [DONE]\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"model\":\"fixture-model\",\"delta\":\"text only\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
     );
     let (base, server) = spawn(vec![
         ("400 Bad Request", "application/json", error),
@@ -220,9 +241,9 @@ fn error_json_is_an_http_failure_and_vision_rejection_retries_without_images() {
     let turn = client.stream_turn(&request(), &mut |_| {}).unwrap();
     let captured = server.join().unwrap();
     assert_eq!(captured.len(), 2);
-    assert!(captured[0].body.to_string().contains("image_url"));
+    assert!(captured[0].body.to_string().contains("input_image"));
     let retry = captured[1].body.to_string();
-    assert!(!retry.contains("image_url"), "{retry}");
+    assert!(!retry.contains("input_image"), "{retry}");
     assert!(!retry.contains("AAAA"), "{retry}");
     assert!(retry.contains("model does not accept image input"));
     assert_eq!(
@@ -251,16 +272,18 @@ fn non_vision_error_is_returned_and_not_retried() {
 }
 
 #[test]
-fn path_auto_detects_chat_completions() {
+fn path_auto_detects_responses() {
     let (base, server) = spawn(vec![(
         "200 OK",
         "text/event-stream",
         concat!(
-            "data: {\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"model\":\"fixture-model\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
         ),
     )]);
-    let client = Client::new(&format!("{base}/v1/chat/completions"), "fixture-model");
+    let client = Client::new(&format!("{base}/v1/responses"), "fixture-model");
     assert_eq!(client.resolved_format(), ApiFormat::OpenAi);
     let turn = client
         .stream_turn(
@@ -275,7 +298,7 @@ fn path_auto_detects_chat_completions() {
             &mut |_| {},
         )
         .unwrap();
-    assert_eq!(server.join().unwrap()[0].path, "/v1/chat/completions");
+    assert_eq!(server.join().unwrap()[0].path, "/v1/responses");
     assert_eq!(
         turn.message.content,
         vec![ContentPart::Text { text: "ok".into() }]

@@ -440,30 +440,26 @@ is restored.
 
 ### Model gateway
 
-`greppy agent` and `greppy -p` call a local HTTP gateway. The default wire is
-Anthropic Messages (`POST /v1/messages`) at `GREPPY_ENDPOINT` (default
+`greppy agent` and `greppy -p` call a local router over plain HTTP. The default
+wire is Anthropic Messages (`POST /v1/messages`) at `GREPPY_ENDPOINT` (default
 `http://127.0.0.1:8317`, CLIProxyAPI). Set `GREPPY_API_FORMAT=openai` or
-`--api-format openai` for Chat Completions (`POST /v1/chat/completions`).
-`auto` (the default) selects `openai` only when the endpoint path is
-`/v1/chat/completions`, and `anthropic` when it is `/v1/messages`. Every other
+`--api-format openai` for the OpenAI Responses API (`POST /v1/responses`) on
+that same router. `auto` (the default) selects `openai` only when the endpoint
+path is `/v1/responses`, and `anthropic` when it is `/v1/messages`. Every other
 URL stays on the Anthropic wire, so an existing gateway does not change.
 
-The client has no TLS stack. OpenAI and OpenRouter need a local
-TLS-terminating HTTP proxy. vLLM, llama.cpp, Ollama, and LM Studio can be
-used directly on `http://…/v1`.
+The client has no TLS stack and does not call a cloud endpoint. `https://`
+fails before any connection. The model behind the router is the router's
+business; greppy only dials the local `http://` router.
 
 ```bash
-# Ollama
-GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:11434/v1 \
-  GREPPY_MODEL=qwen2.5-coder greppy -p "TASK"
+# Responses API on the local router
+GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:8317/v1 \
+  GREPPY_MODEL=model-behind-router greppy -p "TASK"
 
-# LM Studio
-GREPPY_API_FORMAT=openai GREPPY_ENDPOINT=http://127.0.0.1:1234/v1 \
-  GREPPY_MODEL=local-model greppy agent
-
-# llama.cpp or vLLM; the path selects openai when the format is auto
-GREPPY_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions \
-  GREPPY_MODEL=local greppy -p "TASK"
+# The path selects openai when the format is auto
+GREPPY_ENDPOINT=http://127.0.0.1:8317/v1/responses \
+  GREPPY_MODEL=model-behind-router greppy agent
 ```
 
 `GREPPY_API_KEY` is sent as `Authorization: Bearer` for `openai`, and as both

@@ -123,10 +123,10 @@ AGENT:
 
 The task does not edit the working checkout. Review with git show <ref>, apply with
 git cherry-pick -n <ref>. greppy -p --help describes gateway setup. The gateway is
-GREPPY_ENDPOINT (default http://127.0.0.1:8317, plain HTTP, no TLS).
-GREPPY_API_FORMAT=anthropic|openai selects Anthropic Messages or OpenAI Chat
-Completions; auto (the default) stays anthropic unless the endpoint path is
-/v1/chat/completions or /v1/messages. GREPPY_MODEL / --model is the model id.
+a local router at GREPPY_ENDPOINT (default http://127.0.0.1:8317, plain HTTP, no TLS,
+no cloud endpoint). GREPPY_API_FORMAT=anthropic|openai selects Anthropic Messages or
+the OpenAI Responses API (POST /v1/responses). auto stays anthropic unless the path
+is /v1/responses or /v1/messages. GREPPY_MODEL / --model is the model id.
 GREPPY_API_KEY is a bearer token for openai and is never a flag.
 
 CHAIN:
