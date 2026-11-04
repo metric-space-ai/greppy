@@ -5444,10 +5444,12 @@ fn model_facing_source(
     if let Some(text) = source
         .get("text")
         .and_then(|value| value.as_str())
-        .map(str::to_owned)
     {
-        let truncated = text.chars().count() > MODEL_TEXT_CHARS;
-        let snippet: String = text.chars().take(MODEL_TEXT_CHARS).collect();
+        // Inspect only the bounded prefix. Counting every character and
+        // cloning the whole artifact here made even a 4 KiB answer pay for
+        // another complete multi-megabyte text pass and allocation.
+        let truncate_at = text.char_indices().nth(MODEL_TEXT_CHARS).map(|(byte, _)| byte);
+        let truncated = truncate_at.is_some();
         if truncated {
             let digest_ok = source
                 .get("digest")
@@ -5460,7 +5462,9 @@ fn model_facing_source(
             }
         }
         if let Some(object) = source.as_object_mut() {
-            object.insert("text".into(), json!(snippet));
+            if let (Some(end), Some(Value::String(text))) = (truncate_at, object.get_mut("text")) {
+                text.truncate(end);
+            }
             object.insert("text_truncated".into(), json!(truncated));
             if truncated {
                 object.insert("full_text".into(), json!("artifact"));
@@ -6748,6 +6752,20 @@ mod redirect_chain_tests {
         assert_eq!(compact["path"], "objects/sha256/abc");
         assert_eq!(compact["label"], "web.read");
         assert_eq!(compact["redaction_status"], "not_redacted");
+    }
+
+    #[test]
+    fn model_facing_source_preserves_unicode_at_the_character_boundary() {
+        let manifest = sample_manifest(false, "abc");
+        for (length, truncated) in [(4095, false), (4096, false), (4097, true)] {
+            let compact = super::model_facing_source(
+                json!({"text": "🦀".repeat(length), "digest": "abc"}),
+                &manifest,
+            ).unwrap();
+            assert_eq!(compact["text"], "🦀".repeat(length.min(4096)));
+            assert_eq!(compact["text_truncated"], truncated);
+            assert_eq!(compact["full_text"].is_null(), !truncated);
+        }
     }
 
     #[test]
