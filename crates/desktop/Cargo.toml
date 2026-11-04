@@ -29,6 +29,8 @@ agent-desktop-core = { git = "https://github.com/vercel-labs/agent-desktop", tag
 agent-desktop-linux = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Calls libc::proc_bsdshortinfo. Cargo.lock must keep libc >= 0.2.189
+# (the version agent-desktop v1.1.0 locks). See THIRD_PARTY.md.
 agent-desktop-macos = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
 
 [target.'cfg(target_os = "windows")'.dependencies]

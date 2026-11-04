@@ -144,6 +144,41 @@ mod tests {
     }
 
     #[test]
+    fn locked_libc_defines_macos_proc_bsdshortinfo() {
+        // agent-desktop-macos calls libc::proc_bsdshortinfo and
+        // PROC_PIDT_SHORTBSDINFO. Those symbols exist from libc 0.2.187.
+        // agent-desktop v1.1.0 locks 0.2.189; an older workspace lock fails
+        // the macOS build. See THIRD_PARTY.md.
+        let lock = include_str!("../../../Cargo.lock");
+        let mut version = None;
+        let mut after_name = false;
+        for line in lock.lines() {
+            if line == "name = \"libc\"" {
+                after_name = true;
+                continue;
+            }
+            if after_name {
+                if let Some(rest) = line.strip_prefix("version = \"") {
+                    version = Some(rest.trim_end_matches('"').to_owned());
+                    break;
+                }
+            }
+            if after_name && line.starts_with("name = ") {
+                break;
+            }
+        }
+        let version = version.expect("libc package in Cargo.lock");
+        let mut parts = version.split('.');
+        let major: u64 = parts.next().unwrap().parse().unwrap();
+        let minor: u64 = parts.next().unwrap().parse().unwrap();
+        let patch: u64 = parts.next().unwrap().parse().unwrap();
+        assert!(
+            (major, minor, patch) >= (0, 2, 189),
+            "libc {version} is older than agent-desktop v1.1.0; macOS needs proc_bsdshortinfo"
+        );
+    }
+
+    #[test]
     fn platform_adapters_are_target_cfg_dependencies_only() {
         let manifest = include_str!("../Cargo.toml");
         let unconditional = target_table_after(manifest, "[dependencies]");

@@ -172,6 +172,17 @@ all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
   `cargo tree -p greppy-desktop --target <triple>`. The test
   `platform_adapters_are_target_cfg_dependencies_only` refuses an
   unconditional platform dependency.
+- Audit: Linux AT-SPI brings `zvariant` (RUSTSEC-2026-0370), `zbus_names`
+  (RUSTSEC-2026-0371), and `zvariant_derive` (RUSTSEC-2026-0372). RustSec
+  marks those crates unmaintained. They are not vulnerabilities. The audit
+  workflow ignores those three IDs; the removal condition is in SECURITY.md.
+  Re-check the list when this pin moves.
+- libc: `Cargo.lock` keeps workspace `libc` at 0.2.189 or newer, matching
+  the lock in agent-desktop v1.1.0. `agent-desktop-macos` calls
+  `proc_bsdshortinfo` and `PROC_PIDT_SHORTBSDINFO`, which libc 0.2.186 does
+  not define. The requirement stays `libc = "0.2"`. The test
+  `locked_libc_defines_macos_proc_bsdshortinfo` fails if the lock drops below
+  0.2.189.
 
 #### Updating the pin
 
