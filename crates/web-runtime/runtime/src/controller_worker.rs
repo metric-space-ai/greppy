@@ -413,6 +413,7 @@ extension!(
 );
 
 pub fn run() -> io::Result<()> {
+    crate::supervisor::detach_when_parent_dies();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

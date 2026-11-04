@@ -6732,6 +6732,7 @@ fn trace_startup(stage: &str) {
 }
 
 pub fn run() -> io::Result<()> {
+    crate::supervisor::detach_when_parent_dies();
     trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
     trace_startup("sandbox");

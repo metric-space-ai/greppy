@@ -455,8 +455,35 @@ impl Drop for Supervisor {
                 .unwrap_or_else(|error| error.into_inner())
                 .insert(self.run_id.clone());
             eprintln!("web-runtime: phase harness-drop ESCALATION pid={pid}");
+            // SIGTERM runs the supervisor handler, which SIGKILLs worker
+            // process groups. SIGKILL of this pid alone leaves those groups
+            // behind, and the next start blocks behind them.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            let kill_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < kill_deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => {
+                        reaped = true;
+                        break;
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        }
+        if !reaped {
             let _ = self.child.kill();
-            let _ = self.child.try_wait();
+            let kill_deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < kill_deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => {
+                        reaped = true;
+                        break;
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(20)),
+                }
+            }
         }
         eprintln!("web-runtime: phase harness-drop done pid={pid} reaped={reaped}");
         let _ = std::fs::remove_file(&self.socket);
@@ -1128,6 +1155,53 @@ impl Drop for NavigationLifecycleFixture {
     }
 }
 
+fn accept_as_blocking(stream: &std::net::TcpStream) {
+    // macOS and other BSDs copy the listener's O_NONBLOCK onto the accepted
+    // socket. Linux does not. Clearing it makes the read timeout wait for the
+    // request instead of returning EAGAIN immediately.
+    let _ = stream.set_nonblocking(false);
+}
+
+#[test]
+fn accepted_socket_reads_request_that_arrives_after_accept() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream
+            .write_all(b"GET /parser-gate.js HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .unwrap();
+    });
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    };
+    accept_as_blocking(&stream);
+    let mut stream = stream;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buffer = [0_u8; 256];
+    let n = stream
+        .read(&mut buffer)
+        .expect("request that arrives after accept must be readable");
+    let request = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        request.contains("/parser-gate.js"),
+        "late request was lost: {request}"
+    );
+    client.join().unwrap();
+}
+
 fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1156,6 +1230,9 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                 }
                 Err(_) => break,
             };
+            // BSD accept copies O_NONBLOCK from the listener. A read then
+            // returns EAGAIN (os error 35) before the request bytes arrive.
+            accept_as_blocking(&stream);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
             let events_tx = events_tx.clone();
@@ -2204,6 +2281,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    accept_as_blocking(&stream);
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
