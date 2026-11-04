@@ -895,7 +895,7 @@ fn try_qualified_file_fallback(
             format!(" (`{name}` not found; first lines)")
         }
     );
-    print!("{}", read_numbered_lines(&body, start));
+    print!("{}", read_numbered_lines(body, start));
     if !body.ends_with('\n') {
         println!();
     }
@@ -1043,7 +1043,6 @@ const READ_SMART_EXPAND_WHOLE_LINES: usize = 150;
 /// `read PATH` prints the file in the `read-file` format up to
 /// [`READ_FILE_DEFAULT_WINDOW`] lines. Longer indexed files keep the outline
 /// and name `read-file --lines`.
-
 #[expect(
     clippy::too_many_arguments,
     reason = "keeps the read compatibility decisions at one dispatch boundary"

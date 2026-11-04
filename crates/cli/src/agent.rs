@@ -637,7 +637,7 @@ fn resolve_headless_session_record(
 
 /// Isolated worktree (default) or the caller's checkout (`--in-place`).
 enum ActiveWorkspace {
-    Isolated(AgentWorkspace),
+    Isolated(Box<AgentWorkspace>),
     InPlace(InPlaceWorkspace),
 }
 
@@ -828,7 +828,7 @@ fn run_agent(
     let workspace = match if args.in_place {
         InPlaceWorkspace::create(&cwd, &run_id).map(ActiveWorkspace::InPlace)
     } else {
-        AgentWorkspace::create(&cwd, &run_id).map(ActiveWorkspace::Isolated)
+        AgentWorkspace::create(&cwd, &run_id).map(|workspace| ActiveWorkspace::Isolated(Box::new(workspace)))
     } {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {
