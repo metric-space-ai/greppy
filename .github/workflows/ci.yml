@@ -284,7 +284,7 @@ jobs:
       # GPU backend — and it must say so out loud rather than drift into a
       # silent CPU build.
       - name: Build default product binary with real assets
-        run: cargo build -p greppy --bin greppy ${{ runner.os == 'Windows' && '--features cpu-only' || '' }}
+        run: cargo build -p greppy --bin greppy --features ${{ runner.os == 'Windows' && 'cpu-only' || runner.os == 'macOS' && 'metal' || 'cuda' }}
 
       - name: Real CPU embedding inference gates
         run: |

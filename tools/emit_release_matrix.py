@@ -1,8 +1,9 @@
 """Choose the official production release matrix.
 
-Production packages are limited to macOS arm64 with Metal and Linux x86_64
-with CUDA. The static matrix retains other rows for debug/CI and historical
-artifact-contract compatibility, but this script never emits them for release.
+Production packages are macOS arm64 with Metal, Linux x86_64 with CUDA, and
+Linux x86_64 with the CPU feature. The static matrix retains other rows for
+debug/CI and historical artifact-contract compatibility, but this script
+never emits them for release.
 """
 
 from __future__ import annotations
@@ -19,12 +20,13 @@ SECRET_ENV = (
     "WINDOWS_CERTIFICATE_PASSWORD",
 )
 PRODUCTION_RELEASE_NAMES = {
-    "build": frozenset(("macos-arm64", "linux-x86_64")),
-    "verify": frozenset(("macos-arm64", "linux-x86_64-no-toolkit")),
+    "build": frozenset(("macos-arm64", "linux-x86_64", "linux-x86_64-cpu")),
+    "verify": frozenset(("macos-arm64", "linux-x86_64-no-toolkit", "linux-x86_64-cpu")),
 }
 PRODUCTION_BUILD_FEATURES = {
     "macos-arm64": "metal",
     "linux-x86_64": "cuda",
+    "linux-x86_64-cpu": "cpu",
 }
 
 
@@ -35,8 +37,8 @@ def signing_enabled(environ: dict[str, str] | None = None) -> bool:
 
 def filtered_includes(enabled: bool, matrix: dict | None = None) -> dict[str, list]:
     # Keep ``enabled`` in the interface because the workflow still records
-    # signing readiness for diagnostics. Signing readiness does not make a
-    # CPU-only package eligible for an official production release.
+    # signing readiness for diagnostics. Signing readiness does not add the
+    # historical Windows row. The Linux CPU package is its own matrix row.
     del enabled
     if matrix is None:
         path = Path(__file__).with_name("release_matrix.json")

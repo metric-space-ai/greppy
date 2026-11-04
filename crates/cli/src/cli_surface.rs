@@ -36,9 +36,10 @@ pub struct Cli {
     pub root: Option<String>,
 
     /// Native inference backend for both embedded models.
-    /// `auto` uses the platform GPU and does not fall back to CPU.
-    /// `cpu` runs the built-in CPU kernels on a product binary; `--features cpu-only`
-    /// is a debug-only build and is not required for this flag.
+    /// `auto` uses CUDA or Metal when this binary was built with that feature,
+    /// and the CPU kernels otherwise. `cpu` always runs the CPU kernels.
+    /// `--features cpu` is a release feature; a plain `cargo build --release`
+    /// without `cuda` or `metal` is the same CPU product.
     #[arg(long, global = true, value_name = "auto|cpu|metal|cuda[:INDEX]")]
     pub device: Option<String>,
 

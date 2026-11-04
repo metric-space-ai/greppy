@@ -94,19 +94,19 @@ fn main() {
     let prompt_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     prompt_contract::write_snapshots(&prompt_root, &prompt_out).unwrap_or_else(|e| panic!("{e}"));
     let profile = std::env::var("PROFILE").expect("PROFILE");
-    let debug_info = std::env::var("DEBUG").as_deref() == Ok("true");
     println!("cargo:rustc-check-cfg=cfg(greppy_debug_profile)");
     if profile == "debug" {
         println!("cargo:rustc-cfg=greppy_debug_profile");
     }
-    if std::env::var_os("CARGO_FEATURE_CPU_ONLY").is_some()
-        && !build_policy::cpu_only_allowed(&profile, debug_info)
+    // `cpu` / `cpu-only` are release features. A host without nvcc builds the
+    // CPU product with `cargo build --release` or `--features cpu`.
+    if (std::env::var_os("CARGO_FEATURE_CPU").is_some()
+        || std::env::var_os("CARGO_FEATURE_CPU_ONLY").is_some())
+        && !build_policy::cpu_feature_allowed(&profile)
     {
         panic!(
-            "cpu-only is restricted to Cargo's debug profile; Greppy product builds require \
-             Metal on macOS or CUDA/nvcc on Linux x86_64. A release binary still accepts \
-             --device cpu at runtime; that flag selects the CPU kernels compiled into the \
-             product binary and does not enable this cargo feature"
+            "the cpu feature is supported in the debug, release, and release-cpu profiles; \
+             profile {profile} is not one of them"
         );
     }
 

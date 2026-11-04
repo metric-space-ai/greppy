@@ -48,17 +48,10 @@ pub use metal::model::{MetalEmbeddingModel, MetalForwardProfile};
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 pub use cuda::model::{CudaEmbeddingModel, CudaForwardProfile};
 
-/// Whether this build carries a GPU backend for the current target. Callers
-/// assert on it at compile time: a CPU-only binary is twenty times slower at
-/// exactly the work greppy does on every query, and nothing fails when it is
-/// missing — it just gets slow, which is why it has to be caught by the
-/// compiler rather than noticed later.
-/// CUDA additionally requires that the kernels were actually compiled: the
-/// `cuda` feature is enabled unconditionally on Linux/Windows by a target
-/// dependency, so the feature alone says only that a backend was *wanted*.
-/// `embed_native_has_cuda_dylib` is set by the build script when nvcc produced
-/// the dylib, which is what makes a missing toolchain surface as the honest
-/// "no GPU backend for this target" error instead of a silent CPU build.
+/// Whether this build carries a GPU backend for the current target.
+/// CUDA is not implied by the target: the feature has to be requested, and
+/// `embed_native_has_cuda_dylib` is set only after nvcc produces the dylib.
+/// A release build that does not request `cuda` or `metal` is the CPU product.
 pub const HAS_GPU_BACKEND: bool = cfg!(any(
     all(feature = "metal", target_os = "macos"),
     all(
@@ -280,10 +273,17 @@ impl EmbeddingGemma {
     /// Metal and CUDA compute the same intermediates but do not surface them,
     /// so shipping a head that needs them requires exposing them there too.
     pub fn line_states(&self, lines: &[String]) -> Result<Vec<Vec<f32>>> {
-        let EmbeddingBackend::Cpu(model) = &self.backend else {
-            return Err(Error::InvalidGguf(
-                "line_states needs per-token states, which only the CPU backend exposes".into(),
-            ));
+        let model = match &self.backend {
+            EmbeddingBackend::Cpu(model) => model,
+            #[cfg(any(
+                all(feature = "metal", target_os = "macos"),
+                all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
+            ))]
+            _ => {
+                return Err(Error::InvalidGguf(
+                    "line_states needs per-token states, which only the CPU backend exposes".into(),
+                ));
+            }
         };
         // The window is a TOKEN budget, not a line count. 64 lines of build
         // output measured 4600 tokens against a 2048 position limit — lines are

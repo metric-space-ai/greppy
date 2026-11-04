@@ -43,6 +43,13 @@ BUILD_ENVIRONMENTS = {
         "runner_arch": "X64",
         "rust_host": "x86_64-unknown-linux-gnu",
     },
+    "build-environment-linux-x86_64-cpu.json": {
+        "matrix_name": "linux-x86_64-cpu",
+        "build_features": "cpu",
+        "runner_os": "Linux",
+        "runner_arch": "X64",
+        "rust_host": "x86_64-unknown-linux-gnu",
+    },
     "build-environment-windows-x86_64.json": {
         "matrix_name": "windows-x86_64",
         "build_features": "cpu-only",

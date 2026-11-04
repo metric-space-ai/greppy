@@ -24,6 +24,17 @@
       "cuda_non_cuda_sub_packages": "[\"libcublas\", \"libcublas-dev\"]"
     },
     {
+      "name": "linux-x86_64-cpu",
+      "os": "ubuntu-22.04",
+      "asset": "greppy-linux-x86_64-cpu.deb",
+      "secondary_asset": "greppy-linux-x86_64-cpu.rpm",
+      "features": "cpu",
+      "footprint_devices": "",
+      "runner_os": "Linux",
+      "runner_arch": "X64",
+      "rust_host": "x86_64-unknown-linux-gnu"
+    },
+    {
       "name": "windows-x86_64",
       "os": "windows-2022",
       "asset": "greppy-windows-x86_64.msi",
@@ -46,6 +57,13 @@
       "os": "ubuntu-22.04",
       "asset": "greppy-linux-x86_64.deb",
       "secondary_asset": "greppy-linux-x86_64.rpm",
+      "rust_host": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "name": "linux-x86_64-cpu",
+      "os": "ubuntu-22.04",
+      "asset": "greppy-linux-x86_64-cpu.deb",
+      "secondary_asset": "greppy-linux-x86_64-cpu.rpm",
       "rust_host": "x86_64-unknown-linux-gnu"
     },
     {

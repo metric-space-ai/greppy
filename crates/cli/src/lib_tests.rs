@@ -217,7 +217,7 @@ fn base_build_owner_watchdog_retries_interrupted_reads() {
     assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
-#[cfg(not(feature = "cpu-only"))]
+#[cfg(all(any(feature = "cuda", feature = "metal"), not(feature = "cpu")))]
 #[test]
 fn product_build_contains_embedding_and_summary_gpu_backends() {
     const {

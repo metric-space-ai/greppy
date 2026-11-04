@@ -424,7 +424,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 28)
+        self.assertEqual(len(names), 35)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
@@ -439,9 +439,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         # out of band (hours-long CPU index on the hosted runner), and the
         # edit-regime coding benchmark publishes per commit but does not gate.
         self.assertNotIn("runtime-footprint-windows-x86_64-cpu.json", names)
-        # Product builds refuse CPU inference and the hosted Linux runner has no
-        # GPU: the CUDA package's inference acceptance runs on the CUDA lane.
+        # The CPU package is an installable asset. Its multi-hour footprint is
+        # not a release gate; CUDA inference acceptance stays on the CUDA lane.
         self.assertNotIn("runtime-footprint-linux-x86_64-cpu.json", names)
+        self.assertIn("greppy-linux-x86_64-cpu.deb", names)
         self.assertNotIn("greppy-agent-benchmark.tar.gz", names)
         self.assertNotIn("greppy-agent-benchmark.tar.gz.sha256", names)
         self.assertNotIn("greppy-coding-benchmark.tar.gz", names)
@@ -513,7 +514,8 @@ class ReleaseArtifactTests(unittest.TestCase):
                 "windows-x86_64", [row["name"] for row in with_signing[key]]
             )
         self.assertEqual(
-            [row["features"] for row in with_signing["build"]], ["metal", "cuda"]
+            [row["features"] for row in with_signing["build"]],
+            ["metal", "cuda", "cpu"],
         )
         output = self.root / "release-matrix-output"
         matrix_emit.write_github_output(
@@ -523,11 +525,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertEqual(emitted["enabled"], "true")
         self.assertEqual(
             [row["name"] for row in json.loads(emitted["build_include"])],
-            ["macos-arm64", "linux-x86_64"],
+            ["macos-arm64", "linux-x86_64", "linux-x86_64-cpu"],
         )
         self.assertEqual(
             [row["name"] for row in json.loads(emitted["verify_include"])],
-            ["macos-arm64", "linux-x86_64-no-toolkit"],
+            ["macos-arm64", "linux-x86_64-no-toolkit", "linux-x86_64-cpu"],
         )
         invalid_matrix = json.loads(
             (REPOSITORY_ROOT / "tools/release_matrix.json").read_text(

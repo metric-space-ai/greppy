@@ -25,25 +25,18 @@ compile_error!("ci-test-assets is forbidden outside debug/test builds");
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(all(feature = "cpu-only", not(greppy_debug_profile)))]
-compile_error!(
-    "the Greppy CLI cannot be built outside Cargo's debug profile with `cpu-only`; supported product targets \
-     are macOS with Metal and Linux x86_64 with CUDA/nvcc. `cpu-only` is restricted to \
-     debug and numerical-reference use"
-);
-
 #[cfg(test)]
 mod build_policy;
 
-/// Product binaries require compiled GPU implementations for both inference
-/// workloads. The CUDA constants include the build-script signal emitted only
-/// after nvcc creates the shared backend, so a requested feature is not enough.
-#[cfg(not(feature = "cpu-only"))]
+/// A build that requests CUDA or Metal must contain the compiled backend.
+/// Plain `cargo build --release` requests neither and is the CPU product, as
+/// is `--features cpu` (and the older name `--features cpu-only`).
+#[cfg(all(any(feature = "cuda", feature = "metal"), not(feature = "cpu")))]
 const _: () = assert!(
     greppy_embed_native::HAS_GPU_BACKEND && greppy_qwen35_native::HAS_GPU_BACKEND,
-    "Greppy requires compiled GPU backends for both embeddings and summaries. \
-     Supported product targets are macOS with Metal and Linux x86_64 with CUDA/nvcc; \
-     `cpu-only` is restricted to debug and numerical-reference use"
+    "this build requests CUDA or Metal, but the compiled backend is missing. \
+     Install nvcc (Linux) or the Metal toolchain (macOS), or build the CPU release \
+     with --features cpu. A plain cargo build --release without those features is CPU."
 );
 
 // Route this module's stdout through one optional collector. Query commands
@@ -2430,25 +2423,25 @@ mod optional_workspace_status_tests {
 }
 
 fn embed_daemon_busy_message() -> &'static str {
-    #[cfg(feature = "cpu-only")]
+    #[cfg(feature = "cpu")]
     {
         "EmbeddingGemma daemon remained busy until the request deadline; \
          retry, or run with --device cpu to bypass the shared daemon"
     }
-    #[cfg(not(feature = "cpu-only"))]
+    #[cfg(not(feature = "cpu"))]
     {
         "EmbeddingGemma daemon remained busy until the request deadline; retry shortly"
     }
 }
 
 fn embed_daemon_failed_message() -> &'static str {
-    #[cfg(feature = "cpu-only")]
+    #[cfg(feature = "cpu")]
     {
         "EmbeddingGemma daemon answered faulted while holding the model; \
          it recovers on its idle TTL — retry shortly, or run with \
          --device cpu to bypass it"
     }
-    #[cfg(not(feature = "cpu-only"))]
+    #[cfg(not(feature = "cpu"))]
     {
         "EmbeddingGemma daemon answered faulted while holding the model; \
          it recovers on its idle TTL — retry shortly"
