@@ -1574,6 +1574,54 @@ impl ContentEngine {
         }
     }
 
+    /// `LoadStatus::Complete` is already true before `go_back` / `go_forward`
+    /// starts, so waiting for that status returns the previous URL. The
+    /// back-forward index also lags the URL by a turn, which makes
+    /// `can_go_forward` false immediately after a back traversal that has
+    /// already changed `location`.
+    fn traverse_history(
+        &self,
+        webview: &WebView,
+        timeout: Duration,
+        can_move: impl Fn(&WebView) -> bool,
+        move_by: impl Fn(&WebView),
+    ) -> io::Result<serde_json::Value> {
+        let current_url = |view: &WebView| view.url().map(|url| url.to_string()).unwrap_or_default();
+        let before = current_url(webview);
+        let settle_for = timeout.min(Duration::from_millis(300));
+        let settle_until = Instant::now() + settle_for;
+        while !can_move(webview) {
+            if Instant::now() >= settle_until {
+                return Ok(json!({ "ok": false, "url": before }));
+            }
+            self.spin_all_event_loops();
+            thread::sleep(Duration::from_millis(5));
+        }
+        move_by(webview);
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.spin_all_event_loops();
+            let url = current_url(webview);
+            if url != before && webview.load_status() == LoadStatus::Complete {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for history traversal",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Let the session-history index catch the URL before the next call.
+        self.spin_all_event_loops();
+        webview.paint();
+        Ok(json!({
+            "ok": true,
+            "url": current_url(webview),
+        }))
+    }
+
     fn spin_until_loaded(
         &self,
         webview: &WebView,
@@ -4497,34 +4545,26 @@ impl ContentEngine {
             "page.goBack" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                let ok = webview.can_go_back();
-                if ok {
-                    webview.go_back(1);
-                    let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
-                    webview.paint();
-                    self.spin_all_event_loops();
-                }
-                Ok(json!({
-                    "ok": ok,
-                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
-                }))
+                self.traverse_history(
+                    &webview,
+                    call_timeout(&params),
+                    |view| view.can_go_back(),
+                    |view| {
+                        view.go_back(1);
+                    },
+                )
             }
             "page.goForward" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                let ok = webview.can_go_forward();
-                if ok {
-                    webview.go_forward(1);
-                    let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
-                    webview.paint();
-                    self.spin_all_event_loops();
-                }
-                Ok(json!({
-                    "ok": ok,
-                    "url": webview.url().map(|url| url.to_string()).unwrap_or_default()
-                }))
+                self.traverse_history(
+                    &webview,
+                    call_timeout(&params),
+                    |view| view.can_go_forward(),
+                    |view| {
+                        view.go_forward(1);
+                    },
+                )
             }
             "page.addCookies" => {
                 let page_id = required_str(&params, "page")?;
@@ -4877,6 +4917,7 @@ impl ContentEngine {
         let mut last = String::from("failed_check=stable");
         let mut stable: Option<ResolvedNode> = None;
         let mut stable_since: Option<Instant> = None;
+        let mut sampled_once = false;
         let timeout_err = |last: &str| {
             let detail = if last.contains("failed_check=") {
                 last.to_owned()
@@ -4892,17 +4933,30 @@ impl ContentEngine {
             if self.parent_dead() {
                 return Err(Self::parent_gone());
             }
-            if Instant::now() >= deadline {
+            if sampled_once && Instant::now() >= deadline {
                 return Err(timeout_err(&last));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let sampled = match self.evaluate_until(webview.clone(), &script, remaining) {
+            // A 100ms action timeout is shorter than one Servo evaluation when
+            // the runner is busy. The first sample classifies strict mode
+            // (no match / several matches) and must be allowed to finish;
+            // later samples still stop at the caller's deadline.
+            let sample_budget = if sampled_once {
+                if remaining.is_zero() {
+                    return Err(timeout_err(&last));
+                }
+                remaining
+            } else {
+                remaining.max(Duration::from_millis(400))
+            };
+            let sampled = match self.evaluate_until(webview.clone(), &script, sample_budget) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     return Err(timeout_err(&last));
                 }
                 Err(error) => return Err(error),
             };
+            sampled_once = true;
             match sampled {
                 JSValue::Object(values) => {
                     if bool_field(&values, "staleRef").unwrap_or(false) {
