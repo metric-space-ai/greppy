@@ -828,7 +828,8 @@ fn run_agent(
     let workspace = match if args.in_place {
         InPlaceWorkspace::create(&cwd, &run_id).map(ActiveWorkspace::InPlace)
     } else {
-        AgentWorkspace::create(&cwd, &run_id).map(|workspace| ActiveWorkspace::Isolated(Box::new(workspace)))
+        AgentWorkspace::create(&cwd, &run_id)
+            .map(|workspace| ActiveWorkspace::Isolated(Box::new(workspace)))
     } {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {

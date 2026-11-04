@@ -1368,7 +1368,10 @@ fn read_accepts_emitted_and_simplified_path_qualified_rust_variables() {
         stdout.contains("src/core/gateway.rs"),
         "a mistyped path is resolved by symbol name: {stdout}"
     );
-    assert!(stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"), "{stdout}");
+    assert!(
+        stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"),
+        "{stdout}"
+    );
 }
 
 #[test]
