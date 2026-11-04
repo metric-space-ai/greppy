@@ -941,48 +941,31 @@ impl Daemon {
         run_control: Arc<RunControl>,
         startup: Arc<StartupGate>,
     ) -> io::Result<Self> {
-        // Controller (V8) and content (Servo) init independently. Sequential handshake
-        // of the 400MB image exceeded the 30s socket wait and panicked wait_for_accepting
-        // before bind, leaving in-flight process-group leaders reparented to PID 1.
+        // Fork one worker at a time. Two threads forking this process on macOS
+        // can wait forever when the other thread holds a lock, and the accept
+        // loop keeps answering "starting" for that whole wait. Image hashing is
+        // already done before the socket is bound, so the handshakes no longer
+        // need to overlap.
         let controller_token = random_token()?;
         let content_token = random_token()?;
         let data_root = data_root(&config.run_id);
         let persistent_profiles = persistent_profiles_root();
         std::fs::create_dir_all(&persistent_profiles)?;
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); } }
-        let controller_startup = Arc::clone(&startup);
-        let controller_thread = thread::Builder::new()
-            .name("web-spawn-controller".into())
-            .spawn(move || {
-                let mut worker = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); } }
-                worker.handshake()?;
-                controller_startup.mark_controller_ready();
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); } }
-                Ok::<_, io::Error>(worker)
-            })
-            .map_err(io::Error::other)?;
+        let mut controller = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); } }
+        controller.handshake()?;
+        startup.mark_controller_ready();
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); } }
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-content"); } }
-        let content_thread = thread::Builder::new()
-            .name("web-spawn-content".into())
-            .spawn(move || {
-                let mut worker = WorkerProcess::spawn_with_persistent_profiles(
-                    WorkerKind::Content,
-                    content_token,
-                    Some(persistent_profiles),
-                )?;
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); } }
-                worker.handshake()?;
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); } }
-                Ok::<_, io::Error>(worker)
-            })
-            .map_err(io::Error::other)?;
-        let controller = controller_thread
-            .join()
-            .map_err(|_| io::Error::other("controller spawn thread panicked"))??;
-        let content = content_thread
-            .join()
-            .map_err(|_| io::Error::other("content spawn thread panicked"))??;
+        let mut content = WorkerProcess::spawn_with_persistent_profiles(
+            WorkerKind::Content,
+            content_token,
+            Some(persistent_profiles),
+        )?;
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); } }
+        content.handshake()?;
+        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); } }
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase workers-ready"); } }
         run_control
             .controller_pid

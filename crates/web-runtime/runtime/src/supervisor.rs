@@ -1084,76 +1084,10 @@ fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::Owned
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
-/// Install worker FDs 3 and 5, then `Command::spawn` without `pre_exec`.
-///
-/// Without `pre_exec`, std uses `posix_spawn`. `pre_exec` forces `fork` in
-/// this already-multithreaded supervisor, and that `fork` can wait until the
-/// process is killed when another thread holds a lock.
-#[cfg(target_os = "macos")]
-fn spawn_macos_inheriting_worker_fds(
-    command: &mut Command,
-    cap_read_fd: i32,
-    proto_child_fd: i32,
-) -> io::Result<Child> {
-    static SPAWN_FDS: Mutex<()> = Mutex::new(());
-    let _guard = SPAWN_FDS.lock().unwrap_or_else(|error| error.into_inner());
-    let parked_cap = park_fd(crate::worker::CAPABILITY_FD)?;
-    let parked_proto = park_fd(crate::worker::PROTOCOL_FD)?;
-    install_inheritable_fd(cap_read_fd, crate::worker::CAPABILITY_FD)?;
-    install_inheritable_fd(proto_child_fd, crate::worker::PROTOCOL_FD)?;
-    let spawned = command.spawn();
-    drop(parked_proto);
-    drop(parked_cap);
-    spawned
-}
-
-#[cfg(target_os = "macos")]
-struct ParkedFd {
-    target: i32,
-    saved: i32,
-}
-
-#[cfg(target_os = "macos")]
-fn park_fd(target: i32) -> io::Result<ParkedFd> {
-    let saved = unsafe { libc::dup(target) };
-    if saved < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(ParkedFd { target, saved: -1 });
-        }
-        return Err(error);
-    }
-    unsafe {
-        libc::fcntl(saved, libc::F_SETFD, libc::FD_CLOEXEC);
-    }
-    Ok(ParkedFd { target, saved })
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for ParkedFd {
-    fn drop(&mut self) {
-        unsafe {
-            if self.saved >= 0 {
-                libc::dup2(self.saved, self.target);
-                libc::fcntl(self.target, libc::F_SETFD, libc::FD_CLOEXEC);
-                libc::close(self.saved);
-                self.saved = -1;
-            } else {
-                libc::close(self.target);
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn install_inheritable_fd(source: i32, target: i32) -> io::Result<()> {
-    if source != target && unsafe { libc::dup2(source, target) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(target, libc::F_SETFD, 0) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+fn with_serialized_worker_fork<T>(spawn: impl FnOnce() -> T) -> T {
+    static FORK: Mutex<()> = Mutex::new(());
+    let _guard = FORK.lock().unwrap_or_else(|error| error.into_inner());
+    spawn()
 }
 
 #[cfg(unix)]
@@ -1226,44 +1160,32 @@ fn spawn_unix(
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
         command.process_group(0);
-        // macOS must not fork this multithreaded supervisor. pre_exec forces
-        // fork, and fork waits forever when another thread holds a lock. The
-        // socket is already answering "starting" for that whole wait.
-        #[cfg(not(target_os = "macos"))]
-        {
-            let sandbox_exe = path.clone();
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if cap_read_fd != crate::worker::CAPABILITY_FD {
-                        libc::close(cap_read_fd);
-                    }
-                    if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if proto_child_fd != crate::worker::PROTOCOL_FD {
-                        libc::close(proto_child_fd);
-                    }
-                    let _ = sandbox_exe;
-                    Ok(())
-                });
-            }
+        let sandbox_exe = path.clone();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if cap_read_fd != crate::worker::CAPABILITY_FD {
+                    libc::close(cap_read_fd);
+                }
+                if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if proto_child_fd != crate::worker::PROTOCOL_FD {
+                    libc::close(proto_child_fd);
+                }
+                let _ = sandbox_exe;
+                Ok(())
+            });
         }
         let image = crate::worker::apply_same_image_reexec(&mut command)?;
         // Cache parent identity before exec so the first child cannot race the digest.
         let _ = parent_image()?;
-        let spawned = {
-            #[cfg(target_os = "macos")]
-            {
-                spawn_macos_inheriting_worker_fds(&mut command, cap_read_fd, proto_child_fd)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                command.spawn()
-            }
-        };
+        // Two worker threads must not fork at once. On macOS the second fork
+        // waits forever if the first thread, or a drain thread it started,
+        // holds a lock. The socket answers "starting" until both forks return.
+        let spawned = with_serialized_worker_fork(|| command.spawn());
         let mut child = spawned.map_err(|error| {
             unsafe {
                 libc::close(cap_read_fd);
