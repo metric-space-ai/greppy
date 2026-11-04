@@ -59,7 +59,9 @@ foreach ($relative in $required) {
 }
 
 $reported = (& (Join-Path $DistDir 'greppy.exe') --version) -join ' '
-if ($LASTEXITCODE -ne 0 -or $reported.Split(' ')[-1] -ne $Version) {
+# --version is "greppy <semver>" or "greppy <semver> (<commit>)".
+$semver = @($reported -split '\s+' | Where-Object { $_ })[1]
+if ($LASTEXITCODE -ne 0 -or $semver -ne $Version) {
     throw "staged greppy.exe version '$reported' does not match $Version"
 }
 
