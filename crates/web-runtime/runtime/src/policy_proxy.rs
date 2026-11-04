@@ -407,7 +407,7 @@ fn rewrite_request_line(head: &str, path: &str) -> String {
     let _target = parts.next();
     let version = parts.next().unwrap_or("HTTP/1.1");
     let mut out = format!("{method} {path} {version}\r\n");
-    for line in lines {
+    for line in lines.take_while(|line| !line.is_empty()) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("proxy-connection:") {
             continue;
@@ -415,9 +415,9 @@ fn rewrite_request_line(head: &str, path: &str) -> String {
         out.push_str(line);
         out.push_str("\r\n");
     }
-    if !out.ends_with("\r\n\r\n") {
-        out.push_str("\r\n");
-    }
+    // One empty line ends the headers. Copying split()'s trailing empty
+    // entries inserted another CRLF before every forwarded request body.
+    out.push_str("\r\n");
     out
 }
 
@@ -432,22 +432,32 @@ fn remaining_body_length(head: &str) -> usize {
 }
 
 fn read_headers(stream: &mut TcpStream) -> io::Result<(String, Vec<u8>)> {
-    let mut buf = Vec::new();
-    let mut byte = [0_u8; 1];
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
     while buf.len() < HEADER_LIMIT {
-        let n = stream.read(&mut byte)?;
+        // Peek in batches, then consume only header bytes. Reading beyond the
+        // terminator here would swallow a pipelined request or the first TLS
+        // bytes after CONNECT; those belong to the next reader.
+        let take = chunk.len().min(HEADER_LIMIT - buf.len());
+        let n = stream.peek(&mut chunk[..take])?;
         if n == 0 {
             break;
         }
-        buf.push(byte[0]);
-        if buf.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        let previous = buf.len();
+        buf.extend_from_slice(&chunk[..n]);
+        // Only a delimiter crossing the old/new boundary or in the new chunk
+        // can be new. Rescanning the entire prefix per byte was quadratic.
+        let scan_from = previous.saturating_sub(3);
+        if let Some(idx) = buf[scan_from..]
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+        {
+            let end = scan_from + idx + 4;
+            stream.read_exact(&mut chunk[..end - previous])?;
+            buf.truncate(end);
+            return Ok((String::from_utf8_lossy(&buf).into_owned(), Vec::new()));
         }
-    }
-    if let Some(idx) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-        let head = String::from_utf8_lossy(&buf[..idx + 4]).into_owned();
-        let rest = buf[idx + 4..].to_vec();
-        return Ok((head, rest));
+        stream.read_exact(&mut chunk[..n])?;
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -592,6 +602,103 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         (status, text)
+    }
+
+    #[test]
+    fn header_batches_preserve_body_and_connect_bytes() {
+        for method in [
+            "POST http://example.test/ HTTP/1.1",
+            "CONNECT example.test:443 HTTP/1.1",
+        ] {
+            for end in [4093, 4094, 4095, 4096, 4097, HEADER_LIMIT] {
+                let prefix = format!("{method}\r\nX-Pad: ");
+                let header = format!("{prefix}{}\r\n\r\n", "x".repeat(end - prefix.len() - 4));
+                let trailing = b"\x16\x03\x01body-or-next-request\r\n\r\n";
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let (mut server, _) = listener.accept().unwrap();
+                server
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let sent = header.clone();
+                let writer = thread::spawn(move || {
+                    client.write_all(sent.as_bytes()).unwrap();
+                    client.write_all(trailing).unwrap();
+                });
+                let (parsed, rest) = read_headers(&mut server).unwrap();
+                assert_eq!(parsed, header);
+                assert!(rest.is_empty());
+                let mut remaining = Vec::new();
+                server.read_to_end(&mut remaining).unwrap();
+                assert_eq!(remaining, trailing, "{method}, end={end}");
+                writer.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn header_batches_reject_oversize_and_truncated_headers() {
+        for input in [
+            b"GET / HTTP/1.1\r\n".to_vec(),
+            vec![b'x'; HEADER_LIMIT + 1],
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let writer = thread::spawn(move || {
+                client.write_all(&input).unwrap();
+            });
+            let error = read_headers(&mut server).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn proxy_preserves_post_body_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = b"abc123xyz";
+        let origin = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (header, _) = read_headers(&mut stream).unwrap();
+            assert!(header.starts_with("POST /submit HTTP/1.1\r\n"));
+            assert!(!header.to_ascii_lowercase().contains("proxy-connection:"));
+            let mut received = vec![0; body.len()];
+            stream.read_exact(&mut received).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        received.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(&received).unwrap();
+            received
+        });
+        let proxy = PolicyProxy::spawn(SharedProfile::new(NetworkProfile::Project)).unwrap();
+        let mut client = TcpStream::connect(proxy.addr()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(format!(
+                "POST http://{address}/submit HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n", body.len()
+            ).as_bytes())
+            .unwrap();
+        client.write_all(body).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(origin.join().unwrap(), body);
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1.as_bytes(), body);
     }
 
     #[test]
