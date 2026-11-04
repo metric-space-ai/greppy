@@ -164,8 +164,9 @@ fn copy_counted(
     // A socket timeout is "no bytes right now", not a reset. On macOS that
     // timeout is EAGAIN. Failing the splice here shuts the other direction
     // down and the browser reports UnexpectedEof for a transfer that is
-    // still in progress (gated fixtures, a slow origin).
-    let idle_limit = Duration::from_secs(120);
+    // still in progress. Cap the idle wait near the socket timeout so a
+    // finished tunnel does not keep a thread for minutes.
+    let idle_limit = Duration::from_secs(35);
     let mut idle_since: Option<Instant> = None;
     loop {
         let n = match reader.read(&mut buf) {
@@ -195,7 +196,7 @@ fn copy_counted(
 }
 
 fn write_all_retrying_timeout(writer: &mut impl Write, mut buf: &[u8]) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(35);
     while !buf.is_empty() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -374,6 +375,7 @@ fn handle_forward(
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if greppy_web_client::socket_timeout(&error) => {
+                    let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 }
@@ -385,7 +387,8 @@ fn handle_forward(
         }
     }
     let _ = server.shutdown(std::net::Shutdown::Write);
-    copy_counted(&mut server, client, transferred).map(|_| ())?;
+    let mut writer = RearmingIo { stream: client };
+    copy_counted(&mut server, &mut writer, transferred).map(|_| ())?;
     Ok(!connection_close(head))
 }
 
@@ -513,6 +516,9 @@ fn read_headers(stream: &mut TcpStream, deadline: Instant) -> io::Result<(String
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if greppy_web_client::socket_timeout(&error) => {
+                // macOS keeps returning EAGAIN after SO_RCVTIMEO until the
+                // timeout is armed again, even when the next bytes are buffered.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
@@ -530,6 +536,40 @@ fn read_headers(stream: &mut TcpStream, deadline: Instant) -> io::Result<(String
     ))
 }
 
+struct RearmingIo<'a> {
+    stream: &'a mut TcpStream,
+}
+
+impl Read for RearmingIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.stream.read(buf) {
+            Err(error) if greppy_web_client::socket_timeout(&error) => {
+                let _ = self.stream.set_read_timeout(Some(Duration::from_secs(1)));
+                Err(error)
+            }
+            other => other,
+        }
+    }
+}
+
+impl Write for RearmingIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.stream.write(buf) {
+            Err(error) if greppy_web_client::socket_timeout(&error) => {
+                let _ = self
+                    .stream
+                    .set_write_timeout(Some(Duration::from_secs(30)));
+                Err(error)
+            }
+            other => other,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io::Result<()> {
     let _ = a.set_nodelay(true);
     let _ = b.set_nodelay(true);
@@ -537,7 +577,9 @@ fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io
     let mut b_write = b.try_clone()?;
     let up_counter = Arc::clone(&transferred);
     let up = thread::spawn(move || {
-        let result = copy_counted(&mut a_read, &mut b_write, &up_counter);
+        let mut reader = RearmingIo { stream: &mut a_read };
+        let mut writer = RearmingIo { stream: &mut b_write };
+        let result = copy_counted(&mut reader, &mut writer, &up_counter);
         if result.is_err() {
             // Wake the other copy before joining it: a reset must not leave
             // the peer waiting for bytes on a connection that already failed.
@@ -549,7 +591,9 @@ fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io
         }
         result
     });
-    let down = copy_counted(&mut b, &mut a, &transferred);
+    let mut down_reader = RearmingIo { stream: &mut b };
+    let mut down_writer = RearmingIo { stream: &mut a };
+    let down = copy_counted(&mut down_reader, &mut down_writer, &transferred);
     if down.is_err() {
         let _ = a.shutdown(std::net::Shutdown::Both);
         let _ = b.shutdown(std::net::Shutdown::Both);

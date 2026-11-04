@@ -785,16 +785,30 @@ fn recv_any(
 
 #[cfg(unix)]
 fn poll_writable(fd: i32, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
     let mut fds = [libc::pollfd {
         fd,
         events: libc::POLLOUT,
         revents: 0,
     }];
-    let ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
     loop {
+        // SIGCHLD interrupts poll. Restarting with the original timeout
+        // never reaches n == 0, so Hello is never written and the child
+        // sits in read-hello until the test kills the supervisor.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {timeout:?} writing worker protocol"),
+            ));
+        }
+        let ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+        fds[0].revents = 0;
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
         if n > 0 {
-            if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+                && fds[0].revents & libc::POLLOUT == 0
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "worker protocol socket is not writable",
