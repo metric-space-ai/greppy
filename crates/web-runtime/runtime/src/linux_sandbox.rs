@@ -183,8 +183,31 @@ fn fs_allow_list(
         refuse_filesystem_root(&path, "persistent profiles")?;
         grants.push(FsPathGrant::persistent_write_tree(path, true));
     }
+    extend_dns_grants(&mut grants, Path::new("/etc/resolv.conf"));
 
     Ok(grants)
+}
+
+/// `/etc` is already readable, but Ubuntu makes `/etc/resolv.conf` a symlink
+/// into `/run/systemd/resolve`. Landlock checks the target, so without that
+/// path glibc cannot read the file and DNS falls back to 127.0.0.1:53.
+fn extend_dns_grants(grants: &mut Vec<FsPathGrant>, resolv: &Path) {
+    grants.push(FsPathGrant::read_tree("/run/systemd/resolve", false));
+    let Ok(meta) = std::fs::symlink_metadata(resolv) else {
+        return;
+    };
+    if !meta.file_type().is_symlink() {
+        return;
+    }
+    let Ok(target) = std::fs::canonicalize(resolv) else {
+        return;
+    };
+    grants.push(FsPathGrant::read_file(&target, false, false));
+    if let Some(dir) = target.parent() {
+        if dir != Path::new("/run/systemd/resolve") {
+            grants.push(FsPathGrant::read_tree(dir, false));
+        }
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -696,12 +719,47 @@ mod tests {
             exe,
             Path::new("/opt/greppy/libexec"),
             tmp,
+            Path::new("/run/systemd/resolve"),
         ] {
             assert!(
                 paths.contains(&expected),
                 "missing {expected:?} in {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolv_symlink_target_is_granted_read_only() {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-resolv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let real_dir = root.join("run/systemd/resolve");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("stub-resolv.conf");
+        std::fs::write(&real, b"nameserver 1.1.1.1\n").unwrap();
+        let link = root.join("resolv.conf");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&real, &link).unwrap();
+        let mut grants = Vec::new();
+        extend_dns_grants(&mut grants, &link);
+        let paths = grant_paths(&grants);
+        assert!(paths.contains(&Path::new("/run/systemd/resolve")));
+        #[cfg(unix)]
+        {
+            let target = std::fs::canonicalize(&link).unwrap();
+            assert!(
+                paths.iter().any(|path| *path == target.as_path()),
+                "symlink target {target:?} missing from {paths:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -787,8 +845,12 @@ mod tests {
 
     #[test]
     fn allow_list_refuses_filesystem_root_as_tmp() {
-        let err =
-            fs_allow_list(Path::new("/opt/greppy/bin/web-runtime"), Path::new("/"), None).unwrap_err();
+        let err = fs_allow_list(
+            Path::new("/opt/greppy/bin/web-runtime"),
+            Path::new("/"),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("filesystem root"), "{err}");
     }

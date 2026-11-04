@@ -53,9 +53,14 @@ pub struct Session {
     /// CPU charged to this session's serialized operation intervals. These
     /// counters survive worker respawns; the daemon adds only the process CPU
     /// delta observed around each operation, so one session cannot inherit
-    /// another session's shared-worker work.
+    /// another session's shared-worker work. The limit check uses the
+    /// navigation counters below, which reset on each navigation.
     pub content_cpu_used_ns: u64,
     pub controller_cpu_used_ns: u64,
+    /// Content and controller CPU since the last navigation. A heavy page
+    /// must not exhaust the next page's budget.
+    pub navigation_content_cpu_ns: u64,
+    pub navigation_controller_cpu_ns: u64,
     pub started: Instant,
     pub inflight_engine_request_id: Option<u64>,
     pub inflight_engine_method: Option<String>,
@@ -74,7 +79,11 @@ impl Session {
             operation_id: None,
             last_heartbeat: Instant::now(),
             profile,
-            limits: SessionLimits::for_profile(profile.as_str()),
+            limits: {
+                let mut limits = SessionLimits::for_profile(profile.as_str());
+                limits.apply_host_shape();
+                limits
+            },
             page_id: None,
             engine_context_id: None,
             tabs: Vec::new(),
@@ -89,6 +98,8 @@ impl Session {
             peak_rss_bytes: 0,
             content_cpu_used_ns: 0,
             controller_cpu_used_ns: 0,
+            navigation_content_cpu_ns: 0,
+            navigation_controller_cpu_ns: 0,
             started: Instant::now(),
             inflight_engine_request_id: None,
             inflight_engine_method: None,
@@ -97,6 +108,13 @@ impl Session {
             owner: None,
             trace: None,
         }
+    }
+
+    /// Drop the CPU charged to the page that is being replaced. The session
+    /// totals stay, so a worker restart still cannot underflow them.
+    pub fn begin_navigation(&mut self) {
+        self.navigation_content_cpu_ns = 0;
+        self.navigation_controller_cpu_ns = 0;
     }
 
     pub fn transition(&mut self, next: SessionState) -> Result<(), String> {

@@ -1200,13 +1200,13 @@ impl Daemon {
                 session
                     .limits
                     .check_cpu_time(
-                        Duration::from_nanos(session.content_cpu_used_ns),
+                        Duration::from_nanos(session.navigation_content_cpu_ns),
                         session.limits.content_cpu_time,
                         "content",
                     )
                     .and_then(|_| {
                         session.limits.check_cpu_time(
-                            Duration::from_nanos(session.controller_cpu_used_ns),
+                            Duration::from_nanos(session.navigation_controller_cpu_ns),
                             session.limits.controller_cpu_time,
                             "controller",
                         )
@@ -1844,13 +1844,13 @@ impl Daemon {
             if let Err(message) = session
                 .limits
                 .check_cpu_time(
-                    Duration::from_nanos(session.content_cpu_used_ns),
+                    Duration::from_nanos(session.navigation_content_cpu_ns),
                     session.limits.content_cpu_time,
                     "content",
                 )
                 .and_then(|_| {
                     session.limits.check_cpu_time(
-                        Duration::from_nanos(session.controller_cpu_used_ns),
+                        Duration::from_nanos(session.navigation_controller_cpu_ns),
                         session.limits.controller_cpu_time,
                         "controller",
                     )
@@ -2340,7 +2340,7 @@ impl Daemon {
         let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
         let elapsed = session.started.elapsed();
         session.limits.check_wall_time(elapsed)?;
-        let content_cpu = Duration::from_nanos(session.content_cpu_used_ns);
+        let content_cpu = Duration::from_nanos(session.navigation_content_cpu_ns);
         session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
         let timeout = session.limits.operation_budget(elapsed, budget);
         if timeout.is_zero() {
@@ -4179,14 +4179,14 @@ impl Daemon {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                Duration::from_nanos(session.content_cpu_used_ns),
+                Duration::from_nanos(session.navigation_content_cpu_ns),
                 session.limits.content_cpu_time,
                 "content",
             ) {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                Duration::from_nanos(session.controller_cpu_used_ns),
+                Duration::from_nanos(session.navigation_controller_cpu_ns),
                 session.limits.controller_cpu_time,
                 "controller",
             ) {
@@ -5724,6 +5724,8 @@ fn account_operation_cpu(
     );
     session.content_cpu_used_ns = session.content_cpu_used_ns.saturating_add(content_ns);
     session.controller_cpu_used_ns = session.controller_cpu_used_ns.saturating_add(controller_ns);
+    session.navigation_content_cpu_ns = session.navigation_content_cpu_ns.saturating_add(content_ns);
+    session.navigation_controller_cpu_ns = session.navigation_controller_cpu_ns.saturating_add(controller_ns);
     if response.metrics.content_cpu_ms == 0 {
         response.metrics.content_cpu_ms = content_ns / 1_000_000;
     }
@@ -5889,14 +5891,20 @@ fn gate_session_engine(
     session
         .limits
         .check_controller_memory(sample_rss_bytes(controller_pid))?;
-    let content_cpu_ns = session.content_cpu_used_ns.saturating_add(process_cpu_delta_ns(
+    if matches!(
+        method,
+        "page.goto" | "page.reload" | "page.goBack" | "page.goForward" | "page.frameGoto"
+    ) {
+        session.begin_navigation();
+    }
+    let content_cpu_ns = session.navigation_content_cpu_ns.saturating_add(process_cpu_delta_ns(
         content_pid,
         content_cpu_baseline_ns,
         content_pid,
         sample_cpu_ns(content_pid),
     ));
     let controller_cpu_ns = session
-        .controller_cpu_used_ns
+        .navigation_controller_cpu_ns
         .saturating_add(process_cpu_delta_ns(
             controller_pid,
             controller_cpu_baseline_ns,
@@ -6606,6 +6614,42 @@ mod redirect_chain_tests {
         );
         assert_eq!(session.content_cpu_used_ns, 10);
         assert_eq!(session.controller_cpu_used_ns, 6);
+        assert_eq!(session.navigation_content_cpu_ns, 10);
+    }
+
+    #[test]
+    fn a_new_navigation_clears_the_page_budget_and_keeps_the_session_total() {
+        let mut session = super::Session::new("nav", "run", super::NetworkProfile::Research);
+        session.limits.content_cpu_time = std::time::Duration::from_nanos(10);
+        let request = super::Request::new("nav", "web.read", json!({}));
+        let mut response = super::Response::ok(&request, json!({}));
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (1, 0),
+            (1, 30),
+            (2, 0),
+            (2, 0),
+        );
+        assert!(session
+            .limits
+            .check_cpu_time(
+                std::time::Duration::from_nanos(session.navigation_content_cpu_ns),
+                session.limits.content_cpu_time,
+                "content",
+            )
+            .is_err());
+        session.begin_navigation();
+        assert_eq!(session.navigation_content_cpu_ns, 0);
+        assert_eq!(session.content_cpu_used_ns, 30);
+        assert!(session
+            .limits
+            .check_cpu_time(
+                std::time::Duration::from_nanos(session.navigation_content_cpu_ns),
+                session.limits.content_cpu_time,
+                "content",
+            )
+            .is_ok());
     }
 
     #[test]

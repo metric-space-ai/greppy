@@ -3469,6 +3469,7 @@ impl ContentEngine {
                     let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
                     let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
                     let kind = failure.get("kind").and_then(|value| value.as_str()).unwrap_or("transport");
+                    let error = explain_dns_failure(error);
                     let detail = format!(
                         "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
                     );
@@ -6695,6 +6696,21 @@ fn is_parent_eof(error: &io::Error) -> bool {
 
 // Startup-only diagnostics deliberately avoid the per-operation tracing path:
 // a failed handshake needs a last-known phase, not an unbounded event log.
+fn explain_dns_failure(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("name or service not known")
+        || lower.contains("temporary failure in name resolution")
+    {
+        format!(
+            "{error}; DNS did not resolve. On Ubuntu, /etc/resolv.conf is a symlink to /run/systemd/resolve and the worker sandbox must be allowed to read that target. If lookup falls back to 127.0.0.1:53, the file was not readable"
+        )
+    } else {
+        error.to_owned()
+    }
+}
+
 fn trace_startup(stage: &str) {
     if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
         eprintln!(

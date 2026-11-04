@@ -22,6 +22,86 @@ pub struct SessionLimits {
     pub idle_ttl: Duration,
 }
 
+/// Content CPU allowed for one navigation.
+///
+/// One core gets 60s: a page such as Wikipedia on a 1 vCPU VPS uses just
+/// over 30s of content CPU, and that used to be a session-lifetime counter.
+/// Each additional core adds 30s because Servo spreads work across threads.
+pub fn host_live_pages(cores: u32, max_ram: Option<u64>, configured: u32) -> u32 {
+    let small_host = max_ram.is_some_and(|bytes| bytes <= 4 * 1024 * 1024 * 1024);
+    if cores <= 1 || small_host {
+        1
+    } else {
+        configured.max(1)
+    }
+}
+
+pub fn navigation_content_cpu(cores: u32) -> Duration {
+    let cores = cores.max(1);
+    if cores == 1 {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(30).saturating_mul(cores)
+    }
+}
+
+/// `cpu.max` quota/period. `max` means the cgroup is not capping cores.
+pub fn cores_from_cpu_max(text: &str) -> Option<u32> {
+    let mut parts = text.split_whitespace();
+    let quota = parts.next()?;
+    if quota == "max" {
+        return None;
+    }
+    let quota: u64 = quota.parse().ok()?;
+    let period: u64 = parts.next()?.parse().ok()?;
+    if period == 0 {
+        return None;
+    }
+    Some(
+        u32::try_from((quota + period - 1) / period)
+            .unwrap_or(u32::MAX)
+            .max(1),
+    )
+}
+
+pub fn effective_cpu_count() -> u32 {
+    if let Some(cores) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")
+        .ok()
+        .as_deref()
+        .and_then(cores_from_cpu_max)
+    {
+        return cores;
+    }
+    std::thread::available_parallelism()
+        .map(|count| u32::try_from(count.get()).unwrap_or(1))
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// `GREPPY_MAX_RAM` as a byte count. Accepts a bare integer or a K/M/G suffix.
+pub fn max_ram_bytes() -> Option<u64> {
+    let raw = std::env::var("GREPPY_MAX_RAM").ok()?;
+    parse_byte_size(raw.trim())
+}
+
+pub fn parse_byte_size(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (number, shift) = if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'G' | 'g')) {
+        (&raw[..raw.len() - 1], 30u32)
+    } else if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'M' | 'm')) {
+        (&raw[..raw.len() - 1], 20u32)
+    } else if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'K' | 'k')) {
+        (&raw[..raw.len() - 1], 10u32)
+    } else {
+        (raw, 0u32)
+    };
+    let number: u64 = number.trim().parse().ok()?;
+    number.checked_shl(shift)
+}
+
 impl SessionLimits {
     pub fn for_profile(profile: &str) -> Self {
         let mut limits = Self::default();
@@ -77,6 +157,18 @@ impl SessionLimits {
         if let Some(value) = object.get("controller_cpu_ms").and_then(|v| v.as_u64()) {
             self.controller_cpu_time = Duration::from_millis(value);
         }
+    }
+
+    /// Shape defaults for this machine. An explicit payload limit applied
+    /// afterwards still wins. One vCPU, or a host of at most 4 GiB named by
+    /// `GREPPY_MAX_RAM`, keeps a single live page so a heavy tab cannot sit
+    /// beside another. The CPU budget is per navigation and grows with cores.
+    pub fn apply_host_shape(&mut self) {
+        let cores = effective_cpu_count();
+        self.max_pages = host_live_pages(cores, max_ram_bytes(), self.max_pages);
+        let budget = navigation_content_cpu(cores);
+        self.content_cpu_time = budget;
+        self.controller_cpu_time = budget;
     }
 
     pub fn check_pages(&self, pages: u32) -> Result<(), String> {
@@ -215,7 +307,9 @@ impl SessionLimits {
         label: &str,
     ) -> Result<(), String> {
         if used > limit {
-            Err(format!("{label} cpu time exceeded ({used:?} > {limit:?})"))
+            Err(format!(
+                "{label} cpu time exceeded for this navigation ({used:?} > {limit:?}); the next navigation starts a new budget"
+            ))
         } else {
             Ok(())
         }
@@ -371,5 +465,47 @@ mod tests {
         assert_eq!(limits.idle_ttl, Duration::from_millis(50));
         assert_eq!(limits.wall_time, Some(Duration::from_millis(75)));
         assert!(limits.check_pages(1).is_err());
+    }
+
+    #[test]
+    fn one_vcpu_budget_is_one_live_page_and_sixty_seconds() {
+        assert_eq!(super::navigation_content_cpu(1), Duration::from_secs(60));
+        assert_eq!(super::navigation_content_cpu(4), Duration::from_secs(120));
+        assert_eq!(super::cores_from_cpu_max("100000 100000"), Some(1));
+        assert_eq!(super::cores_from_cpu_max("250000 100000"), Some(3));
+        assert_eq!(super::cores_from_cpu_max("max 100000"), None);
+        assert_eq!(super::parse_byte_size("4G"), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(
+            super::parse_byte_size("4096M"),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(super::host_live_pages(1, None, 16), 1);
+        assert_eq!(
+            super::host_live_pages(4, Some(4 * 1024 * 1024 * 1024), 16),
+            1
+        );
+        assert_eq!(
+            super::host_live_pages(4, Some(8 * 1024 * 1024 * 1024), 16),
+            16
+        );
+    }
+
+    #[test]
+    fn taskset_one_cpu_quota_matches_the_one_page_budget() {
+        let quota = super::cores_from_cpu_max("100000 100000").expect("1 vCPU quota");
+        assert_eq!(quota, 1);
+        assert_eq!(super::host_live_pages(quota, None, 16), 1);
+        assert_eq!(
+            super::navigation_content_cpu(quota),
+            Duration::from_secs(60)
+        );
+        // When taskset is installed, pinning CPU 0 must be a successful
+        // one-core placement. The budget above is what that placement uses.
+        if let Ok(status) = std::process::Command::new("taskset")
+            .args(["-c", "0", "true"])
+            .status()
+        {
+            assert!(status.success(), "taskset -c 0 true failed: {status}");
+        }
     }
 }

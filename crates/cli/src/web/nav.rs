@@ -285,7 +285,7 @@ pub(super) fn resolve_or_create_session_with_spawn(
     }
 }
 
-fn create_session(
+pub(super) fn create_session(
     root: Option<&str>,
     json: bool,
     spawn: &SupervisorSpawn,

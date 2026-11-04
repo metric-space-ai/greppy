@@ -200,7 +200,7 @@ fn known_runtime_routes(root: Option<&str>) -> Vec<SessionRoute> {
         .collect()
 }
 
-fn remove_session_route(root: Option<&str>, session: &str) {
+pub(super) fn remove_session_route(root: Option<&str>, session: &str) {
     let _ = std::fs::remove_file(session_route_path(root, session));
 }
 
@@ -270,6 +270,17 @@ pub(super) fn is_missing_session(error: &ErrorObject) -> bool {
     // Only the runtime's typed missing-session result can invalidate a cached
     // session; diagnostic wording is not a lifecycle signal.
     error.code == "session_not_found"
+}
+
+/// A stale `current.json` session should be replaced. An explicit session id
+/// that was never the remembered one must still fail as not found.
+pub(super) fn should_recreate_cached_session(
+    root: Option<&str>,
+    rejected_session: &str,
+    error: &ErrorObject,
+) -> bool {
+    is_missing_session(error)
+        && read_current_scope(root).session.as_deref() == Some(rejected_session)
 }
 
 pub(super) fn read_current_scope(root: Option<&str>) -> CurrentScope {
@@ -2928,6 +2939,31 @@ mod scope_tests {
             read_current_scope(Some(root)).tab.as_deref(),
             Some("new_tab")
         );
+    }
+
+    #[test]
+    fn only_the_remembered_session_is_recreated_after_the_runtime_forgets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_current_scope(Some(root), "wrs_stale", None).unwrap();
+        let mut missing = invalid("session wrs_stale was not found");
+        missing.code = "session_not_found".into();
+        assert!(should_recreate_cached_session(
+            Some(root),
+            "wrs_stale",
+            &missing
+        ));
+        assert!(!should_recreate_cached_session(
+            Some(root),
+            "wrs_explicit",
+            &missing
+        ));
+        missing.code = "engine_error".into();
+        assert!(!should_recreate_cached_session(
+            Some(root),
+            "wrs_stale",
+            &missing
+        ));
     }
 
     fn restore(name: &str, value: Option<String>) {
