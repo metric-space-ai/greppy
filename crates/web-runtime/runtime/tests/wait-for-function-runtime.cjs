@@ -101,6 +101,9 @@ test("timeout and predicate errors cancel all pending scheduling", () => {
     assert.equal(h.listeners.size, 0);
     assert.equal(h.disconnected(), 1);
     assert.deepEqual(h.notices, ["__greppyWaitDone:scheduler-test:" + outcome]);
+    if (outcome === "timeout") {
+      assert.equal(h.context["__greppyWait_scheduler-test"], undefined);
+    }
   }
 });
 

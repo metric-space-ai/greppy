@@ -2304,8 +2304,9 @@ impl ContentEngine {
                 // Reinstall on the new Document with the ORIGINAL deadline.
                 // The old nonce must not certify this new document, even if
                 // an old console completion was already in the delegate.
-                delegate.clear_wait_notice(&token);
-                token = alloc_wait_nonce()?;
+                let stale = std::mem::replace(&mut token, alloc_wait_nonce()?);
+                self.drop_wait_slot(&webview, &stale, io_deadline);
+                delegate.clear_wait_notice(&stale);
                 document_generation = delegate.document_generation.get();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining < Duration::from_millis(1) {
@@ -2421,12 +2422,11 @@ impl ContentEngine {
     }
 
     fn drop_wait_slot(&self, webview: &WebView, token: &str, deadline: Option<Instant>) {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
-        if budget.is_zero() {
-            // The installed JS deadline still cancels observers/frames. Do not
-            // start another synchronous evaluation after the caller's budget.
-            return;
-        }
+        // Removing the slot is not extra wait time. An exhausted predicate
+        // deadline must not skip it: the page timeout may not have run yet,
+        // and the caller inspects window as soon as the timeout returns.
+        let _ = deadline;
+        let budget = Duration::from_millis(80);
         let Ok(key_js) = serde_json::to_string(&Self::wait_slot_key(token)) else {
             return;
         };
@@ -2489,13 +2489,40 @@ impl ContentEngine {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = take_wait_completion_in_document(
+        let completed = match take_wait_completion_in_document(
             &delegate.document_generation,
             document_generation,
             || self.take_completed_wait_slot(webview, token, deadline),
-        )?
-        else {
+        ) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                // The completion read can refuse once the caller deadline is
+                // gone. That refusal must still remove the slot: the page
+                // scan runs as soon as this timeout returns.
+                self.drop_wait_slot(webview, token, deadline);
+                delegate.clear_wait_notice(token);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((status, value)) = completed else {
+            if delegate.document_generation.get() != document_generation {
+                // A new document has to reinstall the waiter. An old notice
+                // must not finish that new document as a timeout.
+                delegate.clear_wait_notice(token);
+                return Ok(None);
+            }
             delegate.clear_wait_notice(token);
+            if notice == "timeout" {
+                // The page timeout path deletes its slot in the same turn as
+                // the console signal. The notice is still the outcome.
+                self.drop_wait_slot(webview, token, deadline);
+                return Ok(Some(self.finish_wait_outcome(
+                    webview,
+                    WaitOutcome::Timeout,
+                    strict_budget,
+                )));
+            }
             return Ok(None);
         };
         let status = if status.is_empty() { notice } else { status };
@@ -6705,6 +6732,7 @@ fn trace_startup(stage: &str) {
 }
 
 pub fn run() -> io::Result<()> {
+    crate::supervisor::detach_when_parent_dies();
     trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
     trace_startup("sandbox");

@@ -14,7 +14,7 @@ fn emit_line(line: &str) {
 }
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -88,6 +88,40 @@ pub(crate) extern "C" fn handle_supervisor_sigterm(_sig: i32) {
     }
     unsafe { libc::_exit(143) };
 }
+
+/// Workers are process-group leaders. SIGKILL of the supervisor does not run
+/// `handle_supervisor_sigterm`, so a child would keep running and the next
+/// start would block behind it. This thread notices the parent is gone and
+/// tears the group down.
+#[cfg(unix)]
+#[cfg_attr(
+    not(any(feature = "controller-runtime", feature = "content-runtime")),
+    allow(dead_code)
+)]
+pub(crate) fn detach_when_parent_dies() {
+    let parent = unsafe { libc::getppid() };
+    let _ = thread::Builder::new()
+        .name("web-runtime-parent-watch".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_millis(200));
+            let now = unsafe { libc::getppid() };
+            if now != parent {
+                let pid = std::process::id() as i32;
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::_exit(143);
+                }
+            }
+        });
+}
+
+#[cfg(not(unix))]
+#[cfg_attr(
+    not(any(feature = "controller-runtime", feature = "content-runtime")),
+    allow(dead_code)
+)]
+pub(crate) fn detach_when_parent_dies() {}
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -839,6 +873,7 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
+    stderr_drain: Option<JoinHandle<()>>,
     worker_temp_dir: Option<OwnedTempDir>,
     reaped: bool,
 }
@@ -856,7 +891,9 @@ impl OwnedTempDir {
     fn for_content_worker_in(temp_root: &Path) -> io::Result<Self> {
         static SEQUENCE: AtomicU32 = AtomicU32::new(1);
         let temp_root = temp_root.canonicalize()?;
-        reap_stale_content_worker_dirs_in(&temp_root);
+        // Deleting abandoned trees here runs while the socket already answers
+        // "starting". A large tree makes that answer last for minutes.
+        schedule_stale_content_worker_reap(&temp_root);
         for _ in 0..32 {
             let path = temp_root.join(format!(
                 "greppy-web-content-{}-{}",
@@ -873,6 +910,24 @@ impl OwnedTempDir {
             io::ErrorKind::AlreadyExists,
             "could not reserve an exclusive content-worker temp directory",
         ))
+    }
+}
+
+fn schedule_stale_content_worker_reap(temp_root: &Path) {
+    #[cfg(unix)]
+    {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let root = temp_root.to_path_buf();
+        let _ = thread::Builder::new()
+            .name("web-runtime-reap-temp".into())
+            .spawn(move || reap_stale_content_worker_dirs_in(&root));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = temp_root;
     }
 }
 
@@ -1091,7 +1146,7 @@ fn spawn_unix(
             .env("TEMP", &worker_temp_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         if let Some(dir) = content_config_dir.as_ref() {
             command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
         }
@@ -1167,6 +1222,23 @@ fn spawn_unix(
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdout was not piped")
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "worker stderr was not piped")
+        })?;
+        let stderr_drain = match thread::Builder::new()
+            .name(format!("web-runtime-{worker:?}-stderr-drain"))
+            .spawn(move || drain_worker_stderr(stderr))
+        {
+            Ok(stderr_drain) => stderr_drain,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn {worker:?} stderr drain: {error}"),
+                ));
+            }
+        };
         let stdout_log = Arc::new(Mutex::new(Vec::new()));
         let drain_buf = Arc::clone(&stdout_log);
         let stdout_drain = match thread::Builder::new()
@@ -1223,6 +1295,7 @@ fn spawn_unix(
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
+            stderr_drain: Some(stderr_drain),
             worker_temp_dir: Some(worker_temp_dir),
             reaped: false,
         })
@@ -1246,6 +1319,44 @@ fn drain_worker_stdout(mut stdout: std::process::ChildStdout, log: Arc<Mutex<Vec
     }
 }
 
+/// Forward worker stderr, but never block the worker on a full capture pipe.
+///
+/// `cargo test` reads that pipe as the test runs. A full pipe stalls the
+/// writer for good, and Servo plus startup traces write enough to fill it.
+/// O_NONBLOCK cannot be set on the inherited description: it is shared with
+/// the test process. Drop bytes the capture is not reading.
+#[cfg(unix)]
+fn drain_worker_stderr(mut stderr: std::process::ChildStderr) {
+    let mut buf = [0_u8; 4096];
+    loop {
+        let n = match stderr.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        let _ = write_inherited_stderr_if_ready(&buf[..n]);
+    }
+}
+
+#[cfg(unix)]
+fn write_inherited_stderr_if_ready(bytes: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let outer = io::stderr();
+    let mut fds = [libc::pollfd {
+        fd: outer.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    }];
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+    if ready <= 0 || fds[0].revents & libc::POLLOUT == 0 {
+        return Ok(());
+    }
+    let mut locked = outer.lock();
+    locked.write_all(bytes)?;
+    locked.flush()?;
+    Ok(())
+}
 
 #[cfg(target_os = "macos")]
 fn sbpl_subpath(path: &Path) -> String {
@@ -1951,6 +2062,14 @@ impl WorkerProcess {
 
     fn join_reader_bounded(&mut self, timeout: Duration) {
         if let Some(drain) = self.stdout_drain.take() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = drain.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(timeout);
+        }
+        if let Some(drain) = self.stderr_drain.take() {
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 let _ = drain.join();

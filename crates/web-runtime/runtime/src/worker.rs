@@ -948,15 +948,34 @@ exit 0;
         );
     }
 
+    /// ELF whose behavior does not depend on argv[0].
+    ///
+    /// Ubuntu 26.04 hard-links `/bin/sleep` and `/bin/true` to the uutils
+    /// multicall image. A copy under another filename exits 1: that image
+    /// refuses to dispatch on argv[0] (`unix_wait_status(256)`). GNU `true`
+    /// would have exited 0, so that status is not the replaced path winning.
+    /// The pin test needs two different programs.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn unix_bin(name: &str) -> std::path::PathBuf {
-        for candidate in [format!("/bin/{name}"), format!("/usr/bin/{name}")] {
-            let path = std::path::PathBuf::from(&candidate);
-            if path.is_file() {
-                return path;
-            }
-        }
-        panic!("missing {name}");
+    fn fixture_executable(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let source = dir.join(format!("{name}.c"));
+        let output = dir.join(name);
+        std::fs::write(
+            &source,
+            format!("#include <unistd.h>\nint main(void) {{\n{body}\n}}\n"),
+        )
+        .unwrap();
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let status = std::process::Command::new(&cc)
+            .arg("-O2")
+            .arg("-o")
+            .arg(&output)
+            .arg(&source)
+            .status()
+            .unwrap_or_else(|error| {
+                panic!("cc ({cc}) is required to build an argv0-independent fixture: {error}")
+            });
+        assert!(status.success(), "{cc} failed to compile {name}");
+        output
     }
 
     #[cfg(unix)]
@@ -1038,8 +1057,6 @@ exit 0;
     #[test]
     fn linux_spawn_uses_fd_backed_exec() {
         use std::process::{Command, Stdio};
-        let sleep = unix_bin("sleep");
-        let true_bin = unix_bin("true");
         let root = std::env::temp_dir().join(format!(
             "greppy-fexecve-{}-{}",
             std::process::id(),
@@ -1049,20 +1066,17 @@ exit 0;
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let probe = root.join("probe");
-        std::fs::copy(&sleep, &probe).unwrap();
+        let probe = fixture_executable(&root, "probe", "for (;;) pause();");
+        let _replacement = fixture_executable(&root, "replacement", "return 42;");
         let image = PinnedSupervisorImage::open_path(&probe).unwrap();
         assert_eq!(image.exec_kind(), ImageExecKind::Fexecve);
         assert!(image.is_fd_backed());
         // Replace the directory entry with a different inode. Copying directly
         // to `probe` would truncate and rewrite the already pinned inode, which
         // is not a path-lookup TOCTOU and necessarily changes what the FD sees.
-        let replacement = root.join("replacement");
-        std::fs::copy(&true_bin, &replacement).unwrap();
-        std::fs::rename(&replacement, &probe).unwrap();
+        std::fs::rename(root.join("replacement"), &probe).unwrap();
         let mut command = Command::new(&probe);
         command
-            .arg("30")
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1073,7 +1087,7 @@ exit 0;
         let early_status = child.try_wait().unwrap();
         assert!(
             early_status.is_none(),
-            "fexecve must run the pinned sleep image, not the replaced true path; status={early_status:?}"
+            "fexecve must run the pinned ELF, not the replaced one (exit 42); status={early_status:?}"
         );
         image.prove_child(child.id()).unwrap();
         let _ = child.kill();
@@ -1113,7 +1127,16 @@ exit 0;
             return;
         }
 
-        let true_bin = unix_bin("true");
+        let root = std::env::temp_dir().join(format!(
+            "greppy-fexecve-fd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let true_bin = fixture_executable(&root, "exit0", "return 0;");
         let image = PinnedSupervisorImage::open_path(&true_bin).unwrap();
         assert_eq!(image.as_raw_fd(), 3, "isolated image must occupy FD 3");
         let null = std::fs::File::open("/dev/null").unwrap();
@@ -1154,14 +1177,23 @@ exit 0;
     #[test]
     fn linux_identity_mismatch_kills_child() {
         use std::process::{Command, Stdio};
-        let sleep = unix_bin("sleep");
-        let true_bin = unix_bin("true");
+        let root = std::env::temp_dir().join(format!(
+            "greppy-fexecve-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let sleep = fixture_executable(&root, "sleeper", "for (;;) pause();");
+        let true_bin = fixture_executable(&root, "other", "return 0;");
         let sleep_img = PinnedSupervisorImage::open_path(&sleep).unwrap();
         let true_img = PinnedSupervisorImage::open_path(&true_bin).unwrap();
         assert_ne!(
             sleep_img.dev_ino().unwrap(),
             true_img.dev_ino().unwrap(),
-            "sleep and true must be distinct inodes"
+            "fixture ELFs must be distinct inodes"
         );
         let mut command = Command::new(&sleep);
         command

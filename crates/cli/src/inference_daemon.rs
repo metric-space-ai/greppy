@@ -4039,7 +4039,8 @@ mod tests {
     }
 
     fn wait_for_server(endpoint: &Endpoint) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // macOS CI has taken longer than 5s to accept the socket under load.
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if matches!(
                 request(
