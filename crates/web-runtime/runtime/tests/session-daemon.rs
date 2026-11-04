@@ -11689,14 +11689,14 @@ fn controller_exception_redacts_authorization_secrets() {
 #[test]
 fn known_http_navigation_does_not_copy_document_text_or_html() {
     let origin = serve_fixture(
-        r#"<!doctype html><html><head><script>
+        r#"<!doctype html><html><head><title>Navigation probe</title><script>
 window.navigationProbeReads = { text: 0, html: 0, elements: 0 };
 Object.defineProperty(document.documentElement, 'outerHTML', {
   get() { window.navigationProbeReads.html++; return 'x'.repeat(3 * 1024 * 1024); }
 });
 const selectAll = document.querySelectorAll.bind(document);
 document.querySelectorAll = function(selector) {
-  if (selector === '*:not(html):not(head):not(body)') window.navigationProbeReads.elements++;
+  if (['*:not(html):not(head):not(body)', 'h1,h2,h3,h4', 'a[href]'].includes(selector)) window.navigationProbeReads.elements++;
   return selectAll(selector);
 };
 document.addEventListener('DOMContentLoaded', function() {
@@ -11734,6 +11734,43 @@ await browser.close();
         Duration::from_secs(60),
     );
     assert_eq!(result.status, "ok", "{result:?}");
+
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_nav_probe", method, payload),
+            Duration::from_secs(60),
+        )
+        .expect("navigation probe request")
+    };
+    let created = call("web.session.create", json!({"profile": "project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let read = call("web.read", json!({"session_id": session, "url": origin}));
+    assert_eq!(read.status, "ok", "{read:?}");
+    let extracted = &read.result.as_ref().unwrap()["source"];
+    assert_eq!(extracted["title"], "Navigation probe");
+    assert_eq!(extracted["final_url"], origin);
+    assert_eq!(extracted["text_truncated"], true);
+    let inspected = call(
+        "web.evaluate",
+        json!({
+            "session_id": session,
+            "source": "JSON.stringify(window.navigationProbeReads)",
+        }),
+    );
+    assert_eq!(inspected.status, "ok", "{inspected:?}");
+    let counts: serde_json::Value = serde_json::from_str(
+        inspected.result.as_ref().unwrap()["value"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(counts, json!({"text": 1, "html": 0, "elements": 0}));
+    assert_eq!(
+        call("web.session.close", json!({"session_id": session})).status,
+        "ok"
+    );
 }
 
 #[test]

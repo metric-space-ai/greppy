@@ -4355,7 +4355,7 @@ impl Daemon {
             .map_err(|error| engine_error(request, error, 34))?;
         self.apply_page_record_limits(session_id, page, request)?;
         let tree = self
-            .engine_call("page.observe", json!({ "page": page }))
+            .engine_call("page.observe", json!({ "page": page, "metadata_only": true }))
             .map_err(|error| engine_error(request, error, 34))?;
         let max_transfer_bytes = self
             .sessions

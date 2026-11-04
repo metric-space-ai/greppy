@@ -3456,6 +3456,19 @@ impl ContentEngine {
                         detail
                     }));
                 }
+                // Read/research only need this metadata before their existing
+                // bounded text transfer. Do not build an unused observation
+                // (layout text, headings, links, scopes and refs) for them.
+                if params.get("metadata_only").and_then(|value| value.as_bool()) == Some(true) {
+                    return match self.evaluate(
+                        webview,
+                        "JSON.stringify({url: location.href, title: document.title})",
+                    )? {
+                        JSValue::String(encoded) => serde_json::from_str(&encoded)
+                            .map_err(|error| io::Error::other(format!("page metadata json: {error}"))),
+                        other => Err(io::Error::other(format!("page metadata returned {other:?}"))),
+                    };
+                }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
                     .get("include_html")
