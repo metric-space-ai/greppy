@@ -11687,6 +11687,56 @@ fn controller_exception_redacts_authorization_secrets() {
 }
 
 #[test]
+fn known_http_navigation_does_not_copy_document_text_or_html() {
+    let origin = serve_fixture(
+        r#"<!doctype html><html><head><script>
+window.navigationProbeReads = { text: 0, html: 0, elements: 0 };
+Object.defineProperty(document.documentElement, 'outerHTML', {
+  get() { window.navigationProbeReads.html++; return 'x'.repeat(3 * 1024 * 1024); }
+});
+const selectAll = document.querySelectorAll.bind(document);
+document.querySelectorAll = function(selector) {
+  if (selector === '*:not(html):not(head):not(body)') window.navigationProbeReads.elements++;
+  return selectAll(selector);
+};
+document.addEventListener('DOMContentLoaded', function() {
+  Object.defineProperty(document.body, 'innerText', {
+    get() { window.navigationProbeReads.text++; return 'x'.repeat(3 * 1024 * 1024); }
+  });
+});
+</script></head><body><p>Known response</p></body></html>"#,
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-nav-probe-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_nav_probe", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = format!(
+        r#"
+import {{ chromium }} from 'playwright';
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({});
+const reads = await page.evaluate(() => window.navigationProbeReads);
+if (reads.text !== 0 || reads.html !== 0 || reads.elements !== 0) {{
+  throw new Error('navigation copied document evidence: ' + JSON.stringify(reads));
+}}
+await browser.close();
+"#,
+        serde_json::to_string(&origin).unwrap()
+    );
+    let result = run_playwright_source(
+        &socket,
+        "run_nav_probe",
+        &source,
+        None,
+        Duration::from_secs(60),
+    );
+    assert_eq!(result.status, "ok", "{result:?}");
+}
+
+#[test]
 fn large_read_is_truncated_and_artifact_backed() {
     let body = format!(
         "<!DOCTYPE html><html><body><p>{}</p></body></html>",

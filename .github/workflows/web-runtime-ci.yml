@@ -34,6 +34,9 @@ jobs:
         with:
           toolchain: '1.95.0'
 
+      - name: Check bounded navigation document probes
+        run: node --test crates/web-runtime/runtime/tests/navigation-document-probe.cjs
+
       - name: Check bounded worker capability framing
         shell: bash
         run: >-
