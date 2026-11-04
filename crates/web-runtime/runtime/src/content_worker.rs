@@ -256,6 +256,10 @@ enum WakePoll {
     TimedOut,
 }
 const ANIMATION_FRAME_BUDGET: Duration = Duration::from_millis(16);
+/// One Servo evaluation that only deletes a wait slot. Longer than the old
+/// 80ms fallback, which returned before the delete ran under CI load, and
+/// still bounded so a timeout does not become an unbounded spin.
+const WAIT_SLOT_CLEANUP: Duration = Duration::from_millis(500);
 
 fn animation_frame_budget(remaining: Duration) -> Duration {
     remaining.min(ANIMATION_FRAME_BUDGET)
@@ -2279,10 +2283,11 @@ impl ContentEngine {
                 &webview,
                 delegate,
                 &token,
-                document_generation,
-                Some(deadline),
-                strict_boolean,
-            )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                 return result;
             }
             if delegate.document_generation.get() == document_generation
@@ -2304,9 +2309,10 @@ impl ContentEngine {
                 // Reinstall on the new Document with the ORIGINAL deadline.
                 // The old nonce must not certify this new document, even if
                 // an old console completion was already in the delegate.
+                // Drop it before the early timeout return: reassigning the
+                // token first leaked the previous window slot.
+                self.drop_wait_slot(&webview, &token, io_deadline);
                 delegate.clear_wait_notice(&token);
-                token = alloc_wait_nonce()?;
-                document_generation = delegate.document_generation.get();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining < Duration::from_millis(1) {
                     return Err(io::Error::new(
@@ -2314,6 +2320,8 @@ impl ContentEngine {
                         "timeout: waitForFunction",
                     ));
                 }
+                token = alloc_wait_nonce()?;
+                document_generation = delegate.document_generation.get();
                 let waiter = wait_for_function_waiter_script(
                     source,
                     &token,
@@ -2333,10 +2341,11 @@ impl ContentEngine {
                         &webview,
                         delegate,
                         &token,
-                        document_generation,
-                        Some(deadline),
-                        strict_boolean,
-                    )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                         return result;
                     }
                     if delegate.document_generation.get() == document_generation
@@ -2355,10 +2364,11 @@ impl ContentEngine {
                 &webview,
                 delegate,
                 &token,
-                document_generation,
-                Some(deadline),
-                strict_boolean,
-            )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2393,10 +2403,11 @@ impl ContentEngine {
                         &webview,
                         delegate,
                         &token,
-                        document_generation,
-                        Some(deadline),
-                        strict_boolean,
-                    )? {
+                    document_generation,
+                    Some(deadline),
+                    io_deadline,
+                    strict_boolean,
+                )? {
                         return result;
                     }
                     if delegate.document_generation.get() != document_generation {
@@ -2421,19 +2432,31 @@ impl ContentEngine {
     }
 
     fn drop_wait_slot(&self, webview: &WebView, token: &str, deadline: Option<Instant>) {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
-        if budget.is_zero() {
-            // The installed JS deadline still cancels observers/frames. Do not
-            // start another synchronous evaluation after the caller's budget.
-            return;
-        }
+        // Predicate sampling stops at the caller deadline. Removing the slot
+        // is separate: the next script sees a leftover __greppyWait_* as a
+        // failed wait. An expired strict deadline used to skip this
+        // evaluation, and the public path's 80ms fallback often ended before
+        // Servo ran the delete on a busy runner. One bounded cleanup is not
+        // extra predicate time.
+        let budget = crate::wait_contract::wait_io_budget(deadline, WAIT_SLOT_CLEANUP);
+        let budget = if budget.is_zero() {
+            WAIT_SLOT_CLEANUP
+        } else {
+            budget
+        };
         let Ok(key_js) = serde_json::to_string(&Self::wait_slot_key(token)) else {
             return;
         };
-        let mut script = String::from("(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return 0; })(");
+        let mut script = String::from("(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return Object.prototype.hasOwnProperty.call(window, key) ? 0 : 1; })(");
         script.push_str(&key_js);
         script.push_str(")");
-        let _ = self.evaluate_until(webview.clone(), &script, budget);
+        for _ in 0..2 {
+            match self.evaluate_until(webview.clone(), &script, budget) {
+                Ok(JSValue::Number(value)) if value != 0.0 => return,
+                Ok(JSValue::Boolean(true)) => return,
+                _ => {}
+            }
+        }
     }
 
     fn take_completed_wait_slot(
@@ -2484,17 +2507,29 @@ impl ContentEngine {
         token: &str,
         document_generation: u64,
         deadline: Option<Instant>,
+        cleanup_deadline: Option<Instant>,
         strict_budget: bool,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = take_wait_completion_in_document(
+        let completed = match take_wait_completion_in_document(
             &delegate.document_generation,
             document_generation,
             || self.take_completed_wait_slot(webview, token, deadline),
-        )?
-        else {
+        ) {
+            Ok(completed) => completed,
+            Err(error) => {
+                // A zero completion budget returns TimedOut without reading
+                // the slot. Propagating that error used to skip drop_wait_slot,
+                // so window.__greppyWait_* was still there when the caller
+                // inspected the page.
+                delegate.clear_wait_notice(token);
+                self.drop_wait_slot(webview, token, cleanup_deadline);
+                return Err(error);
+            }
+        };
+        let Some((status, value)) = completed else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
@@ -6748,6 +6783,13 @@ pub fn run() -> io::Result<()> {
                         if tx.send(Ok(message)).is_err() {
                             return;
                         }
+                    }
+                    Err(error) if greppy_web_client::socket_timeout(&error) => {
+                        // macOS can surface a transient EAGAIN (os error 35)
+                        // on a blocking socket. That is not parent EOF and
+                        // must not tear the worker down.
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
                     }
                     Err(error) => {
                         parent_for_reader.store(false, Ordering::Relaxed);

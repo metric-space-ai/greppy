@@ -7,7 +7,8 @@ use crate::protocol::{Message, WorkerKind};
 use crate::session::{LocatorSnapshot, Session, SessionState};
 use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
-    new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
+    new_session_id, read_frame_until, write_frame, ErrorObject, Handshake, Request, Response,
+    SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -712,9 +713,15 @@ fn accept_loop(
             Ok(stream) => stream,
             Err(_) => continue,
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-        let request: Request = match read_frame(&mut stream) {
+        // Keep bytes already read when macOS reports the socket timeout as
+        // EAGAIN. Dropping the connection here makes the client observe
+        // UnexpectedEof instead of a timeout.
+        let request: Request = match read_frame_until(
+            &mut stream,
+            Instant::now() + Duration::from_secs(30),
+        ) {
             Ok(request) => request,
             Err(_) => continue,
         };
