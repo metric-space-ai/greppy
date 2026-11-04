@@ -1,8 +1,9 @@
-//! Blocking Anthropic Messages client for a localhost gateway.
+//! Blocking chat client for a plain-HTTP gateway.
 //!
-//! Speaks plain HTTP (no TLS) against a CLIProxyAPI-style proxy, default
-//! base `http://127.0.0.1:8317`. Streaming is assembled into a single
-//! assistant [`Message`] plus stop reason and usage.
+//! Speaks either Anthropic Messages or the OpenAI Responses API. There is no
+//! TLS stack: the default base is `http://127.0.0.1:8317` (a local router).
+//! Streaming is assembled into a single assistant [`Message`] plus stop
+//! reason and usage. The agent loop does not branch on the wire format.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -12,6 +13,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::api_format::{plain_http_refusal, resolve_endpoint, ApiFormat, ApiFormatSetting};
+use crate::openai::{self, OpenAiSseParser};
 use crate::protocol::{ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, Usage};
 use crate::wire::{to_messages_request_body, SseItem, SseParser};
 
@@ -91,12 +94,16 @@ impl std::fmt::Display for ProbeError {
 
 impl std::error::Error for ProbeError {}
 
-/// Blocking client for a single model against a localhost Messages gateway.
+/// Blocking client for a single model against a plain-HTTP chat gateway.
 #[derive(Clone)]
 pub struct Client {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    api_format: ApiFormatSetting,
+    /// Cleared after one OpenAI gateway rejects image input. Later turns omit
+    /// images instead of failing the task.
+    openai_vision: std::sync::Arc<AtomicBool>,
     /// Injectable stream byte cap (tests use a small value).
     stream_byte_cap: usize,
     /// Injectable stream event cap (tests use a small value).
@@ -111,6 +118,8 @@ impl std::fmt::Debug for Client {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_format", &self.api_format)
+            .field("openai_vision", &self.openai_vision.load(Ordering::Relaxed))
             .field("stream_byte_cap", &self.stream_byte_cap)
             .field("stream_event_cap", &self.stream_event_cap)
             .finish()
@@ -127,14 +136,44 @@ impl Client {
             base_url: normalize_base_url(base_url),
             model: model.to_string(),
             api_key: None,
+            api_format: ApiFormatSetting::Auto,
+            openai_vision: std::sync::Arc::new(AtomicBool::new(true)),
             stream_byte_cap: DEFAULT_STREAM_BYTE_CAP,
             stream_event_cap: DEFAULT_STREAM_EVENT_CAP,
             output_limits: Default::default(),
         }
     }
 
-    /// Attach a gateway API key, sent as both `x-api-key` and
-    /// `Authorization: Bearer` on every request (gateways accept either).
+    /// Select Anthropic Messages, the OpenAI Responses API, or path-based auto.
+    ///
+    /// `auto` stays on Anthropic unless the endpoint path is `/v1/messages` or
+    /// `/v1/responses`. That is the default, so existing gateways do not
+    /// change protocol.
+    pub fn with_api_format(mut self, format: ApiFormatSetting) -> Self {
+        self.api_format = format;
+        self
+    }
+
+    /// Format choice stored on this client, before path resolution.
+    pub fn api_format(&self) -> ApiFormatSetting {
+        self.api_format
+    }
+
+    /// Wire format for the current base URL.
+    pub fn resolved_format(&self) -> ApiFormat {
+        resolve_endpoint(&self.base_url, self.api_format).format
+    }
+
+    /// Same credentials, format, and vision memory pointed at another model.
+    pub fn rebound(&self, endpoint: &str, model: &str) -> Self {
+        let mut next = self.clone();
+        next.base_url = normalize_base_url(endpoint);
+        next.model = model.to_string();
+        next
+    }
+
+    /// Attach a gateway API key. Anthropic sends `x-api-key` and
+    /// `Authorization: Bearer`. OpenAI Responses sends only the bearer token.
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         let key = key.into();
         self.api_key = if key.is_empty() { None } else { Some(key) };
@@ -149,12 +188,17 @@ impl Client {
     }
 
     /// Apply the configured auth headers, if any, to a request.
+    ///
+    /// Anthropic gateways receive both `x-api-key` and `Authorization: Bearer`.
+    /// OpenAI Responses receives only the bearer token. The key is never
+    /// written into the body or into `Debug` output.
     fn authed(&self, req: ureq::Request) -> ureq::Request {
-        match &self.api_key {
-            Some(key) => req
+        match (&self.api_key, self.resolved_format()) {
+            (Some(key), ApiFormat::OpenAi) => req.set("Authorization", &format!("Bearer {key}")),
+            (Some(key), ApiFormat::Anthropic) => req
                 .set("x-api-key", key)
                 .set("Authorization", &format!("Bearer {key}")),
-            None => req,
+            (None, _) => req,
         }
     }
 
@@ -168,19 +212,34 @@ impl Client {
         &self.model
     }
 
-    /// URL used by [`Client::probe`] (`GET {base}/v1/models`).
+    /// URL used by [`Client::probe`] (`GET {origin}/v1/models`).
     pub fn models_url(&self) -> String {
-        format!("{}/v1/models", self.base_url)
+        resolve_endpoint(&self.base_url, self.api_format).models_url
     }
 
-    /// URL used by [`Client::stream_turn`] (`POST {base}/v1/messages`).
+    /// Anthropic completion URL for this base (`POST {origin}/v1/messages`).
     pub fn messages_url(&self) -> String {
-        format!("{}/v1/messages", self.base_url)
+        resolve_endpoint(
+            &self.base_url,
+            ApiFormatSetting::Explicit(ApiFormat::Anthropic),
+        )
+        .completion_url
     }
+
+    /// URL [`Client::stream_turn`] posts to for the resolved format.
+    pub fn completion_url(&self) -> String {
+        resolve_endpoint(&self.base_url, self.api_format).completion_url
+    }
+
     /// Use only an advertised model output limit for the unlimited-loop sentinel.
     /// Unknown metadata remains absent; it must never become a fabricated 8192 cap.
     fn request_body(&self, req: &ModelRequest) -> Value {
-        let mut body = to_messages_request_body(req);
+        let mut body = match self.resolved_format() {
+            ApiFormat::Anthropic => to_messages_request_body(req),
+            ApiFormat::OpenAi => {
+                openai::to_responses_body(req, self.openai_vision.load(Ordering::Relaxed))
+            }
+        };
         if req.max_tokens != u64::MAX {
             return body;
         }
@@ -209,7 +268,10 @@ impl Client {
             }
         };
         if let Some(limit) = limit {
-            body["max_tokens"] = serde_json::json!(limit);
+            match self.resolved_format() {
+                ApiFormat::Anthropic => body["max_tokens"] = serde_json::json!(limit),
+                ApiFormat::OpenAi => body["max_output_tokens"] = serde_json::json!(limit),
+            }
         }
         body
     }
@@ -219,6 +281,9 @@ impl Client {
     /// Unknown JSON shapes return an empty list rather than failing; the
     /// interactive UI then falls back to the currently selected model.
     pub fn list_models(&self) -> Result<Vec<String>, ProbeError> {
+        if let Some(message) = plain_http_refusal(&self.base_url) {
+            return Err(ProbeError::BadResponse(message));
+        }
         let url = self.models_url();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(GATEWAY_CONNECT_TIMEOUT)
@@ -246,6 +311,9 @@ impl Client {
     /// Distinguishes connect failures ([`ProbeError::Unreachable`]) from
     /// non-2xx / garbage ([`ProbeError::BadResponse`]).
     pub fn probe(&self) -> Result<(), ProbeError> {
+        if let Some(message) = plain_http_refusal(&self.base_url) {
+            return Err(ProbeError::BadResponse(message));
+        }
         let url = self.models_url();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(GATEWAY_CONNECT_TIMEOUT)
@@ -279,35 +347,36 @@ impl Client {
         req: &ModelRequest,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> Result<TurnResult, ClientError> {
-        let url = self.messages_url();
-        let body = self.request_body(req);
-        let body_str = serde_json::to_string(&body)
-            .map_err(|e| ClientError::Transport(format!("serialize model request: {e}")))?;
+        let response = match self.send_ureq(req) {
+            Err(error) if self.note_vision_rejection(req, &error) => self.send_ureq(req)?,
+            other => other?,
+        };
+        let mut reader = response.into_reader();
+        self.consume_sse(&mut reader, on_event)
+    }
 
+    fn send_ureq(&self, req: &ModelRequest) -> Result<ureq::Response, ClientError> {
+        let (url, body) = self.completion_request(req)?;
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             // Streaming turns can run long; no short overall read timeout.
             .timeout_read(Duration::from_secs(600))
             .build();
-
-        let response = match self
+        match self
             .authed(agent.post(&url))
             .set("Content-Type", "application/json")
             .set("Accept", "text/event-stream")
-            .send_string(&body_str)
+            .send_string(&body)
         {
-            Ok(r) => r,
+            Ok(response) => Ok(response),
             Err(ureq::Error::Status(code, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
-                return Err(ClientError::Http { status: code, body });
+                Err(ClientError::Http { status: code, body })
             }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(ClientError::Transport(format!("send model request: {t}")));
-            }
-        };
-
-        let mut reader = response.into_reader();
-        self.consume_sse(&mut reader, on_event)
+            Err(ureq::Error::Transport(error)) => Err(ClientError::Transport(format!(
+                "send model request: {error}"
+            ))),
+        }
     }
 
     /// Stream a turn with cancellation during connect, headers, and body reads.
@@ -336,23 +405,14 @@ impl Client {
             .map_err(|error| {
                 ClientError::Transport(format!("create model HTTP client: {error}"))
             })?;
-        let body = serde_json::to_string(&self.request_body(req))
-            .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
-        let mut request = client
-            .post(self.messages_url())
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .body(body);
-        if let Some(key) = &self.api_key {
-            request = request.header("x-api-key", key).bearer_auth(key);
-        }
-        let response = interruptible_wait(&runtime, cancel, request.send())?
-            .map_err(|error| ClientError::Transport(format!("send model request: {error}")))?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = interruptible_wait(&runtime, cancel, response.text())?.unwrap_or_default();
-            return Err(ClientError::Http { status, body });
-        }
+        let (url, body) = self.completion_request(req)?;
+        let response = match self.send_reqwest(&client, &runtime, cancel, &url, body) {
+            Err(error) if self.note_vision_rejection(req, &error) => {
+                let (url, body) = self.completion_request(req)?;
+                self.send_reqwest(&client, &runtime, cancel, &url, body)?
+            }
+            other => other?,
+        };
         let mut reader = InterruptibleReader {
             runtime: &runtime,
             cancel,
@@ -378,7 +438,7 @@ impl Client {
         reader: &mut dyn Read,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> Result<TurnResult, ClientError> {
-        let mut parser = SseParser::new();
+        let mut parser = StreamDecoder::new(self.resolved_format());
         let mut assembler = TurnAssembler::new();
         let mut byte_buf: Vec<u8> = Vec::new();
         let mut total_bytes: usize = 0;
@@ -450,6 +510,92 @@ impl Client {
         }
 
         assembler.finish()
+    }
+
+    fn completion_request(&self, req: &ModelRequest) -> Result<(String, String), ClientError> {
+        if let Some(message) = plain_http_refusal(&self.base_url) {
+            return Err(ClientError::Http {
+                status: 400,
+                body: message,
+            });
+        }
+        let url = self.completion_url();
+        let body = serde_json::to_string(&self.request_body(req))
+            .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
+        Ok((url, body))
+    }
+
+    /// Record that this OpenAI gateway rejected images, and ask for one retry
+    /// without them. Any other failure is returned unchanged.
+    fn note_vision_rejection(&self, req: &ModelRequest, error: &ClientError) -> bool {
+        let ClientError::Http { status, body } = error else {
+            return false;
+        };
+        let retry = self.resolved_format() == ApiFormat::OpenAi
+            && self.openai_vision.load(Ordering::Relaxed)
+            && openai::request_has_image(req)
+            && openai::vision_unsupported(*status, body);
+        if retry {
+            self.openai_vision.store(false, Ordering::Relaxed);
+        }
+        retry
+    }
+
+    fn send_reqwest(
+        &self,
+        client: &reqwest::Client,
+        runtime: &tokio::runtime::Runtime,
+        cancel: &AtomicBool,
+        url: &str,
+        body: String,
+    ) -> Result<reqwest::Response, ClientError> {
+        let mut request = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .body(body);
+        if let Some(key) = &self.api_key {
+            request = match self.resolved_format() {
+                ApiFormat::OpenAi => request.bearer_auth(key),
+                ApiFormat::Anthropic => request.header("x-api-key", key).bearer_auth(key),
+            };
+        }
+        let response = interruptible_wait(runtime, cancel, request.send())?
+            .map_err(|error| ClientError::Transport(format!("send model request: {error}")))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = interruptible_wait(runtime, cancel, response.text())?.unwrap_or_default();
+            return Err(ClientError::Http { status, body });
+        }
+        Ok(response)
+    }
+}
+
+enum StreamDecoder {
+    Anthropic(SseParser),
+    OpenAi(OpenAiSseParser),
+}
+
+impl StreamDecoder {
+    fn new(format: ApiFormat) -> Self {
+        match format {
+            ApiFormat::Anthropic => Self::Anthropic(SseParser::new()),
+            ApiFormat::OpenAi => Self::OpenAi(OpenAiSseParser::new()),
+        }
+    }
+
+    fn feed_line(&mut self, line: &str) -> Vec<SseItem> {
+        match self {
+            Self::Anthropic(parser) => parser.feed_line(line),
+            Self::OpenAi(parser) => parser.feed_line(line),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<SseItem> {
+        match self {
+            Self::Anthropic(parser) => parser.finish(),
+            Self::OpenAi(parser) => parser.finish(),
+        }
     }
 }
 
@@ -1232,7 +1378,46 @@ mod tests {
         assert_eq!(c.base_url(), "http://127.0.0.1:8317");
         assert_eq!(c.models_url(), "http://127.0.0.1:8317/v1/models");
         assert_eq!(c.messages_url(), "http://127.0.0.1:8317/v1/messages");
+        assert_eq!(c.completion_url(), "http://127.0.0.1:8317/v1/messages");
+        assert_eq!(c.resolved_format(), ApiFormat::Anthropic);
         assert_eq!(c.model(), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn openai_completion_url_and_debug_redacts_the_key() {
+        let client = Client::new("http://127.0.0.1:11434/v1", "qwen")
+            .with_api_format(ApiFormatSetting::Explicit(ApiFormat::OpenAi))
+            .with_api_key("sekrit-key");
+        assert_eq!(
+            client.completion_url(),
+            "http://127.0.0.1:11434/v1/responses"
+        );
+        assert_eq!(client.models_url(), "http://127.0.0.1:11434/v1/models");
+        let debug = format!("{client:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("sekrit-key"), "{debug}");
+    }
+
+    #[test]
+    fn https_is_rejected_before_any_connection() {
+        let client = Client::new("https://user:sekrit-key@api.openai.com/v1", "gpt-4.1")
+            .with_api_format(ApiFormatSetting::Explicit(ApiFormat::OpenAi));
+        let request = ModelRequest {
+            model: "gpt-4.1".into(),
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: crate::protocol::ToolChoice::Auto,
+            max_tokens: 8,
+        };
+        let error = client.stream_turn(&request, &mut |_| {}).unwrap_err();
+        match error {
+            ClientError::Http { status: 400, body } => {
+                assert!(body.contains("no TLS"), "{body}");
+                assert!(!body.contains("sekrit-key"), "{body}");
+            }
+            other => panic!("expected plain-HTTP refusal, got {other:?}"),
+        }
     }
 
     #[test]

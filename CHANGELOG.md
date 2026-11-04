@@ -4,6 +4,16 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Coding agent (`greppy -p` / `greppy agent`)
+
+- OpenAI Responses (`GREPPY_API_FORMAT=openai` or `--api-format openai`,
+  `POST /v1/responses`) runs through the same agent loop as the Anthropic
+  Messages gateway. Streaming, tool calls, images, cancellation, usage, and
+  retry are shared. The client stays plain HTTP and talks only to a local
+  router; there is no TLS and no direct cloud endpoint. `auto` (the default)
+  stays on Anthropic unless the endpoint path is `/v1/messages` or
+  `/v1/responses`.
+
 ## [0.4.6] — 2026-10-23
 
 ### Coding agent (`greppy -p`)

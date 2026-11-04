@@ -124,6 +124,7 @@ fn fixture(root: &Path) -> (Server, Receiver<Value>) {
         endpoint: "http://127.0.0.1:1".into(),
         model: "fixture-model".into(),
         api_key: None,
+        api_format: greppy_agent::ApiFormatSetting::Auto,
         max_turns: 2,
         data_root: Some(root.join("state")),
         after_messages: None,

@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, system_prompt_for_mode, AgentConfig, BuiltinPromptMode, Client,
-    ClientError, ExecutionEnv, GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest,
-    ModelStream, StreamEvent, ToolOutcome, TurnResult,
+    run_agent_loop_with_history, system_prompt_for_mode, AgentConfig, ApiFormatSetting,
+    BuiltinPromptMode, Client, ClientError, ExecutionEnv, GreppyEnv, LoopError, LoopEvent,
+    LoopStop, Message, ModelRequest, ModelStream, StreamEvent, ToolOutcome, TurnResult,
 };
 use serde_json::{json, Value};
 
@@ -57,6 +57,7 @@ pub(crate) struct AcpConfig {
     pub endpoint: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub api_format: ApiFormatSetting,
     pub max_turns: usize,
     pub data_root: Option<PathBuf>,
     #[cfg(test)]
@@ -75,6 +76,10 @@ impl Default for AcpConfig {
             api_key: std::env::var("GREPPY_API_KEY")
                 .ok()
                 .filter(|key| !key.is_empty()),
+            api_format: std::env::var("GREPPY_API_FORMAT")
+                .ok()
+                .and_then(|value| ApiFormatSetting::parse(&value).ok())
+                .unwrap_or_default(),
             max_turns: DEFAULT_MAX_TURNS,
             data_root: None,
             #[cfg(test)]
@@ -89,16 +94,24 @@ impl Default for AcpConfig {
 #[derive(Parser, Debug)]
 #[command(
     name = "greppy agent stdio",
-    about = "Speak the Agent Client Protocol on stdin/stdout.",
+    about = "Speak the Agent Client Protocol on stdin/stdout. The gateway is a local plain-HTTP router (GREPPY_ENDPOINT / GREPPY_MODEL / GREPPY_API_KEY / GREPPY_API_FORMAT; anthropic or openai Responses; no TLS).",
     disable_version_flag = true
 )]
 struct StdioArgs {
     /// Initial model id. `session/set_model` can replace it.
     #[arg(long, env = "GREPPY_MODEL")]
     model: Option<String>,
-    /// Anthropic-Messages gateway base URL.
+    /// Local router base URL (Anthropic Messages or OpenAI Responses).
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    /// `anthropic`, `openai`, or `auto` (default). See `greppy -p --help`.
+    #[arg(
+        long,
+        env = "GREPPY_API_FORMAT",
+        default_value = "auto",
+        value_name = "FORMAT"
+    )]
+    api_format: String,
     /// Maximum assistant turns for one prompt.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
     max_turns: usize,
@@ -130,10 +143,18 @@ pub(crate) fn run(rest: &[std::ffi::OsString]) -> u8 {
         }
     };
     let defaults = AcpConfig::default();
+    let api_format = match ApiFormatSetting::parse(&args.api_format) {
+        Ok(format) => format,
+        Err(error) => {
+            eprintln!("greppy agent stdio: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let config = AcpConfig {
         endpoint: args.endpoint,
         model: args.model.unwrap_or(defaults.model),
         max_turns: args.max_turns,
+        api_format,
         ..defaults
     };
     let stdin = io::stdin();
@@ -1028,7 +1049,8 @@ fn run_prompt(
     pending: &Arc<Mutex<HashMap<String, PendingPermission>>>,
     next_request_id: &Arc<AtomicU64>,
 ) -> Result<PromptDone, String> {
-    let mut client = Client::new(&config.endpoint, &prepared.model);
+    let mut client =
+        Client::new(&config.endpoint, &prepared.model).with_api_format(config.api_format);
     if let Some(key) = &config.api_key {
         client = client.with_api_key(key);
     }

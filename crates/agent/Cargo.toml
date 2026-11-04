@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "greppy agent wire layer: provider-neutral protocol types and Anthropic Messages SSE client"
+description = "greppy agent wire layer: provider-neutral protocol types and Anthropic Messages / OpenAI Responses clients"
 
 [dependencies]
 serde = { workspace = true }
