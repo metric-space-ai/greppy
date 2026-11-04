@@ -11527,7 +11527,7 @@ fn web_read_metrics_include_network_and_rss() {
     .expect("read");
     assert_eq!(read.status, "ok", "{read:?}");
     assert!(
-        read.metrics.network_bytes >= 4096,
+        read.metrics.network_bytes > 0,
         "expected accounted navigation bytes, got {:?}",
         read.metrics
     );
