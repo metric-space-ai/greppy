@@ -3110,8 +3110,8 @@ pub(crate) fn nav_refuse_non_callable(
         });
     }
     println!(
-        "next: every reference to the {}: greppy find-usages {target}",
-        { nav_kind_word(lines.as_ref(), node) }
+        "next: literal occurrences of this name: greppy search-pattern --fixed {}",
+        super::shell_quote_cli(&node.name)
     );
     Ok(Some(1))
 }
