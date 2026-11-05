@@ -121,6 +121,7 @@ mod tests {
             let mut samples = Vec::new();
             for _ in 0..rounds {
                 let start = Instant::now();
+                let mut received = Vec::new();
                 for index in 0..calls {
                     let method = if calls == 1 { "page.recordUsage" } else {
                         ["page.consoleMessages", "page.downloads", "page.responses"][index]
@@ -132,8 +133,18 @@ mod tests {
                     std::io::Write::write_all(&mut client, &frame).unwrap();
                     let Message::EngineResult { result, ok, .. } = read_message(&mut client).unwrap() else { panic!("engine result") };
                     assert!(ok);
-                    if calls == 1 { assert_eq!(serde_json::from_value::<RecordUsage>(result).unwrap(), usage); }
+                    received.push(result);
                 }
+                let observed = if calls == 1 {
+                    serde_json::from_value::<RecordUsage>(received.remove(0)).unwrap()
+                } else {
+                    RecordUsage::from_rows(
+                        received[0]["messages"].as_array().unwrap(),
+                        received[1]["downloads"].as_array().unwrap(),
+                        received[2]["responses"].as_array().unwrap(),
+                    )
+                };
+                assert_eq!(observed, usage, "both transports must report identical usage");
                 samples.push(start.elapsed().as_micros());
             }
             let bytes = request_bytes + peer.join().unwrap();

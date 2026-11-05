@@ -12367,6 +12367,7 @@ fn oversized_console_is_a_limit_error_without_restarting_content() {
     let guard = Supervisor::spawn(&socket, "run_largecon", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let before = content_worker_pid(guard.child.id()).expect("content worker before limit");
+    let started = Instant::now();
     let ran = run_playwright_source_with_limits(
         &socket,
         "run_largecon",
@@ -12382,6 +12383,7 @@ await page.evaluate(() => console.log("x".repeat(2 * 1024 * 1024)));
     );
     assert_eq!(ran.status, "error", "{ran:?}");
     let error = ran.error.as_ref().expect("limit error");
+    eprintln!("OVERSIZED_ACCOUNTING latency_ms={} metrics={:?} error={:?}", started.elapsed().as_millis(), ran.metrics, error);
     assert_eq!(error.code, "resource_limit", "{ran:?}");
     assert!(error.message.contains("console limit"), "{ran:?}");
     assert_eq!(content_worker_pid(guard.child.id()), Some(before), "accounting must not crash the worker");

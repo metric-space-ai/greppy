@@ -6072,15 +6072,6 @@ fn apply_record_limits(
 }
 
 
-fn sum_byte_lengths(rows: &[serde_json::Value]) -> u64 {
-    rows.iter()
-        .map(|row| {
-            row.get("byteLength")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0)
-        })
-        .sum()
-}
 
 impl Daemon {
     fn attach_session_metrics(&self, session_id: &str, response: &mut Response) {
