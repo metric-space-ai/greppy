@@ -130,7 +130,7 @@ fn spawn_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
                         }
                         let first = head.lines().next().unwrap_or("");
                         if first.starts_with("GET /v1/models") {
-                            let body = r#"{"data":[{"id":"test"}]}"#;
+                            let body = r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#;
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()

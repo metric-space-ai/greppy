@@ -132,7 +132,7 @@ fn spawn_stub_gateway_with_delay(
                     }
                     drop(reader);
                     if first_line.starts_with("GET /v1/models") {
-                        let body = r#"{"data":[{"id":"test"}]}"#;
+                        let body = r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),

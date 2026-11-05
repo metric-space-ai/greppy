@@ -93,7 +93,7 @@ fn spawn_gateway_sequence(
                     let req = String::from_utf8_lossy(&request);
                     let first_line = req.lines().next().unwrap_or("");
                     if first_line.starts_with("GET /v1/models") {
-                        let body = r#"{"data":[{"id":"test"}]}"#;
+                        let body = r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
@@ -101,6 +101,17 @@ fn spawn_gateway_sequence(
                         );
                         let _ = stream.write_all(resp.as_bytes());
                     } else if first_line.starts_with("POST /v1/messages") {
+                        let body_start = request
+                            .windows(4)
+                            .position(|part| part == b"\r\n\r\n")
+                            .expect("complete HTTP headers")
+                            + 4;
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request[body_start..]).expect("Messages JSON");
+                        assert!(
+                            body["max_tokens"].as_u64().is_some_and(|n| (1..=1024).contains(&n)),
+                            "Messages requires a positive numeric bound within the advertised fixture cap"
+                        );
                         let sse = responses[message_index.min(responses.len() - 1)];
                         message_index += 1;
                         let resp = format!(
