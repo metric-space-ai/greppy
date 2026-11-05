@@ -512,6 +512,10 @@ pub(crate) fn route_until_script_complete_gated(
                     ..
                 }) => {
                     if let Err(message) = gate.before_call(&method, &params) {
+                        settle_aborted_script(
+                            controller, content, request_id, &mut pending, &mut parked,
+                            deadline, &message, &mut gate,
+                        );
                         return Err(io::Error::other(format!("resource_limit: {message}")));
                     }
                     wait_point = format!("content:{method}");
@@ -558,12 +562,10 @@ pub(crate) fn route_until_script_complete_gated(
                             &mut gate,
                             &mut parked,
                         ) {
-                            let _ = controller.send(&Message::engine_result(
-                                request_id,
-                                false,
-                                serde_json::json!({}),
-                                Some(format!("resource_limit: {message}")),
-                            ));
+                            settle_aborted_script(
+                                controller, content, request_id, &mut pending, &mut parked,
+                                deadline, &message, &mut gate,
+                            );
                             return Err(io::Error::other(format!("resource_limit: {message}")));
                         }
                     }
@@ -602,6 +604,72 @@ pub(crate) fn route_until_script_complete_gated(
                     ));
                 }
             },
+        }
+    }
+}
+
+/// A failed engine gate returns before the controller's awaiting JavaScript
+/// has completed. Finish that script before reusing its protocol stream, or
+/// its late ScriptComplete can be mistaken for the next web.run's result.
+/// No further page actions are dispatched and the original deadline is kept.
+fn settle_aborted_script(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    rejected_id: u64,
+    pending: &mut HashMap<u64, (String, serde_json::Value)>,
+    parked: &mut VecDeque<Message>,
+    deadline: Instant,
+    reason: &str,
+    gate: &mut impl EngineGate,
+) {
+    let failure = |id| Message::engine_result(
+        id, false, serde_json::Value::Null, Some(format!("resource_limit: {reason}")),
+    );
+    let retire = |controller: &mut WorkerProcess, content: &mut WorkerProcess, inflight: bool| {
+        controller.kill_tree_now();
+        if inflight {
+            content.kill_tree_now();
+        }
+    };
+    for id in std::iter::once(rejected_id).chain(pending.keys().copied()) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || controller.send_timeout(&failure(id), remaining).is_err() {
+            retire(controller, content, !pending.is_empty());
+            return;
+        }
+    }
+    let mut completed = false;
+    while !completed || !pending.is_empty() {
+        gate.poll_control();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || gate.is_cancelled() {
+            retire(controller, content, !pending.is_empty());
+            return;
+        }
+        let incoming = if let Some(message) = parked.pop_front() {
+            Ok(Incoming::Content(message))
+        } else {
+            recv_any(controller, content, remaining)
+        };
+        match incoming {
+            Ok(Incoming::Controller(Message::ScriptComplete { .. })) => completed = true,
+            Ok(Incoming::Controller(Message::EngineCall { request_id, .. })) => {
+                // A script can catch the rejection; it still cannot resume
+                // page actions after this operation's resource gate failed.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || controller.send_timeout(&failure(request_id), remaining).is_err() {
+                    retire(controller, content, !pending.is_empty());
+                    return;
+                }
+            }
+            Ok(Incoming::Content(Message::EngineResult { request_id, ok, error, .. })) => {
+                pending.remove(&request_id);
+                gate.note_discarded_engine_result(request_id, ok, error);
+            }
+            _ => {
+                retire(controller, content, !pending.is_empty());
+                return;
+            }
         }
     }
 }
