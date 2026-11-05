@@ -57,8 +57,8 @@ pub use prompt::{
     PUBLIC_PROMPT, SYSTEM_PROMPT,
 };
 pub use protocol::{
-    ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,
-    Usage,
+    ContentPart, Message, ModelRequest, OutputTokenLimit, Role, StopReason, StreamEvent,
+    ToolChoice, ToolDefinition, Usage,
 };
 pub use sandbox::{SandboxError, SandboxMode, SandboxSpec};
 pub use wire::{to_messages_request_body, SseItem, SseParser};
