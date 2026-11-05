@@ -928,6 +928,17 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
         };
     }
+    let argv = match take_max_ram_flag(argv) {
+        Ok((argv, Some(raw))) => {
+            std::env::set_var("GREPPY_MAX_RAM", raw);
+            argv
+        }
+        Ok((argv, None)) => argv,
+        Err(message) => {
+            println!("{message}");
+            return EXIT_USAGE;
+        }
+    };
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
     // `greppy -p` and `greppy agent` are structured agent invocations. Intercept before
@@ -1936,6 +1947,96 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
     }
     // No tokens at all → not a passthrough (clap prints help).
     false
+}
+
+/// `--max-ram` is the whole host, with the same K/M/G suffixes as `GREPPY_MAX_RAM`.
+pub fn parse_max_ram_flag(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (number, shift) = if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'G' | 'g')) {
+        (&raw[..raw.len() - 1], 30u32)
+    } else if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'M' | 'm')) {
+        (&raw[..raw.len() - 1], 20u32)
+    } else if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'K' | 'k')) {
+        (&raw[..raw.len() - 1], 10u32)
+    } else {
+        (raw, 0u32)
+    };
+    let number: u64 = number.trim().parse().ok()?;
+    number.checked_shl(shift)
+}
+
+pub fn take_max_ram_flag(
+    argv: Vec<std::ffi::OsString>,
+) -> std::result::Result<(Vec<std::ffi::OsString>, Option<String>), String> {
+    let mut kept = Vec::with_capacity(argv.len());
+    let mut raw = None;
+    let mut args = argv.into_iter();
+    while let Some(arg) = args.next() {
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            kept.push(arg);
+            kept.extend(args);
+            break;
+        }
+        if text == "--max-ram" {
+            let Some(next) = args.next() else {
+                return Err("--max-ram requires a size such as 4G".into());
+            };
+            let value = next.to_string_lossy().into_owned();
+            if parse_max_ram_flag(&value).is_none() {
+                return Err(format!(
+                    "--max-ram expects a byte count such as 4G, 4096M, or 4294967296, not {value}"
+                ));
+            }
+            raw = Some(value);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--max-ram=") {
+            if parse_max_ram_flag(value).is_none() {
+                return Err(format!(
+                    "--max-ram expects a byte count such as 4G, 4096M, or 4294967296, not {value}"
+                ));
+            }
+            raw = Some(value.to_owned());
+            continue;
+        }
+        kept.push(arg);
+    }
+    Ok((kept, raw))
+}
+
+#[cfg(test)]
+mod max_ram_flag_tests {
+    use super::{parse_max_ram_flag, take_max_ram_flag, Cli};
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn max_ram_is_removed_before_clap_and_documented() {
+        assert_eq!(parse_max_ram_flag("4G"), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_max_ram_flag("4096M"), Some(4 * 1024 * 1024 * 1024));
+        assert!(parse_max_ram_flag("nope").is_none());
+        let argv = ["greppy", "--max-ram", "4G", "web", "read", "https://example.com"]
+            .map(OsString::from)
+            .to_vec();
+        let (kept, raw) = take_max_ram_flag(argv).unwrap();
+        assert_eq!(raw.as_deref(), Some("4G"));
+        assert_eq!(
+            kept,
+            ["greppy", "web", "read", "https://example.com"].map(OsString::from)
+        );
+        assert!(take_max_ram_flag(vec![OsString::from("greppy"), OsString::from("--max-ram=nope")]).is_err());
+        let help = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| Cli::try_parse_from(["greppy", "--help"]).unwrap_err().to_string())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(help.contains("--max-ram"), "{help}");
+    }
 }
 
 /// Dispatch a parsed CLI to the correct handler. Returns the desired exit

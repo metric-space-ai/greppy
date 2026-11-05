@@ -882,6 +882,10 @@ struct Daemon {
     run_control: Arc<RunControl>,
     workflow_deadline: Option<Instant>,
     workflow_defer_observation: bool,
+    /// Content CPU already spent in this operation by a worker that was replaced.
+    content_cpu_carry_ns: u64,
+    /// Baseline for the content worker that is running the rest of this operation.
+    content_cpu_baseline: Option<(u32, u64)>,
 }
 
 fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
@@ -1016,6 +1020,8 @@ impl Daemon {
             run_control,
             workflow_deadline: None,
             workflow_defer_observation: false,
+            content_cpu_carry_ns: 0,
+            content_cpu_baseline: None,
         })
     }
 
@@ -1093,6 +1099,8 @@ impl Daemon {
         let content_pid_before = self.content.pid();
         let controller_pid_before = self.controller.pid();
         let content_cpu_before_ns = sample_cpu_ns(content_pid_before);
+        self.content_cpu_carry_ns = 0;
+        self.content_cpu_baseline = Some((content_pid_before, content_cpu_before_ns));
         let controller_cpu_before_ns = sample_cpu_ns(controller_pid_before);
         let session_id = request
             .payload
@@ -1169,12 +1177,19 @@ impl Daemon {
         let controller_pid_after = self.controller.pid();
         let content_cpu_after_ns = sample_cpu_ns(content_pid_after);
         let controller_cpu_after_ns = sample_cpu_ns(controller_pid_after);
+        let (content_base_pid, content_base_ns) = self
+            .content_cpu_baseline
+            .unwrap_or((content_pid_before, content_cpu_before_ns));
+        let carried_content_ns = self.content_cpu_carry_ns;
+        self.content_cpu_carry_ns = 0;
+        self.content_cpu_baseline = None;
         let mut observed_content_cpu_ns = process_cpu_delta_ns(
-            content_pid_before,
-            content_cpu_before_ns,
+            content_base_pid,
+            content_base_ns,
             content_pid_after,
             content_cpu_after_ns,
-        );
+        )
+        .saturating_add(carried_content_ns);
         let mut observed_controller_cpu_ns = process_cpu_delta_ns(
             controller_pid_before,
             controller_cpu_before_ns,
@@ -1186,10 +1201,11 @@ impl Daemon {
                 (observed_content_cpu_ns, observed_controller_cpu_ns) = account_operation_cpu(
                     session,
                     &mut response,
-                    (content_pid_before, content_cpu_before_ns),
+                    (content_base_pid, content_base_ns),
                     (content_pid_after, content_cpu_after_ns),
                     (controller_pid_before, controller_cpu_before_ns),
                     (controller_pid_after, controller_cpu_after_ns),
+                    carried_content_ns,
                 );
             }
         }
@@ -1222,7 +1238,17 @@ impl Daemon {
             })
         });
         if let Some(message) = cpu_limit_error {
-            if response.status == "ok" {
+            let keep_text = response.status == "ok"
+                && crate::text_mode::is_text_read(&limit_request.operation)
+                && response
+                    .result
+                    .as_ref()
+                    .is_some_and(crate::text_mode::result_has_text);
+            if keep_text {
+                if let Some(result) = response.result.as_mut() {
+                    crate::text_mode::mark_partial(result, &message);
+                }
+            } else if response.status == "ok" {
                 let metrics = response.metrics.clone();
                 response = limit_error(&limit_request, message);
                 response.metrics = metrics;
@@ -2717,6 +2743,10 @@ impl Daemon {
     }
 
     fn web_read(&mut self, request: &Request) -> Response {
+        self.web_read_attempt(request, true)
+    }
+
+    fn web_read_attempt(&mut self, request: &Request, allow_retry: bool) -> Response {
         let Some(url) = request.payload.get("url").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.read requires url");
         };
@@ -2739,6 +2769,13 @@ impl Daemon {
                     }
                     Err(response) => {
                         self.finish_session(&session_id);
+                        if allow_retry
+                            && response.error.as_ref().is_some_and(|error| {
+                                crate::text_mode::incomplete_worker_frame(&error.message)
+                            })
+                        {
+                            return self.web_read_attempt(request, false);
+                        }
                         response
                     }
                 }
@@ -2871,15 +2908,20 @@ impl Daemon {
         let mut admitted = Vec::new();
         let mut omitted = 0u32;
         let mut omitted_reasons = Vec::new();
-        for result in results.into_iter().take(max_sources) {
-            let Some(href) = result.get("href").and_then(|v| v.as_str()) else {
-                omitted += 1;
-                omitted_reasons.push(json!({"reason": "missing href"}));
+        for result in results {
+            if admitted.len() >= max_sources {
+                break;
+            }
+            let Some(href) = result
+                .get("href")
+                .and_then(|v| v.as_str())
+                .and_then(crate::text_mode::research_target_url)
+            else {
                 continue;
             };
             let mut read_req = request.clone();
             read_req.payload =
-                json!({ "url": href, "session_id": request.payload.get("session_id") });
+                json!({ "url": href.as_str(), "session_id": request.payload.get("session_id") });
             match self.web_read(&read_req) {
                 response if response.status == "ok" => {
                     if let Some(source) = response
@@ -4419,9 +4461,42 @@ impl Daemon {
             }
             session.requests = session.requests.saturating_add(1);
         }
-        self.engine_call("page.goto", json!({ "page": page, "url": url }))
-            .map_err(|error| engine_error(request, error, 34))?;
-        self.apply_page_record_limits(session_id, page, request)?;
+        let text_mode = crate::text_mode::is_text_read(&request.operation);
+        let mut goto_params = json!({ "page": page, "url": url });
+        if text_mode {
+            // Do not wait for images and the load event. On one core that
+            // wait ran to the 30s engine timeout (exit 34) on JS-heavy pages.
+            goto_params["textOnly"] = json!(true);
+            goto_params["waitUntil"] = json!("domcontentloaded");
+            goto_params["timeout"] = json!(15_000);
+        }
+        let mut partial_reason: Option<String> = None;
+        if let Err(error) = self.engine_call("page.goto", goto_params) {
+            if crate::text_mode::incomplete_worker_frame(&error)
+                || error.contains("died while reading")
+            {
+                return Err(engine_error(
+                    request,
+                    crate::text_mode::worker_frame_message(),
+                    34,
+                ));
+            }
+            if text_mode && crate::text_mode::navigation_can_salvage(&error) {
+                partial_reason = Some(error);
+            } else {
+                return Err(engine_error(request, error, 34));
+            }
+        }
+        if let Err(response) = self.apply_page_record_limits(session_id, page, request) {
+            let network = response.error.as_ref().is_some_and(|error| {
+                error.code == "resource_limit" && error.message.contains("network limit")
+            });
+            if text_mode && network {
+                partial_reason = response.error.map(|error| error.message.to_string());
+            } else {
+                return Err(response);
+            }
+        }
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
@@ -4486,6 +4561,11 @@ impl Daemon {
             .rev()
             .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
         let text = rendered_text;
+        if text.trim().is_empty() {
+            if let Some(reason) = partial_reason {
+                return Err(engine_error(request, reason, 34));
+            }
+        }
         let title = tree
             .get("title")
             .and_then(|v| v.as_str())
@@ -4515,6 +4595,8 @@ impl Daemon {
                 "artifact_digest": stored.digest.hex,
                 "http_status": http_status,
                 "classification": "original",
+                "partial": partial_reason.is_some(),
+                "partial_reason": partial_reason,
                 "session_id": session_id,
                 "operation_id": request.request_id,
                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
@@ -4810,10 +4892,16 @@ impl Daemon {
                     let died = !self.content.is_running();
                     let detail = self.content.death_detail();
                     let message = error.to_string();
-                    if recover_worker {
+                    let frame_died = crate::text_mode::incomplete_worker_frame(&message);
+                    if recover_worker && (died || frame_died) {
+                        let _ = self.recover_content(&format!("content worker: {message}"));
+                    } else if recover_worker {
                         let _ = self.recover_content(&format!("content worker: {message}"));
                     }
-                    if died {
+                    if died || frame_died {
+                        let detail = detail.or_else(|| {
+                            frame_died.then(|| crate::text_mode::worker_frame_message().to_owned())
+                        });
                         return Err(worker_restarted_message(detail));
                     }
                     return Err(message);
@@ -5005,7 +5093,9 @@ impl Daemon {
         let reason = format!(
             "content rss {rss} exceeded recycle budget {limit}; replacing the content worker before the next navigation"
         );
+        self.carry_replaced_content_cpu();
         self.replace_content_worker(&reason)?;
+        self.arm_content_cpu_baseline();
         for session in self.sessions.values_mut() {
             session.page_id = None;
             session.engine_context_id = None;
@@ -5021,6 +5111,20 @@ impl Daemon {
             json!({ "rss_bytes": rss, "limit_bytes": limit }),
         );
         Ok(())
+    }
+
+    fn carry_replaced_content_cpu(&mut self) {
+        if let Some((pid, baseline)) = self.content_cpu_baseline.take() {
+            let now = sample_cpu_ns(pid);
+            self.content_cpu_carry_ns = self.content_cpu_carry_ns.saturating_add(
+                process_cpu_delta_ns(pid, baseline, pid, now),
+            );
+        }
+    }
+
+    fn arm_content_cpu_baseline(&mut self) {
+        let pid = self.content.pid();
+        self.content_cpu_baseline = Some((pid, sample_cpu_ns(pid)));
     }
 
     fn live_page_count(&self) -> u32 {
@@ -6159,13 +6263,15 @@ fn account_operation_cpu(
     content_after: (u32, u64),
     controller_before: (u32, u64),
     controller_after: (u32, u64),
+    carried_content_ns: u64,
 ) -> (u64, u64) {
     let content_ns = process_cpu_delta_ns(
         content_before.0,
         content_before.1,
         content_after.0,
         content_after.1,
-    );
+    )
+    .saturating_add(carried_content_ns);
     let controller_ns = process_cpu_delta_ns(
         controller_before.0,
         controller_before.1,
@@ -6979,6 +7085,7 @@ mod redirect_chain_tests {
             (7, 110),
             (9, 200),
             (9, 203),
+            0,
         );
         super::account_operation_cpu(
             &mut session_b,
@@ -6987,6 +7094,7 @@ mod redirect_chain_tests {
             (7, 150),
             (9, 203),
             (9, 210),
+            0,
         );
         super::account_operation_cpu(
             &mut session_a,
@@ -6995,6 +7103,7 @@ mod redirect_chain_tests {
             (7, 151),
             (9, 210),
             (9, 211),
+            0,
         );
 
         assert_eq!(session_a.content_cpu_used_ns, 11);
@@ -7037,6 +7146,7 @@ mod redirect_chain_tests {
             (11, 107),
             (12, 5),
             (12, 8),
+            0,
         );
         super::account_operation_cpu(
             &mut session,
@@ -7045,6 +7155,7 @@ mod redirect_chain_tests {
             (12, 1),
             (12, 8),
             (13, 1),
+            0,
         );
         assert_eq!(session.content_cpu_used_ns, 7);
         assert_eq!(session.controller_cpu_used_ns, 3);
@@ -7056,10 +7167,30 @@ mod redirect_chain_tests {
             (12, 4),
             (13, 1),
             (13, 4),
+            0,
         );
         assert_eq!(session.content_cpu_used_ns, 10);
         assert_eq!(session.controller_cpu_used_ns, 6);
         assert_eq!(session.navigation_content_cpu_ns, 10);
+    }
+
+    #[test]
+    fn a_recycled_worker_still_reports_content_cpu() {
+        let mut session = super::Session::new("recycle", "run", super::NetworkProfile::Research);
+        let request = super::Request::new("recycle", "web.read", json!({}));
+        let mut response = super::Response::ok(&request, json!({}));
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (20, 0),
+            (21, 50),
+            (3, 0),
+            (3, 0),
+            6_500_000_000,
+        );
+        assert_eq!(response.metrics.content_cpu_ms, 6_500);
+        assert_eq!(session.content_cpu_used_ns, 6_500_000_000);
+        assert_ne!(response.metrics.content_cpu_ms, 0);
     }
 
     #[test]
@@ -7075,6 +7206,7 @@ mod redirect_chain_tests {
             (1, 30),
             (2, 0),
             (2, 0),
+            0,
         );
         assert!(session
             .limits

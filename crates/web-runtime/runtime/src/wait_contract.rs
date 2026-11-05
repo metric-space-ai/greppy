@@ -27,6 +27,9 @@ pub(crate) fn remaining_wait_budget(
     elapsed: Duration,
     session_remaining: Option<Duration>,
 ) -> Duration {
+    // A missing deadline (0) must not collapse a real wait. delay/40 with
+    // timeout_ms 40000 was returning in under a second when deadline_ms was 0.
+    let request_ms = if request_ms == 0 { timeout_ms } else { request_ms };
     let request_remaining =
         Duration::from_millis(request_ms.min(timeout_ms)).saturating_sub(elapsed);
     session_remaining
@@ -96,6 +99,18 @@ pub(crate) fn wait_error_detail(message: &str) -> (&'static str, &'static str, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forty_second_wait_survives_a_missing_request_deadline() {
+        assert_eq!(
+            remaining_wait_budget(0, 40_000, Duration::ZERO, None),
+            Duration::from_millis(40_000)
+        );
+        assert!(
+            remaining_wait_budget(0, 40_000, Duration::from_millis(500), None)
+                > Duration::from_secs(39)
+        );
+    }
 
     #[test]
     fn queued_worker_calls_spend_the_original_deadline() {

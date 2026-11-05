@@ -371,6 +371,7 @@ struct Delegate {
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
     dropped_responses: Cell<u64>,
+    text_only: Cell<bool>,
     current_main_frame_request: RefCell<Option<String>>,
     main_frame_navigation_epoch: Cell<u64>,
     navigation_intent_generation: Cell<u64>,
@@ -421,6 +422,7 @@ impl Delegate {
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
             dropped_responses: Cell::new(0),
+            text_only: Cell::new(false),
             current_main_frame_request: RefCell::new(None),
             main_frame_navigation_epoch: Cell::new(0),
             navigation_intent_generation: Cell::new(0),
@@ -570,7 +572,11 @@ impl WebViewDelegate for Delegate {
 
     fn notify_new_frame_ready(&self, webview: WebView) {
         *self.new_frame_ready.borrow_mut() = true;
-        webview.paint();
+        // Text reads do not need llvmpipe. Painting here was most of the
+        // content CPU on a one-core host.
+        if !self.text_only.get() {
+            webview.paint();
+        }
         self.wake.wake();
     }
 
@@ -772,6 +778,16 @@ impl WebViewDelegate for Delegate {
                     rule.continue_headers.clone(),
                 )
             });
+        if self.text_only.get()
+            && !load.request.is_for_main_frame
+            && (crate::text_mode::blocks_subresource(
+                &format!("{:?}", load.request.destination).to_ascii_lowercase(),
+            ) || crate::text_mode::blocks_tracker_host(load.request.url.host_str().unwrap_or("")))
+        {
+            load.intercept(WebResourceResponse::new(load.request.url.clone()))
+                .cancel();
+            return;
+        }
         let Some((action, body, status, content_type, continue_headers)) = matched else {
             let extras = extra_request_headers(&self.extra_headers.borrow());
             if !extras.is_empty() {
@@ -2676,6 +2692,11 @@ impl ContentEngine {
         };
         self.reject_stale_objects(method, &params)?;
         self.reclaim_pump_tokens();
+        for slot in self.pages.values() {
+            if let PageSlot::Live { pair, .. } = slot {
+                pair.1.text_only.set(false);
+            }
+        }
         self.renderer_error.borrow_mut().take();
         let result = (|| -> io::Result<serde_json::Value> {
             match method {
@@ -2949,6 +2970,11 @@ impl ContentEngine {
                 // top-level navigation only and has stalled at HeadParsed.
                 delegate.navigation_failure.replace(None);
                 release_navigation_caches(&delegate);
+                let text_only = params
+                    .get("textOnly")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                delegate.text_only.set(text_only);
                 let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
                 let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
@@ -3055,7 +3081,10 @@ impl ContentEngine {
                 webview.show();
                 webview.focus();
                 let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
-                webview.paint();
+                if !text_only {
+                    webview.paint();
+                }
+                delegate.text_only.set(false);
                 self.spin_all_event_loops();
                 // Complete is the load signal. Subresource scripts are waited
                 // by waitForFunction / init scripts on the event loop; a

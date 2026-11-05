@@ -137,7 +137,9 @@ impl SessionLimits {
         let mut limits = Self::default();
         if profile == "research" {
             limits.max_pages = 8;
-            limits.max_network_bytes = 8 * 1024 * 1024;
+            // 32 MiB per navigation. 8 MiB rejected GitHub, Tagesschau, and
+            // DuckDuckGo HTML (10.4 MB) before any text was returned.
+            limits.max_network_bytes = 32 * 1024 * 1024;
             limits.max_artifact_bytes = 4 * 1024 * 1024;
             limits.idle_ttl = Duration::from_secs(2 * 60);
         }
@@ -385,6 +387,8 @@ mod tests {
         let research = SessionLimits::for_profile("research");
         let project = SessionLimits::for_profile("project");
         assert!(research.max_pages < project.max_pages);
+        assert_eq!(research.max_network_bytes, 32 * 1024 * 1024);
+        assert!(research.max_network_bytes >= 10 * 1024 * 1024);
         assert!(research.check_pages(9).is_err());
         assert!(project.check_pages(9).is_ok());
     }

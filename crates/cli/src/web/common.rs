@@ -1423,12 +1423,19 @@ pub(super) fn ensure_supervisor(
             if let Some(cookie) = load_attach_cookie(&socket) {
                 crate::web_attach::adopt_persistent_token(cookie);
             } else if socket_connected(&socket) {
-                return Err(not_owned(
-                    "web-runtime is running but this process has no inherited attach token",
-                ));
+                // A sibling may still be writing the cookie. Failing here was
+                // exit 32 for one of four parallel session creates on 1 vCPU.
+                match wait_for_attach_cookie(&socket, Duration::from_secs(5)) {
+                    Some(cookie) => crate::web_attach::adopt_persistent_token(cookie),
+                    None => {
+                        return Err(not_owned(
+                            "web-runtime is running but this process has no inherited attach token",
+                        ));
+                    }
+                }
             }
         }
-        let capability = match crate::web_attach::current_token() {
+        let mut capability = match crate::web_attach::current_token() {
             Some(token) => {
                 let _ = crate::web_attach::claim_persistent_parent();
                 token
@@ -1468,8 +1475,6 @@ pub(super) fn ensure_supervisor(
             }
             RuntimeDisposition::Spawn => {}
         }
-        save_attach_cookie(&socket, &capability);
-        let _ = std::fs::remove_file(&socket);
         let spawned_child: RefCell<Option<std::process::Child>> = RefCell::new(None);
         let issued_for_child = capability.clone();
         let mut attach_pass = None;
@@ -1477,6 +1482,11 @@ pub(super) fn ensure_supervisor(
         let mut startup_log = None;
         let mut spawn_error = None;
         let spawned = crate::inference_daemon::spawn_once(&endpoint, || {
+            // Only the spawn winner may publish the token or unlink the socket.
+            // A contending process that did this deleted the live socket and
+            // replaced the owner cookie, so its session create returned exit 32.
+            save_attach_cookie(&socket, &issued_for_child);
+            let _ = std::fs::remove_file(&socket);
             // A regular private file cannot backpressure a worker like an
             // inherited stderr pipe. Retain it only on failure; its path makes
             // engine startup errors inspectable instead of discarding them.
@@ -1550,8 +1560,13 @@ pub(super) fn ensure_supervisor(
             )));
         }
         match spawned {
-            crate::inference_daemon::SpawnOutcome::Spawned
-            | crate::inference_daemon::SpawnOutcome::Contended => {}
+            crate::inference_daemon::SpawnOutcome::Spawned => {}
+            crate::inference_daemon::SpawnOutcome::Contended => {
+                if let Some(cookie) = wait_for_attach_cookie(&socket, Duration::from_secs(5)) {
+                    crate::web_attach::adopt_persistent_token(cookie.clone());
+                    capability = cookie;
+                }
+            }
             crate::inference_daemon::SpawnOutcome::Cooldown => {
                 crate::inference_daemon::record_spawn_failure(&endpoint, spawned.attempted());
                 return Err(unavailable(
@@ -1640,6 +1655,19 @@ fn spawn_coordination_unavailable(error: String) -> ErrorObject {
 
 fn attach_cookie_path(socket: &Path) -> PathBuf {
     socket.with_extension("attach")
+}
+
+fn wait_for_attach_cookie(socket: &Path, budget: Duration) -> Option<String> {
+    let started = Instant::now();
+    loop {
+        if let Some(cookie) = load_attach_cookie(socket) {
+            return Some(cookie);
+        }
+        if started.elapsed() >= budget {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn load_attach_cookie(socket: &Path) -> Option<String> {
