@@ -2838,7 +2838,9 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
-pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v4";
+// The established reference-repair namespace also carries Go usages. v5
+// repairs old Go extraction without invalidating unrelated files or Base identity.
+pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v5";
 
 /// JSON `{"count":N,"paths":[...]}` for files skipped by
 /// [`recover_persisted_js_ts_usages`] because extraction still violated the
@@ -2889,7 +2891,7 @@ fn warn_js_ts_usage_repair_skips(paths: &[String]) {
     tracing::warn!(
         count,
         paths = %ordered.join(", "),
-        "JS/TS usage repair skipped files that still violate the provider contract"
+        "Reference usage repair skipped files that still violate the provider contract"
     );
 }
 
@@ -2907,20 +2909,21 @@ fn validated_js_ts_repair_extraction(
         && relative.rsplit(['/', '\\']).next() == Some("contract-invalid.js")
     {
         return Err(greppy_core::Error::Invalid(format!(
-            "JS/TS usage repair extraction incomplete for {relative}: synthetic residual contract violation (0 invalid records removed)"
+            "Reference usage repair extraction incomplete for {relative}: synthetic residual contract violation (0 invalid records removed)"
         )));
     }
     let (validated, dropped, error) = validate_or_degrade(language, relative, extraction);
     if let Some(error) = error {
         return Err(greppy_core::Error::Invalid(format!(
-            "JS/TS usage repair extraction incomplete for {relative}: {error} ({dropped} invalid records removed)"
+            "Reference usage repair extraction incomplete for {relative}: {error} ({dropped} invalid records removed)"
         )));
     }
     Ok(validated)
 }
 
-/// One-shot source-validated usage recovery, separately partitioned from Rust.
-/// Validate all visible source and definition identities before atomic publication.
+/// Source-validated JS/TS and Go reference recovery in the existing compatibility pass.
+/// A valid v4 completion retains JS/TS facts; only Go is extracted for the v5 upgrade.
+/// Validate all affected source and definition identities before atomic publication.
 pub fn recover_persisted_js_ts_usages(
     store: &mut Store,
     project: &str,
@@ -2929,23 +2932,72 @@ pub fn recover_persisted_js_ts_usages(
     if js_ts_usages_repaired(store)? {
         return Ok(false);
     }
+    // v4 already certified JS/TS with this extractor. Reuse that evidence,
+    // including an immutable Base's completion, and validate only Go sources.
+    let mut legacy_js_schema = None;
+    for schema in if store.is_overlay() {
+        &["main", "greppy_base"][..]
+    } else {
+        &["main"][..]
+    } {
+        let complete: bool = store.conn().query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {schema}.schema_meta WHERE key='greppy.js_ts_usage_repair_v4' AND value='complete')"),
+            [],
+            |row| row.get(0),
+        ).map_err(sqlite_err)?;
+        if complete {
+            legacy_js_schema = Some(*schema);
+            break;
+        }
+    }
+    let previous_skips = if let Some(schema) = legacy_js_schema {
+        let raw: String = store.conn().query_row(
+            &format!(r#"SELECT COALESCE((SELECT value FROM {schema}.schema_meta WHERE key=?1), '{{"count":0,"paths":[]}}')"#),
+            [JS_TS_USAGE_REPAIR_SKIPS_KEY],
+            |row| row.get(0),
+        ).map_err(sqlite_err)?;
+        Some(
+            serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| {
+                greppy_core::Error::Invalid(format!("reference repair skip metadata: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
     let root = std::fs::canonicalize(root).map_err(|e| {
-        greppy_core::Error::Invalid(format!("JS/TS usage repair root unavailable: {e}"))
+        greppy_core::Error::Invalid(format!("Reference usage repair root unavailable: {e}"))
     })?;
     let states = store.list_file_states(project)?;
     let indexed = store.list_nodes(project, "", "", 0, i64::MAX as usize)?;
     let relevant = |path: &str| {
-        matches!(
-            greppy_parser::language_for_path(Path::new(path)),
-            Language::JavaScript | Language::TypeScript { .. }
-        )
+        let language = greppy_parser::language_for_path(Path::new(path));
+        matches!(language, Language::Go)
+            || (legacy_js_schema.is_none()
+                && matches!(language, Language::JavaScript | Language::TypeScript { .. }))
     };
+    let fingerprint_paths: std::collections::HashSet<_> =
+        states.iter().map(|state| state.rel_path.as_str()).collect();
     if indexed.iter().any(|node| {
-        relevant(&node.file_path) && !states.iter().any(|state| state.rel_path == node.file_path)
+        relevant(&node.file_path) && !fingerprint_paths.contains(node.file_path.as_str())
     }) {
         return Err(greppy_core::Error::Invalid(
-            "JS/TS usage repair requires indexed source fingerprints".into(),
+            "Reference usage repair requires indexed source fingerprints".into(),
         ));
+    }
+    if legacy_js_schema.is_some() && !states.iter().any(|state| relevant(&state.rel_path)) {
+        // No Go files: certify the extension without re-reading JS/TS or
+        // loading/rebuilding its graph. Existing skips remain visible.
+        let tx = store.transaction()?;
+        tx.raw().execute(
+            "INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [JS_TS_USAGE_REPAIR_KEY],
+        ).map_err(sqlite_err)?;
+        tx.raw().execute(
+            "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![JS_TS_USAGE_REPAIR_SKIPS_KEY, previous_skips.unwrap().to_string()],
+        ).map_err(sqlite_err)?;
+        tx.commit()?;
+        return Ok(false);
     }
     // A Store-CoW Delta retains fingerprints for discovery-filtered files,
     // although those files deliberately have no graph definitions. Do not
@@ -2967,23 +3019,23 @@ pub fn recover_persisted_js_ts_usages(
             .any(|part| !matches!(part, std::path::Component::Normal(_)))
         {
             return Err(greppy_core::Error::Invalid(
-                "unsafe JS/TS usage repair path".into(),
+                "unsafe Reference usage repair path".into(),
             ));
         }
         let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
-            greppy_core::Error::Invalid(format!("JS/TS usage repair source unavailable: {e}"))
+            greppy_core::Error::Invalid(format!("Reference usage repair source unavailable: {e}"))
         })?;
         if !path.starts_with(&root) {
             return Err(greppy_core::Error::Invalid(
-                "JS/TS usage repair source escapes root".into(),
+                "Reference usage repair source escapes root".into(),
             ));
         }
         let (bytes, _) = read_stable_file(&path).map_err(|e| {
-            greppy_core::Error::Invalid(format!("JS/TS usage repair source unreadable: {e}"))
+            greppy_core::Error::Invalid(format!("Reference usage repair source unreadable: {e}"))
         })?;
         if file_state::sha256_hex(&bytes) != state.sha256 {
             return Err(greppy_core::Error::Invalid(format!(
-                "JS/TS usage repair source {} changed since indexing",
+                "Reference usage repair source {} changed since indexing",
                 state.rel_path
             )));
         }
@@ -3022,7 +3074,7 @@ pub fn recover_persisted_js_ts_usages(
                     || cached.end_line != i64::from(node.end_line)
             }) {
                 return Err(greppy_core::Error::Invalid(format!(
-                    "JS/TS usage repair definition unavailable: {}",
+                    "Reference usage repair definition unavailable: {}",
                     node.qualified_name
                 )));
             }
@@ -3063,7 +3115,7 @@ pub fn recover_persisted_js_ts_usages(
     {
         let Some(source) = index.by_qname(&edge.source_qualified_name) else {
             return Err(greppy_core::Error::Invalid(format!(
-                "JS/TS usage repair source identity unavailable: {}:{} source={} reference={}",
+                "Reference usage repair source identity unavailable: {}:{} source={} reference={}",
                 edge.file_path,
                 edge.line,
                 edge.source_qualified_name,
@@ -3108,7 +3160,24 @@ pub fn recover_persisted_js_ts_usages(
         .filter(|edge| edge.edge_type == "USAGE")
         .map(|edge| new_raw_edge_for(project, &edge.file_path, edge))
         .collect::<Vec<_>>();
-    let skip_json = js_ts_usage_repair_skip_json(&skipped_contract_files);
+    let skip_json = if let Some(previous) = previous_skips {
+        let mut paths = previous["paths"].as_array().cloned().unwrap_or_default();
+        paths.extend(
+            skipped_contract_files
+                .iter()
+                .map(|path| serde_json::json!(path)),
+        );
+        paths.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        paths.dedup();
+        paths.truncate(20);
+        serde_json::json!({
+            "count": previous["count"].as_u64().unwrap_or(0) + skipped_contract_files.len() as u64,
+            "paths": paths,
+        })
+        .to_string()
+    } else {
+        js_ts_usage_repair_skip_json(&skipped_contract_files)
+    };
     store
         .conn()
         .execute_batch("SAVEPOINT greppy_js_ts_usage_repair")
