@@ -96,7 +96,7 @@ fn spawn_stub_gateway(delay_ms: u64) -> (String, Arc<AtomicBool>, thread::JoinHa
                     let req = String::from_utf8_lossy(&buf[..n]);
                     let first_line = req.lines().next().unwrap_or("");
                     if first_line.starts_with("GET /v1/models") {
-                        let body = r#"{"data":[{"id":"test"},{"id":"other-model"}]}"#;
+                        let body = r#"{"data":[{"id":"test","max_completion_tokens":1024},{"id":"other-model","max_completion_tokens":1024}]}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
