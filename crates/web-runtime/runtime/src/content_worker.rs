@@ -969,13 +969,11 @@ impl WebViewDelegate for Delegate {
 }
 
 fn release_navigation_caches(delegate: &Delegate) {
-    delegate.last_responses.borrow_mut().clear();
-    delegate.dropped_responses.set(0);
+    // Request and response logs stay. web.network reads every navigation in
+    // the session; clearing them left only the last document. The budget
+    // counters reset so the next page can load its own side resources.
     delegate.observed_network.set(0);
     delegate.budget_exhausted.set(false);
-    delegate.requests.borrow_mut().clear();
-    delegate.dropped_requests.set(0);
-    delegate.downloads.borrow_mut().clear();
     // glibc keeps freed arenas. Without this the content process grows across
     // navigations even after the previous document is gone.
     #[cfg(target_os = "linux")]
