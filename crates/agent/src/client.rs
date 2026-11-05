@@ -665,6 +665,47 @@ mod metadata_tests {
         assert_eq!(registered_output_limit("kimi-k3.1-pro-extra"), None);
     }
     #[test]
+    fn required_anthropic_output_limit_preserves_gateway_reasoning_suffix() {
+        let model = "kimi-k3.1-pro(high)";
+        let client = Client::new("http://127.0.0.1:1", model);
+        let mut req = ModelRequest {
+            model: model.into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: crate::protocol::ToolChoice::Auto,
+            max_tokens: u64::MAX,
+        };
+        client
+            .output_limits
+            .lock()
+            .unwrap()
+            .insert(req.model.clone(), None);
+        let body = client
+            .request_body(&req)
+            .expect("gateway-supported reasoning suffix");
+        assert_eq!(body["model"], model);
+        assert_eq!(body["max_tokens"], 65536);
+        let metadata = r#"{"data":[{"id":"kimi-k3.1-pro","max_completion_tokens":11111},{"id":"kimi-k3.1-pro(high)","max_completion_tokens":22222}]}"#;
+        assert_eq!(advertised_output_limit(metadata, model), Some(22222));
+        let base_only = r#"{"data":[{"id":"kimi-k3.1-pro","max_completion_tokens":11111}]}"#;
+        assert_eq!(advertised_output_limit(base_only, model), Some(11111));
+        for unknown in [
+            "kimi-k3.1-pro-extra(high)",
+            "kimi-k3.1-pro(unknown)",
+            "kimi-k3.1-pro(high)extra",
+        ] {
+            req.model = unknown.into();
+            client
+                .output_limits
+                .lock()
+                .unwrap()
+                .insert(req.model.clone(), None);
+            assert!(client.request_body(&req).is_err(), "{unknown}");
+        }
+    }
+
+    #[test]
     fn only_exact_advertised_output_limit_is_used() {
         let metadata = r#"{"data":[{"id":"m","context_length":100000,"max_output_tokens":16000},{"id":"other","max_output_tokens":64000}]}"#;
         assert_eq!(advertised_output_limit(metadata, "m"), Some(16000));
