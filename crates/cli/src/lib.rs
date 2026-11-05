@@ -6468,6 +6468,36 @@ fn spawn_background_job_handle_scoped(
     if admission_stderr.is_none() {
         command.stderr(std::process::Stdio::null());
     }
+    // Keep the real child's cause for this owned CI fixture, without changing
+    // release diagnostics or replacing the configured admission runner's log.
+    #[cfg(all(debug_assertions, feature = "ci-test-assets"))]
+    if admission_stderr.is_none() {
+        if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_OUTPUT") {
+            command.env_remove("GREPPY_TEST_BACKGROUND_OUTPUT");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(path).and_then(|stderr| {
+                let stdout = stderr.try_clone()?;
+                Ok((stdout, stderr))
+            }) {
+                Ok((stdout, stderr)) => {
+                    command.stdout(stdout).stderr(stderr);
+                }
+                Err(error) => {
+                    value["state"] = serde_json::json!("failed");
+                    value["last_error"] =
+                        serde_json::json!(format!("create owned background test log: {error}"));
+                    let _ = write_background_job(&job_path, &value);
+                    return None;
+                }
+            }
+        }
+    }
     let configured_workers =
         configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
     debug_assert_eq!(Some(configured_workers), worker_count);
