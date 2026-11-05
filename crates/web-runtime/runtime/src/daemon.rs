@@ -6061,8 +6061,8 @@ fn apply_record_limits(
     session_id: &str,
     records: &crate::record_usage::RecordUsage,
 ) -> Result<(), String> {
-    if let Some(error) = &records.retention_error {
-        return Err(error.clone());
+    if records.retention_overflow {
+        return Err("retained page records exceeded their memory budget; close the page or session to release its history".to_owned());
     }
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());

@@ -15,7 +15,7 @@ use servo::{
     RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
     TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
     WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -39,6 +39,8 @@ const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js
 const NAVIGATION_DOCUMENT_PROBE: &str = include_str!("../js/navigation-document-probe.js");
 const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
 use crate::retained_records::RetainedRecords;
+#[cfg(debug_assertions)]
+static LIVE_DELEGATES: AtomicU64 = AtomicU64::new(0);
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -359,7 +361,9 @@ struct Delegate {
     requests: RefCell<RetainedRecords>,
     dropped_requests: Cell<u64>,
     downloads: RefCell<RetainedRecords>,
-    popups: RefCell<Vec<(WebView, WebView)>>,
+    // The opener's ID cannot retain its WebView -> Delegate -> popup cycle.
+    // Retain the child's actual delegate so adoption preserves event state.
+    popups: RefCell<Vec<(WebView, WebViewId, Rc<Delegate>)>>,
     opener_id: RefCell<Option<String>>,
     last_dialogs: RefCell<Vec<serde_json::Value>>,
     dialog_action: RefCell<DialogAction>,
@@ -396,6 +400,13 @@ struct Delegate {
     user_content: Rc<UserContentManager>,
 }
 
+#[cfg(debug_assertions)]
+impl Drop for Delegate {
+    fn drop(&mut self) {
+        LIVE_DELEGATES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl Delegate {
     fn new(
         rendering_context: Rc<dyn RenderingContext>,
@@ -403,6 +414,8 @@ impl Delegate {
         wake: WakeFlag,
         user_content: Rc<UserContentManager>,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        LIVE_DELEGATES.fetch_add(1, Ordering::Relaxed);
         Self {
             new_frame_ready: RefCell::new(false),
             routes: RefCell::new(Vec::new()),
@@ -608,18 +621,21 @@ impl WebViewDelegate for Delegate {
     }
 
     fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
+        let delegate = Rc::new(Delegate::new(
+            Rc::clone(&self.rendering_context),
+            self.profile.clone(),
+            self.wake.clone(),
+            Rc::clone(&self.user_content),
+        ));
         let child = request
             .builder(Rc::clone(&self.rendering_context))
-            .delegate(Rc::new(Delegate::new(
-                Rc::clone(&self.rendering_context),
-                self.profile.clone(),
-                self.wake.clone(),
-                Rc::clone(&self.user_content),
-            )))
+            .delegate(Rc::clone(&delegate) as Rc<dyn WebViewDelegate>)
             .user_content_manager(Rc::clone(&self.user_content))
             .build();
         child.show();
-        self.popups.borrow_mut().push((child, parent));
+        self.popups
+            .borrow_mut()
+            .push((child, parent.id(), delegate));
     }
 
     fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
@@ -2888,6 +2904,7 @@ impl ContentEngine {
                 "pages": self.pages.len(),
                 "contexts": self.contexts.len(),
                 "browsers": self.browsers.len(),
+                "delegates": LIVE_DELEGATES.load(Ordering::Relaxed),
                 "retained_record_bytes": self.pages.values().filter_map(|slot| match slot {
                     PageSlot::Live { pair: (_, delegate), .. } => Some(
                         delegate.requests.borrow().bytes() +
@@ -3991,7 +4008,7 @@ impl ContentEngine {
                     delegate.downloads.borrow().overflowed() ||
                     delegate.requests.borrow().overflowed() ||
                     delegate.last_responses.borrow().overflowed() {
-                    usage.retention_error = Some("retained page records exceeded their memory budget; close the page or session to release its history".to_owned());
+                    usage.retention_overflow = true;
                 }
                 serde_json::to_value(usage).map_err(io::Error::other)
             }
@@ -4299,12 +4316,12 @@ impl ContentEngine {
             }
             "page.popups" => {
                 let page_id = required_str(&params, "page")?;
-                let taken: Vec<(WebView, WebView)> = {
+                let taken: Vec<(WebView, WebViewId, Rc<Delegate>)> = {
                     let delegate = &self.page(&page_id)?.1;
                     delegate.popups.borrow_mut().drain(..).collect()
                 };
                 let mut pages = Vec::new();
-                for (webview, parent) in taken {
+                for (webview, parent, delegate) in taken {
                     let opener = self
                         .pages
                         .iter()
@@ -4312,7 +4329,7 @@ impl ContentEngine {
                             PageSlot::Live {
                                 pair: (existing, _),
                                 ..
-                            } if existing == &parent => Some(id.clone()),
+                            } if existing.id() == parent => Some(id.clone()),
                             _ => None,
                         })
                         .unwrap_or_else(|| page_id.clone());
@@ -4334,26 +4351,7 @@ impl ContentEngine {
                         },
                     };
                     let id = self.alloc_id("page");
-                    let (rendering_context, profile, wake, user_content) = match bundle.as_ref() {
-                        Some(bundle) => (
-                            Rc::clone(&bundle.rendering_context),
-                            bundle.profile.clone(),
-                            bundle.wake.clone(),
-                            Rc::clone(&bundle.user_content),
-                        ),
-                        None => (
-                            Rc::clone(&self.rendering_context),
-                            self.profile.clone(),
-                            self.wake.clone(),
-                            Rc::clone(&self.user_content),
-                        ),
-                    };
-                    let delegate = Rc::new(Delegate::new(
-                        rendering_context,
-                        profile,
-                        wake,
-                        user_content,
-                    ));
+
                     if let Some(bundle) = bundle.as_ref() {
                         debug_assert!(Rc::ptr_eq(
                             &delegate.rendering_context,

@@ -11,8 +11,8 @@ pub struct RecordUsage {
     pub console_bytes: u64,
     pub download_bytes: u64,
     pub network_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retention_error: Option<String>,
+    #[serde(default)]
+    pub retention_overflow: bool,
 }
 
 impl RecordUsage {
@@ -25,7 +25,7 @@ impl RecordUsage {
             }),
             download_bytes: byte_lengths(downloads),
             network_bytes: byte_lengths(responses),
-            retention_error: None,
+            retention_overflow: false,
         }
     }
 }
