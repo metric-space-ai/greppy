@@ -2922,7 +2922,7 @@ fn validated_js_ts_repair_extraction(
 }
 
 /// Source-validated JS/TS and Go reference recovery in the existing compatibility pass.
-/// A valid v4 completion retains JS/TS facts; only Go is extracted for the v5 upgrade.
+/// Reuse v4-certified JS/TS facts per layer; validate Go and uncertified Delta sources.
 /// Validate all affected source and definition identities before atomic publication.
 pub fn recover_persisted_js_ts_usages(
     store: &mut Store,
@@ -2933,7 +2933,7 @@ pub fn recover_persisted_js_ts_usages(
         return Ok(false);
     }
     // v4 already certified JS/TS with this extractor. Reuse that evidence,
-    // including an immutable Base's completion, and validate only Go sources.
+    // including immutable Base facts. Private JS/TS still needs its own evidence.
     let mut legacy_js_schema = None;
     for schema in if store.is_overlay() {
         &["main", "greppy_base"][..]
@@ -2968,43 +2968,88 @@ pub fn recover_persisted_js_ts_usages(
         greppy_core::Error::Invalid(format!("Reference usage repair root unavailable: {e}"))
     })?;
     let states = store.list_file_states(project)?;
-    let indexed = store.list_nodes(project, "", "", 0, i64::MAX as usize)?;
+    // Only source identities are needed here, not every node/property payload.
+    let indexed = {
+        let mut statement = store
+            .conn()
+            .prepare("SELECT DISTINCT file_path FROM nodes WHERE project=?1")
+            .map_err(sqlite_err)?;
+        let paths = statement
+            .query_map([project], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+        paths
+    };
+    let mut uncertified_js_files = std::collections::HashSet::new();
+    if legacy_js_schema == Some("greppy_base") {
+        // A Base certificate says nothing about private Delta facts. Include
+        // owned files, raw/resolved facts and prior reference-override masks.
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT rel_path FROM main.file_state WHERE project=?1
+             UNION SELECT file_path FROM main.nodes WHERE project=?1
+             UNION SELECT file_path FROM main.raw_edges WHERE project=?1
+             UNION SELECT n.file_path FROM main.overlay_edges e JOIN nodes n
+               ON n.project=e.project AND n.qualified_name=e.source_qualified_name
+               WHERE e.project=?1
+             UNION SELECT CAST(f.value AS TEXT) FROM main.schema_meta m, json_each(m.value) f
+               WHERE m.key IN (?2,?3)",
+            )
+            .map_err(sqlite_err)?;
+        let paths = statement
+            .query_map(
+                rusqlite::params![
+                    project,
+                    format!("greppy.js_ts_usage_override_files.{project}"),
+                    format!("greppy.js_ts_caller_override_files.{project}")
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sqlite_err)?;
+        for path in paths {
+            uncertified_js_files.insert(path.map_err(sqlite_err)?);
+        }
+    }
     let relevant = |path: &str| {
         let language = greppy_parser::language_for_path(Path::new(path));
         matches!(language, Language::Go)
-            || (legacy_js_schema.is_none()
+            || ((legacy_js_schema.is_none() || uncertified_js_files.contains(path))
                 && matches!(language, Language::JavaScript | Language::TypeScript { .. }))
     };
     let fingerprint_paths: std::collections::HashSet<_> =
         states.iter().map(|state| state.rel_path.as_str()).collect();
-    if indexed.iter().any(|node| {
-        relevant(&node.file_path) && !fingerprint_paths.contains(node.file_path.as_str())
-    }) {
+    if indexed
+        .iter()
+        .any(|path| relevant(path) && !fingerprint_paths.contains(path.as_str()))
+    {
         return Err(greppy_core::Error::Invalid(
             "Reference usage repair requires indexed source fingerprints".into(),
         ));
     }
     if legacy_js_schema.is_some() && !states.iter().any(|state| relevant(&state.rel_path)) {
-        // No Go files: certify the extension without re-reading JS/TS or
-        // loading/rebuilding its graph. Existing skips remain visible.
-        let tx = store.transaction()?;
-        tx.raw().execute(
-            "INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [JS_TS_USAGE_REPAIR_KEY],
-        ).map_err(sqlite_err)?;
-        tx.raw().execute(
-            "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            rusqlite::params![JS_TS_USAGE_REPAIR_SKIPS_KEY, previous_skips.unwrap().to_string()],
-        ).map_err(sqlite_err)?;
-        tx.commit()?;
+        // No Go or uncertified JS/TS sources: certify without reading their
+        // source or loading node payloads/rebuilding the graph.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete'),(?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![
+                    JS_TS_USAGE_REPAIR_KEY,
+                    JS_TS_USAGE_REPAIR_SKIPS_KEY,
+                    previous_skips.unwrap().to_string()
+                ],
+            )
+            .map_err(sqlite_err)?;
         return Ok(false);
     }
     // A Store-CoW Delta retains fingerprints for discovery-filtered files,
     // although those files deliberately have no graph definitions. Do not
     // re-extract them as if their absent definitions were cache corruption.
     let discovery_filtered = discovery_filtered_recovery_identities(store, project)?;
-    let indexed_paths: std::collections::BTreeSet<_> =
-        indexed.iter().map(|node| node.file_path.as_str()).collect();
+    let indexed_paths: std::collections::BTreeSet<_> = indexed.iter().map(String::as_str).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
     let mut skipped_contract_files = Vec::new();

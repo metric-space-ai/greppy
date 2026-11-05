@@ -51,6 +51,26 @@ def main():
             print(f"mutation: original filter turns {exact} red")
     finally:
         SOURCE.write_bytes(original)
+    indexer = ROOT / "crates/indexer/src/lib.rs"
+    original_indexer = indexer.read_bytes()
+    layer_guard = b"legacy_js_schema.is_none() || uncertified_js_files.contains(path)"
+    if original_indexer.count(layer_guard) != 1:
+        raise SystemExit("layer mutation target must match exactly once")
+    try:
+        indexer.write_bytes(original_indexer.replace(
+            layer_guard, b"legacy_js_schema.is_none()", 1,
+        ))
+        layer = run("greppy-indexer", "base_v4_does_not_certify_unrepaired_private_js_without_go")
+        if (
+            layer.returncode != 101
+            or "Base-v4 must not certify unvalidated private JS facts" not in layer.stdout
+            or "test result: FAILED" not in layer.stdout
+        ):
+            print(layer.stdout)
+            raise SystemExit("layer mutation did not fail at the private JS contract")
+        print("mutation: trusting Base-v4 for private JS turns the layer contract red")
+    finally:
+        indexer.write_bytes(original_indexer)
     for package, _, _ in CASES:
         green = run(package)
         if green.returncode != 0:

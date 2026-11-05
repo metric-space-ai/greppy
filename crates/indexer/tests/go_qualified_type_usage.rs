@@ -60,6 +60,85 @@ fn qualified_go_type_usage_reaches_the_graph_without_guessing_ambiguous_names() 
     }
 }
 
+#[test]
+fn base_v4_does_not_certify_unrepaired_private_js_without_go() {
+    let repo = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let base_path = scratch.path().join("base.db");
+    mixed_cache(repo.path(), &base_path, false);
+    let base_bytes = fs::read(&base_path).unwrap();
+    let mut overlay = Store::open_overlay(
+        &base_path,
+        &scratch.path().join("delta.db"),
+        &greppy_store::VisibilityIndex::default(),
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("delta.tsx"),
+        "import { Boundary } from './retained';\nexport function PrivateView() { return <Boundary />; }\n",
+    ).unwrap();
+    greppy_indexer::index_with_options(
+        &mut overlay,
+        repo.path(),
+        "anko",
+        &greppy_indexer::IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["delta.tsx".to_string()])),
+            ..greppy_indexer::IndexOptions::default()
+        },
+    )
+    .unwrap();
+    // Keep Base-v4 and the private source/fingerprints/definitions, but simulate
+    // old private JSX facts that were never certified by main-v4.
+    overlay
+        .conn()
+        .execute_batch(
+            "DELETE FROM main.raw_edges WHERE file_path='delta.tsx' AND edge_type='USAGE';
+         DELETE FROM main.overlay_edges WHERE edge_type='USAGE'
+           AND source_qualified_name='delta.tsx::Function::PrivateView';
+         DELETE FROM main.schema_meta WHERE key='greppy.js_ts_usage_repair_v4';",
+        )
+        .unwrap();
+    overlay
+        .conn()
+        .execute(
+            "DELETE FROM main.schema_meta WHERE key=?1",
+            [greppy_indexer::JS_TS_USAGE_REPAIR_KEY],
+        )
+        .unwrap();
+    let boundary = overlay
+        .get_node_by_qname("anko", "retained.tsx::Function::Boundary")
+        .unwrap()
+        .unwrap();
+    let caller = overlay
+        .get_node_by_qname("anko", "delta.tsx::Function::PrivateView")
+        .unwrap()
+        .unwrap();
+    assert!(!overlay
+        .incoming_edges(boundary.id, Some("USAGE"), 30)
+        .unwrap()
+        .iter()
+        .any(|edge| edge.source_id == caller.id));
+    let mut before = preserved_cache(&overlay);
+    before.remove(3); // These private JS raw facts are the intended repair.
+    assert!(
+        greppy_indexer::recover_persisted_js_ts_usages(&mut overlay, "anko", repo.path(),).unwrap(),
+        "Base-v4 must not certify unvalidated private JS facts"
+    );
+    assert!(overlay
+        .incoming_edges(boundary.id, Some("USAGE"), 30)
+        .unwrap()
+        .iter()
+        .any(|edge| edge.source_id == caller.id));
+    let mut after = preserved_cache(&overlay);
+    after.remove(3);
+    assert_eq!(before, after);
+    assert!(
+        !greppy_indexer::recover_persisted_js_ts_usages(&mut overlay, "anko", repo.path(),)
+            .unwrap()
+    );
+    assert_eq!(base_bytes, fs::read(&base_path).unwrap());
+}
+
 fn mixed_cache(repo: &std::path::Path, path: &std::path::Path, with_go: bool) {
     fs::write(repo.join("retained.rs"), "pub fn retained() {}\n").unwrap();
     fs::write(
@@ -271,6 +350,24 @@ fn old_go_cache_repairs_private_and_overlay_without_invalidating_mixed_base() {
     );
     let mut private = Store::open(&base_path).unwrap();
     assert_go_cache_repair(&mut private, repo.path());
+    private
+        .conn()
+        .execute(
+            "DELETE FROM file_state WHERE project='anko' AND rel_path='vm/vmStmt.go'",
+            [],
+        )
+        .unwrap();
+    private
+        .conn()
+        .execute(
+            "DELETE FROM schema_meta WHERE key=?1",
+            [greppy_indexer::JS_TS_USAGE_REPAIR_KEY],
+        )
+        .unwrap();
+    let error = greppy_indexer::recover_persisted_js_ts_usages(&mut private, "anko", repo.path())
+        .unwrap_err();
+    assert!(error.to_string().contains("fingerprints"), "{error}");
+    assert!(!greppy_indexer::js_ts_usages_repaired(&private).unwrap());
 }
 
 #[test]
