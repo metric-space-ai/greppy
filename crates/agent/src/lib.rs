@@ -60,5 +60,6 @@ pub use protocol::{
 pub use sandbox::{SandboxError, SandboxMode, SandboxSpec};
 pub use wire::{to_messages_request_body, SseItem, SseParser};
 pub use workspace::{
-    apply_proposal, ensure_ordinary_workspace_available, AgentWorkspace, RunOutcome, WorkspaceError,
+    apply_proposal, ensure_agent_repository, ensure_ordinary_workspace_available, AgentWorkspace,
+    RunOutcome, WorkspaceError,
 };

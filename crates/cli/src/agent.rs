@@ -574,6 +574,24 @@ fn run_agent(
             return EXIT_AGENT;
         }
     };
+    let cwd = match greppy_agent::ensure_agent_repository(&cwd) {
+        Ok((path, scratch)) => {
+            if scratch {
+                let label = if interactive { "greppy agent" } else { "greppy -p" };
+                eprintln!(
+                    "{label}: current directory is not a Git repository; using scratch workspace {}",
+                    path.display()
+                );
+            }
+            path
+        }
+        Err(error) => {
+            eprintln!(
+                "greppy -p: cannot prepare a workspace outside a Git repository: {error}"
+            );
+            return EXIT_AGENT;
+        }
+    };
     let shared_data_root = greppy_core::cache::data_root();
     // Capture operator TMPDIR before replacing it with per-workspace scratch.
     // Expand IDs must survive the mandatory deletion of that workspace.
