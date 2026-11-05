@@ -100,6 +100,8 @@ test("navigation without network observers avoids historical snapshots and the i
   await page.goto("https://fixture.invalid/");
   assert(!f.calls.some(call => ["page.requests", "page.responses", "page.waitForRequest"].includes(call.method)));
   await browser.close();
+});
+
 test("a late network observer does not replay requests completed before subscription", async () => {
   const f = fixture();
   const browser = await f.chromium.launch();
@@ -116,5 +118,4 @@ test("a late network observer does not replay requests completed before subscrip
   assert.deepEqual(seen, ["https://fixture.invalid/new"]);
   assert.equal(f.calls.filter(call => call.method === "page.networkBaseline").length, 1);
   await browser.close();
-});
 });
