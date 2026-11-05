@@ -37,3 +37,7 @@ if __name__ == "__main__":
               "this._context._pages = this._context._pages",
               ["node", "--test", "crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs"],
               "closed pages and contexts release wrapper ownership")
+        prove(ROOT / "crates/web-runtime/runtime/js/playwright.mjs",
+              "  _primeNetworkHistory() {", "  _primeNetworkHistory() { return;",
+              ["node", "--test", "crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs"],
+              "a late network observer does not replay")

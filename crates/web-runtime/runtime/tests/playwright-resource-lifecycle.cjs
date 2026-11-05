@@ -19,6 +19,7 @@ function fixture() {
       if (method === "chromium.launch") return { browser: "browser-" + ++sequence };
       if (method === "browser.newContext") return { context: "context-" + ++sequence };
       if (method === "context.newPage") return { page: "page-" + ++sequence };
+      if (method === "page.networkBaseline") return { seen: records.baseline || [] };
       if (method === "page.requests") return { requests: records.requests };
       if (method === "page.responses") return { responses: records.responses };
       if (method === "page.frames") return { frames: [] };
@@ -99,4 +100,21 @@ test("navigation without network observers avoids historical snapshots and the i
   await page.goto("https://fixture.invalid/");
   assert(!f.calls.some(call => ["page.requests", "page.responses", "page.waitForRequest"].includes(call.method)));
   await browser.close();
+test("a late network observer does not replay requests completed before subscription", async () => {
+  const f = fixture();
+  const browser = await f.chromium.launch();
+  const page = await browser.newPage();
+  await page.goto("https://fixture.invalid/old");
+  f.records.baseline = [{ id: "old", failed: false, finished: true }];
+  f.records.requests = [{ requestId: "old", url: "https://fixture.invalid/old" }];
+  f.records.responses = [{ requestId: "old", url: "https://fixture.invalid/old", status: 200 }];
+  const seen = [];
+  page.on("response", response => seen.push(response.url()));
+  f.records.requests.push({ requestId: "new", url: "https://fixture.invalid/new" });
+  f.records.responses.push({ requestId: "new", url: "https://fixture.invalid/new", status: 201 });
+  await page._dispatchNetwork(true);
+  assert.deepEqual(seen, ["https://fixture.invalid/new"]);
+  assert.equal(f.calls.filter(call => call.method === "page.networkBaseline").length, 1);
+  await browser.close();
+});
 });
