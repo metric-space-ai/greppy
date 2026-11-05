@@ -448,6 +448,10 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     install_console_capture(&mut runtime)?;
 
     {
+        crate::supervisor::wait_fd_readable(
+            std::os::fd::AsRawFd::as_raw_fd(&protocol_in),
+            std::time::Duration::from_secs(20),
+        )?;
         match read_message(&mut protocol_in)? {
             Message::Hello {
                 worker: WorkerKind::Controller,

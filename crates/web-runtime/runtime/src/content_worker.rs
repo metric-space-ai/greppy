@@ -6785,12 +6785,16 @@ fn is_parent_eof(error: &io::Error) -> bool {
 // Startup-only diagnostics deliberately avoid the per-operation tracing path:
 // a failed handshake needs a last-known phase, not an unbounded event log.
 fn trace_startup(stage: &str) {
-    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
-        eprintln!(
-            "web-runtime: startup worker=content pid={} stage={stage}",
-            std::process::id()
-        );
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_none() {
+        return;
     }
+    // CI turns this on. A blocking stderr write fills cargo's capture pipe
+    // and stalls the worker before it can finish the handshake.
+    let line = format!(
+        "web-runtime: startup worker=content pid={} stage={stage}\n",
+        std::process::id()
+    );
+    crate::supervisor::write_stderr_best_effort(line.as_bytes());
 }
 
 pub fn run() -> io::Result<()> {
@@ -6809,6 +6813,10 @@ pub fn run() -> io::Result<()> {
     let parent_alive = Arc::new(AtomicBool::new(true));
     let mut engine = ContentEngine::new(Arc::clone(&parent_alive), capability.clone())?;
     trace_startup("read-hello");
+    crate::supervisor::wait_fd_readable(
+        std::os::fd::AsRawFd::as_raw_fd(&protocol_in),
+        Duration::from_secs(20),
+    )?;
     match read_message(&mut protocol_in)? {
         Message::Hello {
             worker: WorkerKind::Content,

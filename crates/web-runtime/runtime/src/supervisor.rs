@@ -43,6 +43,79 @@ pub(crate) fn phase_trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("GREPPY_WEB_TRACE_PHASE").is_some())
 }
 
+/// Write diagnostics without blocking the caller.
+///
+/// `cargo test` captures stderr in a 64 KB pipe. A blocking write there stalls
+/// the supervisor or a content worker for good, including the thread that
+/// still has to send `Hello`. A duplicate of stderr is set nonblocking so the
+/// process-wide flag on fd 2 stays unchanged.
+pub(crate) fn write_stderr_best_effort(bytes: &[u8]) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let stderr = std::io::stderr();
+        let dup = unsafe { libc::dup(stderr.as_raw_fd()) };
+        if dup < 0 {
+            return;
+        }
+        unsafe {
+            let flags = libc::fcntl(dup, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(dup, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            libc::write(dup, bytes.as_ptr().cast(), bytes.len());
+            libc::close(dup);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bytes;
+    }
+}
+
+pub(crate) fn wait_fd_readable(fd: i32, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {timeout:?} waiting for worker protocol bytes"),
+            ));
+        }
+        let ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+        if n > 0 {
+            let revents = fds[0].revents;
+            if revents & libc::POLLIN != 0 {
+                return Ok(());
+            }
+            if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "worker protocol socket closed",
+                ));
+            }
+            return Ok(());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {timeout:?} waiting for worker protocol bytes"),
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 macro_rules! phase {
     ($($arg:tt)*) => {
         if crate::supervisor::phase_trace_enabled() {
@@ -1153,8 +1226,16 @@ fn spawn_unix(
             libc::close(cap_read_fd);
             libc::close(proto_child_fd);
         }
-        image.prove_child_or_kill(&mut child)?;
-        if let Err(error) = prove_same_executable(child.id()) {
+        // Identity proof opens the mapped executable. That can stall while the
+        // child is already blocked in read-hello, and nothing else in this
+        // function has a deadline. Bound it and kill the child on expiry so
+        // the caller can retry the spawn.
+        let prove_pid = child.id();
+        let prove_result = run_bounded(Duration::from_secs(8), move || {
+            image.prove_child(prove_pid)?;
+            prove_same_executable(prove_pid)
+        });
+        if let Err(error) = prove_result {
             unsafe {
                 libc::close(proto_parent_fd);
             }
@@ -1652,6 +1733,35 @@ fn parent_image() -> io::Result<&'static ImageId> {
     Ok(PARENT.get().expect("parent image id"))
 }
 
+fn run_bounded<T: Send + 'static>(
+    timeout: Duration,
+    task: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("web-bounded-task".into())
+        .spawn(move || {
+            let _ = tx.send(task());
+        })
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to spawn bounded task: {error}"),
+            )
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out after {timeout:?}"),
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "bounded task exited without a result",
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn prove_same_executable(child_pid: u32) -> io::Result<()> {
     let parent = parent_image()?;
@@ -1860,9 +1970,12 @@ impl WorkerProcess {
             }
             Err(failure) => failure,
         };
-        eprintln!(
-            "web-runtime: phase {:?}-{failure} pid={pid}; escalating to reap",
-            self.worker
+        write_stderr_best_effort(
+            format!(
+                "web-runtime: phase {:?}-{failure} pid={pid}; escalating to reap\n",
+                self.worker
+            )
+            .as_bytes(),
         );
         self.kill_tree();
     }

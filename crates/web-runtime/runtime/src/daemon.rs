@@ -1018,6 +1018,25 @@ fn network_record_failed(record: &Value) -> bool {
             .is_some_and(|status| status >= 400)
 }
 
+fn spawn_worker_with_retry(
+    attempts: u32,
+    mut spawn: impl FnMut() -> io::Result<WorkerProcess>,
+) -> io::Result<WorkerProcess> {
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        match spawn() {
+            Ok(worker) => return Ok(worker),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < attempts {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("worker spawn was not attempted")))
+}
+
 impl Daemon {
     fn start(
         config: DaemonConfig,
@@ -1038,9 +1057,15 @@ impl Daemon {
         let controller_thread = thread::Builder::new()
             .name("web-spawn-controller".into())
             .spawn(move || {
-                let mut worker = WorkerProcess::spawn(WorkerKind::Controller, controller_token)?;
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-controller"); } }
-                worker.handshake()?;
+                let worker = spawn_worker_with_retry(3, || {
+                    let mut worker =
+                        WorkerProcess::spawn(WorkerKind::Controller, controller_token.clone())?;
+                    if let Err(error) = worker.handshake() {
+                        worker.kill_tree();
+                        return Err(error);
+                    }
+                    Ok(worker)
+                })?;
                 controller_startup.mark_controller_ready();
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase controller-ready"); } }
                 Ok::<_, io::Error>(worker)
@@ -1050,13 +1075,18 @@ impl Daemon {
         let content_thread = thread::Builder::new()
             .name("web-spawn-content".into())
             .spawn(move || {
-                let mut worker = WorkerProcess::spawn_with_persistent_profiles(
-                    WorkerKind::Content,
-                    content_token,
-                    Some(persistent_profiles),
-                )?;
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); } }
-                worker.handshake()?;
+                let worker = spawn_worker_with_retry(3, || {
+                    let mut worker = WorkerProcess::spawn_with_persistent_profiles(
+                        WorkerKind::Content,
+                        content_token.clone(),
+                        Some(persistent_profiles.clone()),
+                    )?;
+                    if let Err(error) = worker.handshake() {
+                        worker.kill_tree();
+                        return Err(error);
+                    }
+                    Ok(worker)
+                })?;
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); } }
                 Ok::<_, io::Error>(worker)
             })
