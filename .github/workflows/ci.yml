@@ -2,7 +2,7 @@ name: CI
 
 # Track C — CI + release-build battle/soak validation.
 #
-# Gates every push and pull request on:
+# Gates every pull request and Main push on:
 #   * fast non-inference build/test/clippy with SHA-verified sentinel assets
 #   * default product links with both real models on ELF, Mach-O, and PE/COFF
 #   * cargo fmt    --check
@@ -15,7 +15,7 @@ name: CI
 #
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -39,6 +39,9 @@ jobs:
     # Branch protection consumes this published name. ubuntu-latest moved to
     # Ubuntu 26.04, whose NVIDIA network repo carries no CUDA 12.5 packages;
     # the Linux leg runs on ubuntu-24.04 under its stable ubuntu-latest name.
+    # Keep the existing macos-latest check context, but pin its runner to the
+    # supported macOS 15 ARM64 image: the moving latest image exhausted hosted
+    # capacity while the same head passed on macos-15 (job127310078387).
     name: build / test / lint (${{ matrix.os }})
     runs-on: ${{ matrix.runner || matrix.os }}
     env:
@@ -50,10 +53,16 @@ jobs:
         include:
           - os: ubuntu-latest
             runner: ubuntu-24.04
+          - os: macos-latest
+            runner: macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Verify Apple Silicon runner
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = arm64
 
       - name: Reject tracked files covered by .gitignore
         shell: bash
@@ -86,9 +95,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-fast-assets-v1-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.runner || matrix.os }}-cargo-fast-assets-v2-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-fast-assets-v1-
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.runner || matrix.os }}-cargo-fast-assets-v2-
 
       # The battle scripts shell out to sqlite3 (PRAGMA integrity_check,
       # node/edge dumps). macOS runners ship it; Ubuntu needs the CLI.
@@ -133,6 +142,10 @@ jobs:
       # test's concurrent index()/discovery and skips files — intermittent
       # failures. Run unit tests single-threaded for deterministic results;
       # real concurrency is covered separately by bench/battle/concurrency.sh.
+      - name: Anthropic required output-bound mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anthropic_output_limit_mutation.py
+
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         # The unoptimized, generated full CLI parser exceeds the 2 MiB
         # libtest thread stack. Same-source verification: debug2MiB aborts,
