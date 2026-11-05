@@ -183,8 +183,41 @@ fn fs_allow_list(
         refuse_filesystem_root(&path, "persistent profiles")?;
         grants.push(FsPathGrant::persistent_write_tree(path, true));
     }
+    extend_dns_grants(&mut grants, Path::new("/etc/resolv.conf"));
+    if let Some(path) = std::env::var_os("GREPPY_WEB_SHADER_CACHE") {
+        extend_shader_cache_grant(&mut grants, Path::new(&path));
+    }
 
     Ok(grants)
+}
+
+fn extend_shader_cache_grant(grants: &mut Vec<FsPathGrant>, cache: &Path) {
+    if cache.as_os_str().is_empty() || is_filesystem_root(cache) {
+        return;
+    }
+    grants.push(FsPathGrant::write_tree(cache, false));
+}
+
+/// `/etc` is already readable, but Ubuntu makes `/etc/resolv.conf` a symlink
+/// into `/run/systemd/resolve`. Landlock checks the target, so without that
+/// path glibc cannot read the file and DNS falls back to 127.0.0.1:53.
+fn extend_dns_grants(grants: &mut Vec<FsPathGrant>, resolv: &Path) {
+    grants.push(FsPathGrant::read_tree("/run/systemd/resolve", false));
+    let Ok(meta) = std::fs::symlink_metadata(resolv) else {
+        return;
+    };
+    if !meta.file_type().is_symlink() {
+        return;
+    }
+    let Ok(target) = std::fs::canonicalize(resolv) else {
+        return;
+    };
+    grants.push(FsPathGrant::read_file(&target, false, false));
+    if let Some(dir) = target.parent() {
+        if dir != Path::new("/run/systemd/resolve") {
+            grants.push(FsPathGrant::read_tree(dir, false));
+        }
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -572,6 +605,7 @@ mod linux {
         let kill = libc::SECCOMP_RET_KILL_PROCESS;
         let allow = libc::SECCOMP_RET_ALLOW;
         let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+        let eperm = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
         let mut f = Vec::new();
         // struct seccomp_data { nr: i32 @0, arch: u32 @4, ip: u64 @8, args[0]: u64 @16 }
@@ -586,6 +620,13 @@ mod linux {
         for nr in deny_kill_syscalls() {
             f.push(bpf_jump(jmp_eq, nr as u32, 0, 1));
             f.push(bpf_stmt(ret, kill));
+        }
+        // EPERM, not SIGSYS. SpiderMonkey and Mesa call perf_event_open when
+        // `perf record` is attached; killing the content worker made every
+        // Wikipedia read exit under the profiler.
+        for nr in deny_errno_syscalls() {
+            f.push(bpf_jump(jmp_eq, nr as u32, 0, 1));
+            f.push(bpf_stmt(ret, eperm));
         }
 
         f.push(bpf_jump(jmp_eq, libc::SYS_clone3 as u32, 0, 1));
@@ -633,7 +674,6 @@ mod linux {
             libc::SYS_kexec_file_load,
             libc::SYS_bpf,
             libc::SYS_userfaultfd,
-            libc::SYS_perf_event_open,
             libc::SYS_unshare,
             libc::SYS_setns,
             libc::SYS_acct,
@@ -661,12 +701,28 @@ mod linux {
         }
         nrs
     }
+
+    fn deny_errno_syscalls() -> Vec<libc::c_long> {
+        vec![libc::SYS_perf_event_open]
+    }
+
+    #[cfg(test)]
+    pub(super) fn perf_event_open_returns_eperm() -> bool {
+        !deny_kill_syscalls().contains(&libc::SYS_perf_event_open)
+            && deny_errno_syscalls().contains(&libc::SYS_perf_event_open)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perf_event_open_is_eperm_not_a_kill() {
+        assert!(linux::perf_event_open_returns_eperm());
+    }
     #[cfg(target_os = "linux")]
     fn require_live_landlock() -> bool {
         matches!(
@@ -696,12 +752,63 @@ mod tests {
             exe,
             Path::new("/opt/greppy/libexec"),
             tmp,
+            Path::new("/run/systemd/resolve"),
         ] {
             assert!(
                 paths.contains(&expected),
                 "missing {expected:?} in {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolv_symlink_target_is_granted_read_only() {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-resolv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let real_dir = root.join("run/systemd/resolve");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("stub-resolv.conf");
+        std::fs::write(&real, b"nameserver 1.1.1.1\n").unwrap();
+        let link = root.join("resolv.conf");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&real, &link).unwrap();
+        let mut grants = Vec::new();
+        extend_dns_grants(&mut grants, &link);
+        let paths = grant_paths(&grants);
+        assert!(paths.contains(&Path::new("/run/systemd/resolve")));
+        #[cfg(unix)]
+        {
+            let target = std::fs::canonicalize(&link).unwrap();
+            assert!(
+                paths.iter().any(|path| *path == target.as_path()),
+                "symlink target {target:?} missing from {paths:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shader_cache_dir_is_a_write_grant_and_not_the_filesystem_root() {
+        let mut grants = Vec::new();
+        extend_shader_cache_grant(&mut grants, Path::new("/var/lib/greppy/mesa-shader-cache"));
+        assert_eq!(
+            grants[0].path,
+            Path::new("/var/lib/greppy/mesa-shader-cache")
+        );
+        assert!(grants[0].is_write_tree());
+        assert!(!grants[0].required);
+        let before = grants.len();
+        extend_shader_cache_grant(&mut grants, Path::new("/"));
+        extend_shader_cache_grant(&mut grants, Path::new(""));
+        assert_eq!(grants.len(), before);
     }
 
     #[test]
@@ -787,8 +894,12 @@ mod tests {
 
     #[test]
     fn allow_list_refuses_filesystem_root_as_tmp() {
-        let err =
-            fs_allow_list(Path::new("/opt/greppy/bin/web-runtime"), Path::new("/"), None).unwrap_err();
+        let err = fs_allow_list(
+            Path::new("/opt/greppy/bin/web-runtime"),
+            Path::new("/"),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("filesystem root"), "{err}");
     }

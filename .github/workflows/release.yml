@@ -353,6 +353,12 @@ jobs:
           "GREPPY_WINFSP_FORK_ROOT=$fork" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build release binary
+        env:
+          # Thin LTO and one codegen unit push rustc on the greppy crate past
+          # 8 GiB. The CPU package splits codegen. GPU packages stay on the
+          # release profile in Cargo.toml (thin LTO, codegen-units = 1).
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.features == 'cpu' && 'off' || 'thin' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.features == 'cpu' && '16' || '1' }}
         run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features ${{ matrix.features }}
 
       - name: Build the linked web runtime
@@ -575,7 +581,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') && runner.os != 'Windows'
         run: |
           want="${GITHUB_REF_NAME#v}"
-          got="$(target/release/greppy --version | awk '{print $NF}')"
+          got="$(target/release/greppy --version | awk '{print $2}')"
           echo "tag=$want binary=$got"
           [ "$want" = "$got" ] || { echo "::error::version mismatch"; exit 1; }
 
@@ -584,7 +590,7 @@ jobs:
         shell: pwsh
         run: |
           $want = $env:GITHUB_REF_NAME -replace '^v',''
-          $got = (& target/release/greppy.exe --version).Split(' ')[-1]
+          $got = (& target/release/greppy.exe --version).Split(' ')[1]
           Write-Host "tag=$want binary=$got"
           if ($want -ne $got) { Write-Error "version mismatch"; exit 1 }
 
@@ -673,7 +679,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          version="$(target/release/greppy --version | awk '{print $NF}')"
+          version="$(target/release/greppy --version | awk '{print $2}')"
           platform/linux/build-packages.sh \
             target/release/greppy \
             target/release/greppy-workspace-provider \
@@ -711,7 +717,7 @@ jobs:
           SHOULD_SIGN: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
           INSTALLER_SIGNING_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
         run: |
-          version="$(target/release/greppy --version | awk '{print $NF}')"
+          version="$(target/release/greppy --version | awk '{print $2}')"
           installer_identity=
           if [ "$SHOULD_SIGN" = true ]; then
             test -n "$INSTALLER_SIGNING_IDENTITY"
@@ -772,7 +778,7 @@ jobs:
           Copy-Item tools/package_winfsp_source.py,tools/verify_winfsp_fork.py,tools/windows_driver_contract.py,tools/verify_windows_driver_signatures.ps1 dist/
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock dist/
           Copy-Item licenses dist/licenses -Recurse
-          $version = (& target/release/greppy.exe --version).Split(' ')[-1]
+          $version = (& target/release/greppy.exe --version).Split(' ')[1]
           $arguments = @{
             DistDir = 'dist'
             OutputPath = '${{ matrix.asset }}'
@@ -840,9 +846,10 @@ jobs:
             MODEL-REDISTRIBUTION.lock.json; do
             test -s "$deb_licenses/$license"
           done
-          # Product builds refuse CPU inference and hosted Linux runners have no
-          # GPU: the inference smoke for the CUDA package runs on the self-hosted
-          # CUDA lane (gpu3), not here. Structural package checks stay above.
+          # CUDA inference smoke runs on the self-hosted CUDA lane. The CPU
+          # package is greppy-linux-x86_64-cpu.deb and greppy-linux-x86_64-cpu.rpm;
+          # this step also checks greppy-linux-x86_64.deb and greppy-linux-x86_64.rpm.
+          # Structural package checks stay above.
           "$deb_bin/greppy" --version
 
       - name: Smoke-test packaged artifact (macOS)
@@ -1097,7 +1104,7 @@ jobs:
             --target "${{ matrix.rust_host }}"
           docker run --rm -v "$PWD/package:/packages:ro" ubuntu:22.04 bash -ceu '
             apt-get update >/dev/null
-            apt-get install --yes /packages/greppy-linux-x86_64.deb >/dev/null
+            apt-get install --yes /packages/${{ matrix.asset }} >/dev/null
             greppy --version
             test -x /usr/lib/greppy/bin/greppy-workspace-provider
             apt-get remove --yes greppy >/dev/null
@@ -1105,7 +1112,7 @@ jobs:
             test ! -e /usr/lib/greppy
           '
           docker run --rm -v "$PWD/package:/packages:ro" fedora:latest bash -ceu '
-            dnf install --assumeyes /packages/greppy-linux-x86_64.rpm >/dev/null
+            dnf install --assumeyes /packages/${{ matrix.secondary_asset }} >/dev/null
             greppy --version
             test -x /usr/lib/greppy/bin/greppy-workspace-provider
             dnf remove --assumeyes greppy >/dev/null

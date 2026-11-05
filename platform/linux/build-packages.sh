@@ -84,10 +84,15 @@ for license_path in "$repository_root"/licenses/*; do
   install -m 0644 "$license_path" "$STAGING_ROOT/usr/share/licenses/greppy/"
 done
 
-"$STAGING_ROOT/usr/lib/greppy/bin/greppy" --version | grep -Fx "greppy $VERSION" >/dev/null || {
-  echo "greppy version does not match package version $VERSION" >&2
-  exit 65
-}
+# --version is "greppy <semver>" or "greppy <semver> (<commit>)".
+got="$("$STAGING_ROOT/usr/lib/greppy/bin/greppy" --version)"
+case "$got" in
+  "greppy $VERSION"|"greppy $VERSION ("*) ;;
+  *)
+    echo "greppy version does not match package version $VERSION: $got" >&2
+    exit 65
+    ;;
+esac
 "$STAGING_ROOT/usr/lib/greppy/bin/greppy-workspace-provider" --version >/dev/null
 
 deb_root="$work_root/deb"

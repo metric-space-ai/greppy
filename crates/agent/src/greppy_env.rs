@@ -225,7 +225,7 @@ impl GreppyEnv {
     fn greppy_tool_def() -> ToolDefinition {
         ToolDefinition {
             name: "greppy".to_string(),
-            description: "Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit) and runs commands via bash-smart. Pass argv as an array, e.g. [\"who-calls\", \"my_func\"] or [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
+            description: "Large outputs are retained: use [\"expand\", \"agent-output-ID\", \"--offset\", \"0\"] to retrieve a page (next offsets are printed). Answers every question about this repository (search, navigate, read, edit), reads the public web, and runs commands via bash-smart. Pass argv as an array. Web is available without asking: [\"web\", \"read\", \"https://example.com\"], [\"web\", \"search\", \"QUERY\"], [\"web\", \"research\", \"QUERY\"]. Repository example: [\"who-calls\", \"my_func\"]. Commands: [\"bash-smart\", \"--\", \"cargo\", \"test\"]. bash-smart returns compacted output: verdict line, then errors and warnings.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1613,6 +1613,18 @@ mod tests {
         assert!(
             defs[0].description.contains("bash-smart"),
             "description must teach bash-smart: {}",
+            defs[0].description
+        );
+        assert!(
+            defs[0].description.contains("web"),
+            "description must teach web read: {}",
+            defs[0].description
+        );
+        assert!(
+            defs[0]
+                .description
+                .contains("[\"web\", \"read\", \"https://example.com\"]"),
+            "description={}",
             defs[0].description
         );
     }

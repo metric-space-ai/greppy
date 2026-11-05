@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Must match `web_runtime::protocol::MAX_FRAME_BYTES`. Wikipedia replies
+/// are a few megabytes and do not fit in 1 MiB.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum FrameError {

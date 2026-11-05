@@ -1,18 +1,19 @@
-pub(crate) fn cpu_only_allowed(profile: &str, _debug_info: bool) -> bool {
-    profile == "debug"
+pub(crate) fn cpu_feature_allowed(profile: &str) -> bool {
+    matches!(profile, "debug" | "release" | "release-cpu")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cpu_only_allowed;
+    use super::cpu_feature_allowed;
 
     #[test]
-    fn release_profile_refuses_cpu_only_even_with_debug_info() {
-        assert!(!cpu_only_allowed("release", true));
+    fn release_profile_allows_the_cpu_feature() {
+        assert!(cpu_feature_allowed("release"));
+        assert!(cpu_feature_allowed("release-cpu"));
     }
 
     #[test]
-    fn debug_profile_allows_cpu_only_even_without_debug_info() {
-        assert!(cpu_only_allowed("debug", false));
+    fn debug_profile_allows_the_cpu_feature() {
+        assert!(cpu_feature_allowed("debug"));
     }
 }

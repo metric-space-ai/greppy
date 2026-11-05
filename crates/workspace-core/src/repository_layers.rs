@@ -200,12 +200,25 @@ pub(crate) fn ensure_layers(
         Ok(())
     })();
     if let Err(error) = inserted {
-        if !captured_snapshot_owns_chunks {
+        // Two tasks can snapshot the same baseline together. The loser of the
+        // insert finds the winner's row and shares that dirty layer.
+        let duplicate = is_duplicate_dirty_layer(&error);
+        if duplicate || !captured_snapshot_owns_chunks {
             let _ = release_snapshot_chunks(store, baseline);
+        }
+        if duplicate {
+            return Ok((base_id, dirty_id));
         }
         return Err(error);
     }
     Ok((base_id, dirty_id))
+}
+
+fn is_duplicate_dirty_layer(error: &Error) -> bool {
+    let Error::Sql(rusqlite::Error::SqliteFailure(_, Some(message))) = error else {
+        return false;
+    };
+    message.contains("cow_dirty_layers")
 }
 
 fn ensure_empty_base(connection: &mut Connection, baseline: &BaselineSnapshot) -> Result<String> {

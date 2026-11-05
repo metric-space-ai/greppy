@@ -39,6 +39,10 @@ pub struct Session {
     /// active one; a session with several tabs keeps them all here so a
     /// caller can switch without losing the others.
     pub tabs: Vec<String>,
+    /// Tabs snapshotted to disk so the content worker can drop their documents.
+    pub swapped_tabs: Vec<String>,
+    /// Old tab id to the page id created when that snapshot was restored.
+    pub tab_aliases: HashMap<String, String>,
     /// Document-bound recipes per page. Observing one tab must not replace
     /// another tab's scope. The worker independently checks actual node identity.
     pub locator_snapshots: HashMap<String, LocatorSnapshot>,
@@ -53,9 +57,20 @@ pub struct Session {
     /// CPU charged to this session's serialized operation intervals. These
     /// counters survive worker respawns; the daemon adds only the process CPU
     /// delta observed around each operation, so one session cannot inherit
-    /// another session's shared-worker work.
+    /// another session's shared-worker work. The limit check uses the
+    /// navigation counters below, which reset on each navigation.
     pub content_cpu_used_ns: u64,
     pub controller_cpu_used_ns: u64,
+    /// Content and controller CPU since the last navigation. A heavy page
+    /// must not exhaust the next page's budget.
+    pub navigation_content_cpu_ns: u64,
+    pub navigation_controller_cpu_ns: u64,
+    /// High-water mark of response bytes reported for the current navigation.
+    /// `network_bytes` keeps the session total for metrics; the limit uses
+    /// this counter. `begin_navigation` clears it, so the next page starts
+    /// a new budget. A repeated snapshot of the same document is not billed
+    /// again.
+    pub navigation_network_bytes: u64,
     pub started: Instant,
     pub inflight_engine_request_id: Option<u64>,
     pub inflight_engine_method: Option<String>,
@@ -74,10 +89,16 @@ impl Session {
             operation_id: None,
             last_heartbeat: Instant::now(),
             profile,
-            limits: SessionLimits::for_profile(profile.as_str()),
+            limits: {
+                let mut limits = SessionLimits::for_profile(profile.as_str());
+                limits.apply_host_shape();
+                limits
+            },
             page_id: None,
             engine_context_id: None,
             tabs: Vec::new(),
+            swapped_tabs: Vec::new(),
+            tab_aliases: HashMap::new(),
             locator_snapshots: HashMap::new(),
             pages: 0,
             contexts: 0,
@@ -89,6 +110,9 @@ impl Session {
             peak_rss_bytes: 0,
             content_cpu_used_ns: 0,
             controller_cpu_used_ns: 0,
+            navigation_content_cpu_ns: 0,
+            navigation_controller_cpu_ns: 0,
+            navigation_network_bytes: 0,
             started: Instant::now(),
             inflight_engine_request_id: None,
             inflight_engine_method: None,
@@ -97,6 +121,14 @@ impl Session {
             owner: None,
             trace: None,
         }
+    }
+
+    /// Drop the CPU and network bytes charged to the page being replaced.
+    /// The session totals stay, so a worker restart still cannot underflow them.
+    pub fn begin_navigation(&mut self) {
+        self.navigation_content_cpu_ns = 0;
+        self.navigation_controller_cpu_ns = 0;
+        self.navigation_network_bytes = 0;
     }
 
     pub fn transition(&mut self, next: SessionState) -> Result<(), String> {
@@ -136,11 +168,46 @@ impl Session {
         self.operation_id = Some(operation_id.into());
         Ok(())
     }
+
+    pub fn canonical_tab(&self, tab: &str) -> String {
+        let mut id = tab.to_string();
+        for _ in 0..8 {
+            match self.tab_aliases.get(&id) {
+                Some(next) if next != &id => id = next.clone(),
+                _ => break,
+            }
+        }
+        id
+    }
+
+    pub fn owns_tab(&self, tab: &str) -> bool {
+        let id = self.canonical_tab(tab);
+        self.page_id.as_deref() == Some(id.as_str())
+            || self.tabs.iter().any(|page| page == &id)
+            || self
+                .swapped_tabs
+                .iter()
+                .any(|page| page == &id || page == tab)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swapped_tab_stays_addressable_until_restore() {
+        let mut session = Session::new("wrs_1", "run", crate::policy::NetworkProfile::Project);
+        session.swapped_tabs.push("tab-old".into());
+        assert!(session.owns_tab("tab-old"));
+        session
+            .tab_aliases
+            .insert("tab-old".into(), "tab-new".into());
+        session.tabs.push("tab-new".into());
+        session.swapped_tabs.clear();
+        assert_eq!(session.canonical_tab("tab-old"), "tab-new");
+        assert!(session.owns_tab("tab-old"));
+    }
 
     #[test]
     fn ready_busy_ready_close() {

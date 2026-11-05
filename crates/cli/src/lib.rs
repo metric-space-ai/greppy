@@ -25,25 +25,18 @@ compile_error!("ci-test-assets is forbidden outside debug/test builds");
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(all(feature = "cpu-only", not(greppy_debug_profile)))]
-compile_error!(
-    "the Greppy CLI cannot be built outside Cargo's debug profile with `cpu-only`; supported product targets \
-     are macOS with Metal and Linux x86_64 with CUDA/nvcc. `cpu-only` is restricted to \
-     debug and numerical-reference use"
-);
-
 #[cfg(test)]
 mod build_policy;
 
-/// Product binaries require compiled GPU implementations for both inference
-/// workloads. The CUDA constants include the build-script signal emitted only
-/// after nvcc creates the shared backend, so a requested feature is not enough.
-#[cfg(not(feature = "cpu-only"))]
+/// A build that requests CUDA or Metal must contain the compiled backend.
+/// Plain `cargo build --release` requests neither and is the CPU product, as
+/// is `--features cpu` (and the older name `--features cpu-only`).
+#[cfg(all(any(feature = "cuda", feature = "metal"), not(feature = "cpu")))]
 const _: () = assert!(
     greppy_embed_native::HAS_GPU_BACKEND && greppy_qwen35_native::HAS_GPU_BACKEND,
-    "Greppy requires compiled GPU backends for both embeddings and summaries. \
-     Supported product targets are macOS with Metal and Linux x86_64 with CUDA/nvcc; \
-     `cpu-only` is restricted to debug and numerical-reference use"
+    "this build requests CUDA or Metal, but the compiled backend is missing. \
+     Install nvcc (Linux) or the Metal toolchain (macOS), or build the CPU release \
+     with --features cpu. A plain cargo build --release without those features is CPU."
 );
 
 // Route this module's stdout through one optional collector. Query commands
@@ -939,6 +932,17 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
         };
     }
+    let argv = match take_max_ram_flag(argv) {
+        Ok((argv, Some(raw))) => {
+            std::env::set_var("GREPPY_MAX_RAM", raw);
+            argv
+        }
+        Ok((argv, None)) => argv,
+        Err(message) => {
+            println!("{message}");
+            return EXIT_USAGE;
+        }
+    };
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
     // `greppy -p` and `greppy agent` are structured agent invocations. Intercept before
@@ -1951,6 +1955,111 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
     false
 }
 
+/// `--max-ram` is the whole host, with the same K/M/G suffixes as `GREPPY_MAX_RAM`.
+pub fn parse_max_ram_flag(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (number, shift) = if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'G' | 'g')) {
+        (&raw[..raw.len() - 1], 30u32)
+    } else if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'M' | 'm')) {
+        (&raw[..raw.len() - 1], 20u32)
+    } else if raw.len() > 1 && raw.ends_with(|ch: char| matches!(ch, 'K' | 'k')) {
+        (&raw[..raw.len() - 1], 10u32)
+    } else {
+        (raw, 0u32)
+    };
+    let number: u64 = number.trim().parse().ok()?;
+    number.checked_shl(shift)
+}
+
+pub fn take_max_ram_flag(
+    argv: Vec<std::ffi::OsString>,
+) -> std::result::Result<(Vec<std::ffi::OsString>, Option<String>), String> {
+    let mut kept = Vec::with_capacity(argv.len());
+    let mut raw = None;
+    let mut args = argv.into_iter();
+    while let Some(arg) = args.next() {
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            kept.push(arg);
+            kept.extend(args);
+            break;
+        }
+        if text == "--max-ram" {
+            let Some(next) = args.next() else {
+                return Err("--max-ram requires a size such as 4G".into());
+            };
+            let value = next.to_string_lossy().into_owned();
+            if parse_max_ram_flag(&value).is_none() {
+                return Err(format!(
+                    "--max-ram expects a byte count such as 4G, 4096M, or 4294967296, not {value}"
+                ));
+            }
+            raw = Some(value);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--max-ram=") {
+            if parse_max_ram_flag(value).is_none() {
+                return Err(format!(
+                    "--max-ram expects a byte count such as 4G, 4096M, or 4294967296, not {value}"
+                ));
+            }
+            raw = Some(value.to_owned());
+            continue;
+        }
+        kept.push(arg);
+    }
+    Ok((kept, raw))
+}
+
+#[cfg(test)]
+mod max_ram_flag_tests {
+    use super::{parse_max_ram_flag, take_max_ram_flag, Cli};
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn max_ram_is_removed_before_clap_and_documented() {
+        assert_eq!(parse_max_ram_flag("4G"), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_max_ram_flag("4096M"), Some(4 * 1024 * 1024 * 1024));
+        assert!(parse_max_ram_flag("nope").is_none());
+        let argv = [
+            "greppy",
+            "--max-ram",
+            "4G",
+            "web",
+            "read",
+            "https://example.com",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let (kept, raw) = take_max_ram_flag(argv).unwrap();
+        assert_eq!(raw.as_deref(), Some("4G"));
+        assert_eq!(
+            kept,
+            ["greppy", "web", "read", "https://example.com"].map(OsString::from)
+        );
+        assert!(take_max_ram_flag(vec![
+            OsString::from("greppy"),
+            OsString::from("--max-ram=nope")
+        ])
+        .is_err());
+        let help = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from(["greppy", "--help"])
+                    .unwrap_err()
+                    .to_string()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(help.contains("--max-ram"), "{help}");
+    }
+}
+
 /// Dispatch a parsed CLI to the correct handler. Returns the desired exit
 /// code. Use `dispatch_to_code` to run the dispatcher and translate the
 /// result into a `u8` exit code for `ExitCode::from`.
@@ -2436,25 +2545,25 @@ mod optional_workspace_status_tests {
 }
 
 fn embed_daemon_busy_message() -> &'static str {
-    #[cfg(feature = "cpu-only")]
+    #[cfg(feature = "cpu")]
     {
         "EmbeddingGemma daemon remained busy until the request deadline; \
          retry, or run with --device cpu to bypass the shared daemon"
     }
-    #[cfg(not(feature = "cpu-only"))]
+    #[cfg(not(feature = "cpu"))]
     {
         "EmbeddingGemma daemon remained busy until the request deadline; retry shortly"
     }
 }
 
 fn embed_daemon_failed_message() -> &'static str {
-    #[cfg(feature = "cpu-only")]
+    #[cfg(feature = "cpu")]
     {
         "EmbeddingGemma daemon answered faulted while holding the model; \
          it recovers on its idle TTL — retry shortly, or run with \
          --device cpu to bypass it"
     }
-    #[cfg(not(feature = "cpu-only"))]
+    #[cfg(not(feature = "cpu"))]
     {
         "EmbeddingGemma daemon answered faulted while holding the model; \
          it recovers on its idle TTL — retry shortly"

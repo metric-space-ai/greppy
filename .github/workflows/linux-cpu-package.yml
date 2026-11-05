@@ -1,0 +1,132 @@
+name: linux-cpu-package
+
+# Linux x86_64 CPU .deb/.rpm for hosts that have no nvcc and not enough RAM to
+# rustc the greppy crate with thin LTO. Release tags also build this row inside
+# release.yml; this workflow publishes the same package as an artifact on pull
+# requests that touch the build and on manual dispatch.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-cpu-package.yml"
+      - ".github/workflows/release.yml"
+      - "crates/cli/**"
+      - "crates/embed-native/**"
+      - "crates/qwen35-native/**"
+      - "crates/indexer/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "platform/linux/**"
+      - "tools/release_matrix.json"
+      - "tools/release_asset_contract.v1.json"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: linux x86_64 CPU package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Restore model assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf
+            crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
+            crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+            crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
+          key: model-assets-${{ hashFiles('crates/cli/assets/MODEL_ASSETS.json') }}
+
+      - name: Fetch model assets (release-hosted, sha-pinned)
+        shell: bash
+        run: ./tools/fetch_model_assets.sh
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: "1.95.0"
+
+      - name: Pin coherent Linux Clang and libclang toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang-15 libclang-15-dev llvm-15-dev rpm cpio
+          resource_dir="$(/usr/bin/clang-15 -print-resource-dir)"
+          test -r "$resource_dir/include/emmintrin.h"
+          printf '%s\n' '/usr/lib/llvm-15/bin' >> "$GITHUB_PATH"
+          printf '%s\n' \
+            'CC=/usr/bin/clang-15' \
+            'CXX=/usr/bin/clang++-15' \
+            'HOST_CC=/usr/bin/clang-15' \
+            'HOST_CXX=/usr/bin/clang++-15' \
+            'CLANG_PATH=/usr/bin/clang-15' \
+            'LLVM_CONFIG_PATH=/usr/bin/llvm-config-15' \
+            'LIBCLANG_PATH=/usr/lib/llvm-15/lib' \
+            "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=$resource_dir" >> "$GITHUB_ENV"
+
+      - name: Build CPU release binaries
+        run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features cpu
+
+      - name: Show version and accept --device cpu
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(target/release/greppy --version)"
+          echo "$version"
+          echo "$version" | grep -E '^greppy [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+|unknown)\)$'
+          target/release/greppy --device cpu --version
+          ! ldd target/release/greppy | grep -E 'cudart|cublas|nvrtc'
+
+      - name: Build the linked web runtime
+        shell: bash
+        run: |
+          cargo build --locked --release \
+            --manifest-path crates/web-runtime/Cargo.toml \
+            --package web-runtime \
+            --bin web-runtime
+
+      - name: Stage the linked web runtime distributable
+        shell: bash
+        env:
+          GREPPY_SOURCE_COMMIT: ${{ github.sha }}
+        run: crates/web-runtime/scripts/package-web-runtime.sh "$GITHUB_WORKSPACE/target/web-runtime-dist"
+
+      - name: Package deb and rpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(target/release/greppy --version | awk '{print $2}')"
+          platform/linux/build-packages.sh \
+            target/release/greppy \
+            target/release/greppy-workspace-provider \
+            target/web-runtime-dist \
+            "$version" \
+            greppy-linux-x86_64-cpu.deb \
+            greppy-linux-x86_64-cpu.rpm \
+            dist
+          sha256sum greppy-linux-x86_64-cpu.deb greppy-linux-x86_64-cpu.rpm
+          {
+            echo "### Linux x86_64 CPU package"
+            echo
+            echo "Install \`greppy-linux-x86_64-cpu.deb\` from this job's artifacts."
+            echo "The binary is \`cargo build --release --features cpu\` with LTO off and 16 codegen units."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload CPU package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greppy-linux-x86_64-cpu
+          path: |
+            greppy-linux-x86_64-cpu.deb
+            greppy-linux-x86_64-cpu.rpm
+          if-no-files-found: error
+          retention-days: 14

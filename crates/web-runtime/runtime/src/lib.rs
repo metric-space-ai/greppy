@@ -20,6 +20,8 @@ pub mod record_usage;
 mod rendering_backend;
 pub mod session;
 pub mod supervisor;
+pub mod text_mode;
+pub mod tab_swap;
 #[cfg(feature = "content-runtime")]
 pub mod web_api_shims;
 pub mod worker;

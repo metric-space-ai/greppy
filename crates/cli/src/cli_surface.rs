@@ -14,9 +14,10 @@ const EDIT_VERIFY_HELP: &str = "Verification: --verify runs local syntax/build c
     name = "greppy",
     bin_name = "greppy",
     version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GREPPY_GIT_COMMIT"), ")"),
     about = "Code navigation for coding agents, with byte-exact real-grep passthrough for ordinary grep invocations.",
     long_about = None,
-    after_help = "Agent modes:\n  greppy agent [\"INITIAL TASK\"] --model MODEL   Interactive TUI\n  greppy -p \"TASK\" --model MODEL                Headless one-shot",
+    after_help = "Agent modes:\n  greppy agent [\"INITIAL TASK\"] --model MODEL   Interactive TUI\n  greppy -p \"TASK\" --model MODEL                Headless one-shot\n\n--max-ram SIZE\n  Entire host RAM, not memory left after the OS. Example: --max-ram 4G.\n  Unset, the limit is the cgroup memory.max or /proc/meminfo value, not a\n  hardcoded size. GREPPY_MAX_RAM is the same value. Live pages, the JS heap,\n  the frame size, and the worker recycle point are derived from it (512 MiB:\n  1 page, recycle at 256 MiB; 4 GiB: 2 pages, recycle at 2 GiB). A smaller\n  budget serializes work. It does not fail the read. Network and CPU budgets\n  do not exit; only an unreachable host or a sandbox violation does.\n  --deadline is the optional time stop.",
     allow_external_subcommands = true,
     disable_help_subcommand = true,
     trailing_var_arg = true,
@@ -35,6 +36,10 @@ pub struct Cli {
     pub root: Option<String>,
 
     /// Native inference backend for both embedded models.
+    /// `auto` uses CUDA or Metal when this binary was built with that feature,
+    /// and the CPU kernels otherwise. `cpu` always runs the CPU kernels.
+    /// `--features cpu` is a release feature; a plain `cargo build --release`
+    /// without `cuda` or `metal` is the same CPU product.
     #[arg(long, global = true, value_name = "auto|cpu|metal|cuda[:INDEX]")]
     pub device: Option<String>,
 

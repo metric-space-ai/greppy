@@ -350,14 +350,36 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 Ok(session) => session,
                 Err(code) => return Ok(code),
             };
-            rpc_with_spawn(
-                root,
-                json,
-                "web.read",
-                json!({ "url": url, "query": query, "session_id": session }),
-                Some(session),
-                spawn,
-            )
+            let profile = super::nav::standalone_profile(&spawn, Some(&url));
+            let mut payload = json!({ "url": url, "query": query, "session_id": session });
+            let response = rpc_response(root, "web.read", payload.clone(), Some(session.clone()));
+            let (session, response) = match response {
+                Ok(answer)
+                    if answer.error.as_ref().is_some_and(|error| {
+                        should_recreate_cached_session(root, &session, error)
+                    }) && forget_current_session(root, &session) =>
+                {
+                    remove_session_route(root, &session);
+                    let fresh = match super::nav::create_session(root, json, &spawn, profile) {
+                        Ok(fresh) => fresh,
+                        Err(code) => return Ok(code),
+                    };
+                    payload["session_id"] = json!(fresh);
+                    (
+                        fresh.clone(),
+                        rpc_response(root, "web.read", payload, Some(fresh)),
+                    )
+                }
+                other => (session, other),
+            };
+            let code = match response {
+                Ok(response) => emit_response(json, response)?,
+                Err(error) => emit_error(json, error)?,
+            };
+            if code == 0 {
+                let _ = write_current_scope(root, &session, None);
+            }
+            Ok(code)
         }
         ResultsCommand::Research {
             positional_query,

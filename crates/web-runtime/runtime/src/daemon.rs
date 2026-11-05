@@ -882,6 +882,10 @@ struct Daemon {
     run_control: Arc<RunControl>,
     workflow_deadline: Option<Instant>,
     workflow_defer_observation: bool,
+    /// Content CPU already spent in this operation by a worker that was replaced.
+    content_cpu_carry_ns: u64,
+    /// Baseline for the content worker that is running the rest of this operation.
+    content_cpu_baseline: Option<(u32, u64)>,
 }
 
 fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
@@ -1016,6 +1020,8 @@ impl Daemon {
             run_control,
             workflow_deadline: None,
             workflow_defer_observation: false,
+            content_cpu_carry_ns: 0,
+            content_cpu_baseline: None,
         })
     }
 
@@ -1093,6 +1099,8 @@ impl Daemon {
         let content_pid_before = self.content.pid();
         let controller_pid_before = self.controller.pid();
         let content_cpu_before_ns = sample_cpu_ns(content_pid_before);
+        self.content_cpu_carry_ns = 0;
+        self.content_cpu_baseline = Some((content_pid_before, content_cpu_before_ns));
         let controller_cpu_before_ns = sample_cpu_ns(controller_pid_before);
         let session_id = request
             .payload
@@ -1100,6 +1108,13 @@ impl Daemon {
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .or_else(|| request.session_id.clone());
+        if touches_page {
+            if let Some(id) = session_id.as_deref() {
+                if let Some(session) = self.sessions.get_mut(id) {
+                    session.begin_navigation();
+                }
+            }
+        }
         let network_scope = session_id.as_ref().map(|session_id| {
             let page = request
                 .payload
@@ -1162,12 +1177,19 @@ impl Daemon {
         let controller_pid_after = self.controller.pid();
         let content_cpu_after_ns = sample_cpu_ns(content_pid_after);
         let controller_cpu_after_ns = sample_cpu_ns(controller_pid_after);
+        let (content_base_pid, content_base_ns) = self
+            .content_cpu_baseline
+            .unwrap_or((content_pid_before, content_cpu_before_ns));
+        let carried_content_ns = self.content_cpu_carry_ns;
+        self.content_cpu_carry_ns = 0;
+        self.content_cpu_baseline = None;
         let mut observed_content_cpu_ns = process_cpu_delta_ns(
-            content_pid_before,
-            content_cpu_before_ns,
+            content_base_pid,
+            content_base_ns,
             content_pid_after,
             content_cpu_after_ns,
-        );
+        )
+        .saturating_add(carried_content_ns);
         let mut observed_controller_cpu_ns = process_cpu_delta_ns(
             controller_pid_before,
             controller_cpu_before_ns,
@@ -1179,10 +1201,11 @@ impl Daemon {
                 (observed_content_cpu_ns, observed_controller_cpu_ns) = account_operation_cpu(
                     session,
                     &mut response,
-                    (content_pid_before, content_cpu_before_ns),
+                    (content_base_pid, content_base_ns),
                     (content_pid_after, content_cpu_after_ns),
                     (controller_pid_before, controller_cpu_before_ns),
                     (controller_pid_after, controller_cpu_after_ns),
+                    carried_content_ns,
                 );
             }
         }
@@ -1200,13 +1223,13 @@ impl Daemon {
                 session
                     .limits
                     .check_cpu_time(
-                        Duration::from_nanos(session.content_cpu_used_ns),
+                        Duration::from_nanos(session.navigation_content_cpu_ns),
                         session.limits.content_cpu_time,
                         "content",
                     )
                     .and_then(|_| {
                         session.limits.check_cpu_time(
-                            Duration::from_nanos(session.controller_cpu_used_ns),
+                            Duration::from_nanos(session.navigation_controller_cpu_ns),
                             session.limits.controller_cpu_time,
                             "controller",
                         )
@@ -1214,15 +1237,12 @@ impl Daemon {
                     .err()
             })
         });
-        if let Some(message) = cpu_limit_error {
-            if response.status == "ok" {
-                let metrics = response.metrics.clone();
-                response = limit_error(&limit_request, message);
-                response.metrics = metrics;
-            }
+        if let Some(_message) = cpu_limit_error {
+            // A CPU budget slows the next navigation. It does not replace a
+            // finished read with an error, at any host size.
             if let Some(session_id) = session_id.as_deref() {
                 if let Some(session) = self.sessions.get_mut(session_id) {
-                    let _ = session.transition(SessionState::Failed);
+                    release_navigation_budget(session);
                 }
             }
         }
@@ -1844,19 +1864,19 @@ impl Daemon {
             if let Err(message) = session
                 .limits
                 .check_cpu_time(
-                    Duration::from_nanos(session.content_cpu_used_ns),
+                    Duration::from_nanos(session.navigation_content_cpu_ns),
                     session.limits.content_cpu_time,
                     "content",
                 )
                 .and_then(|_| {
                     session.limits.check_cpu_time(
-                        Duration::from_nanos(session.controller_cpu_used_ns),
+                        Duration::from_nanos(session.navigation_controller_cpu_ns),
                         session.limits.controller_cpu_time,
                         "controller",
                     )
                 })
             {
-                let _ = session.transition(SessionState::Failed);
+                release_navigation_budget(session);
                 return limit_error(request, message);
             }
             if let Err(message) = session.begin_operation(&request.request_id) {
@@ -2340,7 +2360,7 @@ impl Daemon {
         let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
         let elapsed = session.started.elapsed();
         session.limits.check_wall_time(elapsed)?;
-        let content_cpu = Duration::from_nanos(session.content_cpu_used_ns);
+        let content_cpu = Duration::from_nanos(session.navigation_content_cpu_ns);
         session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
         let timeout = session.limits.operation_budget(elapsed, budget);
         if timeout.is_zero() {
@@ -2710,6 +2730,10 @@ impl Daemon {
     }
 
     fn web_read(&mut self, request: &Request) -> Response {
+        self.web_read_attempt(request, true)
+    }
+
+    fn web_read_attempt(&mut self, request: &Request, allow_retry: bool) -> Response {
         let Some(url) = request.payload.get("url").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.read requires url");
         };
@@ -2732,6 +2756,13 @@ impl Daemon {
                     }
                     Err(response) => {
                         self.finish_session(&session_id);
+                        if allow_retry
+                            && response.error.as_ref().is_some_and(|error| {
+                                crate::text_mode::incomplete_worker_frame(&error.message)
+                            })
+                        {
+                            return self.web_read_attempt(request, false);
+                        }
                         response
                     }
                 }
@@ -2864,15 +2895,20 @@ impl Daemon {
         let mut admitted = Vec::new();
         let mut omitted = 0u32;
         let mut omitted_reasons = Vec::new();
-        for result in results.into_iter().take(max_sources) {
-            let Some(href) = result.get("href").and_then(|v| v.as_str()) else {
-                omitted += 1;
-                omitted_reasons.push(json!({"reason": "missing href"}));
+        for result in results {
+            if admitted.len() >= max_sources {
+                break;
+            }
+            let Some(href) = result
+                .get("href")
+                .and_then(|v| v.as_str())
+                .and_then(crate::text_mode::research_target_url)
+            else {
                 continue;
             };
             let mut read_req = request.clone();
             read_req.payload =
-                json!({ "url": href, "session_id": request.payload.get("session_id") });
+                json!({ "url": href.as_str(), "session_id": request.payload.get("session_id") });
             match self.web_read(&read_req) {
                 response if response.status == "ok" => {
                     if let Some(source) = response
@@ -3209,6 +3245,10 @@ impl Daemon {
                 }
                 let result = match action {
                     "new" => {
+                        if let Some(message) = self.room_for_another_page(&session_id) {
+                            self.finish_session(&session_id);
+                            return limit_error(request, message);
+                        }
                         let context = self
                             .sessions
                             .get(&session_id)
@@ -3231,51 +3271,60 @@ impl Daemon {
                     },
                     "switch" => match target {
                         None => Err("web.tab switch requires a tab id".to_owned()),
-                        Some(tab) => {
-                            let known = self
-                                .sessions
-                                .get(&session_id)
-                                .map(|session| session.tabs.contains(&tab))
-                                .unwrap_or(false);
-                            if !known {
-                                Err(format!("no tab {tab} in this session"))
-                            } else {
-                                if let Some(session) = self.sessions.get_mut(&session_id) {
-                                    session.page_id = Some(tab.clone());
-                                }
-                                Ok(json!({ "tab": tab, "active": true }))
-                            }
-                        }
+                        Some(tab) => self.activate_tab(&session_id, &tab),
                     },
                     "close" => {
                         let tab = target.unwrap_or_else(|| active.clone());
-                        let remaining = {
-                            let session = self.sessions.get_mut(&session_id);
-                            match session {
-                                None => Vec::new(),
-                                Some(session) => {
-                                    session.tabs.retain(|id| id != &tab);
-                                    session.locator_snapshots.remove(&tab);
-                                    session.pages = session.tabs.len() as u32;
-                                    if session.page_id.as_deref() == Some(tab.as_str()) {
-                                        session.page_id = session.tabs.last().cloned();
+                        let swapped = self.sessions.get(&session_id).is_some_and(|session| {
+                            let canonical = session.canonical_tab(&tab);
+                            session
+                                .swapped_tabs
+                                .iter()
+                                .any(|id| id == &tab || id == &canonical)
+                        });
+                        if swapped {
+                            self.forget_swapped_tab(&session_id, &tab);
+                            let remaining = self
+                                .sessions
+                                .get(&session_id)
+                                .map(|session| session.tabs.clone())
+                                .unwrap_or_default();
+                            Ok(json!({ "closed": tab, "tabs": remaining, "swapped": true }))
+                        } else {
+                            let remaining = {
+                                let session = self.sessions.get_mut(&session_id);
+                                match session {
+                                    None => Vec::new(),
+                                    Some(session) => {
+                                        session.tabs.retain(|id| id != &tab);
+                                        session.locator_snapshots.remove(&tab);
+                                        session.pages = session.tabs.len() as u32;
+                                        if session.page_id.as_deref() == Some(tab.as_str()) {
+                                            session.page_id = session.tabs.last().cloned();
+                                        }
+                                        session.tabs.clone()
                                     }
-                                    session.tabs.clone()
                                 }
-                            }
-                        };
-                        // Closing the last tab would leave the session without
-                        // a page; the next operation recreates one on demand.
-                        let _ = self.engine_call("page.close", json!({ "page": tab }));
-                        Ok(json!({ "closed": tab, "tabs": remaining }))
+                            };
+                            // Closing the last tab would leave the session without
+                            // a page; the next operation recreates one on demand.
+                            let _ = self.engine_call("page.close", json!({ "page": tab }));
+                            Ok(json!({ "closed": tab, "tabs": remaining }))
+                        }
                     }
                     _ => {
-                        let (tabs, active_id) = self
+                        let (tabs, swapped, active_id) = self
                             .sessions
                             .get(&session_id)
-                            .map(|session| (session.tabs.clone(), session.page_id.clone()))
+                            .map(|session| {
+                                (
+                                    session.tabs.clone(),
+                                    session.swapped_tabs.clone(),
+                                    session.page_id.clone(),
+                                )
+                            })
                             .unwrap_or_default();
-                        let rows: Vec<serde_json::Value> = tabs
+                        let mut rows: Vec<serde_json::Value> = tabs
                             .iter()
                             .map(|id| {
                                 let url = self
@@ -3286,10 +3335,26 @@ impl Daemon {
                                 json!({
                                     "tab": id,
                                     "active": Some(id.clone()) == active_id,
+                                    "swapped": false,
                                     "url": url,
                                 })
                             })
                             .collect();
+                        for id in swapped {
+                            let url = self
+                                .swap_path(&session_id, &id)
+                                .ok()
+                                .and_then(|path| std::fs::read_to_string(path).ok())
+                                .and_then(|raw| crate::tab_swap::PageSnapshot::from_json(&raw).ok())
+                                .map(|snapshot| snapshot.url)
+                                .unwrap_or_default();
+                            rows.push(json!({
+                                "tab": id,
+                                "active": false,
+                                "swapped": true,
+                                "url": url,
+                            }));
+                        }
                         Ok(json!({ "tabs": rows, "count": rows.len() }))
                     }
                 };
@@ -3493,7 +3558,15 @@ impl Daemon {
         let Some(timeout_ms) = request.payload.get("timeout_ms").and_then(|v| v.as_u64()) else {
             return protocol_error(request, "web.wait requires an unsigned integer timeout_ms");
         };
-        let request_deadline = started.checked_add(Duration::from_millis(request.deadline_ms.min(timeout_ms)))
+        // deadline_ms 0 is unset. delay/40 carries timeout_ms and must not
+        // expire while the session page is still being acquired.
+        let bounded_ms = if request.deadline_ms == 0 {
+            timeout_ms
+        } else {
+            request.deadline_ms.min(timeout_ms)
+        };
+        let request_deadline = started
+            .checked_add(Duration::from_millis(bounded_ms))
             .unwrap_or(started);
         let (session_id, page) = match self.with_session_page_until(request, "web.wait", Some(request_deadline)) {
             Ok(context) => context,
@@ -4145,10 +4218,10 @@ impl Daemon {
                 let Some(tab) = value.as_str().filter(|tab| !tab.is_empty()) else {
                     return Err(protocol_error(request, "tab_id must be a non-empty string"));
                 };
-                let known = self.sessions.get(&session_id).is_some_and(|session| {
-                    session.page_id.as_deref() == Some(tab)
-                        || session.tabs.iter().any(|page| page == tab)
-                });
+                let known = self
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.owns_tab(tab));
                 if !known {
                     let mut error = ErrorObject::new(
                         "TAB_NOT_FOUND",
@@ -4163,8 +4236,27 @@ impl Daemon {
                 Some(tab.to_owned())
             }
         };
-        let content_rss = sample_rss_bytes(self.content.pid());
+        let mut content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
+        if crate::limits::should_recycle_content(
+            content_rss,
+            crate::limits::effective_cpu_count(),
+            crate::limits::max_ram_bytes(),
+        ) && matches!(operation, "web.read" | "web.search" | "web.goto")
+        {
+            let limit = crate::limits::content_rss_recycle_bytes(
+                crate::limits::effective_cpu_count(),
+                crate::limits::max_ram_bytes(),
+            )
+            .unwrap_or(content_rss);
+            if let Err(error) =
+                self.recycle_content_keeping_session(&session_id, content_rss, limit)
+            {
+                self.finish_session(&session_id);
+                return Err(engine_error(request, error, 34));
+            }
+            content_rss = sample_rss_bytes(self.content.pid());
+        }
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
             if let Err(message) = session.begin_operation(&request.request_id) {
@@ -4179,19 +4271,17 @@ impl Daemon {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                Duration::from_nanos(session.content_cpu_used_ns),
+                Duration::from_nanos(session.navigation_content_cpu_ns),
                 session.limits.content_cpu_time,
                 "content",
             ) {
-                let _ = session.transition(SessionState::Failed);
-                Some(("limit", message))
+                Some(("budget", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                Duration::from_nanos(session.controller_cpu_used_ns),
+                Duration::from_nanos(session.navigation_controller_cpu_ns),
                 session.limits.controller_cpu_time,
                 "controller",
             ) {
-                let _ = session.transition(SessionState::Failed);
-                Some(("limit", message))
+                Some(("budget", message))
             } else {
                 None
             }
@@ -4204,6 +4294,12 @@ impl Daemon {
                 // Refuse the expired session without destroying live tabs.
                 return Err(limit_error(request, message));
             }
+            Some(("budget", message)) => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    release_navigation_budget(session);
+                }
+                return Err(limit_error(request, message));
+            }
             Some(("limit", message)) => {
                 let _ = self.recover_content(&format!("wall time exceeded: {message}"));
                 return Err(limit_error(request, message));
@@ -4211,18 +4307,27 @@ impl Daemon {
             Some(_) => unreachable!(),
             None => {}
         }
-        let page = requested_page.or_else(|| {
-            self.sessions.get(&session_id).and_then(|session| session.page_id.clone())
+        let page_hint = requested_page.or_else(|| {
+            self.sessions
+                .get(&session_id)
+                .and_then(|session| session.page_id.clone())
         });
-        let page = match page {
+        let page_hint = if let Some(tab) = page_hint {
+            match self.prepare_requested_tab(&session_id, &tab) {
+                Ok(page) => page,
+                Err(error) => {
+                    self.finish_session(&session_id);
+                    return Err(engine_error(request, error, 34));
+                }
+            }
+        } else {
+            None
+        };
+        let page = match page_hint {
             Some(page) => page,
             None => {
-                if let Some(session) = self.sessions.get(&session_id) {
-                    if let Err(message) =
-                        session.limits.check_pages(session.pages.saturating_add(1))
-                    {
-                        return Err(limit_error(request, message));
-                    }
+                if let Some(message) = self.room_for_another_page(&session_id) {
+                    return Err(limit_error(request, message));
                 }
                 if deadline.is_some() {
                     self.finish_session(&session_id);
@@ -4336,24 +4441,59 @@ impl Daemon {
             });
         }
         if let Some(session) = self.sessions.get_mut(session_id) {
+            session.begin_navigation();
             if let Err(message) = session
                 .limits
                 .check_requests(session.requests.saturating_add(1))
             {
                 return Err(limit_error(request, message));
             }
-            if let Err(message) = session
-                .limits
-                .check_network_bytes(session.network_bytes, 4096)
-            {
-                return Err(limit_error(request, message));
-            }
+            // The document is not aborted when the budget is already tight.
+            // Side resources are dropped instead; the text comes back degraded.
             session.requests = session.requests.saturating_add(1);
-            session.network_bytes = session.network_bytes.saturating_add(4096);
         }
-        self.engine_call("page.goto", json!({ "page": page, "url": url }))
-            .map_err(|error| engine_error(request, error, 34))?;
-        self.apply_page_record_limits(session_id, page, request)?;
+        let text_mode = crate::text_mode::is_text_read(&request.operation);
+        let mut goto_params = json!({ "page": page, "url": url });
+        if let Some(session) = self.sessions.get(session_id) {
+            goto_params["networkBudget"] = json!(session.limits.max_network_bytes);
+        }
+        if text_mode {
+            // Do not wait for images and the load event. On one core that
+            // wait ran to the 30s engine timeout (exit 34) on JS-heavy pages.
+            goto_params["textOnly"] = json!(true);
+            goto_params["waitUntil"] = json!("domcontentloaded");
+            // No default clock. A short timeout made 512 MiB hosts return a
+            // different page than 4 GiB hosts. --deadline is the optional stop.
+        }
+        let mut partial_reason: Option<String> = None;
+        if let Err(error) = self.engine_call("page.goto", goto_params) {
+            if crate::text_mode::incomplete_worker_frame(&error)
+                || error.contains("died while reading")
+            {
+                return Err(engine_error(
+                    request,
+                    crate::text_mode::worker_frame_message(),
+                    34,
+                ));
+            }
+            if crate::text_mode::degrade_reason(&error).is_some() {
+                partial_reason = Some(error);
+            } else {
+                return Err(engine_error(request, error, 34));
+            }
+        }
+        if let Err(response) = self.apply_page_record_limits(session_id, page, request) {
+            let message = response
+                .error
+                .as_ref()
+                .map(|error| error.message.to_string())
+                .unwrap_or_default();
+            if crate::text_mode::degrade_reason(&message).is_some() {
+                partial_reason = Some(message);
+            } else {
+                return Err(response);
+            }
+        }
         let tree = self
             .engine_call("page.observe", json!({ "page": page, "metadata_only": true }))
             .map_err(|error| engine_error(request, error, 34))?;
@@ -4418,6 +4558,27 @@ impl Daemon {
             .rev()
             .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
         let text = rendered_text;
+        if text.trim().is_empty() {
+            if let Some(reason) = &partial_reason {
+                if crate::text_mode::degrade_reason(reason).is_none() {
+                    return Err(engine_error(request, reason.clone(), 34));
+                }
+            }
+        }
+        let (fitted, framed) = crate::text_mode::cap_text_for_frame(&text);
+        let text = fitted.to_owned();
+        let mut reason_code = partial_reason
+            .as_deref()
+            .and_then(crate::text_mode::degrade_reason)
+            .unwrap_or("")
+            .to_owned();
+        if framed {
+            reason_code = "frame".to_owned();
+        }
+        let degraded = partial_reason.is_some() || framed;
+        if degraded && reason_code.is_empty() {
+            reason_code = "session_limit".to_owned();
+        }
         let title = tree
             .get("title")
             .and_then(|v| v.as_str())
@@ -4447,6 +4608,10 @@ impl Daemon {
                 "artifact_digest": stored.digest.hex,
                 "http_status": http_status,
                 "classification": "original",
+                "degraded": degraded,
+                "reason": if degraded { Some(reason_code) } else { None },
+                "partial": degraded,
+                "partial_reason": partial_reason,
                 "session_id": session_id,
                 "operation_id": request.request_id,
                 "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
@@ -4658,13 +4823,12 @@ impl Daemon {
             }
         }
         if !self.content.is_running() {
+            let detail = self.content.death_detail();
             if !recover_worker {
                 return Err("content worker is unavailable; observation did not restart it".into());
             }
             self.recover_content("content worker exited")?;
-            return Err(
-                "content worker crashed and was restarted; session pages were reset".into(),
-            );
+            return Err(worker_restarted_message(detail));
         }
         self.content
             .prepare_engine_params(method, &mut params)
@@ -4680,10 +4844,13 @@ impl Daemon {
             &Message::engine_call(request_id, method.to_owned(), params),
             timeout,
         ) {
-            if recover_worker {
-                let _ = self.recover_content(&format!("content send failed: {error}"));
+            let message = error.to_string();
+            // Refused before any byte is written, so the worker protocol is
+            // still aligned. Restarting here would drop the live page.
+            if recover_worker && !message.contains("encoded frame length") {
+                let _ = self.recover_content(&format!("content send failed: {message}"));
             }
-            return Err(error.to_string());
+            return Err(message);
         }
         // Diagnostic reads spend one bounded budget across send and receive.
         // Preserve the existing ordinary-call contract in this scoped change.
@@ -4728,20 +4895,29 @@ impl Daemon {
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
                         if !self.content.is_running() {
+                            let detail = self.content.death_detail();
                             if !recover_worker {
                                 return Err("content worker exited during observation; it was not restarted".into());
                             }
                             self.recover_content("content worker exited while handling request")?;
-                            return Err(
-                                "content worker crashed and was restarted; session pages were reset"
-                                    .into(),
-                            );
+                            return Err(worker_restarted_message(detail));
                         }
                         continue;
                     }
+                    let died = !self.content.is_running();
+                    let detail = self.content.death_detail();
                     let message = error.to_string();
-                    if recover_worker {
+                    let frame_died = crate::text_mode::incomplete_worker_frame(&message);
+                    if recover_worker && (died || frame_died) {
                         let _ = self.recover_content(&format!("content worker: {message}"));
+                    } else if recover_worker {
+                        let _ = self.recover_content(&format!("content worker: {message}"));
+                    }
+                    if died || frame_died {
+                        let detail = detail.or_else(|| {
+                            frame_died.then(|| crate::text_mode::worker_frame_message().to_owned())
+                        });
+                        return Err(worker_restarted_message(detail));
                     }
                     return Err(message);
                 }
@@ -4866,6 +5042,7 @@ impl Daemon {
             session.page_id = None;
             session.engine_context_id = None;
             session.tabs.clear();
+            session.tab_aliases.clear();
             session.locator_snapshots.clear();
             session.pages = 0;
         }
@@ -4879,6 +5056,7 @@ impl Daemon {
             session.page_id = None;
             session.engine_context_id = None;
             session.tabs.clear();
+            session.tab_aliases.clear();
             session.locator_snapshots.clear();
             session.pages = 0;
             if session.state == SessionState::Busy {
@@ -4910,6 +5088,380 @@ impl Daemon {
             json!({ "reason": redact_secrets(reason) }),
         );
         Ok(())
+    }
+
+    fn recycle_content_keeping_session(
+        &mut self,
+        session_id: &str,
+        rss: u64,
+        limit: u64,
+    ) -> Result<(), String> {
+        let reason = format!(
+            "content rss {rss} exceeded recycle budget {limit}; replacing the content worker before the next navigation"
+        );
+        self.carry_replaced_content_cpu();
+        self.replace_content_worker(&reason)?;
+        self.arm_content_cpu_baseline();
+        for session in self.sessions.values_mut() {
+            session.page_id = None;
+            session.engine_context_id = None;
+            session.tabs.clear();
+            session.tab_aliases.clear();
+            session.locator_snapshots.clear();
+            session.pages = 0;
+        }
+        self.journal(
+            session_id,
+            "",
+            "content.recycled",
+            json!({ "rss_bytes": rss, "limit_bytes": limit }),
+        );
+        Ok(())
+    }
+
+    fn carry_replaced_content_cpu(&mut self) {
+        if let Some((pid, baseline)) = self.content_cpu_baseline.take() {
+            let now = sample_cpu_ns(pid);
+            self.content_cpu_carry_ns = self.content_cpu_carry_ns.saturating_add(
+                process_cpu_delta_ns(pid, baseline, pid, now),
+            );
+        }
+    }
+
+    fn arm_content_cpu_baseline(&mut self) {
+        let pid = self.content.pid();
+        self.content_cpu_baseline = Some((pid, sample_cpu_ns(pid)));
+    }
+
+    fn live_page_count(&self) -> u32 {
+        self.sessions
+            .values()
+            .map(|session| {
+                let mut count = session.tabs.len() as u32;
+                if let Some(page) = session.page_id.as_ref() {
+                    let listed = session.tabs.iter().any(|id| id == page)
+                        || session.swapped_tabs.iter().any(|id| id == page);
+                    if !listed {
+                        count += 1;
+                    }
+                }
+                count
+            })
+            .sum()
+    }
+
+    fn oldest_live_page(&self) -> Option<(String, String)> {
+        let mut sessions: Vec<_> = self.sessions.iter().collect();
+        sessions.sort_by_key(|(_, session)| session.started);
+        for (session_id, session) in sessions {
+            if let Some(page) = session.tabs.first() {
+                return Some((session_id.clone(), page.clone()));
+            }
+            if let Some(page) = session.page_id.clone() {
+                if !session.swapped_tabs.iter().any(|id| id == &page) {
+                    return Some((session_id.clone(), page));
+                }
+            }
+        }
+        None
+    }
+
+    fn live_page_ceiling(&self) -> u32 {
+        self.sessions
+            .values()
+            .map(|session| session.limits.max_pages.max(1))
+            .min()
+            .unwrap_or(1)
+    }
+
+    fn make_room_for_live_page(&mut self) {
+        let mut attempts = 0;
+        while self.live_page_count() >= self.live_page_ceiling() {
+            attempts += 1;
+            if attempts > 32 {
+                break;
+            }
+            let Some((session_id, page_id)) = self.oldest_live_page() else {
+                break;
+            };
+            if self.swap_live_page(&session_id, &page_id).is_err() {
+                break;
+            }
+        }
+    }
+
+    fn room_for_another_page(&mut self, session_id: &str) -> Option<String> {
+        let overflow = self.sessions.get(session_id).and_then(|session| {
+            session
+                .limits
+                .check_pages(session.pages.saturating_add(1))
+                .err()
+        });
+        if overflow.is_none() {
+            return None;
+        }
+        self.make_room_for_live_page();
+        self.sessions.get(session_id).and_then(|session| {
+            session
+                .limits
+                .check_pages(session.pages.saturating_add(1))
+                .err()
+        })
+    }
+
+    fn prepare_requested_tab(
+        &mut self,
+        session_id: &str,
+        tab: &str,
+    ) -> Result<Option<String>, String> {
+        let canonical = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(tab))
+            .unwrap_or_else(|| tab.to_owned());
+        let swapped = self.sessions.get(session_id).is_some_and(|session| {
+            session
+                .swapped_tabs
+                .iter()
+                .any(|id| id == tab || id == &canonical)
+        });
+        if swapped {
+            return Ok(Some(self.restore_swapped_page(session_id, &canonical)?));
+        }
+        let live = self.sessions.get(session_id).is_some_and(|session| {
+            session.page_id.as_deref() == Some(canonical.as_str())
+                || session.tabs.iter().any(|id| id == &canonical)
+        });
+        if live { Ok(Some(canonical)) } else { Ok(None) }
+    }
+
+    fn activate_tab(
+        &mut self,
+        session_id: &str,
+        tab: &str,
+    ) -> Result<serde_json::Value, String> {
+        let canonical = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(tab))
+            .unwrap_or_else(|| tab.to_owned());
+        let swapped = self.sessions.get(session_id).is_some_and(|session| {
+            session
+                .swapped_tabs
+                .iter()
+                .any(|id| id == tab || id == &canonical)
+        });
+        if swapped {
+            let page = self.restore_swapped_page(session_id, &canonical)?;
+            return Ok(json!({ "tab": page, "active": true, "restored": true }));
+        }
+        let known = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.tabs.iter().any(|id| id == &canonical));
+        if !known {
+            return Err(format!("no tab {tab} in this session"));
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.page_id = Some(canonical.clone());
+        }
+        Ok(json!({ "tab": canonical, "active": true }))
+    }
+
+    fn swap_path(&self, session_id: &str, page_id: &str) -> Result<PathBuf, String> {
+        let session_id = isolated_id(session_id)?;
+        let page_id = isolated_id(page_id)?;
+        Ok(data_root(&self.run_id)
+            .join("tab-swap")
+            .join(session_id)
+            .join(format!("{page_id}.json")))
+    }
+
+    fn forget_swapped_tab(&mut self, session_id: &str, page_id: &str) {
+        let canonical = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(page_id))
+            .unwrap_or_else(|| page_id.to_owned());
+        for id in [page_id.to_owned(), canonical.clone()] {
+            if let Ok(path) = self.swap_path(session_id, &id) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session
+                .swapped_tabs
+                .retain(|id| id != page_id && id != &canonical);
+            session
+                .tab_aliases
+                .retain(|from, to| from != page_id && to != page_id);
+        }
+    }
+
+    fn capture_snapshot(&mut self, page_id: &str) -> crate::tab_swap::PageSnapshot {
+        let mut snapshot = crate::tab_swap::PageSnapshot::blank();
+        snapshot.notes.push(
+            "document.cookie only; HttpOnly cookies and the history stack are not captured".into(),
+        );
+        if let Ok(value) = self.engine_call("page.url", json!({ "page": page_id })) {
+            snapshot.url = value
+                .get("url")
+                .and_then(|url| url.as_str())
+                .unwrap_or("")
+                .to_string();
+        } else {
+            snapshot.notes.push("url was not readable".into());
+        }
+        if let Ok(value) = self.engine_call("page.title", json!({ "page": page_id })) {
+            snapshot.title = value
+                .get("title")
+                .and_then(|title| title.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        if let Ok(value) = self.engine_call("page.cookies", json!({ "page": page_id })) {
+            snapshot.document_cookie = value
+                .get("cookie")
+                .and_then(|cookie| cookie.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        if let Ok(value) = self.engine_call("page.content", json!({ "page": page_id })) {
+            if let Some(html) = value.get("html").and_then(|html| html.as_str()) {
+                let (html, truncated) = crate::tab_swap::cap_html(html.to_string());
+                snapshot.html = html;
+                snapshot.html_truncated = truncated;
+                if truncated {
+                    snapshot
+                        .notes
+                        .push("outerHTML exceeded 1 MiB and was omitted".into());
+                }
+            }
+        }
+        match self.engine_call(
+            "page.evaluate",
+            json!({ "page": page_id, "source": crate::tab_swap::capture_script() }),
+        ) {
+            Ok(value) => match crate::tab_swap::parse_evaluate_state(&value) {
+                Some(state) => {
+                    snapshot.scroll_x = state.scroll_x;
+                    snapshot.scroll_y = state.scroll_y;
+                    snapshot.local_storage = state.local_storage;
+                    snapshot.session_storage = state.session_storage;
+                }
+                None => snapshot
+                    .notes
+                    .push("scroll and storage did not parse".into()),
+            },
+            Err(_) => snapshot
+                .notes
+                .push("scroll and storage were not captured".into()),
+        }
+        snapshot
+    }
+
+    fn swap_live_page(&mut self, session_id: &str, page_id: &str) -> Result<(), String> {
+        let snapshot = self.capture_snapshot(page_id);
+        let path = self.swap_path(session_id, page_id)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(&path, snapshot.to_json()).map_err(|error| error.to_string())?;
+        self.engine_call("page.close", json!({ "page": page_id }))?;
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.tabs.retain(|id| id != page_id);
+            session.locator_snapshots.remove(page_id);
+            if !session.swapped_tabs.iter().any(|id| id == page_id) {
+                session.swapped_tabs.push(page_id.to_string());
+            }
+            session.pages = session.tabs.len() as u32;
+            if session.page_id.as_deref() == Some(page_id) {
+                session.page_id = session.tabs.last().cloned();
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_swapped_page(&mut self, session_id: &str, page_id: &str) -> Result<String, String> {
+        let page_id = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(page_id))
+            .unwrap_or_else(|| page_id.to_owned());
+        let path = self.swap_path(session_id, &page_id)?;
+        let snapshot = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| crate::tab_swap::PageSnapshot::from_json(&raw).ok())
+            .ok_or_else(|| format!("tab {page_id} is not swapped"))?;
+        self.make_room_for_live_page();
+        let context = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.engine_context_id.clone());
+        let created = if let Some(context) = context {
+            self.engine_call("context.newPage", json!({ "context": context }))?
+        } else {
+            let storage_key = self
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.persistent_profile.clone())
+                .map(|name| format!("persistent-{name}"))
+                .unwrap_or_else(|| format!("ephemeral-{session_id}"));
+            self.engine_call(
+                "session.ensurePage",
+                json!({ "session": session_id, "storage_key": storage_key }),
+            )?
+        };
+        let new_page = created
+            .get("page")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "engine returned no page id".to_owned())?
+            .to_string();
+        if crate::tab_swap::restore_via_navigation(&snapshot.url) {
+            let _ = self.engine_call(
+                "page.goto",
+                json!({ "page": new_page, "url": snapshot.url }),
+            );
+        } else if let Some(html) = snapshot.html.clone() {
+            let _ = self.engine_call(
+                "page.setContent",
+                json!({ "page": new_page, "html": html }),
+            );
+        }
+        let cookies: Vec<_> = crate::tab_swap::cookie_pairs(&snapshot.document_cookie)
+            .into_iter()
+            .map(|(name, value)| json!({ "name": name, "value": value, "path": "/" }))
+            .collect();
+        if !cookies.is_empty() {
+            let _ = self.engine_call(
+                "page.addCookies",
+                json!({ "page": new_page, "cookies": cookies }),
+            );
+        }
+        let _ = self.engine_call(
+            "page.evaluate",
+            json!({
+                "page": new_page,
+                "source": crate::tab_swap::restore_script(&snapshot),
+            }),
+        );
+        self.forget_swapped_tab(session_id, &page_id);
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.tab_aliases.insert(page_id, new_page.clone());
+            session.swapped_tabs.retain(|id| id != &new_page);
+            if !session.tabs.contains(&new_page) {
+                session.tabs.push(new_page.clone());
+            }
+            session.page_id = Some(new_page.clone());
+            session.pages = session.tabs.len() as u32;
+            if session.engine_context_id.is_none() {
+                session.engine_context_id = created
+                    .get("context")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+            }
+        }
+        Ok(new_page)
     }
 
     fn persist_session_snapshot(&self, session: &Session, extra: serde_json::Value) {
@@ -5365,6 +5917,23 @@ fn locator_error(request: &Request, message: impl Into<String>) -> Response {
     )
 }
 
+fn release_navigation_budget(session: &mut Session) {
+    session.begin_navigation();
+    if matches!(session.state, SessionState::Busy | SessionState::Failed) {
+        let _ = session.transition(SessionState::Ready);
+    }
+}
+
+fn worker_restarted_message(detail: Option<String>) -> String {
+    let mut message =
+        "content worker crashed and was restarted; session pages were reset".to_owned();
+    if let Some(detail) = detail {
+        message.push_str(". ");
+        message.push_str(&detail);
+    }
+    message
+}
+
 fn limit_error(request: &Request, message: impl Into<String>) -> Response {
     Response::error(
         request,
@@ -5704,13 +6273,15 @@ fn account_operation_cpu(
     content_after: (u32, u64),
     controller_before: (u32, u64),
     controller_after: (u32, u64),
+    carried_content_ns: u64,
 ) -> (u64, u64) {
     let content_ns = process_cpu_delta_ns(
         content_before.0,
         content_before.1,
         content_after.0,
         content_after.1,
-    );
+    )
+    .saturating_add(carried_content_ns);
     let controller_ns = process_cpu_delta_ns(
         controller_before.0,
         controller_before.1,
@@ -5719,6 +6290,8 @@ fn account_operation_cpu(
     );
     session.content_cpu_used_ns = session.content_cpu_used_ns.saturating_add(content_ns);
     session.controller_cpu_used_ns = session.controller_cpu_used_ns.saturating_add(controller_ns);
+    session.navigation_content_cpu_ns = session.navigation_content_cpu_ns.saturating_add(content_ns);
+    session.navigation_controller_cpu_ns = session.navigation_controller_cpu_ns.saturating_add(controller_ns);
     if response.metrics.content_cpu_ms == 0 {
         response.metrics.content_cpu_ms = content_ns / 1_000_000;
     }
@@ -5880,34 +6453,43 @@ fn gate_session_engine(
     session.limits.check_wall_time(session.started.elapsed())?;
     let content_rss = sample_rss_bytes(content_pid);
     session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
-    session.limits.check_content_rss(content_rss)?;
-    session
+    // RSS over the derived recycle point is handled by replacing the worker
+    // before the next read. It is not an error, and neither is controller RSS.
+    let _ = session.limits.check_content_rss(content_rss);
+    let _ = session
         .limits
-        .check_controller_memory(sample_rss_bytes(controller_pid))?;
-    let content_cpu_ns = session.content_cpu_used_ns.saturating_add(process_cpu_delta_ns(
+        .check_controller_memory(sample_rss_bytes(controller_pid));
+    if matches!(
+        method,
+        "page.goto" | "page.reload" | "page.goBack" | "page.goForward" | "page.frameGoto"
+    ) {
+        session.begin_navigation();
+    }
+    let content_cpu_ns = session.navigation_content_cpu_ns.saturating_add(process_cpu_delta_ns(
         content_pid,
         content_cpu_baseline_ns,
         content_pid,
         sample_cpu_ns(content_pid),
     ));
     let controller_cpu_ns = session
-        .controller_cpu_used_ns
+        .navigation_controller_cpu_ns
         .saturating_add(process_cpu_delta_ns(
             controller_pid,
             controller_cpu_baseline_ns,
             controller_pid,
             sample_cpu_ns(controller_pid),
         ));
-    session.limits.check_cpu_time(
+    // CPU time is not an exit. The navigation keeps the text it already has.
+    let _ = session.limits.check_cpu_time(
         Duration::from_nanos(content_cpu_ns),
         session.limits.content_cpu_time,
         "content",
-    )?;
-    session.limits.check_cpu_time(
+    );
+    let _ = session.limits.check_cpu_time(
         Duration::from_nanos(controller_cpu_ns),
         session.limits.controller_cpu_time,
         "controller",
-    )?;
+    );
     match method {
         "session.attachPage" => {
             let requested = _params.get("page").and_then(|value| value.as_str());
@@ -5931,11 +6513,12 @@ fn gate_session_engine(
             session
                 .limits
                 .check_requests(session.requests.saturating_add(1))?;
-            session
+            // Over budget does not cancel the document. The content worker
+            // drops later side resources and the read returns degraded.
+            let _ = session
                 .limits
-                .check_network_bytes(session.network_bytes, 4096)?;
+                .check_network_bytes(session.navigation_network_bytes, 4096);
             session.requests = session.requests.saturating_add(1);
-            session.network_bytes = session.network_bytes.saturating_add(4096);
         }
         _ => {}
     }
@@ -6062,12 +6645,19 @@ fn apply_record_limits(
     session.limits.check_download_bytes(0, download_bytes)?;
     session.console_bytes = console_bytes;
     session.download_bytes = download_bytes;
-    let recorded_network = records.network_bytes;
-    if recorded_network > 0 {
-        let accounted = session.network_bytes.max(recorded_network);
-        session.limits.check_network_bytes(0, accounted)?;
-        session.network_bytes = accounted;
+    // `network_bytes` is the current document's retained total (main's
+    // payload-free record usage). The navigation counter is a high-water
+    // mark that `begin_navigation` clears, so the next page gets a new
+    // budget. The session total only grows, for metrics.
+    let snapshot = records.network_bytes;
+    if snapshot > session.navigation_network_bytes {
+        let delta = snapshot - session.navigation_network_bytes;
+        session.navigation_network_bytes = snapshot;
+        session.network_bytes = session.network_bytes.saturating_add(delta);
     }
+    session
+        .limits
+        .check_network_bytes(0, session.navigation_network_bytes)?;
     Ok(())
 }
 
@@ -6490,6 +7080,7 @@ mod redirect_chain_tests {
             (7, 110),
             (9, 200),
             (9, 203),
+            0,
         );
         super::account_operation_cpu(
             &mut session_b,
@@ -6498,6 +7089,7 @@ mod redirect_chain_tests {
             (7, 150),
             (9, 203),
             (9, 210),
+            0,
         );
         super::account_operation_cpu(
             &mut session_a,
@@ -6506,6 +7098,7 @@ mod redirect_chain_tests {
             (7, 151),
             (9, 210),
             (9, 211),
+            0,
         );
 
         assert_eq!(session_a.content_cpu_used_ns, 11);
@@ -6548,6 +7141,7 @@ mod redirect_chain_tests {
             (11, 107),
             (12, 5),
             (12, 8),
+            0,
         );
         super::account_operation_cpu(
             &mut session,
@@ -6556,6 +7150,7 @@ mod redirect_chain_tests {
             (12, 1),
             (12, 8),
             (13, 1),
+            0,
         );
         assert_eq!(session.content_cpu_used_ns, 7);
         assert_eq!(session.controller_cpu_used_ns, 3);
@@ -6567,9 +7162,113 @@ mod redirect_chain_tests {
             (12, 4),
             (13, 1),
             (13, 4),
+            0,
         );
         assert_eq!(session.content_cpu_used_ns, 10);
         assert_eq!(session.controller_cpu_used_ns, 6);
+        assert_eq!(session.navigation_content_cpu_ns, 10);
+    }
+
+    #[test]
+    fn a_recycled_worker_still_reports_content_cpu() {
+        let mut session = super::Session::new("recycle", "run", super::NetworkProfile::Research);
+        let request = super::Request::new("recycle", "web.read", json!({}));
+        let mut response = super::Response::ok(&request, json!({}));
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (20, 0),
+            (21, 50),
+            (3, 0),
+            (3, 0),
+            6_500_000_000,
+        );
+        assert_eq!(response.metrics.content_cpu_ms, 6_500);
+        assert_eq!(session.content_cpu_used_ns, 6_500_000_000);
+        assert_ne!(response.metrics.content_cpu_ms, 0);
+    }
+
+    #[test]
+    fn a_new_navigation_clears_the_page_budget_and_keeps_the_session_total() {
+        let mut session = super::Session::new("nav", "run", super::NetworkProfile::Research);
+        session.limits.content_cpu_time = std::time::Duration::from_nanos(10);
+        let request = super::Request::new("nav", "web.read", json!({}));
+        let mut response = super::Response::ok(&request, json!({}));
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (1, 0),
+            (1, 30),
+            (2, 0),
+            (2, 0),
+            0,
+        );
+        assert!(session
+            .limits
+            .check_cpu_time(
+                std::time::Duration::from_nanos(session.navigation_content_cpu_ns),
+                session.limits.content_cpu_time,
+                "content",
+            )
+            .is_err());
+        session.begin_navigation();
+        assert_eq!(session.navigation_content_cpu_ns, 0);
+        assert_eq!(session.content_cpu_used_ns, 30);
+        assert!(session
+            .limits
+            .check_cpu_time(
+                std::time::Duration::from_nanos(session.navigation_content_cpu_ns),
+                session.limits.content_cpu_time,
+                "content",
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn a_new_navigation_resets_the_network_budget_without_rebilling_old_responses() {
+        let mut sessions = std::collections::HashMap::new();
+        let mut session = super::Session::new("nav", "run", super::NetworkProfile::Research);
+        session.limits.max_network_bytes = 100;
+        session.transition(super::SessionState::Ready).unwrap();
+        sessions.insert("nav".to_owned(), session);
+        let usage = |network_bytes| crate::record_usage::RecordUsage {
+            console_bytes: 0,
+            download_bytes: 0,
+            network_bytes,
+        };
+        super::apply_record_limits(&mut sessions, "nav", &usage(80)).unwrap();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 80);
+        assert_eq!(sessions["nav"].network_bytes, 80);
+        // The same snapshot is the retained log, not a second copy of those bytes.
+        super::apply_record_limits(&mut sessions, "nav", &usage(80)).unwrap();
+        assert_eq!(sessions["nav"].network_bytes, 80);
+        let exceeded = super::apply_record_limits(&mut sessions, "nav", &usage(120)).unwrap_err();
+        assert!(exceeded.contains("network limit"), "{exceeded}");
+        assert_eq!(sessions["nav"].state, super::SessionState::Ready);
+        assert_eq!(sessions["nav"].network_bytes, 120);
+        sessions.get_mut("nav").unwrap().begin_navigation();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 0);
+        assert_eq!(sessions["nav"].network_bytes, 120);
+        // Goto clears the previous document, so the next snapshot is a new page.
+        super::apply_record_limits(&mut sessions, "nav", &usage(60)).unwrap();
+        assert_eq!(sessions["nav"].navigation_network_bytes, 60);
+        assert_eq!(sessions["nav"].network_bytes, 180);
+        assert_ne!(sessions["nav"].state, super::SessionState::Failed);
+    }
+
+    #[test]
+    fn a_budget_failure_returns_the_session_to_ready() {
+        let mut session = super::Session::new("nav", "run", super::NetworkProfile::Research);
+        session.transition(super::SessionState::Ready).unwrap();
+        session.begin_operation("op").unwrap();
+        session.navigation_content_cpu_ns = 99;
+        session.navigation_network_bytes = 50;
+        session.transition(super::SessionState::Failed).unwrap();
+        super::release_navigation_budget(&mut session);
+        assert_eq!(session.state, super::SessionState::Ready);
+        assert_eq!(session.navigation_content_cpu_ns, 0);
+        assert_eq!(session.navigation_network_bytes, 0);
+        assert_eq!(session.content_cpu_used_ns, 0);
     }
 
     #[test]

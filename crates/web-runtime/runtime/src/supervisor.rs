@@ -908,6 +908,8 @@ pub(crate) struct WorkerProcess {
     stdout_drain: Option<JoinHandle<()>>,
     worker_temp_dir: Option<OwnedTempDir>,
     reaped: bool,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -995,6 +997,25 @@ impl Drop for OwnedTempDir {
             }
         }
     }
+}
+
+/// Mesa shader cache that survives reboot. `/tmp/greppy-web-runtime` is wiped
+/// on boot, so this follows the store root: `GREPPY_STORE_DIR`, else
+/// `$XDG_DATA_HOME/greppy` or `~/.local/share/greppy`, else `/var/cache/greppy`.
+fn mesa_shader_cache_dir() -> PathBuf {
+    let root = if let Some(dir) = std::env::var_os("GREPPY_STORE_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("greppy")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("greppy")
+    } else {
+        PathBuf::from("/var/cache/greppy")
+    };
+    root.join("mesa-shader-cache")
 }
 
 fn inherited_worker_env() -> Vec<(OsString, OsString)> {
@@ -1162,6 +1183,21 @@ fn spawn_unix(
         if let Some(dir) = content_config_dir.as_ref() {
             command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
         }
+        if worker == WorkerKind::Content {
+            let mut caches = vec![mesa_shader_cache_dir()];
+            let fallback = PathBuf::from("/var/cache/greppy/mesa-shader-cache");
+            if caches[0] != fallback {
+                caches.push(fallback);
+            }
+            if let Some(cache) = caches
+                .into_iter()
+                .find(|path| fs::create_dir_all(path).is_ok())
+            {
+                command.env("GREPPY_WEB_SHADER_CACHE", &cache);
+                command.env("MESA_SHADER_CACHE_DIR", &cache);
+                command.env("MESA_GLSL_CACHE_DIR", &cache);
+            }
+        }
         if let Some(dir) = persistent_profiles.as_ref() {
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
@@ -1292,6 +1328,8 @@ fn spawn_unix(
             stdout_drain: Some(stdout_drain),
             worker_temp_dir: Some(worker_temp_dir),
             reaped: false,
+            exit_code: None,
+            exit_signal: None,
         })
 }
 
@@ -1367,6 +1405,12 @@ fn macos_sandbox_profile(
     let persistent_profiles = persistent_profiles
         .map(sbpl_subpath)
         .unwrap_or_default();
+    let shader_cache = std::env::var_os("GREPPY_WEB_SHADER_CACHE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .and_then(|path| path.canonicalize().ok())
+        .map(|path| sbpl_subpath(&path))
+        .unwrap_or_default();
     format!(
         r#"(version 1)
 (deny default)
@@ -1386,6 +1430,7 @@ fn macos_sandbox_profile(
   {exe_dir}
   {tmp}
   {persistent_profiles}
+  {shader_cache}
   (subpath "/private/var/folders")
   (subpath "/private/tmp")
   (subpath "/tmp")
@@ -1397,6 +1442,7 @@ fn macos_sandbox_profile(
 (allow file-write*
   {tmp}
   {persistent_profiles}
+  {shader_cache}
 )
 (allow sysctl-read)
 (allow mach-lookup)
@@ -1416,6 +1462,7 @@ fn macos_sandbox_profile(
         exe_dir = sbpl_subpath(exe_dir),
         tmp = sbpl_subpath(tmp),
         persistent_profiles = persistent_profiles,
+        shader_cache = shader_cache,
     )
 }
 
@@ -1841,13 +1888,49 @@ impl WorkerProcess {
 
     pub(crate) fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => {
+            Ok(None) => !self.reaped,
+            Ok(Some(status)) => {
+                self.note_exit(&status);
                 self.reaped = true;
                 false
             }
             Err(_) => false,
         }
+    }
+
+    fn note_exit(&mut self, status: &std::process::ExitStatus) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            self.exit_code = status.code();
+            self.exit_signal = status.signal();
+        }
+        #[cfg(not(unix))]
+        {
+            self.exit_code = status.code();
+            let _ = self.exit_signal;
+        }
+    }
+
+    /// Why a reaped content worker died. `perf_event_open` itself returns
+    /// EPERM; SIGSYS means a different seccomp deny still killed the process.
+    pub(crate) fn death_detail(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            if self.exit_signal == Some(libc::SIGSYS) {
+                return Some(
+                    "seccomp killed the content worker with SIGSYS. perf_event_open is denied with EPERM so `perf record` does not abort the process; another denied syscall (ptrace, bpf, mount) still kills the worker"
+                        .to_owned(),
+                );
+            }
+            if let Some(signal) = self.exit_signal {
+                return Some(format!("content worker exited from signal {signal}"));
+            }
+            if let Some(code) = self.exit_code {
+                return Some(format!("content worker exited with status {code}"));
+            }
+        }
+        None
     }
 
     pub(crate) fn kill_tree(&mut self) {
@@ -2257,6 +2340,18 @@ fn stage_input_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shader_cache_is_outside_tmp() {
+        let path = mesa_shader_cache_dir();
+        let tmp = std::env::temp_dir();
+        assert!(
+            !path.starts_with(&tmp),
+            "shader cache must survive reboot, not live under tmp: {}",
+            path.display()
+        );
+        assert!(path.ends_with("mesa-shader-cache"));
+    }
 
     #[cfg(unix)]
     #[test]

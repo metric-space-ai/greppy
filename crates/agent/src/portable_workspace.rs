@@ -551,6 +551,17 @@ impl AgentWorkspace {
             }
         };
         trace_workspace_phase(run_id, "git-initialized", started);
+        if let Err(error) = publish_task_branch(&private_git_dir, run_id, &baseline_view_commit) {
+            let _ = core.abort_workspace_pair(run_id, &git_run_id);
+            cleanup_failed_ordinary_paths(
+                &data_root,
+                run_id,
+                ordinary_content_owned,
+                &git_run_id,
+                ordinary_git_owned,
+            );
+            return Err(error);
+        }
         let ordinary_identity = if provider.is_none() {
             let root = ordinary_workspace_root(&data_root);
             let identity = ordinary_workspace_identity(run_id, &baseline_hash);
@@ -617,6 +628,11 @@ impl AgentWorkspace {
 
     pub fn worktree_path(&self) -> &Path {
         &self.worktree
+    }
+
+    /// Branch that belongs only to this task, inside its private Git directory.
+    pub fn task_branch(&self) -> String {
+        task_branch_name(&self.run_id)
     }
 
     /// Original repository captured into this immutable workspace view.
@@ -3404,6 +3420,102 @@ fn sync_directory(path: &Path) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
+/// Directory used when `greppy -p` is started outside a Git repository.
+///
+/// A real repository is returned unchanged. Otherwise a scratch repository is
+/// created once under the workspace store (`scratch-repo`) and reused.
+pub fn ensure_agent_repository(cwd: &Path) -> Result<(PathBuf, bool), WorkspaceError> {
+    if git_is_work_tree(cwd) {
+        return Ok((
+            fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+            false,
+        ));
+    }
+    let scratch = workspace_data_root()?.join("scratch-repo");
+    fs::create_dir_all(&scratch)?;
+    if !git_is_work_tree(&scratch) {
+        git_run(&scratch, &["init"])?;
+    }
+    ensure_scratch_commit(&scratch)?;
+    Ok((fs::canonicalize(&scratch)?, true))
+}
+
+fn git_is_work_tree(path: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(path)
+        .output()
+        .map(|output| output.status.success() && output.stdout.starts_with(b"true"))
+        .unwrap_or(false)
+}
+
+fn git_run(path: &Path, args: &[&str]) -> Result<(), WorkspaceError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .map_err(WorkspaceError::from)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(WorkspaceError::GitFailed {
+        command: format!("git {}", args.join(" ")),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        status: output.status.code(),
+    })
+}
+
+fn git_succeeds(path: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn ensure_scratch_commit(root: &Path) -> Result<(), WorkspaceError> {
+    if git_succeeds(root, &["rev-parse", "--verify", "HEAD"]) {
+        return Ok(());
+    }
+    let marker = root.join(".greppy-scratch");
+    if !marker.exists() {
+        fs::write(
+            &marker,
+            "scratch workspace for greppy -p outside a Git repository\n",
+        )?;
+    }
+    git_run(root, &["add", "--", ".greppy-scratch"])?;
+    if git_succeeds(root, &["rev-parse", "--verify", "HEAD"]) {
+        return Ok(());
+    }
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.email=greppy@localhost",
+            "-c",
+            "user.name=greppy",
+            "commit",
+            "-m",
+            "scratch workspace",
+        ])
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "greppy")
+        .env("GIT_AUTHOR_EMAIL", "greppy@localhost")
+        .env("GIT_COMMITTER_NAME", "greppy")
+        .env("GIT_COMMITTER_EMAIL", "greppy@localhost")
+        .output()
+        .map_err(WorkspaceError::from)?;
+    if output.status.success() || git_succeeds(root, &["rev-parse", "--verify", "HEAD"]) {
+        return Ok(());
+    }
+    Err(WorkspaceError::GitFailed {
+        command: "git commit".into(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        status: output.status.code(),
+    })
+}
+
 pub fn workspace_data_root() -> Result<PathBuf, WorkspaceError> {
     if let Some(path) = std::env::var_os("GREPPY_WORKSPACE_DIR") {
         let path = PathBuf::from(path);
@@ -3481,7 +3593,24 @@ fn ensure_owned_ordinary_root(data_root: &Path, root: &Path) -> Result<(), Works
                 detail: "ordinary workspace root is not an owned physical directory".into(),
             });
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(root)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Two tasks can create the shared store root together. The loser
+            // sees the directory the winner just created.
+            match fs::create_dir(root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(root)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(WorkspaceError::Tampered {
+                            path: root.into(),
+                            detail: "ordinary workspace root is not an owned physical directory"
+                                .into(),
+                        });
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         Err(error) => return Err(error.into()),
     }
     let canonical_data = fs::canonicalize(data_root)?;
@@ -4223,6 +4352,51 @@ fn private_git_storage_key(baseline_hash: &str) -> Result<&str, WorkspaceError> 
 
 fn private_git_temporary_path(parent: &Path) -> PathBuf {
     parent.join(format!(".t.{:x}.{:x}", std::process::id(), now_unix_ns()))
+}
+
+/// `greppy/task-<run_id>` — one branch per task, never shared with another run.
+pub fn task_branch_name(run_id: &str) -> String {
+    let safe: String = run_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("greppy/task-{safe}")
+}
+
+fn publish_task_branch(
+    private_git_dir: &Path,
+    run_id: &str,
+    commit: &str,
+) -> Result<(), WorkspaceError> {
+    let path = private_git_dir
+        .join("refs/heads")
+        .join(task_branch_name(run_id));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, format!("{commit}\n")).map_err(|error| {
+        WorkspaceError::Io(io::Error::new(
+            error.kind(),
+            format!("cannot publish task branch {}: {error}", path.display()),
+        ))
+    })?;
+    let head = private_git_dir.join("HEAD");
+    fs::write(
+        &head,
+        format!("ref: refs/heads/{}\n", task_branch_name(run_id)),
+    )
+    .map_err(|error| {
+        WorkspaceError::Io(io::Error::new(
+            error.kind(),
+            format!("cannot check out task branch {}: {error}", head.display()),
+        ))
+    })
 }
 
 fn initialize_private_git(
@@ -5195,6 +5369,138 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const APPLY_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_applies_proposal";
     const PROPOSAL_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_publishes_proposal";
+
+    #[test]
+    fn outside_a_git_repo_uses_a_scratch_repository_in_the_store() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "greppy-scratch-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("not-a-repo")).unwrap();
+        let store = tmp.join("store");
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &store);
+        let cwd = tmp.join("not-a-repo");
+        let (first, scratch) = ensure_agent_repository(&cwd).unwrap();
+        assert!(scratch);
+        assert!(
+            first.starts_with(fs::canonicalize(&store).unwrap()),
+            "{first:?}"
+        );
+        assert!(git_succeeds(&first, &["rev-parse", "--verify", "HEAD"]));
+        let (second, again) = ensure_agent_repository(&cwd).unwrap();
+        assert!(again);
+        assert_eq!(first, second);
+        let repo = tmp.join("real");
+        fs::create_dir_all(&repo).unwrap();
+        git_run(&repo, &["init"]).unwrap();
+        let (kept, scratch) = ensure_agent_repository(&repo).unwrap();
+        assert!(!scratch);
+        assert_eq!(
+            fs::canonicalize(&repo).unwrap(),
+            fs::canonicalize(&kept).unwrap()
+        );
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn two_tasks_edit_the_same_file_without_colliding() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        let root = std::env::temp_dir().join(format!(
+            "greppy-parallel-tasks-{}-{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &root);
+
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init"]);
+        fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        git(&repo, &["add", "shared.txt"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=greppy@localhost",
+                "-c",
+                "user.name=greppy",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        fn edit(repo: &Path, run_id: &str, body: &str) -> (String, String, PathBuf) {
+            let workspace = AgentWorkspace::create(repo, run_id).expect(run_id);
+            let file = workspace.worktree_path().join("shared.txt");
+            fs::write(&file, body).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let seen = fs::read_to_string(&file).unwrap();
+            let branch = workspace.task_branch();
+            let branch_file = workspace.private_git_dir.join("refs/heads").join(&branch);
+            assert_eq!(fs::read_to_string(&branch_file).unwrap().trim().len(), 40);
+            let head = fs::read_to_string(workspace.private_git_dir.join("HEAD")).unwrap();
+            assert!(head.contains(&branch), "{head}");
+            let path = workspace.worktree_path().to_path_buf();
+            workspace.cleanup().unwrap();
+            (seen, branch, path)
+        }
+
+        let left_repo = repo.clone();
+        let right_repo = repo.clone();
+        let left = std::thread::spawn(move || edit(&left_repo, "task-left", "left\n"));
+        let right = std::thread::spawn(move || edit(&right_repo, "task-right", "right\n"));
+        let left = left.join().expect("left task");
+        let right = right.join().expect("right task");
+        assert_eq!(left.0, "left\n");
+        assert_eq!(right.0, "right\n");
+        assert_ne!(left.1, right.1);
+        assert!(left.1.contains("task-left"));
+        assert!(right.1.contains("task-right"));
+        assert_ne!(left.2, right.2);
+        assert!(!left.2.exists());
+        assert!(!right.2.exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "base\n"
+        );
+
+        let outside = root.join("not-a-repo");
+        fs::create_dir_all(&outside).unwrap();
+        let (scratch, created) = ensure_agent_repository(&outside).unwrap();
+        assert!(created);
+        let scratch_left = scratch.clone();
+        let scratch_right = scratch.clone();
+        let left = std::thread::spawn(move || edit(&scratch_left, "scratch-left", "s-left\n"));
+        let right = std::thread::spawn(move || edit(&scratch_right, "scratch-right", "s-right\n"));
+        let left = left.join().expect("scratch left");
+        let right = right.join().expect("scratch right");
+        assert_eq!(left.0, "s-left\n");
+        assert_eq!(right.0, "s-right\n");
+        assert_ne!(left.2, right.2);
+        assert!(!left.2.exists());
+        assert!(!right.2.exists());
+
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn portable_workspace_tracker_liveness_window_extends_only_while_the_owner_is_alive_and_the_heartbeat_advances(

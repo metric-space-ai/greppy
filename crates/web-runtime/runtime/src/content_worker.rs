@@ -372,6 +372,10 @@ struct Delegate {
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
     dropped_responses: Cell<u64>,
+    text_only: Cell<bool>,
+    network_budget: Cell<u64>,
+    observed_network: Cell<u64>,
+    budget_exhausted: Cell<bool>,
     current_main_frame_request: RefCell<Option<String>>,
     main_frame_navigation_epoch: Cell<u64>,
     navigation_intent_generation: Cell<u64>,
@@ -422,6 +426,10 @@ impl Delegate {
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
             dropped_responses: Cell::new(0),
+            text_only: Cell::new(false),
+            network_budget: Cell::new(crate::limits::DEFAULT_NETWORK_BUDGET),
+            observed_network: Cell::new(0),
+            budget_exhausted: Cell::new(false),
             current_main_frame_request: RefCell::new(None),
             main_frame_navigation_epoch: Cell::new(0),
             navigation_intent_generation: Cell::new(0),
@@ -571,7 +579,11 @@ impl WebViewDelegate for Delegate {
 
     fn notify_new_frame_ready(&self, webview: WebView) {
         *self.new_frame_ready.borrow_mut() = true;
-        webview.paint();
+        // Text reads do not need llvmpipe. Painting here was most of the
+        // content CPU on a one-core host.
+        if !self.text_only.get() {
+            webview.paint();
+        }
         self.wake.wake();
     }
 
@@ -773,6 +785,19 @@ impl WebViewDelegate for Delegate {
                     rule.continue_headers.clone(),
                 )
             });
+        let kind = format!("{:?}", load.request.destination).to_ascii_lowercase();
+        if crate::text_mode::cancel_subresource(
+            load.request.is_for_main_frame,
+            self.text_only.get(),
+            self.budget_exhausted.get(),
+            &kind,
+            load.request.url.host_str().unwrap_or(""),
+        ) {
+            let request_url = load.request.url.clone();
+            load.intercept(WebResourceResponse::new(request_url))
+                .cancel();
+            return;
+        }
         let Some((action, body, status, content_type, continue_headers)) = matched else {
             let extras = extra_request_headers(&self.extra_headers.borrow());
             if !extras.is_empty() {
@@ -934,7 +959,28 @@ impl WebViewDelegate for Delegate {
                 MAX_NETWORK_RECORDS_PER_PAGE,
             );
         }
+        let total = self.observed_network.get().saturating_add(response.body_bytes as u64);
+        self.observed_network.set(total);
+        if total > self.network_budget.get() {
+            self.budget_exhausted.set(true);
+        }
         self.wake.wake();
+    }
+}
+
+fn release_navigation_caches(delegate: &Delegate) {
+    // Request and response logs stay. web.network reads every navigation in
+    // the session; clearing them left only the last document. The budget
+    // counters reset so the next page can load its own side resources.
+    delegate.observed_network.set(0);
+    delegate.budget_exhausted.set(false);
+    // glibc keeps freed arenas. Without this the content process grows across
+    // navigations even after the previous document is gone.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: malloc_trim only returns already-freed glibc arenas to the
+        // OS. No Rust allocation is borrowed across the call.
+        unsafe { libc::malloc_trim(0) };
     }
 }
 
@@ -2661,6 +2707,11 @@ impl ContentEngine {
         };
         self.reject_stale_objects(method, &params)?;
         self.reclaim_pump_tokens();
+        for slot in self.pages.values() {
+            if let PageSlot::Live { pair, .. } = slot {
+                pair.1.text_only.set(false);
+            }
+        }
         self.renderer_error.borrow_mut().take();
         let result = (|| -> io::Result<serde_json::Value> {
             match method {
@@ -2933,6 +2984,17 @@ impl ContentEngine {
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
                 // top-level navigation only and has stalled at HeadParsed.
                 delegate.navigation_failure.replace(None);
+                release_navigation_caches(&delegate);
+                let text_only = params
+                    .get("textOnly")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                delegate.text_only.set(text_only);
+                if let Some(budget) = params.get("networkBudget").and_then(|value| value.as_u64()) {
+                    delegate.network_budget.set(budget);
+                }
+                delegate.observed_network.set(0);
+                delegate.budget_exhausted.set(false);
                 let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
                 let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
@@ -3039,7 +3101,10 @@ impl ContentEngine {
                 webview.show();
                 webview.focus();
                 let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
-                webview.paint();
+                if !text_only {
+                    webview.paint();
+                }
+                delegate.text_only.set(false);
                 self.spin_all_event_loops();
                 // Complete is the load signal. Subresource scripts are waited
                 // by waitForFunction / init scripts on the event loop; a
@@ -3447,6 +3512,7 @@ impl ContentEngine {
                     let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
                     let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
                     let kind = failure.get("kind").and_then(|value| value.as_str()).unwrap_or("transport");
+                    let error = explain_dns_failure(error);
                     let detail = format!(
                         "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
                     );
@@ -5302,7 +5368,29 @@ fn engine_preferences(proxy_uri: &str) -> Preferences {
     // until Servo ships a constant-time backend; getRandomValues/randomUUID
     // remain available on `crypto`.
     preferences.dom_crypto_subtle_enabled = false;
+    if let Some(threads) =
+        crate::limits::style_threads_for_host(crate::limits::effective_cpu_count())
+    {
+        // Stylo treats layout.threads <= 1 as "no StyleThread pool": style
+        // runs on the script thread. A dedicated StyleThread would be 2 and
+        // would only contend for the one core.
+        preferences.layout_threads = threads;
+    }
+    if let Some(ram) = crate::limits::effective_ram_bytes() {
+        apply_ram_budget(&mut preferences, ram);
+    }
     preferences
+}
+
+/// `js.mem.max` is mebibytes. Servo accepts 1..256 (256 is exclusive) and
+/// multiplies by 1024*1024 for JSGC_MAX_BYTES. Session history 0 closes the
+/// previous document pipeline on the next navigation instead of retaining it.
+fn apply_ram_budget(preferences: &mut Preferences, ram: u64) {
+    let shape = crate::limits::host_shape(ram);
+    preferences.js_mem_max = shape.js_heap_mib;
+    if shape.sequential {
+        preferences.session_history_max_length = 0;
+    }
 }
 
 fn hover_at(
@@ -5804,6 +5892,18 @@ mod serialize_tests {
             !preferences.dom_crypto_subtle_enabled,
             "Servo's vulnerable RSA-OAEP implementation must not be script-reachable"
         );
+        if crate::limits::effective_cpu_count() <= 1 {
+            assert_eq!(
+                preferences.layout_threads, 1,
+                "layout.threads=1 keeps style on the script thread; Stylo spawns no StyleThread"
+            );
+        } else {
+            assert_eq!(preferences.layout_threads, 3);
+        }
+        let mut tightened = Preferences::default();
+        apply_small_host_memory(&mut tightened);
+        assert_eq!(tightened.js_mem_max, 255);
+        assert_eq!(tightened.session_history_max_length, 0);
     }
 
     #[test]
@@ -6696,6 +6796,21 @@ fn is_parent_eof(error: &io::Error) -> bool {
 
 // Startup-only diagnostics deliberately avoid the per-operation tracing path:
 // a failed handshake needs a last-known phase, not an unbounded event log.
+fn explain_dns_failure(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("name or service not known")
+        || lower.contains("temporary failure in name resolution")
+    {
+        format!(
+            "{error}; DNS did not resolve. On Ubuntu, /etc/resolv.conf is a symlink to /run/systemd/resolve and the worker sandbox must be allowed to read that target. If lookup falls back to 127.0.0.1:53, the file was not readable"
+        )
+    } else {
+        error.to_owned()
+    }
+}
+
 fn trace_startup(stage: &str) {
     if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
         eprintln!(

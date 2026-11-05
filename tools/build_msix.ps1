@@ -199,7 +199,9 @@ try {
     # The packaged binary must report the same version the manifest claims.
     $reported = (& $BinaryPath --version) -join ' '
     if ($LASTEXITCODE -ne 0) { throw 'greppy.exe --version failed' }
-    if ($reported.Split(' ')[-1] -ne $Version) {
+    # --version is "greppy <semver>" or "greppy <semver> (<commit>)".
+    $semver = @($reported -split '\s+' | Where-Object { $_ })[1]
+    if ($semver -ne $Version) {
         throw "greppy.exe reports '$reported' but the package version is $Version"
     }
 

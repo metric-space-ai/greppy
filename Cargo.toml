@@ -85,6 +85,14 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# The greppy crate with thin LTO and one codegen unit peaks well above 8 GiB
+# of rustc RSS. CPU packages and small build hosts use this profile, or:
+#   CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+[profile.release-cpu]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [profile.dev]
 debug = 1
 
