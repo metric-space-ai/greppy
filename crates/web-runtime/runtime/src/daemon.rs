@@ -3216,6 +3216,10 @@ impl Daemon {
                 }
                 let result = match action {
                     "new" => {
+                        if let Some(message) = self.room_for_another_page(&session_id) {
+                            self.finish_session(&session_id);
+                            return limit_error(request, message);
+                        }
                         let context = self
                             .sessions
                             .get(&session_id)
@@ -3238,51 +3242,60 @@ impl Daemon {
                     },
                     "switch" => match target {
                         None => Err("web.tab switch requires a tab id".to_owned()),
-                        Some(tab) => {
-                            let known = self
-                                .sessions
-                                .get(&session_id)
-                                .map(|session| session.tabs.contains(&tab))
-                                .unwrap_or(false);
-                            if !known {
-                                Err(format!("no tab {tab} in this session"))
-                            } else {
-                                if let Some(session) = self.sessions.get_mut(&session_id) {
-                                    session.page_id = Some(tab.clone());
-                                }
-                                Ok(json!({ "tab": tab, "active": true }))
-                            }
-                        }
+                        Some(tab) => self.activate_tab(&session_id, &tab),
                     },
                     "close" => {
                         let tab = target.unwrap_or_else(|| active.clone());
-                        let remaining = {
-                            let session = self.sessions.get_mut(&session_id);
-                            match session {
-                                None => Vec::new(),
-                                Some(session) => {
-                                    session.tabs.retain(|id| id != &tab);
-                                    session.locator_snapshots.remove(&tab);
-                                    session.pages = session.tabs.len() as u32;
-                                    if session.page_id.as_deref() == Some(tab.as_str()) {
-                                        session.page_id = session.tabs.last().cloned();
+                        let swapped = self.sessions.get(&session_id).is_some_and(|session| {
+                            let canonical = session.canonical_tab(&tab);
+                            session
+                                .swapped_tabs
+                                .iter()
+                                .any(|id| id == &tab || id == &canonical)
+                        });
+                        if swapped {
+                            self.forget_swapped_tab(&session_id, &tab);
+                            let remaining = self
+                                .sessions
+                                .get(&session_id)
+                                .map(|session| session.tabs.clone())
+                                .unwrap_or_default();
+                            Ok(json!({ "closed": tab, "tabs": remaining, "swapped": true }))
+                        } else {
+                            let remaining = {
+                                let session = self.sessions.get_mut(&session_id);
+                                match session {
+                                    None => Vec::new(),
+                                    Some(session) => {
+                                        session.tabs.retain(|id| id != &tab);
+                                        session.locator_snapshots.remove(&tab);
+                                        session.pages = session.tabs.len() as u32;
+                                        if session.page_id.as_deref() == Some(tab.as_str()) {
+                                            session.page_id = session.tabs.last().cloned();
+                                        }
+                                        session.tabs.clone()
                                     }
-                                    session.tabs.clone()
                                 }
-                            }
-                        };
-                        // Closing the last tab would leave the session without
-                        // a page; the next operation recreates one on demand.
-                        let _ = self.engine_call("page.close", json!({ "page": tab }));
-                        Ok(json!({ "closed": tab, "tabs": remaining }))
+                            };
+                            // Closing the last tab would leave the session without
+                            // a page; the next operation recreates one on demand.
+                            let _ = self.engine_call("page.close", json!({ "page": tab }));
+                            Ok(json!({ "closed": tab, "tabs": remaining }))
+                        }
                     }
                     _ => {
-                        let (tabs, active_id) = self
+                        let (tabs, swapped, active_id) = self
                             .sessions
                             .get(&session_id)
-                            .map(|session| (session.tabs.clone(), session.page_id.clone()))
+                            .map(|session| {
+                                (
+                                    session.tabs.clone(),
+                                    session.swapped_tabs.clone(),
+                                    session.page_id.clone(),
+                                )
+                            })
                             .unwrap_or_default();
-                        let rows: Vec<serde_json::Value> = tabs
+                        let mut rows: Vec<serde_json::Value> = tabs
                             .iter()
                             .map(|id| {
                                 let url = self
@@ -3293,10 +3306,26 @@ impl Daemon {
                                 json!({
                                     "tab": id,
                                     "active": Some(id.clone()) == active_id,
+                                    "swapped": false,
                                     "url": url,
                                 })
                             })
                             .collect();
+                        for id in swapped {
+                            let url = self
+                                .swap_path(&session_id, &id)
+                                .ok()
+                                .and_then(|path| std::fs::read_to_string(path).ok())
+                                .and_then(|raw| crate::tab_swap::PageSnapshot::from_json(&raw).ok())
+                                .map(|snapshot| snapshot.url)
+                                .unwrap_or_default();
+                            rows.push(json!({
+                                "tab": id,
+                                "active": false,
+                                "swapped": true,
+                                "url": url,
+                            }));
+                        }
                         Ok(json!({ "tabs": rows, "count": rows.len() }))
                     }
                 };
@@ -4152,10 +4181,10 @@ impl Daemon {
                 let Some(tab) = value.as_str().filter(|tab| !tab.is_empty()) else {
                     return Err(protocol_error(request, "tab_id must be a non-empty string"));
                 };
-                let known = self.sessions.get(&session_id).is_some_and(|session| {
-                    session.page_id.as_deref() == Some(tab)
-                        || session.tabs.iter().any(|page| page == tab)
-                });
+                let known = self
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.owns_tab(tab));
                 if !known {
                     let mut error = ErrorObject::new(
                         "TAB_NOT_FOUND",
@@ -4170,8 +4199,27 @@ impl Daemon {
                 Some(tab.to_owned())
             }
         };
-        let content_rss = sample_rss_bytes(self.content.pid());
+        let mut content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
+        if crate::limits::should_recycle_content(
+            content_rss,
+            crate::limits::effective_cpu_count(),
+            crate::limits::max_ram_bytes(),
+        ) && matches!(operation, "web.read" | "web.search" | "web.goto")
+        {
+            let limit = crate::limits::content_rss_recycle_bytes(
+                crate::limits::effective_cpu_count(),
+                crate::limits::max_ram_bytes(),
+            )
+            .unwrap_or(content_rss);
+            if let Err(error) =
+                self.recycle_content_keeping_session(&session_id, content_rss, limit)
+            {
+                self.finish_session(&session_id);
+                return Err(engine_error(request, error, 34));
+            }
+            content_rss = sample_rss_bytes(self.content.pid());
+        }
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
             if let Err(message) = session.begin_operation(&request.request_id) {
@@ -4222,18 +4270,27 @@ impl Daemon {
             Some(_) => unreachable!(),
             None => {}
         }
-        let page = requested_page.or_else(|| {
-            self.sessions.get(&session_id).and_then(|session| session.page_id.clone())
+        let page_hint = requested_page.or_else(|| {
+            self.sessions
+                .get(&session_id)
+                .and_then(|session| session.page_id.clone())
         });
-        let page = match page {
+        let page_hint = if let Some(tab) = page_hint {
+            match self.prepare_requested_tab(&session_id, &tab) {
+                Ok(page) => page,
+                Err(error) => {
+                    self.finish_session(&session_id);
+                    return Err(engine_error(request, error, 34));
+                }
+            }
+        } else {
+            None
+        };
+        let page = match page_hint {
             Some(page) => page,
             None => {
-                if let Some(session) = self.sessions.get(&session_id) {
-                    if let Err(message) =
-                        session.limits.check_pages(session.pages.saturating_add(1))
-                    {
-                        return Err(limit_error(request, message));
-                    }
+                if let Some(message) = self.room_for_another_page(&session_id) {
+                    return Err(limit_error(request, message));
                 }
                 if deadline.is_some() {
                     self.finish_session(&session_id);
@@ -4669,13 +4726,12 @@ impl Daemon {
             }
         }
         if !self.content.is_running() {
+            let detail = self.content.death_detail();
             if !recover_worker {
                 return Err("content worker is unavailable; observation did not restart it".into());
             }
             self.recover_content("content worker exited")?;
-            return Err(
-                "content worker crashed and was restarted; session pages were reset".into(),
-            );
+            return Err(worker_restarted_message(detail));
         }
         self.content
             .prepare_engine_params(method, &mut params)
@@ -4742,20 +4798,23 @@ impl Daemon {
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
                         if !self.content.is_running() {
+                            let detail = self.content.death_detail();
                             if !recover_worker {
                                 return Err("content worker exited during observation; it was not restarted".into());
                             }
                             self.recover_content("content worker exited while handling request")?;
-                            return Err(
-                                "content worker crashed and was restarted; session pages were reset"
-                                    .into(),
-                            );
+                            return Err(worker_restarted_message(detail));
                         }
                         continue;
                     }
+                    let died = !self.content.is_running();
+                    let detail = self.content.death_detail();
                     let message = error.to_string();
                     if recover_worker {
                         let _ = self.recover_content(&format!("content worker: {message}"));
+                    }
+                    if died {
+                        return Err(worker_restarted_message(detail));
                     }
                     return Err(message);
                 }
@@ -4889,6 +4948,7 @@ impl Daemon {
             session.page_id = None;
             session.engine_context_id = None;
             session.tabs.clear();
+            session.tab_aliases.clear();
             session.locator_snapshots.clear();
             session.pages = 0;
         }
@@ -4902,6 +4962,7 @@ impl Daemon {
             session.page_id = None;
             session.engine_context_id = None;
             session.tabs.clear();
+            session.tab_aliases.clear();
             session.locator_snapshots.clear();
             session.pages = 0;
             if session.state == SessionState::Busy {
@@ -4933,6 +4994,364 @@ impl Daemon {
             json!({ "reason": redact_secrets(reason) }),
         );
         Ok(())
+    }
+
+    fn recycle_content_keeping_session(
+        &mut self,
+        session_id: &str,
+        rss: u64,
+        limit: u64,
+    ) -> Result<(), String> {
+        let reason = format!(
+            "content rss {rss} exceeded recycle budget {limit}; replacing the content worker before the next navigation"
+        );
+        self.replace_content_worker(&reason)?;
+        for session in self.sessions.values_mut() {
+            session.page_id = None;
+            session.engine_context_id = None;
+            session.tabs.clear();
+            session.tab_aliases.clear();
+            session.locator_snapshots.clear();
+            session.pages = 0;
+        }
+        self.journal(
+            session_id,
+            "",
+            "content.recycled",
+            json!({ "rss_bytes": rss, "limit_bytes": limit }),
+        );
+        Ok(())
+    }
+
+    fn live_page_count(&self) -> u32 {
+        self.sessions
+            .values()
+            .map(|session| {
+                let mut count = session.tabs.len() as u32;
+                if let Some(page) = session.page_id.as_ref() {
+                    let listed = session.tabs.iter().any(|id| id == page)
+                        || session.swapped_tabs.iter().any(|id| id == page);
+                    if !listed {
+                        count += 1;
+                    }
+                }
+                count
+            })
+            .sum()
+    }
+
+    fn oldest_live_page(&self) -> Option<(String, String)> {
+        let mut sessions: Vec<_> = self.sessions.iter().collect();
+        sessions.sort_by_key(|(_, session)| session.started);
+        for (session_id, session) in sessions {
+            if let Some(page) = session.tabs.first() {
+                return Some((session_id.clone(), page.clone()));
+            }
+            if let Some(page) = session.page_id.clone() {
+                if !session.swapped_tabs.iter().any(|id| id == &page) {
+                    return Some((session_id.clone(), page));
+                }
+            }
+        }
+        None
+    }
+
+    fn live_page_ceiling(&self) -> u32 {
+        self.sessions
+            .values()
+            .map(|session| session.limits.max_pages.max(1))
+            .min()
+            .unwrap_or(1)
+    }
+
+    fn make_room_for_live_page(&mut self) {
+        let mut attempts = 0;
+        while self.live_page_count() >= self.live_page_ceiling() {
+            attempts += 1;
+            if attempts > 32 {
+                break;
+            }
+            let Some((session_id, page_id)) = self.oldest_live_page() else {
+                break;
+            };
+            if self.swap_live_page(&session_id, &page_id).is_err() {
+                break;
+            }
+        }
+    }
+
+    fn room_for_another_page(&mut self, session_id: &str) -> Option<String> {
+        let overflow = self.sessions.get(session_id).and_then(|session| {
+            session
+                .limits
+                .check_pages(session.pages.saturating_add(1))
+                .err()
+        });
+        if overflow.is_none() {
+            return None;
+        }
+        self.make_room_for_live_page();
+        self.sessions.get(session_id).and_then(|session| {
+            session
+                .limits
+                .check_pages(session.pages.saturating_add(1))
+                .err()
+        })
+    }
+
+    fn prepare_requested_tab(
+        &mut self,
+        session_id: &str,
+        tab: &str,
+    ) -> Result<Option<String>, String> {
+        let canonical = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(tab))
+            .unwrap_or_else(|| tab.to_owned());
+        let swapped = self.sessions.get(session_id).is_some_and(|session| {
+            session
+                .swapped_tabs
+                .iter()
+                .any(|id| id == tab || id == &canonical)
+        });
+        if swapped {
+            return Ok(Some(self.restore_swapped_page(session_id, &canonical)?));
+        }
+        let live = self.sessions.get(session_id).is_some_and(|session| {
+            session.page_id.as_deref() == Some(canonical.as_str())
+                || session.tabs.iter().any(|id| id == &canonical)
+        });
+        if live { Ok(Some(canonical)) } else { Ok(None) }
+    }
+
+    fn activate_tab(
+        &mut self,
+        session_id: &str,
+        tab: &str,
+    ) -> Result<serde_json::Value, String> {
+        let canonical = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(tab))
+            .unwrap_or_else(|| tab.to_owned());
+        let swapped = self.sessions.get(session_id).is_some_and(|session| {
+            session
+                .swapped_tabs
+                .iter()
+                .any(|id| id == tab || id == &canonical)
+        });
+        if swapped {
+            let page = self.restore_swapped_page(session_id, &canonical)?;
+            return Ok(json!({ "tab": page, "active": true, "restored": true }));
+        }
+        let known = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.tabs.iter().any(|id| id == &canonical));
+        if !known {
+            return Err(format!("no tab {tab} in this session"));
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.page_id = Some(canonical.clone());
+        }
+        Ok(json!({ "tab": canonical, "active": true }))
+    }
+
+    fn swap_path(&self, session_id: &str, page_id: &str) -> Result<PathBuf, String> {
+        let session_id = isolated_id(session_id)?;
+        let page_id = isolated_id(page_id)?;
+        Ok(data_root(&self.run_id)
+            .join("tab-swap")
+            .join(session_id)
+            .join(format!("{page_id}.json")))
+    }
+
+    fn forget_swapped_tab(&mut self, session_id: &str, page_id: &str) {
+        let canonical = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(page_id))
+            .unwrap_or_else(|| page_id.to_owned());
+        for id in [page_id.to_owned(), canonical.clone()] {
+            if let Ok(path) = self.swap_path(session_id, &id) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session
+                .swapped_tabs
+                .retain(|id| id != page_id && id != &canonical);
+            session
+                .tab_aliases
+                .retain(|from, to| from != page_id && to != page_id);
+        }
+    }
+
+    fn capture_snapshot(&mut self, page_id: &str) -> crate::tab_swap::PageSnapshot {
+        let mut snapshot = crate::tab_swap::PageSnapshot::blank();
+        snapshot.notes.push(
+            "document.cookie only; HttpOnly cookies and the history stack are not captured".into(),
+        );
+        if let Ok(value) = self.engine_call("page.url", json!({ "page": page_id })) {
+            snapshot.url = value
+                .get("url")
+                .and_then(|url| url.as_str())
+                .unwrap_or("")
+                .to_string();
+        } else {
+            snapshot.notes.push("url was not readable".into());
+        }
+        if let Ok(value) = self.engine_call("page.title", json!({ "page": page_id })) {
+            snapshot.title = value
+                .get("title")
+                .and_then(|title| title.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        if let Ok(value) = self.engine_call("page.cookies", json!({ "page": page_id })) {
+            snapshot.document_cookie = value
+                .get("cookie")
+                .and_then(|cookie| cookie.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        if let Ok(value) = self.engine_call("page.content", json!({ "page": page_id })) {
+            if let Some(html) = value.get("html").and_then(|html| html.as_str()) {
+                let (html, truncated) = crate::tab_swap::cap_html(html.to_string());
+                snapshot.html = html;
+                snapshot.html_truncated = truncated;
+                if truncated {
+                    snapshot
+                        .notes
+                        .push("outerHTML exceeded 1 MiB and was omitted".into());
+                }
+            }
+        }
+        match self.engine_call(
+            "page.evaluate",
+            json!({ "page": page_id, "source": crate::tab_swap::capture_script() }),
+        ) {
+            Ok(value) => match crate::tab_swap::parse_evaluate_state(&value) {
+                Some(state) => {
+                    snapshot.scroll_x = state.scroll_x;
+                    snapshot.scroll_y = state.scroll_y;
+                    snapshot.local_storage = state.local_storage;
+                    snapshot.session_storage = state.session_storage;
+                }
+                None => snapshot
+                    .notes
+                    .push("scroll and storage did not parse".into()),
+            },
+            Err(_) => snapshot
+                .notes
+                .push("scroll and storage were not captured".into()),
+        }
+        snapshot
+    }
+
+    fn swap_live_page(&mut self, session_id: &str, page_id: &str) -> Result<(), String> {
+        let snapshot = self.capture_snapshot(page_id);
+        let path = self.swap_path(session_id, page_id)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(&path, snapshot.to_json()).map_err(|error| error.to_string())?;
+        self.engine_call("page.close", json!({ "page": page_id }))?;
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.tabs.retain(|id| id != page_id);
+            session.locator_snapshots.remove(page_id);
+            if !session.swapped_tabs.iter().any(|id| id == page_id) {
+                session.swapped_tabs.push(page_id.to_string());
+            }
+            session.pages = session.tabs.len() as u32;
+            if session.page_id.as_deref() == Some(page_id) {
+                session.page_id = session.tabs.last().cloned();
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_swapped_page(&mut self, session_id: &str, page_id: &str) -> Result<String, String> {
+        let page_id = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.canonical_tab(page_id))
+            .unwrap_or_else(|| page_id.to_owned());
+        let path = self.swap_path(session_id, &page_id)?;
+        let snapshot = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| crate::tab_swap::PageSnapshot::from_json(&raw).ok())
+            .ok_or_else(|| format!("tab {page_id} is not swapped"))?;
+        self.make_room_for_live_page();
+        let context = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.engine_context_id.clone());
+        let created = if let Some(context) = context {
+            self.engine_call("context.newPage", json!({ "context": context }))?
+        } else {
+            let storage_key = self
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.persistent_profile.clone())
+                .map(|name| format!("persistent-{name}"))
+                .unwrap_or_else(|| format!("ephemeral-{session_id}"));
+            self.engine_call(
+                "session.ensurePage",
+                json!({ "session": session_id, "storage_key": storage_key }),
+            )?
+        };
+        let new_page = created
+            .get("page")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "engine returned no page id".to_owned())?
+            .to_string();
+        if crate::tab_swap::restore_via_navigation(&snapshot.url) {
+            let _ = self.engine_call(
+                "page.goto",
+                json!({ "page": new_page, "url": snapshot.url }),
+            );
+        } else if let Some(html) = snapshot.html.clone() {
+            let _ = self.engine_call(
+                "page.setContent",
+                json!({ "page": new_page, "html": html }),
+            );
+        }
+        let cookies: Vec<_> = crate::tab_swap::cookie_pairs(&snapshot.document_cookie)
+            .into_iter()
+            .map(|(name, value)| json!({ "name": name, "value": value, "path": "/" }))
+            .collect();
+        if !cookies.is_empty() {
+            let _ = self.engine_call(
+                "page.addCookies",
+                json!({ "page": new_page, "cookies": cookies }),
+            );
+        }
+        let _ = self.engine_call(
+            "page.evaluate",
+            json!({
+                "page": new_page,
+                "source": crate::tab_swap::restore_script(&snapshot),
+            }),
+        );
+        self.forget_swapped_tab(session_id, &page_id);
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.tab_aliases.insert(page_id, new_page.clone());
+            session.swapped_tabs.retain(|id| id != &new_page);
+            if !session.tabs.contains(&new_page) {
+                session.tabs.push(new_page.clone());
+            }
+            session.page_id = Some(new_page.clone());
+            session.pages = session.tabs.len() as u32;
+            if session.engine_context_id.is_none() {
+                session.engine_context_id = created
+                    .get("context")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+            }
+        }
+        Ok(new_page)
     }
 
     fn persist_session_snapshot(&self, session: &Session, extra: serde_json::Value) {
@@ -5393,6 +5812,16 @@ fn release_navigation_budget(session: &mut Session) {
     if matches!(session.state, SessionState::Busy | SessionState::Failed) {
         let _ = session.transition(SessionState::Ready);
     }
+}
+
+fn worker_restarted_message(detail: Option<String>) -> String {
+    let mut message =
+        "content worker crashed and was restarted; session pages were reset".to_owned();
+    if let Some(detail) = detail {
+        message.push_str(". ");
+        message.push_str(&detail);
+    }
+    message
 }
 
 fn limit_error(request: &Request, message: impl Into<String>) -> Response {

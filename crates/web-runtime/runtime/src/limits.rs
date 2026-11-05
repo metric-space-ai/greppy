@@ -22,20 +22,39 @@ pub struct SessionLimits {
     pub idle_ttl: Duration,
 }
 
-/// Content CPU allowed for one navigation.
-///
-/// One core gets 60s: a page such as Wikipedia on a 1 vCPU VPS uses just
-/// over 30s of content CPU, and that used to be a session-lifetime counter.
-/// Each additional core adds 30s because Servo spreads work across threads.
+pub fn small_host(cores: u32, max_ram: Option<u64>) -> bool {
+    cores <= 1 || max_ram.is_some_and(|bytes| bytes <= 4 * 1024 * 1024 * 1024)
+}
+
 pub fn host_live_pages(cores: u32, max_ram: Option<u64>, configured: u32) -> u32 {
-    let small_host = max_ram.is_some_and(|bytes| bytes <= 4 * 1024 * 1024 * 1024);
-    if cores <= 1 || small_host {
+    if small_host(cores, max_ram) {
         1
     } else {
         configured.max(1)
     }
 }
 
+/// RSS above which a small host replaces the content worker before the next
+/// navigation. The session id stays. 512 MiB leaves room for one heavy page
+/// under an 800 MiB ceiling: the measured 1 vCPU session climbed
+/// 306 -> 554 -> 979 MB -> 1.37 GB because the same process kept every document.
+pub fn content_rss_recycle_bytes(cores: u32, max_ram: Option<u64>) -> Option<u64> {
+    if small_host(cores, max_ram) {
+        Some(512 * 1024 * 1024)
+    } else {
+        None
+    }
+}
+
+pub fn should_recycle_content(rss_bytes: u64, cores: u32, max_ram: Option<u64>) -> bool {
+    content_rss_recycle_bytes(cores, max_ram).is_some_and(|limit| rss_bytes > limit)
+}
+
+/// Content CPU allowed for one navigation.
+///
+/// One core gets 60s: a page such as Wikipedia on a 1 vCPU VPS uses just
+/// over 30s of content CPU, and that used to be a session-lifetime counter.
+/// Each additional core adds 30s because Servo spreads work across threads.
 pub fn navigation_content_cpu(cores: u32) -> Duration {
     let cores = cores.max(1);
     if cores == 1 {
@@ -501,6 +520,21 @@ mod tests {
             super::host_live_pages(4, Some(8 * 1024 * 1024 * 1024), 16),
             16
         );
+        assert!(super::small_host(1, None));
+        assert!(super::small_host(4, Some(4 * 1024 * 1024 * 1024)));
+        assert!(!super::small_host(4, Some(8 * 1024 * 1024 * 1024)));
+        assert!(!super::should_recycle_content(512 * 1024 * 1024, 1, None));
+        assert!(super::should_recycle_content(
+            512 * 1024 * 1024 + 1,
+            1,
+            None
+        ));
+        assert!(!super::should_recycle_content(1024 * 1024 * 1024, 8, None));
+        assert!(super::should_recycle_content(
+            1024 * 1024 * 1024,
+            8,
+            Some(4 * 1024 * 1024 * 1024)
+        ));
     }
 
     #[test]

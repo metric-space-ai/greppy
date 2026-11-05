@@ -39,6 +39,10 @@ pub struct Session {
     /// active one; a session with several tabs keeps them all here so a
     /// caller can switch without losing the others.
     pub tabs: Vec<String>,
+    /// Tabs snapshotted to disk so the content worker can drop their documents.
+    pub swapped_tabs: Vec<String>,
+    /// Old tab id to the page id created when that snapshot was restored.
+    pub tab_aliases: HashMap<String, String>,
     /// Document-bound recipes per page. Observing one tab must not replace
     /// another tab's scope. The worker independently checks actual node identity.
     pub locator_snapshots: HashMap<String, LocatorSnapshot>,
@@ -93,6 +97,8 @@ impl Session {
             page_id: None,
             engine_context_id: None,
             tabs: Vec::new(),
+            swapped_tabs: Vec::new(),
+            tab_aliases: HashMap::new(),
             locator_snapshots: HashMap::new(),
             pages: 0,
             contexts: 0,
@@ -189,11 +195,46 @@ impl Session {
         self.operation_id = Some(operation_id.into());
         Ok(())
     }
+
+    pub fn canonical_tab(&self, tab: &str) -> String {
+        let mut id = tab.to_string();
+        for _ in 0..8 {
+            match self.tab_aliases.get(&id) {
+                Some(next) if next != &id => id = next.clone(),
+                _ => break,
+            }
+        }
+        id
+    }
+
+    pub fn owns_tab(&self, tab: &str) -> bool {
+        let id = self.canonical_tab(tab);
+        self.page_id.as_deref() == Some(id.as_str())
+            || self.tabs.iter().any(|page| page == &id)
+            || self
+                .swapped_tabs
+                .iter()
+                .any(|page| page == &id || page == tab)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swapped_tab_stays_addressable_until_restore() {
+        let mut session = Session::new("wrs_1", "run", crate::policy::NetworkProfile::Project);
+        session.swapped_tabs.push("tab-old".into());
+        assert!(session.owns_tab("tab-old"));
+        session
+            .tab_aliases
+            .insert("tab-old".into(), "tab-new".into());
+        session.tabs.push("tab-new".into());
+        session.swapped_tabs.clear();
+        assert_eq!(session.canonical_tab("tab-old"), "tab-new");
+        assert!(session.owns_tab("tab-old"));
+    }
 
     #[test]
     fn ready_busy_ready_close() {

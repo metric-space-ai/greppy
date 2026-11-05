@@ -937,6 +937,22 @@ impl WebViewDelegate for Delegate {
     }
 }
 
+fn release_navigation_caches(delegate: &Delegate) {
+    delegate.last_responses.borrow_mut().clear();
+    delegate.dropped_responses.set(0);
+    delegate.requests.borrow_mut().clear();
+    delegate.dropped_requests.set(0);
+    delegate.downloads.borrow_mut().clear();
+    // glibc keeps freed arenas. Without this the content process grows across
+    // navigations even after the previous document is gone.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: malloc_trim only returns already-freed glibc arenas to the
+        // OS. No Rust allocation is borrowed across the call.
+        unsafe { libc::malloc_trim(0) };
+    }
+}
+
 fn retain_bounded(records: &mut Vec<serde_json::Value>, dropped: &Cell<u64>, limit: usize) {
     let excess = records.len().saturating_sub(limit);
     if excess != 0 {
@@ -2932,6 +2948,7 @@ impl ContentEngine {
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
                 // top-level navigation only and has stalled at HeadParsed.
                 delegate.navigation_failure.replace(None);
+                release_navigation_caches(&delegate);
                 let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
                 let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
@@ -5305,9 +5322,26 @@ fn engine_preferences(proxy_uri: &str) -> Preferences {
     if let Some(threads) =
         crate::limits::style_threads_for_host(crate::limits::effective_cpu_count())
     {
+        // Stylo treats layout.threads <= 1 as "no StyleThread pool": style
+        // runs on the script thread. A dedicated StyleThread would be 2 and
+        // would only contend for the one core.
         preferences.layout_threads = threads;
     }
+    if crate::limits::small_host(
+        crate::limits::effective_cpu_count(),
+        crate::limits::max_ram_bytes(),
+    ) {
+        apply_small_host_memory(&mut preferences);
+    }
     preferences
+}
+
+/// `js.mem.max` is mebibytes. Servo accepts 1..256 (256 is exclusive) and
+/// multiplies by 1024*1024 for JSGC_MAX_BYTES. Session history 0 closes the
+/// previous document pipeline on the next navigation instead of retaining it.
+fn apply_small_host_memory(preferences: &mut Preferences) {
+    preferences.js_mem_max = 255;
+    preferences.session_history_max_length = 0;
 }
 
 fn hover_at(
@@ -5810,10 +5844,17 @@ mod serialize_tests {
             "Servo's vulnerable RSA-OAEP implementation must not be script-reachable"
         );
         if crate::limits::effective_cpu_count() <= 1 {
-            assert_eq!(preferences.layout_threads, 1);
+            assert_eq!(
+                preferences.layout_threads, 1,
+                "layout.threads=1 keeps style on the script thread; Stylo spawns no StyleThread"
+            );
         } else {
             assert_eq!(preferences.layout_threads, 3);
         }
+        let mut tightened = Preferences::default();
+        apply_small_host_memory(&mut tightened);
+        assert_eq!(tightened.js_mem_max, 255);
+        assert_eq!(tightened.session_history_max_length, 0);
     }
 
     #[test]

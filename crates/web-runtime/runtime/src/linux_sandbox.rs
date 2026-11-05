@@ -605,6 +605,7 @@ mod linux {
         let kill = libc::SECCOMP_RET_KILL_PROCESS;
         let allow = libc::SECCOMP_RET_ALLOW;
         let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+        let eperm = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
         let mut f = Vec::new();
         // struct seccomp_data { nr: i32 @0, arch: u32 @4, ip: u64 @8, args[0]: u64 @16 }
@@ -619,6 +620,13 @@ mod linux {
         for nr in deny_kill_syscalls() {
             f.push(bpf_jump(jmp_eq, nr as u32, 0, 1));
             f.push(bpf_stmt(ret, kill));
+        }
+        // EPERM, not SIGSYS. SpiderMonkey and Mesa call perf_event_open when
+        // `perf record` is attached; killing the content worker made every
+        // Wikipedia read exit under the profiler.
+        for nr in deny_errno_syscalls() {
+            f.push(bpf_jump(jmp_eq, nr as u32, 0, 1));
+            f.push(bpf_stmt(ret, eperm));
         }
 
         f.push(bpf_jump(jmp_eq, libc::SYS_clone3 as u32, 0, 1));
@@ -666,7 +674,6 @@ mod linux {
             libc::SYS_kexec_file_load,
             libc::SYS_bpf,
             libc::SYS_userfaultfd,
-            libc::SYS_perf_event_open,
             libc::SYS_unshare,
             libc::SYS_setns,
             libc::SYS_acct,
@@ -694,12 +701,28 @@ mod linux {
         }
         nrs
     }
+
+    fn deny_errno_syscalls() -> Vec<libc::c_long> {
+        vec![libc::SYS_perf_event_open]
+    }
+
+    #[cfg(test)]
+    pub(super) fn perf_event_open_returns_eperm() -> bool {
+        !deny_kill_syscalls().contains(&libc::SYS_perf_event_open)
+            && deny_errno_syscalls().contains(&libc::SYS_perf_event_open)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perf_event_open_is_eperm_not_a_kill() {
+        assert!(linux::perf_event_open_returns_eperm());
+    }
     #[cfg(target_os = "linux")]
     fn require_live_landlock() -> bool {
         matches!(
