@@ -345,6 +345,19 @@ impl FairRequestQueue {
         }
     }
 
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.by_client.values().map(VecDeque::len).sum())
+            .unwrap_or_default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.rotation.is_empty())
+    }
+
     fn pop_timeout(&self, timeout: Duration) -> Option<RequestJob> {
         let mut state = self.state.lock().ok()?;
         if state.rotation.is_empty() {
@@ -1414,7 +1427,7 @@ where
         }
 
         let model_idle = last_model_completed.elapsed();
-        if model.is_some() && model_idle >= policy.model_ttl {
+        if model.is_some() && model_idle >= policy.model_ttl && job_queue.is_empty() {
             model = None;
             set_state(&status, LifecycleState::Evicted, None);
             if log_enabled(log_prefix) {
@@ -1581,6 +1594,7 @@ fn read_and_queue(
                 status,
                 &id,
                 pending_requests.load(std::sync::atomic::Ordering::Acquire),
+                jobs.len(),
             );
             write_response(&mut stream, response, policy.max_response_bytes);
             finish_request(pending_requests, last_activity);
@@ -1606,6 +1620,7 @@ fn status_response(
     status: &Arc<Mutex<RuntimeStatus>>,
     request_id: &str,
     pending_requests: usize,
+    queued_requests: usize,
 ) -> serde_json::Value {
     let Ok(status) = status.lock() else {
         return serde_json::json!({"request_id": request_id, "error": "status unavailable"});
@@ -1630,6 +1645,7 @@ fn status_response(
         "backend": status.backend,
         "queue_policy": "fair-round-robin-unbounded",
         "pending_requests": pending_requests,
+        "queued_requests": queued_requests,
     })
 }
 
@@ -2813,12 +2829,12 @@ mod tests {
         let status = Arc::new(Mutex::new(RuntimeStatus::default()));
         set_ready(&status, "cuda".into());
         set_active(&status, Some("active-summary".into()));
-        let running = status_response(&status, "probe", 2);
+        let running = status_response(&status, "probe", 2, 0);
         assert_eq!(running["state"], "busy");
         assert_eq!(running["backend"], "cuda");
         assert_eq!(running["active_request_id"], "active-summary");
         complete(&status, true, None);
-        let finished = status_response(&status, "probe", 1);
+        let finished = status_response(&status, "probe", 1, 0);
         assert_eq!(finished["state"], "ready");
         assert_eq!(finished["backend"], "cuda");
         assert!(finished["active_request_id"].is_null());
@@ -2827,16 +2843,16 @@ mod tests {
     #[test]
     fn runtime_status_reports_only_the_loaded_backend() {
         let status = Arc::new(Mutex::new(RuntimeStatus::default()));
-        assert!(status_response(&status, "starting", 0)["backend"].is_null());
+        assert!(status_response(&status, "starting", 0, 0)["backend"].is_null());
 
         set_state(&status, LifecycleState::Loading, None);
-        assert!(status_response(&status, "loading", 0)["backend"].is_null());
+        assert!(status_response(&status, "loading", 0, 0)["backend"].is_null());
 
         set_ready(&status, "metal".into());
-        assert_eq!(status_response(&status, "ready", 0)["backend"], "metal");
+        assert_eq!(status_response(&status, "ready", 0, 0)["backend"], "metal");
 
         set_state(&status, LifecycleState::Evicted, None);
-        assert!(status_response(&status, "evicted", 0)["backend"].is_null());
+        assert!(status_response(&status, "evicted", 0, 0)["backend"].is_null());
 
         set_ready(&status, "metal".into());
         set_state(
@@ -2844,7 +2860,7 @@ mod tests {
             LifecycleState::Faulted,
             Some("inference failed".into()),
         );
-        assert!(status_response(&status, "faulted", 0)["backend"].is_null());
+        assert!(status_response(&status, "faulted", 0, 0)["backend"].is_null());
     }
 
     /// The embedding daemon writes its response and closes. On macOS the
@@ -3576,12 +3592,15 @@ mod tests {
         let handled = Arc::new(AtomicUsize::new(0));
         let server_loads = Arc::clone(&loads);
         let server_handled = Arc::clone(&handled);
+        let (release_first_tx, release_first_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
             run_server(
                 server_endpoint,
                 &server_address,
                 ServerPolicy {
-                    model_ttl: Duration::from_millis(150),
+                    // Even an expired model stays loaded for accepted work.
+                    // This proves queue ownership without depending on CPU scheduling.
+                    model_ttl: Duration::ZERO,
                     exit_ttl: Duration::from_millis(700),
                     request_deadline: Duration::from_secs(10),
                     hard_request_timeout: None,
@@ -3604,7 +3623,11 @@ mod tests {
                     }
                 },
                 move |_raw, model| {
-                    server_handled.fetch_add(1, Ordering::SeqCst);
+                    if server_handled.fetch_add(1, Ordering::SeqCst) == 0 {
+                        release_first_rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("release the accepted request burst");
+                    }
                     std::thread::sleep(Duration::from_millis(15));
                     serde_json::json!({
                         "ok": model.is_some(),
@@ -3634,6 +3657,10 @@ mod tests {
         }
         assert!(reachable, "lifecycle daemon became reachable");
 
+        // A client that has not sent a frame is not queued inference work and
+        // must not pin GPU memory after the real request burst drains.
+        let slow = TransportStream::connect(&endpoint, Duration::from_secs(1)).unwrap();
+
         let barrier = Arc::new(std::sync::Barrier::new(33));
         let mut clients = Vec::new();
         for _ in 0..32 {
@@ -3651,6 +3678,22 @@ mod tests {
             }));
         }
         barrier.wait();
+        let accepted_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = diagnostic(&endpoint);
+            // One client is being handled; the other 31 must be fully queued.
+            if status["queued_requests"].as_u64().unwrap_or_default() == 31 {
+                break;
+            }
+            assert!(
+                Instant::now() < accepted_deadline,
+                "concurrent clients were not accepted before release: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        release_first_tx
+            .send(())
+            .expect("release the accepted request burst");
         let mut model_owners = std::collections::BTreeSet::new();
         for client in clients {
             match client.join().expect("client thread") {
@@ -3669,7 +3712,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(model_owners, std::collections::BTreeSet::from([1]));
+        assert_eq!(
+            model_owners,
+            std::collections::BTreeSet::from([1]),
+            "accepted requests must retain the current model until the queue drains"
+        );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         assert_eq!(handled.load(Ordering::SeqCst), 32);
         assert_eq!(
@@ -3694,10 +3741,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        drop(slow);
         // The reload is proven by the response itself: the second model owner
-        // served it. The status probe can only confirm the backend while the
-        // model is still loaded; with a 150 ms model TTL a slow runner may
-        // already have evicted it again (macOS CI, PR #307).
+        // served it. With the deliberately zero idle TTL it may already be evicted
+        // again before the diagnostic probe reaches the server.
         match request(
             &endpoint,
             serde_json::json!({"op": "infer"}),
