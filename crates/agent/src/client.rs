@@ -177,41 +177,46 @@ impl Client {
     pub fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
-    /// Use only an advertised model output limit for the unlimited-loop sentinel.
-    /// Unknown metadata remains absent; it must never become a fabricated 8192 cap.
-    fn request_body(&self, req: &ModelRequest) -> Value {
-        let mut body = to_messages_request_body(req);
-        if req.max_tokens != u64::MAX {
-            return body;
-        }
-        let cached = self
-            .output_limits
-            .lock()
-            .ok()
-            .and_then(|limits| limits.get(&req.model).copied());
-        let limit = match cached {
-            Some(limit) => limit,
-            None => {
-                let agent = ureq::AgentBuilder::new()
-                    .timeout_connect(Duration::from_secs(2))
-                    .timeout(Duration::from_secs(2))
-                    .build();
-                let limit = self
-                    .authed(agent.get(&self.models_url()))
-                    .call()
-                    .ok()
-                    .and_then(|response| response.into_string().ok())
-                    .and_then(|data| advertised_output_limit(&data, &req.model));
-                if let Ok(mut limits) = self.output_limits.lock() {
-                    limits.insert(req.model.clone(), limit);
+    /// Resolve a finite per-response bound without limiting the agent's turn budget.
+    fn request_body(&self, req: &ModelRequest) -> Result<Value, ClientError> {
+        let limit = if req.max_tokens != u64::MAX {
+            Some(req.max_tokens)
+        } else {
+            let cached = self
+                .output_limits
+                .lock()
+                .ok()
+                .and_then(|limits| limits.get(&req.model).copied());
+            let advertised = match cached {
+                Some(limit) => limit,
+                None => {
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout_connect(Duration::from_secs(2))
+                        .timeout(Duration::from_secs(2))
+                        .build();
+                    let limit = self
+                        .authed(agent.get(&self.models_url()))
+                        .call()
+                        .ok()
+                        .and_then(|response| response.into_string().ok())
+                        .and_then(|data| advertised_output_limit(&data, &req.model));
+                    if let Ok(mut limits) = self.output_limits.lock() {
+                        limits.insert(req.model.clone(), limit);
+                    }
+                    limit
                 }
-                limit
-            }
+            };
+            advertised.or_else(|| registered_output_limit(&req.model))
         };
-        if let Some(limit) = limit {
-            body["max_tokens"] = serde_json::json!(limit);
-        }
-        body
+        let limit = limit.filter(|n| *n > 0 && *n != u64::MAX).ok_or_else(|| {
+            ClientError::Transport(format!(
+                "Anthropic Messages requires a finite positive max_tokens; model {} has no advertised or registered output limit",
+                req.model
+            ))
+        })?;
+        let mut bounded = req.clone();
+        bounded.max_tokens = limit;
+        to_messages_request_body(&bounded).map_err(ClientError::Transport)
     }
 
     /// List model ids advertised by `GET {base}/v1/models`.
@@ -280,7 +285,7 @@ impl Client {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> Result<TurnResult, ClientError> {
         let url = self.messages_url();
-        let body = self.request_body(req);
+        let body = self.request_body(req)?;
         let body_str = serde_json::to_string(&body)
             .map_err(|e| ClientError::Transport(format!("serialize model request: {e}")))?;
 
@@ -336,7 +341,7 @@ impl Client {
             .map_err(|error| {
                 ClientError::Transport(format!("create model HTTP client: {error}"))
             })?;
-        let body = serde_json::to_string(&self.request_body(req))
+        let body = serde_json::to_string(&self.request_body(req)?)
             .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
         let mut request = client
             .post(self.messages_url())
@@ -588,6 +593,7 @@ fn advertised_output_limit(data: &str, model: &str) -> Option<u64> {
         .iter()
         .find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
     [
+        "/max_completion_tokens",
         "/max_output_tokens",
         "/output_token_limit",
         "/max_tokens",
@@ -598,9 +604,68 @@ fn advertised_output_limit(data: &str, model: &str) -> Option<u64> {
     .find(|n| *n > 0 && *n != u64::MAX)
 }
 
+/// Exact model IDs from the gateway's primary registry, not context-size guesses.
+/// https://github.com/router-for-me/CLIProxyAPI/blob/585f97deac9aa57c700301221fb1a7085e1827cc/internal/registry/models/models.json
+fn registered_output_limit(model: &str) -> Option<u64> {
+    match model {
+        "kimi-k3.1-pro" | "kimi-k3.1-pro-highspeed" => Some(65536),
+        "grok-4.7" | "grok-4.7-build-fast" => Some(500000),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn required_anthropic_output_limit_uses_exact_metadata_or_registry() {
+        let client = Client::new("http://127.0.0.1:1", "kimi-k3.1-pro");
+        let mut req = ModelRequest {
+            model: "kimi-k3.1-pro".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: crate::protocol::ToolChoice::Auto,
+            max_tokens: u64::MAX,
+        };
+        // A successfully fetched catalog without caps: no network call in this contract.
+        client
+            .output_limits
+            .lock()
+            .unwrap()
+            .insert(req.model.clone(), None);
+        assert_eq!(client.request_body(&req).unwrap()["max_tokens"], 65536);
+        client
+            .output_limits
+            .lock()
+            .unwrap()
+            .insert(req.model.clone(), Some(16000));
+        assert_eq!(client.request_body(&req).unwrap()["max_tokens"], 16000);
+        req.model = "unregistered".into();
+        client
+            .output_limits
+            .lock()
+            .unwrap()
+            .insert(req.model.clone(), None);
+        assert!(client
+            .request_body(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("unregistered"));
+        req.max_tokens = 1234;
+        assert_eq!(client.request_body(&req).unwrap()["max_tokens"], 1234);
+        req.max_tokens = 0;
+        assert!(client.request_body(&req).is_err());
+        assert_eq!(
+            advertised_output_limit(
+                r#"{"data":[{"id":"m","max_completion_tokens":32000}]}"#,
+                "m"
+            ),
+            Some(32000)
+        );
+        assert_eq!(registered_output_limit("kimi-k3.1-pro-extra"), None);
+    }
     #[test]
     fn only_exact_advertised_output_limit_is_used() {
         let metadata = r#"{"data":[{"id":"m","context_length":100000,"max_output_tokens":16000},{"id":"other","max_output_tokens":64000}]}"#;

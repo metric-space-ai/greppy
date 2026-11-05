@@ -133,6 +133,10 @@ jobs:
       # test's concurrent index()/discovery and skips files — intermittent
       # failures. Run unit tests single-threaded for deterministic results;
       # real concurrency is covered separately by bench/battle/concurrency.sh.
+      - name: Anthropic required output-bound mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anthropic_output_limit_mutation.py
+
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         # The unoptimized, generated full CLI parser exceeds the 2 MiB
         # libtest thread stack. Same-source verification: debug2MiB aborts,
