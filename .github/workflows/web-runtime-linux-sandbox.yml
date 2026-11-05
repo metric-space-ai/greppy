@@ -48,3 +48,8 @@ jobs:
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
+
+      - name: Check payload-free record accounting
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features record_usage -- --test-threads=1
