@@ -98,3 +98,24 @@ pub fn prepare_capability(source: &str) -> String {
     }
     text
 }
+
+/// Compose the signed start variants checked by both product build guards.
+pub fn render_start(
+    public: &str,
+    adapter: &str,
+    mode: BuiltinPromptMode,
+    web_source: &str,
+    desktop_source: &str,
+    web: bool,
+    desktop: bool,
+) -> String {
+    let mut text = render_builtin(public, adapter, mode);
+    for (enabled, source) in [(web, web_source), (desktop, desktop_source)] {
+        if enabled {
+            text.push('\n');
+            text.push_str(prepare_capability(source).trim_end_matches('\n'));
+            text.push('\n');
+        }
+    }
+    text
+}

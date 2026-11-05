@@ -76,27 +76,21 @@ impl CapabilitySet {
     }
 }
 
-fn prepared(source: &str) -> &'static str {
-    // Cached per source address. The two callers pass distinct statics.
-    static WEB: OnceLock<String> = OnceLock::new();
-    static DESKTOP: OnceLock<String> = OnceLock::new();
-    let slot = if std::ptr::eq(source, WEB_CAPABILITY_SOURCE) {
-        &WEB
-    } else {
-        &DESKTOP
-    };
-    slot.get_or_init(|| crate::prompt_contract::render::prepare_capability(source))
-        .as_str()
-}
-
 /// Builtin web manual (stdin features removed). Not part of the default prompt.
 pub fn browser_prompt() -> &'static str {
-    prepared(WEB_CAPABILITY_SOURCE)
+    static WEB: OnceLock<String> = OnceLock::new();
+    WEB.get_or_init(|| crate::prompt_contract::render::prepare_capability(WEB_CAPABILITY_SOURCE))
+        .as_str()
 }
 
 /// Builtin desktop manual (stdin features removed). Not part of the default prompt.
 pub fn desktop_prompt() -> &'static str {
-    prepared(DESKTOP_CAPABILITY_SOURCE)
+    static DESKTOP: OnceLock<String> = OnceLock::new();
+    DESKTOP
+        .get_or_init(|| {
+            crate::prompt_contract::render::prepare_capability(DESKTOP_CAPABILITY_SOURCE)
+        })
+        .as_str()
 }
 
 /// Signed source of a capability manual, including features the built-in agent
@@ -161,7 +155,14 @@ pub fn system_prompt() -> String {
 pub fn system_prompt_with_capabilities(mode: BuiltinPromptMode, caps: CapabilitySet) -> String {
     let mut system = Some(system_prompt_for_mode(mode));
     merge_capability_sections(&mut system, &capability_sections(caps));
-    system.unwrap_or_default()
+    let system = system.unwrap_or_default();
+    assert_eq!(
+        crate::prompt_contract::digest(system.as_bytes()),
+        crate::prompt_contract::approved_start_sha256(mode, caps.web, caps.desktop),
+        "unsigned Greppy start prompt for {}",
+        mode.name(),
+    );
+    system
 }
 
 pub const UNTRUSTED_DESKTOP_OPEN: &str = "UNTRUSTED_DESKTOP_CONTENT\n";
@@ -351,6 +352,19 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn runtime_starts_match_the_owner_signed_manifest() {
+        for mode in crate::prompt_contract::render::BUILTIN_MODES {
+            for (web, desktop) in [(false, false), (true, false), (false, true), (true, true)] {
+                let text = system_prompt_with_capabilities(mode, CapabilitySet { web, desktop });
+                assert_eq!(
+                    crate::prompt_contract::digest(text.as_bytes()),
+                    crate::prompt_contract::approved_start_sha256(mode, web, desktop),
+                );
+            }
+        }
+    }
+
     #[test]
     fn external_contract_is_unchanged_and_versioned() {
         crate::prompt_contract::verify_bytes(

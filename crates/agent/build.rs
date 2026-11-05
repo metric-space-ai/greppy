@@ -3,6 +3,7 @@ mod prompt_contract;
 fn main() {
     let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    // Both build paths verify the signed manuals and all sixteen start variants.
     prompt_contract::write_snapshots(&manifest.join("../.."), &out)
         .unwrap_or_else(|e| panic!("{e}"));
 }
