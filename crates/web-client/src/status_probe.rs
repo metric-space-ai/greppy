@@ -114,6 +114,7 @@ mod tests {
     use super::*;
     use crate::{read_frame, write_frame, Request, Response};
     use serde_json::json;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -130,6 +131,10 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("s");
+        assert!(
+            socket.as_os_str().as_bytes().len() < 104,
+            "private socket path too long; set TMPDIR to a short owned directory"
+        );
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();

@@ -6,9 +6,9 @@ mod frame;
 mod observation_scope;
 mod protocol;
 mod status_probe;
-pub use status_probe::{RuntimeStatus, RuntimeStatusProbe, StatusProbeError};
 #[cfg(unix)]
 pub use status_probe::probe_runtime_status;
+pub use status_probe::{RuntimeStatus, RuntimeStatusProbe, StatusProbeError};
 pub mod record_query;
 pub mod workflow;
 

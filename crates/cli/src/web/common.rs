@@ -3,10 +3,10 @@
 use greppy_core::error::{Error, Result};
 #[cfg(unix)]
 use greppy_web_client::Request;
-use greppy_web_client::{new_request_id, ErrorObject, Handshake, Response, SCHEMA};
-use greppy_web_client::StatusProbeError;
 #[cfg(unix)]
 use greppy_web_client::RuntimeStatusProbe;
+use greppy_web_client::StatusProbeError;
+use greppy_web_client::{new_request_id, ErrorObject, Handshake, Response, SCHEMA};
 use serde_json::json;
 #[cfg(unix)]
 use std::cell::RefCell;
@@ -1074,7 +1074,8 @@ pub(super) fn supervisor_for_session(
                 current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
             );
             if let Some(capability) = capability {
-                if let Some(live) = route_runtime_status(&route_socket, &route_run_id, &capability)? {
+                if let Some(live) = route_runtime_status(&route_socket, &route_run_id, &capability)?
+                {
                     if live.runtime_image_id == route.runtime_image_id {
                         return Ok(SupervisorCtx {
                             socket: route_socket,
@@ -1135,7 +1136,8 @@ pub(super) fn supervisor_for_session(
         if let Some(legacy_socket) = web_runtime_socket(&legacy_identity) {
             let capability = load_attach_cookie(&legacy_socket);
             if let Some(capability) = capability {
-                if let Some(live) = route_runtime_status(&legacy_socket, &legacy_run_id, &capability)?
+                if let Some(live) =
+                    route_runtime_status(&legacy_socket, &legacy_run_id, &capability)?
                 {
                     if runtime_has_session(&legacy_socket, &legacy_run_id, &capability, session) {
                         let ctx = SupervisorCtx {
@@ -1678,7 +1680,11 @@ fn observe_runtime_startup(socket: &Path, run_id: &str, capability: &str) -> Run
     }
 }
 
-fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> std::result::Result<Option<LiveRuntimeStatus>, StatusProbeError> {
+fn wait_runtime_status(
+    socket: &Path,
+    run_id: &str,
+    capability: &str,
+) -> std::result::Result<Option<LiveRuntimeStatus>, StatusProbeError> {
     let started = Instant::now();
     let mut saw_starting = false;
     loop {
@@ -1794,7 +1800,9 @@ fn live_runtime_status(
 ) -> Option<LiveRuntimeStatus> {
     #[cfg(unix)]
     {
-        route_runtime_status(socket, run_id, capability).ok().flatten()
+        route_runtime_status(socket, run_id, capability)
+            .ok()
+            .flatten()
     }
     #[cfg(not(unix))]
     {
