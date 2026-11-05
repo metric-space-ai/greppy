@@ -48,3 +48,67 @@ jobs:
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
+
+      - name: Check payload-free record accounting
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features record_usage -- --test-threads=1
+
+      - name: Prove record accounting regression detects an omitted counter
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/record_usage.rs')
+          original = source.read_text()
+          old = 'console.iter().fold(0u64'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'record_usage_crosses_a_real_frame', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'console.iter().take(0).fold(0u64'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'assertion' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+      - name: Check cancellation and absolute deadline during aborted-script drain
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features aborted_script -- --test-threads=1
+
+      - name: Prove silent-controller cancellation detects a full-budget receive
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/supervisor.rs')
+          original = source.read_text()
+          old = 'receive(remaining.min(Duration::from_millis(50)))'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'aborted_script_receives_cancellation_while_protocol_is_silent', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'receive(remaining)'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'cancellation waited for the script deadline' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Measure accounting IPC on one CPU
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+          print('MEASUREMENT_PROVENANCE cpu_affinity=' + str(sorted(os.sched_getaffinity(0))), flush=True)
+          subprocess.run(['/usr/bin/time', '-v', 'cargo', 'test', '--locked', '--manifest-path',
+                          'crates/web-runtime/Cargo.toml', '-p', 'web-runtime', '--lib',
+                          '--no-default-features', 'record_usage_transport_comparison', '--',
+                          '--ignored', '--test-threads=1', '--nocapture'], check=True)
+          PY

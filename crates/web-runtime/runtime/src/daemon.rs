@@ -4755,21 +4755,12 @@ impl Daemon {
         page: &str,
         request: &Request,
     ) -> Result<(), Response> {
-        let console = self
-            .engine_call("page.consoleMessages", json!({ "page": page }))
+        let usage = self
+            .engine_call("page.recordUsage", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
-        let downloads = self
-            .engine_call("page.downloads", json!({ "page": page }))
-            .map_err(|error| engine_error(request, error, 34))?;
-        let recorded_responses = self
-            .engine_call("page.responses", json!({ "page": page }))
-            .map_err(|error| engine_error(request, error, 34))?;
-        let records = json!({
-            "messages": console.get("messages").cloned().unwrap_or(json!([])),
-            "downloads": downloads.get("downloads").cloned().unwrap_or(json!([])),
-            "responses": recorded_responses.get("responses").cloned().unwrap_or(json!([])),
-        });
-        match apply_record_limits(&mut self.sessions, session_id, &records) {
+        let usage = serde_json::from_value(usage)
+            .map_err(|error| engine_error(request, format!("invalid record usage: {error}"), 34))?;
+        match apply_record_limits(&mut self.sessions, session_id, &usage) {
             Ok(()) => Ok(()),
             Err(message) => Err(limit_error(request, message)),
         }
@@ -6052,7 +6043,7 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
         )
     }
 
-    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+    fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {
         apply_record_limits(self.sessions, &self.session_id, records)
     }
 }
@@ -6060,30 +6051,18 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
 fn apply_record_limits(
     sessions: &mut HashMap<String, Session>,
     session_id: &str,
-    records: &serde_json::Value,
+    records: &crate::record_usage::RecordUsage,
 ) -> Result<(), String> {
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());
     };
-    let console_bytes = records
-        .get("messages")
-        .and_then(|value| value.as_array())
-        .map(|rows| sum_text_bytes(rows))
-        .unwrap_or(0);
-    let download_bytes = records
-        .get("downloads")
-        .and_then(|value| value.as_array())
-        .map(|rows| sum_byte_lengths(rows))
-        .unwrap_or(0);
+    let console_bytes = records.console_bytes;
+    let download_bytes = records.download_bytes;
     session.limits.check_console_bytes(0, console_bytes)?;
     session.limits.check_download_bytes(0, download_bytes)?;
     session.console_bytes = console_bytes;
     session.download_bytes = download_bytes;
-    let recorded_network = records
-        .get("responses")
-        .and_then(|value| value.as_array())
-        .map(|rows| sum_byte_lengths(rows))
-        .unwrap_or(0);
+    let recorded_network = records.network_bytes;
     if recorded_network > 0 {
         let accounted = session.network_bytes.max(recorded_network);
         session.limits.check_network_bytes(0, accounted)?;
@@ -6092,26 +6071,7 @@ fn apply_record_limits(
     Ok(())
 }
 
-fn sum_text_bytes(rows: &[serde_json::Value]) -> u64 {
-    rows.iter()
-        .map(|row| {
-            row.get("text")
-                .and_then(|value| value.as_str())
-                .map(|text| text.len() as u64)
-                .unwrap_or(0)
-        })
-        .sum()
-}
 
-fn sum_byte_lengths(rows: &[serde_json::Value]) -> u64 {
-    rows.iter()
-        .map(|row| {
-            row.get("byteLength")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0)
-        })
-        .sum()
-}
 
 impl Daemon {
     fn attach_session_metrics(&self, session_id: &str, response: &mut Response) {
