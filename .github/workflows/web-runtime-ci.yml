@@ -10,7 +10,7 @@ on:
       - 'crates/cli/src/web/**'
       - 'crates/web-runtime/**'
   push:
-    branches: ['**']
+    branches: ['main']
 
 permissions:
   contents: read

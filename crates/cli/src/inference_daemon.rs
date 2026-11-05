@@ -660,6 +660,49 @@ fn worker_watchdog_timed_out(
     }
 }
 
+#[derive(Debug)]
+struct WatchdogExpiry {
+    phase: LifecycleState,
+    budget: Duration,
+    elapsed: Duration,
+}
+
+fn worker_watchdog_expiry(
+    status: &RuntimeStatus,
+    hard_timeout: Duration,
+    load_budget: Option<Duration>,
+    now: Instant,
+) -> Option<WatchdogExpiry> {
+    let state_elapsed = now.saturating_duration_since(status.state_started);
+    // A cold load has its own budget. Inference starts at the later of the
+    // request and Ready transition; its clock must not include model loading.
+    let active_elapsed = status
+        .active_request_started
+        .map(|started| now.saturating_duration_since(started.max(status.state_started)));
+    if !worker_watchdog_timed_out(
+        status.state,
+        state_elapsed,
+        active_elapsed,
+        hard_timeout,
+        load_budget,
+    ) {
+        return None;
+    }
+    Some(WatchdogExpiry {
+        phase: status.state,
+        budget: if status.state == LifecycleState::Loading {
+            load_budget.unwrap_or(hard_timeout)
+        } else {
+            hard_timeout
+        },
+        elapsed: if status.state == LifecycleState::Loading {
+            state_elapsed
+        } else {
+            active_elapsed.unwrap_or_default()
+        },
+    })
+}
+
 pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
     let request = serde_json::json!({"op": "status"});
     match self::request(
@@ -1921,21 +1964,16 @@ fn spawn_hung_worker_watchdog(
     std::thread::spawn(move || {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             std::thread::sleep(LOOP_INTERVAL);
-            let timed_out = status.lock().ok().is_some_and(|status| {
-                worker_watchdog_timed_out(
-                    status.state,
-                    status.state_started.elapsed(),
-                    status
-                        .active_request_started
-                        .map(|started| started.elapsed()),
-                    timeout,
-                    load_budget,
-                )
+            let expired = status.lock().ok().and_then(|status| {
+                worker_watchdog_expiry(&status, timeout, load_budget, Instant::now())
             });
-            if timed_out {
+            if let Some(expired) = expired {
                 if log_enabled(log_prefix) {
                     eprintln!(
-                        "{log_prefix}: inference worker exceeded hard timeout {timeout:?}; exiting"
+                        "{log_prefix}: inference worker watchdog timeout phase={} budget_ms={} elapsed_ms={}; exiting",
+                        expired.phase.as_str(),
+                        expired.budget.as_millis(),
+                        expired.elapsed.as_millis(),
                     );
                 }
                 // Inference backends cannot be safely interrupted in-process.
@@ -4449,10 +4487,41 @@ mod tests {
         assert!(model_load_budget_for("embed-daemon").is_none());
     }
 
+    #[test]
+    fn cold_model_load_does_not_consume_ready_watchdog_budget() {
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        set_active(&status, Some("cold-request".into()));
+        set_state(&status, LifecycleState::Loading, None);
+        {
+            let mut state = status.lock().unwrap();
+            state.active_request_started = Some(state.state_started - Duration::from_secs(2));
+        }
+        set_ready(&status, "metal".into());
+        let state = status.lock().unwrap();
+        let hard = Duration::from_millis(100);
+        let load = Some(Duration::from_millis(800));
+        assert!(
+            worker_watchdog_expiry(
+                &state,
+                hard,
+                load,
+                state.state_started + Duration::from_millis(99)
+            )
+            .is_none(),
+            "cold model load consumed the ready inference budget"
+        );
+        let expiry = worker_watchdog_expiry(&state, hard, load, state.state_started + hard)
+            .expect("ready inference must still expire at its hard budget");
+        assert_eq!(expiry.phase, LifecycleState::Ready);
+        assert_eq!(expiry.budget, hard);
+        assert_eq!(expiry.elapsed, hard);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn summary_loading_watchdog_uses_model_load_budget() {
         let _lock = test_env_lock();
+        let log = tempfile::NamedTempFile::new().expect("watchdog failure log");
         let identity = format!("{}-{}", std::process::id(), request_id());
         let endpoint = Endpoint::for_identity("crash-test", &identity).unwrap();
         let mut hung = std::process::Command::new(std::env::current_exe().unwrap())
@@ -4463,39 +4532,12 @@ mod tests {
             .env(HANG_LOAD_HELPER, "1")
             .env(WATCHDOG_PREFIX, SUMMARY_LOG_PREFIX)
             .env("GREPPY_TEST_MODEL_LOAD_BUDGET_MS", "800")
+            .env("GREPPY_SUMMARIZE_DAEMON_LOG", "1")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log.reopen().unwrap()))
             .spawn()
             .expect("spawn summary load watchdog child");
-        let observe_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if hung
-                .try_wait()
-                .expect("poll summary load watchdog")
-                .is_some()
-            {
-                panic!("summary model load exited before its load budget");
-            }
-            let status = diagnostic(&endpoint);
-            if status["state"] == "loading" {
-                break;
-            }
-            if Instant::now() >= observe_deadline {
-                let _ = hung.kill();
-                let _ = hung.wait();
-                panic!("summary model load did not report loading: {status}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // The helper's ready-request hard timeout is 100ms. Loading must survive it.
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            hung.try_wait()
-                .expect("poll summary load watchdog")
-                .is_none(),
-            "summary model load was killed by the ready-request hard timeout"
-        );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = hung.try_wait().expect("poll summary load watchdog") {
                 break status;
@@ -4508,6 +4550,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(status.code(), Some(70));
+        // Parent scheduling cannot establish when the child's watchdog fired.
+        // Its own monotonic observation proves the actual phase and budget.
+        let diagnostic = std::fs::read_to_string(log.path()).unwrap();
+        let timeout = diagnostic
+            .lines()
+            .find(|line| line.contains("watchdog timeout phase=loading "))
+            .unwrap_or_else(|| panic!("missing loading watchdog diagnostic: {diagnostic}"));
+        let field = |name: &str| -> u128 {
+            timeout
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(name))
+                .unwrap_or_else(|| panic!("missing {name}: {timeout}"))
+                .trim_end_matches(';')
+                .parse()
+                .expect("watchdog timing must be numeric")
+        };
+        assert_eq!(field("budget_ms="), 800);
+        assert!(
+            field("elapsed_ms=") >= 800,
+            "summary model load ended before its load budget: {timeout}"
+        );
         #[cfg(unix)]
         let _ = std::fs::remove_file(endpoint.address());
         let _ = std::fs::remove_file(endpoint.cooldown_path());
