@@ -6239,7 +6239,13 @@ fn extract_go(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionR
                 if text.is_empty() || is_go_keyword(text) {
                     continue;
                 }
-                if is_definition_name(node) {
+                // A qualified type's `name:` field is a reference (ast.VarStmt),
+                // not a declaration. Other definition-name filtering is unchanged.
+                if is_definition_name(node)
+                    && node
+                        .parent()
+                        .is_none_or(|parent| parent.kind() != "qualified_type")
+                {
                     continue;
                 }
                 if is_inside_kind(node, &["call_expression"]) {

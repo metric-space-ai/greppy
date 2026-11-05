@@ -123,6 +123,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_inference_watchdog_mutation.py
 
+      - name: Go qualified-type usage mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_go_qualified_type_mutation.py
+
       # Several crates' unit tests mutate process-global env via set_var
       # (GREPPY_* config knobs). set_var is process-wide across the test
       # harness's parallel threads, so one test's override leaks into another
