@@ -290,10 +290,13 @@ saved in sessions or settings: changing the model (even back again), endpoint,
 or live session discards it. A setup endpoint override also discards the old
 value. ACP's initial configuration applies it only to a new session's initial
 model; `session/load` discards it. Supply freshly verified metadata on a new
-launch for a new route, or through ACP's existing `session/set_config_option`
-port with `configId: "max_output_tokens"`, a positive integer/decimal-string
-`value`, and the exact current `modelId` and `endpoint`. A stale or missing route
-identity is rejected, and a busy/closed session cannot change its metadata.
+launch for a new route, or through the announced Greppy ACP extension
+`_greppy/set_output_limit`. Check `agentCapabilities._meta.greppyOutputLimit`
+(version 1) first. Its request supplies `sessionId`, the exact current `modelId`
+and `endpoint`, and a positive JSON integer `maxOutputTokens`. A stale or missing
+route identity is rejected; a busy/closed session cannot change its metadata.
+This free-form value does not use standard ACP configuration selectors. See
+[the extension contract](docs/acp.md#verified-route-output-metadata).
 With no caller value, Greppy
 resolves advertised/registered output metadata and clearly refuses unknown limits.
 Rust callers can validate metadata with `greppy_agent::OutputTokenLimit::try_from`

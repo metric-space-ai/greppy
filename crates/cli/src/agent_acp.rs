@@ -41,6 +41,7 @@ const PROTOCOL_VERSION: u64 = 1;
 const AUTH_METHOD_ID: &str = "greppy.env";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
 const DEFAULT_MAX_TURNS: usize = 0;
+const OUTPUT_LIMIT_METHOD: &str = "_greppy/set_output_limit";
 
 thread_local! {
     static ACTIVE_TOOL_CALL: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -415,6 +416,7 @@ impl Server {
             "session/close" => Some(self.session_close(id, params)),
             "session/set_model" => Some(self.session_set_model(id, params)),
             "_workjet/import_history" => Some(self.import_history(id, params)),
+            OUTPUT_LIMIT_METHOD => Some(self.set_route_output_limit(id, params)),
 
             "session/set_config_option" => Some(self.session_set_config(id, params)),
             "session/prompt" => {
@@ -441,7 +443,10 @@ impl Server {
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "_meta": {"workjetImportHistory": {"version": 1}},
+                    "_meta": {
+                        "workjetImportHistory": {"version": 1},
+                        "greppyOutputLimit": {"version": 1, "method": OUTPUT_LIMIT_METHOD}
+                    },
                     "loadSession": true,
 
                     "promptCapabilities": {
@@ -814,6 +819,48 @@ impl Server {
         self.write_model(session_id, model_id.trim(), id)
     }
 
+    /// Greppy extension: fresh caller metadata, independent of ACP selectors.
+    fn set_route_output_limit(&self, id: &Value, params: &Value) -> Value {
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return rpc_error(id, -32602, "sessionId is required");
+        };
+        let Some(limit) = params
+            .get("maxOutputTokens")
+            .and_then(Value::as_u64)
+            .and_then(|n| OutputTokenLimit::try_from(n).ok())
+        else {
+            return rpc_error(
+                id,
+                -32602,
+                "maxOutputTokens expects a finite positive integer",
+            );
+        };
+        let mut state = lock_state(&self.state);
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return rpc_error(id, -32002, &format!("session not found: {session_id}"));
+        };
+        if session.closed || session.busy {
+            return rpc_error(id, -32600, "session is closed or busy");
+        }
+        if params.get("modelId").and_then(Value::as_str) != Some(session.model.as_str())
+            || params.get("endpoint").and_then(Value::as_str) != Some(self.config.endpoint.as_str())
+        {
+            return rpc_error(
+                id,
+                -32602,
+                "output limit requires the exact current modelId and endpoint route",
+            );
+        }
+        session.max_output_tokens = Some(limit);
+        rpc_ok(
+            id,
+            json!({
+                "sessionId": session_id, "modelId": session.model,
+                "endpoint": self.config.endpoint, "maxOutputTokens": limit.get()
+            }),
+        )
+    }
+
     fn session_set_config(&self, id: &Value, params: &Value) -> Value {
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
             return rpc_error(id, -32602, "sessionId is required");
@@ -821,49 +868,6 @@ impl Server {
         let Some(config_id) = params.get("configId").and_then(Value::as_str) else {
             return rpc_error(id, -32602, "configId is required");
         };
-        if config_id == "max_output_tokens" {
-            let limit = params.get("value").and_then(|value| {
-                value
-                    .as_u64()
-                    .and_then(|n| OutputTokenLimit::try_from(n).ok())
-                    .or_else(|| {
-                        value
-                            .as_str()
-                            .and_then(|text| text.parse::<OutputTokenLimit>().ok())
-                    })
-            });
-            let Some(limit) =
-                limit.filter(|_| params.get("type").and_then(Value::as_str) != Some("boolean"))
-            else {
-                return rpc_error(
-                    id,
-                    -32602,
-                    "max_output_tokens expects a finite positive integer",
-                );
-            };
-            let mut state = lock_state(&self.state);
-            let Some(session) = state.sessions.get_mut(session_id) else {
-                return rpc_error(id, -32002, &format!("session not found: {session_id}"));
-            };
-            if session.closed || session.busy {
-                return rpc_error(id, -32600, "session is closed or busy");
-            }
-            if params.get("modelId").and_then(Value::as_str) != Some(session.model.as_str())
-                || params.get("endpoint").and_then(Value::as_str)
-                    != Some(self.config.endpoint.as_str())
-            {
-                return rpc_error(
-                    id,
-                    -32602,
-                    "output limit requires the exact current modelId and endpoint route",
-                );
-            }
-            session.max_output_tokens = Some(limit);
-            return rpc_ok(
-                id,
-                json!({ "configOptions": [model_config(&session.model)] }),
-            );
-        }
         if config_id != "model" {
             return rpc_error(
                 id,
