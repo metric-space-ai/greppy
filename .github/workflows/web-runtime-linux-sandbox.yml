@@ -36,6 +36,55 @@ jobs:
         with:
           toolchain: "1.95.0"
 
+      - name: Check typed status over private Unix sockets
+        run: cargo test --locked -p greppy-web-client --lib status_probe_ -- --test-threads=1
+
+      - name: Prove transport failure cannot be called an ownership denial
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-client/src/status_probe.rs')
+          original = source.read_text()
+          old = '_ => StatusProbeError::Transport,'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '-p', 'greppy-web-client', '--lib',
+                     'status_probe_silent_connected_peer_is_not_an_ownership_denial', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, '_ => StatusProbeError::NotOwned,'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'NotOwned' in result.stdout and 'Transport' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check nonretrying engine recovery
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features engine_failure_guidance_is_nonretrying -- --test-threads=1
+
+      - name: Prove engine recovery rejects the old replay recommendation
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          old = 'inspect greppy web doctor and the current page state; do not automatically repeat the failed operation'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'engine_failure_guidance_is_nonretrying', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'retry the operation or inspect web.doctor'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'engine_failure_guidance_is_nonretrying' in result.stdout and 'FAILED' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Run Linux sandbox and fexecve gates
         run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh
 

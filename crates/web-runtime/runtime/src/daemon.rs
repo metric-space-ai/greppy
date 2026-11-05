@@ -5331,7 +5331,7 @@ fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -
             redact_secrets(&message),
             request.request_id.clone(),
             exit_code,
-            "retry the operation or inspect web.doctor",
+            "inspect greppy web doctor and the current page state; do not automatically repeat the failed operation",
         ),
     )
 }
@@ -6340,6 +6340,20 @@ mod script_stage_tests {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn engine_failure_guidance_is_nonretrying() {
+        for operation in ["web.read", "web.click"] {
+            let request = super::Request::new("recovery-contract", operation, json!({}));
+            let error = super::engine_error(&request, "navigation timed out", 34).error.unwrap();
+            assert_eq!(error.code, "engine_error");
+            assert_eq!(error.exit_code, 34);
+            assert!(!error.retryable);
+            assert!(error.next_action.contains("greppy web doctor"));
+            assert!(error.next_action.contains("do not automatically repeat"));
+            assert!(!error.next_action.contains("retry the operation"));
+        }
+    }
 
     #[test]
     fn trusted_transfer_limit_preserves_resource_error_and_exit_contract() {

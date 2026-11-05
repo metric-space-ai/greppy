@@ -4,6 +4,9 @@ use greppy_core::error::{Error, Result};
 #[cfg(unix)]
 use greppy_web_client::Request;
 use greppy_web_client::{new_request_id, ErrorObject, Handshake, Response, SCHEMA};
+use greppy_web_client::StatusProbeError;
+#[cfg(unix)]
+use greppy_web_client::RuntimeStatusProbe;
 use serde_json::json;
 #[cfg(unix)]
 use std::cell::RefCell;
@@ -1071,7 +1074,7 @@ pub(super) fn supervisor_for_session(
                 current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
             );
             if let Some(capability) = capability {
-                if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
+                if let Some(live) = route_runtime_status(&route_socket, &route_run_id, &capability)? {
                     if live.runtime_image_id == route.runtime_image_id {
                         return Ok(SupervisorCtx {
                             socket: route_socket,
@@ -1081,14 +1084,10 @@ pub(super) fn supervisor_for_session(
                             legacy: route.legacy,
                         });
                     }
-                } else if socket_connected(&route_socket) {
-                    return Err(not_owned(
-                        "saved session belongs to a live runtime with a different attach capability",
-                    ));
                 }
             } else if socket_connected(&route_socket) {
                 return Err(not_owned(
-                    "saved session belongs to a live runtime without an inherited attach capability",
+                    "saved session has no available owner capability in this context",
                 ));
             }
             remove_session_route(root, session);
@@ -1136,7 +1135,7 @@ pub(super) fn supervisor_for_session(
         if let Some(legacy_socket) = web_runtime_socket(&legacy_identity) {
             let capability = load_attach_cookie(&legacy_socket);
             if let Some(capability) = capability {
-                if let Some(live) = live_runtime_status(&legacy_socket, &legacy_run_id, &capability)
+                if let Some(live) = route_runtime_status(&legacy_socket, &legacy_run_id, &capability)?
                 {
                     if runtime_has_session(&legacy_socket, &legacy_run_id, &capability, session) {
                         let ctx = SupervisorCtx {
@@ -1150,14 +1149,10 @@ pub(super) fn supervisor_for_session(
                         save_session_route(root, session, &ctx)?;
                         return Ok(ctx);
                     }
-                } else if socket_connected(&legacy_socket) {
-                    return Err(not_owned(
-                        "legacy session runtime has a different attach capability",
-                    ));
                 }
             } else if socket_connected(&legacy_socket) {
                 return Err(not_owned(
-                    "legacy session runtime has no inherited attach capability",
+                    "legacy session has no available owner capability in this context",
                 ));
             }
         }
@@ -1220,11 +1215,7 @@ pub(super) struct SupervisorCtx {
     legacy: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveRuntimeStatus {
-    runtime_image_id: String,
-    sessions: Option<u64>,
-}
+type LiveRuntimeStatus = greppy_web_client::RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeDisposition {
@@ -1426,7 +1417,8 @@ pub(super) fn ensure_supervisor(
                 unavailable(&format!("failed to generate attach token: {error}"))
             })?,
         };
-        let live = wait_runtime_status(&socket, &run_id, &capability);
+        let live = wait_runtime_status(&socket, &run_id, &capability)
+            .map_err(StatusProbeError::into_error)?;
         match runtime_disposition(
             live.as_ref(),
             socket_connected(&socket),
@@ -1451,9 +1443,11 @@ pub(super) fn ensure_supervisor(
                 live.as_ref().expect("owned runtime status"),
             )?,
             RuntimeDisposition::RefuseUnowned => {
-                return Err(not_owned(
-                    "attach capability does not match the live web-runtime supervisor",
-                ))
+                return Err(if live.is_none() {
+                    StatusProbeError::Transport.into_error()
+                } else {
+                    not_owned("authenticated web-runtime generation has live or unknown sessions")
+                });
             }
             RuntimeDisposition::Spawn => {}
         }
@@ -1578,7 +1572,7 @@ pub(super) fn ensure_supervisor(
                     return Ok(ctx);
                 }
                 RuntimeProbe::Starting => saw_starting = true,
-                RuntimeProbe::Ready(_) | RuntimeProbe::Pending => {}
+                RuntimeProbe::Ready(_) | RuntimeProbe::Pending | RuntimeProbe::Failed(_) => {}
             }
             if started.elapsed() >= startup_wait_budget(saw_starting) {
                 break;
@@ -1656,6 +1650,7 @@ enum RuntimeProbe {
     Ready(LiveRuntimeStatus),
     Starting,
     Pending,
+    Failed(StatusProbeError),
 }
 
 fn startup_wait_budget(saw_starting: bool) -> Duration {
@@ -1666,52 +1661,15 @@ fn startup_wait_budget(saw_starting: bool) -> Duration {
     }
 }
 
-fn classify_runtime_status(
-    status: &str,
-    error_code: Option<&str>,
-    result: Option<&serde_json::Value>,
-) -> RuntimeProbe {
-    if error_code == Some("starting") {
-        return RuntimeProbe::Starting;
-    }
-    if status == "ok" {
-        if let Some(result) = result {
-            if result.get("state").and_then(|value| value.as_str()) == Some("starting") {
-                return RuntimeProbe::Starting;
-            }
-            if let Some(runtime_image_id) = result
-                .get("runtime_build_id")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.is_empty())
-            {
-                return RuntimeProbe::Ready(LiveRuntimeStatus {
-                    runtime_image_id: runtime_image_id.to_owned(),
-                    sessions: result.get("sessions").and_then(|value| value.as_u64()),
-                });
-            }
-        }
-    }
-    RuntimeProbe::Pending
-}
-
 fn observe_runtime_startup(socket: &Path, run_id: &str, capability: &str) -> RuntimeProbe {
     #[cfg(unix)]
     {
-        if !socket.exists() {
-            return RuntimeProbe::Pending;
-        }
-        let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
-        probe.capability = capability.to_owned();
-        let Ok(response) =
-            greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400))
-        else {
-            return RuntimeProbe::Pending;
+        return match greppy_web_client::probe_runtime_status(socket, run_id, capability) {
+            Ok(RuntimeStatusProbe::Ready(status)) => RuntimeProbe::Ready(status),
+            Ok(RuntimeStatusProbe::Starting) => RuntimeProbe::Starting,
+            Err(StatusProbeError::NotRunning) => RuntimeProbe::Pending,
+            Err(error) => RuntimeProbe::Failed(error),
         };
-        return classify_runtime_status(
-            &response.status,
-            response.error.as_ref().map(|error| error.code.as_str()),
-            response.result.as_ref(),
-        );
     }
     #[cfg(not(unix))]
     {
@@ -1720,17 +1678,21 @@ fn observe_runtime_startup(socket: &Path, run_id: &str, capability: &str) -> Run
     }
 }
 
-fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> Option<LiveRuntimeStatus> {
+fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> std::result::Result<Option<LiveRuntimeStatus>, StatusProbeError> {
     let started = Instant::now();
     let mut saw_starting = false;
     loop {
         match observe_runtime_startup(socket, run_id, capability) {
-            RuntimeProbe::Ready(status) => return Some(status),
+            RuntimeProbe::Ready(status) => return Ok(Some(status)),
             RuntimeProbe::Starting => saw_starting = true,
             RuntimeProbe::Pending => {}
+            RuntimeProbe::Failed(error) => return Err(error),
         }
-        if !socket_connected(socket) || started.elapsed() >= startup_wait_budget(saw_starting) {
-            return None;
+        if !socket_connected(socket) {
+            return Ok(None);
+        }
+        if started.elapsed() >= startup_wait_budget(saw_starting) {
+            return Err(StatusProbeError::Starting);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -1799,13 +1761,30 @@ pub(super) fn socket_connected(socket: &std::path::Path) -> bool {
 }
 
 pub(super) fn not_owned(message: &str) -> ErrorObject {
-    ErrorObject::new(
-        "session_not_owned",
-        message,
-        new_request_id(),
-        EXIT_WEB_SESSION,
-        "inherit the parent-issued attach token on fd 4",
-    )
+    let mut error = StatusProbeError::NotOwned.into_error();
+    error.message = message.into();
+    error
+}
+
+fn route_runtime_status(
+    socket: &Path,
+    run_id: &str,
+    capability: &str,
+) -> std::result::Result<Option<LiveRuntimeStatus>, ErrorObject> {
+    #[cfg(unix)]
+    {
+        match greppy_web_client::probe_runtime_status(socket, run_id, capability) {
+            Ok(RuntimeStatusProbe::Ready(status)) => Ok(Some(status)),
+            Ok(RuntimeStatusProbe::Starting) => Err(StatusProbeError::Starting.into_error()),
+            Err(StatusProbeError::NotRunning) => Ok(None),
+            Err(error) => Err(error.into_error()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, run_id, capability);
+        Ok(None)
+    }
 }
 
 fn live_runtime_status(
@@ -1815,21 +1794,7 @@ fn live_runtime_status(
 ) -> Option<LiveRuntimeStatus> {
     #[cfg(unix)]
     {
-        if !socket.exists() {
-            return None;
-        }
-        let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
-        probe.capability = capability.to_owned();
-        let response =
-            greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).ok()?;
-        if response.status != "ok" || response.error.is_some() {
-            return None;
-        }
-        let result = response.result.as_ref()?;
-        Some(LiveRuntimeStatus {
-            runtime_image_id: result.get("runtime_build_id")?.as_str()?.to_owned(),
-            sessions: result.get("sessions").and_then(|value| value.as_u64()),
-        })
+        route_runtime_status(socket, run_id, capability).ok().flatten()
     }
     #[cfg(not(unix))]
     {
@@ -2504,31 +2469,6 @@ mod target_tests {
     fn starting_status_extends_the_runtime_wait_to_three_minutes() {
         assert_eq!(startup_wait_budget(false), Duration::from_secs(60));
         assert_eq!(startup_wait_budget(true), Duration::from_secs(180));
-        let starting = json!({ "state": "starting", "phase": "content", "elapsed_ms": 10 });
-        assert_eq!(
-            classify_runtime_status("ok", None, Some(&starting)),
-            RuntimeProbe::Starting
-        );
-        assert_eq!(
-            classify_runtime_status("error", Some("starting"), None),
-            RuntimeProbe::Starting
-        );
-        match classify_runtime_status(
-            "ok",
-            None,
-            Some(&json!({ "runtime_build_id": "sha256:abc", "sessions": 2 })),
-        ) {
-            RuntimeProbe::Ready(live) => {
-                assert_eq!(live.runtime_image_id, "sha256:abc");
-                assert_eq!(live.sessions, Some(2));
-            }
-            other => panic!("expected a ready runtime, got {other:?}"),
-        }
-        assert_eq!(
-            classify_runtime_status("ok", None, Some(&json!({ "sessions": 1 }))),
-            RuntimeProbe::Pending,
-            "a body without runtime_build_id is not readiness"
-        );
     }
 
     #[test]
