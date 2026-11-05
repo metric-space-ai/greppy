@@ -49,6 +49,20 @@ jobs:
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
 
+      - name: Check bounded retained records
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features retained_records -- --test-threads=1
+
+      - name: Prove retained-record byte bounds
+        run: python3 tools/check_web_resource_mutations.py --records
+
+      - name: Check wrapper resource lifecycle
+        run: node --test crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs
+
+      - name: Prove closed-page retention is detected
+        run: python3 tools/check_web_resource_mutations.py
+
       - name: Check payload-free record accounting
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml

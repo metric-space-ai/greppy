@@ -38,6 +38,7 @@ const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
 const NAVIGATION_DOCUMENT_PROBE: &str = include_str!("../js/navigation-document-probe.js");
 const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
+use crate::retained_records::RetainedRecords;
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -355,9 +356,9 @@ struct Delegate {
     new_frame_ready: RefCell<bool>,
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
-    requests: RefCell<Vec<serde_json::Value>>,
+    requests: RefCell<RetainedRecords>,
     dropped_requests: Cell<u64>,
-    downloads: RefCell<Vec<serde_json::Value>>,
+    downloads: RefCell<RetainedRecords>,
     popups: RefCell<Vec<(WebView, WebView)>>,
     opener_id: RefCell<Option<String>>,
     last_dialogs: RefCell<Vec<serde_json::Value>>,
@@ -366,11 +367,11 @@ struct Delegate {
     init_scripts: RefCell<Vec<String>>,
     viewport: RefCell<(u32, u32)>,
     extra_headers: RefCell<Vec<(String, String)>>,
-    last_console: RefCell<Vec<serde_json::Value>>,
+    last_console: RefCell<RetainedRecords>,
     profile: SharedProfile,
     denied_navigation: RefCell<Option<String>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
-    last_responses: RefCell<Vec<serde_json::Value>>,
+    last_responses: RefCell<RetainedRecords>,
     dropped_responses: Cell<u64>,
     current_main_frame_request: RefCell<Option<String>>,
     main_frame_navigation_epoch: Cell<u64>,
@@ -406,9 +407,12 @@ impl Delegate {
             new_frame_ready: RefCell::new(false),
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
-            requests: RefCell::new(Vec::new()),
+            requests: RefCell::new(RetainedRecords::new(
+                MAX_NETWORK_RECORDS_PER_PAGE,
+                4 * 1024 * 1024,
+            )),
             dropped_requests: Cell::new(0),
-            downloads: RefCell::new(Vec::new()),
+            downloads: RefCell::new(RetainedRecords::new(2_000, 24 * 1024 * 1024)),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
             dialog_action: RefCell::new(DialogAction::Accept),
@@ -416,11 +420,14 @@ impl Delegate {
             init_scripts: RefCell::new(Vec::new()),
             viewport: RefCell::new((1280, 720)),
             extra_headers: RefCell::new(Vec::new()),
-            last_console: RefCell::new(Vec::new()),
+            last_console: RefCell::new(RetainedRecords::new(10_000, 4 * 1024 * 1024)),
             profile,
             denied_navigation: RefCell::new(None),
             last_file_choosers: RefCell::new(Vec::new()),
-            last_responses: RefCell::new(Vec::new()),
+            last_responses: RefCell::new(RetainedRecords::new(
+                MAX_NETWORK_RECORDS_PER_PAGE,
+                4 * 1024 * 1024,
+            )),
             dropped_responses: Cell::new(0),
             current_main_frame_request: RefCell::new(None),
             main_frame_navigation_epoch: Cell::new(0),
@@ -439,12 +446,9 @@ impl Delegate {
     }
 
     fn mark_request_failure(&self, request_id: &str, error_text: &str) {
-        if let Some(row) =
-            self.requests.borrow_mut().iter_mut().rev().find(|row| {
-                row.get("requestId").and_then(|value| value.as_str()) == Some(request_id)
-            })
-        {
+        if self.requests.borrow_mut().update_last(request_id, |row| {
             row["failure"] = json!({ "errorText": error_text });
+        }) {
             self.wake.wake();
         }
     }
@@ -742,11 +746,7 @@ impl WebViewDelegate for Delegate {
             "headers": headers,
             "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
-        retain_bounded(
-            &mut requests,
-            &self.dropped_requests,
-            MAX_NETWORK_RECORDS_PER_PAGE,
-        );
+        self.dropped_requests.set(requests.dropped());
         drop(requests);
         self.wake.wake();
         if let UrlDecision::Deny { reason } = policy {
@@ -827,11 +827,7 @@ impl WebViewDelegate for Delegate {
                         "content-type": content_type,
                     },
                 }));
-                retain_bounded(
-                    &mut responses,
-                    &self.dropped_responses,
-                    MAX_NETWORK_RECORDS_PER_PAGE,
-                );
+                self.dropped_responses.set(responses.dropped());
                 drop(responses);
                 self.wake.wake();
                 let lower = content_type.to_ascii_lowercase();
@@ -922,27 +918,17 @@ impl WebViewDelegate for Delegate {
             );
         }
         let mut responses = self.last_responses.borrow_mut();
-        if let Some(existing) = responses.iter_mut().find(|existing| {
+        if responses.iter().any(|existing| {
             existing.get("requestId").and_then(|id| id.as_str()) == Some(request_id.as_str())
         }) {
-            merge_terminal_response(existing, row);
+            responses.update_last(&request_id, |existing| {
+                merge_terminal_response(existing, row)
+            });
         } else {
             responses.push(row);
-            retain_bounded(
-                &mut responses,
-                &self.dropped_responses,
-                MAX_NETWORK_RECORDS_PER_PAGE,
-            );
         }
+        self.dropped_responses.set(responses.dropped());
         self.wake.wake();
-    }
-}
-
-fn retain_bounded(records: &mut Vec<serde_json::Value>, dropped: &Cell<u64>, limit: usize) {
-    let excess = records.len().saturating_sub(limit);
-    if excess != 0 {
-        records.drain(..excess);
-        dropped.set(dropped.get().saturating_add(excess as u64));
     }
 }
 
@@ -2897,6 +2883,20 @@ impl ContentEngine {
                 // accounting stub.
                 Ok(json!({ "bytes": self.network_bytes_for(&params) }))
             }
+            #[cfg(debug_assertions)]
+            "runtime.resourceUsage" => Ok(json!({
+                "pages": self.pages.len(),
+                "contexts": self.contexts.len(),
+                "browsers": self.browsers.len(),
+                "retained_record_bytes": self.pages.values().filter_map(|slot| match slot {
+                    PageSlot::Live { pair: (_, delegate), .. } => Some(
+                        delegate.requests.borrow().bytes() +
+                        delegate.last_responses.borrow().bytes() +
+                        delegate.last_console.borrow().bytes() +
+                        delegate.downloads.borrow().bytes()),
+                    _ => None,
+                }).sum::<usize>(),
+            })),
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
@@ -3982,17 +3982,23 @@ impl ContentEngine {
             "page.recordUsage" => {
                 let page_id = required_str(&params, "page")?;
                 let delegate = &self.page(&page_id)?.1;
-                serde_json::to_value(crate::record_usage::RecordUsage::from_rows(
+                let mut usage = crate::record_usage::RecordUsage::from_rows(
                     &delegate.last_console.borrow(),
                     &delegate.downloads.borrow(),
                     &delegate.last_responses.borrow(),
-                ))
-                .map_err(io::Error::other)
+                );
+                if delegate.last_console.borrow().overflowed() ||
+                    delegate.downloads.borrow().overflowed() ||
+                    delegate.requests.borrow().overflowed() ||
+                    delegate.last_responses.borrow().overflowed() {
+                    usage.retention_error = Some("retained page records exceeded their memory budget; close the page or session to release its history".to_owned());
+                }
+                serde_json::to_value(usage).map_err(io::Error::other)
             }
             "page.consoleMessages" => {
                 let page_id = required_str(&params, "page")?;
                 Ok(json!({
-                    "messages": self.page(&page_id)?.1.last_console.borrow().clone()
+                    "messages": self.page(&page_id)?.1.last_console.borrow().snapshot()?
                 }))
             }
             "page.clearConsoleMessages" => {
@@ -4235,14 +4241,14 @@ impl ContentEngine {
                 let retained = delegate.requests.borrow().len();
                 let dropped = delegate.dropped_requests.get();
                 Ok(json!({
-                    "requests": crate::daemon::redact_json(json!(delegate.requests.borrow().clone())),
+                    "requests": crate::daemon::redact_json(json!(delegate.requests.borrow().snapshot()?)),
                     "retention": network_retention_metadata(retained, dropped)
                 }))
             }
             "page.responses" => {
                 let page_id = required_str(&params, "page")?;
                 let delegate = &self.page(&page_id)?.1;
-                let responses = delegate.last_responses.borrow().clone();
+                let responses = delegate.last_responses.borrow().snapshot()?.to_vec();
                 let retained = responses.len();
                 let dropped = delegate.dropped_responses.get();
                 Ok(json!({
@@ -4252,7 +4258,7 @@ impl ContentEngine {
             }
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
-                Ok(json!({ "downloads": self.page(&page_id)?.1.downloads.borrow().clone() }))
+                Ok(json!({ "downloads": self.page(&page_id)?.1.downloads.borrow().snapshot()? }))
             }
             "page.saveDownload" => {
                 let page_id = required_str(&params, "page")?;
@@ -4691,6 +4697,14 @@ impl ContentEngine {
             )),
         }
         })();
+        // IDs are never reused. Missing IDs already reject as object_disposed;
+        // keeping one tombstone per historical object only grows daemon memory.
+        self.pages
+            .retain(|_, life| matches!(life, PageSlot::Live { .. }));
+        self.contexts
+            .retain(|_, life| matches!(life, ObjectLife::Live { .. }));
+        self.browsers
+            .retain(|_, life| matches!(life, ObjectLife::Live { .. }));
         if let Some(error) = self.renderer_error.borrow_mut().take() {
             return Err(io::Error::other(error));
         }

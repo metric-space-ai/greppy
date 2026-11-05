@@ -4777,11 +4777,19 @@ impl Daemon {
 
     fn record_crash(&mut self, worker: &str, reason: &str, recovered: bool) {
         let reason = redact_secrets(reason);
+        let reason = if reason.len() > 4096 {
+            format!("{} [truncated]", reason.chars().take(1024).collect::<String>())
+        } else {
+            reason
+        };
         self.last_crash = Some(reason.clone());
         let recovered_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
+        if self.crash_receipts.len() == 64 {
+            self.crash_receipts.remove(0);
+        }
         self.crash_receipts.push(json!({
             "kind": "worker_crash",
             "worker": worker,
@@ -6053,6 +6061,9 @@ fn apply_record_limits(
     session_id: &str,
     records: &crate::record_usage::RecordUsage,
 ) -> Result<(), String> {
+    if let Some(error) = &records.retention_error {
+        return Err(error.clone());
+    }
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());
     };
