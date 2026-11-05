@@ -286,10 +286,15 @@ when a truncated response continues.
 
 The caller owns verification of the route metadata. Greppy does not infer a
 vendor-wide cap or load a harness's protected configuration. The value is not
-saved in sessions or settings: changing the model (even back again) or endpoint
-discards it. ACP's initial configuration applies it only to the exact initial
-model; a saved session with another model cannot inherit it. Supply freshly
-verified metadata on a new launch for a new route. With no caller value, Greppy
+saved in sessions or settings: changing the model (even back again), endpoint,
+or live session discards it. A setup endpoint override also discards the old
+value. ACP's initial configuration applies it only to a new session's initial
+model; `session/load` discards it. Supply freshly verified metadata on a new
+launch for a new route, or through ACP's existing `session/set_config_option`
+port with `configId: "max_output_tokens"`, a positive integer/decimal-string
+`value`, and the exact current `modelId` and `endpoint`. A stale or missing route
+identity is rejected, and a busy/closed session cannot change its metadata.
+With no caller value, Greppy
 resolves advertised/registered output metadata and clearly refuses unknown limits.
 Rust callers can validate metadata with `greppy_agent::OutputTokenLimit::try_from`
 and pass `limit.get()` to the existing `with_max_tokens` builder.

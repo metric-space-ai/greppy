@@ -687,10 +687,9 @@ impl Server {
             project,
             model: model.clone(),
             messages,
-            max_output_tokens: self
-                .config
-                .max_output_tokens
-                .filter(|_| model == self.config.model),
+            // Never revive launch metadata while loading persisted history.
+            // The caller can supply freshly verified metadata via session config.
+            max_output_tokens: None,
             import_ack: record.import_ack,
             cancel: Arc::new(AtomicBool::new(false)),
 
@@ -822,6 +821,49 @@ impl Server {
         let Some(config_id) = params.get("configId").and_then(Value::as_str) else {
             return rpc_error(id, -32602, "configId is required");
         };
+        if config_id == "max_output_tokens" {
+            let limit = params.get("value").and_then(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| OutputTokenLimit::try_from(n).ok())
+                    .or_else(|| {
+                        value
+                            .as_str()
+                            .and_then(|text| text.parse::<OutputTokenLimit>().ok())
+                    })
+            });
+            let Some(limit) =
+                limit.filter(|_| params.get("type").and_then(Value::as_str) != Some("boolean"))
+            else {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "max_output_tokens expects a finite positive integer",
+                );
+            };
+            let mut state = lock_state(&self.state);
+            let Some(session) = state.sessions.get_mut(session_id) else {
+                return rpc_error(id, -32002, &format!("session not found: {session_id}"));
+            };
+            if session.closed || session.busy {
+                return rpc_error(id, -32600, "session is closed or busy");
+            }
+            if params.get("modelId").and_then(Value::as_str) != Some(session.model.as_str())
+                || params.get("endpoint").and_then(Value::as_str)
+                    != Some(self.config.endpoint.as_str())
+            {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "output limit requires the exact current modelId and endpoint route",
+                );
+            }
+            session.max_output_tokens = Some(limit);
+            return rpc_ok(
+                id,
+                json!({ "configOptions": [model_config(&session.model)] }),
+            );
+        }
         if config_id != "model" {
             return rpc_error(
                 id,

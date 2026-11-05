@@ -29,6 +29,56 @@ fn caller_output_limit_belongs_only_to_the_selected_acp_model() {
             .is_none());
         assert_eq!(prepared_for(&server, &id).max_output_tokens, None);
     }
+    // New metadata is accepted only for the exact current route.
+    for (model, endpoint, value) in [
+        ("MiniMax-M3", "http://127.0.0.1:1", json!(131072)),
+        ("fixture-model", "http://127.0.0.1:2", json!(131072)),
+        ("fixture-model", "http://127.0.0.1:1", json!(0)),
+        ("fixture-model", "http://127.0.0.1:1", json!(u64::MAX)),
+    ] {
+        let rejected = request(
+            &server,
+            &rx,
+            "stale",
+            "session/set_config_option",
+            json!({
+                "sessionId":id, "configId":"max_output_tokens", "value":value,
+                "modelId":model, "endpoint":endpoint
+            }),
+        );
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert_eq!(prepared_for(&server, &id).max_output_tokens, None);
+    }
+    let refreshed = request(
+        &server,
+        &rx,
+        "fresh",
+        "session/set_config_option",
+        json!({
+            "sessionId":id, "configId":"max_output_tokens", "value":"131072",
+            "modelId":"fixture-model", "endpoint":"http://127.0.0.1:1"
+        }),
+    );
+    assert!(refreshed.get("error").is_none(), "{refreshed}");
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens.unwrap().get(),
+        131072
+    );
+    let loaded = request(
+        &server,
+        &rx,
+        "load",
+        "session/load",
+        json!({
+            "sessionId":id, "cwd":root.path(), "mcpServers":[]
+        }),
+    );
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens,
+        None,
+        "resume must not revive the original process-start bound"
+    );
 }
 
 #[test]

@@ -507,6 +507,9 @@ fn apply_interactive_settings(
             .as_ref()
             .filter(|value| !value.trim().is_empty())
         {
+            if args.endpoint != *endpoint {
+                args.max_output_tokens = None;
+            }
             args.endpoint = endpoint.clone();
         }
     }
@@ -2155,6 +2158,8 @@ pub(crate) fn spawn_session_worker(
                                 summary.usage = next.usage;
                                 summary.turns = next.turns;
                                 summary.last_stop = None;
+                                // A resumed session has no caller-verified route metadata.
+                                config.max_tokens = u64::MAX;
                                 select_session_model(&mut config, next.model);
                                 session_id = next.id;
                                 summary.session_id = session_id.clone();

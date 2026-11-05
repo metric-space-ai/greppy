@@ -45,6 +45,30 @@ fn caller_output_limit_requires_finite_positive_metadata_and_explicit_model() {
 }
 
 #[test]
+fn caller_output_limit_is_discarded_by_a_setup_endpoint_override() {
+    let previous_endpoint = std::env::var_os("GREPPY_ENDPOINT");
+    std::env::remove_var("GREPPY_ENDPOINT");
+    let mut args = AgentArgs::try_parse_from([
+        "greppy agent",
+        "--model",
+        "glm-5.3",
+        "--max-output-tokens",
+        "65536",
+    ])
+    .unwrap();
+    let settings = crate::agent_tui::AgentSettings {
+        endpoint: Some("http://127.0.0.1:18318".into()),
+        ..crate::agent_tui::AgentSettings::default()
+    };
+    apply_interactive_settings(&mut args, &[], &settings);
+    if let Some(previous_endpoint) = previous_endpoint {
+        std::env::set_var("GREPPY_ENDPOINT", previous_endpoint);
+    }
+    assert_eq!(args.endpoint, "http://127.0.0.1:18318");
+    assert_eq!(args.max_output_tokens, None);
+}
+
+#[test]
 fn caller_output_limit_is_discarded_when_the_session_model_changes() {
     let mut config = AgentConfig::default()
         .with_model("glm-5.3")
