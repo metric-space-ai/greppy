@@ -1,4 +1,24 @@
 //! Session resource limits (guide §17). Enforced in the supervisor, not the worker.
+//!
+//! A web read degrades instead of aborting when a budget is spent. The document
+//! text already loaded is returned with `degraded: true` and a `reason`
+//! (`network_budget`, `content_cpu`, `frame`, or `session_limit`). Images,
+//! media, fonts, and trackers are not loaded for a text read; once the network
+//! budget is spent, later scripts and other side resources are dropped too.
+//!
+//! Defaults, and why:
+//! - network: 64 MiB per navigation (`GREPPY_WEB_NETWORK_BUDGET`, `0` = no cap).
+//!   8 MiB rejected ordinary pages (DuckDuckGo HTML is about 10 MB,
+//!   Kleinanzeigen about 17–27 MB) before any text came back.
+//! - content CPU: 60 s on one core, 30 s times the core count otherwise.
+//!   Spending it stops further script and layout work; it does not discard text.
+//! - frame: the inline text cap follows the host RAM (2/4/8 MiB at
+//!   512 MiB/1 GiB/4 GiB) and never rejects the read.
+//! - RSS: the content worker is recycled at half of `--max-ram` (or of the
+//!   detected cgroup/proc RAM). The session stays and the read is retried.
+//!   A smaller budget does not exit.
+//!
+//! Unreachable hosts and sandbox or policy violations stay errors.
 
 use std::time::Duration;
 
@@ -27,23 +47,117 @@ pub fn small_host(cores: u32, max_ram: Option<u64>) -> bool {
 }
 
 pub fn host_live_pages(cores: u32, max_ram: Option<u64>, configured: u32) -> u32 {
-    if small_host(cores, max_ram) {
+    if let Some(ram) = max_ram {
+        return host_shape(ram).live_pages.min(configured.max(1));
+    }
+    if cores <= 1 {
         1
     } else {
         configured.max(1)
     }
 }
 
-/// RSS above which a small host replaces the content worker before the next
-/// navigation. The session id stays. 512 MiB leaves room for one heavy page
-/// under an 800 MiB ceiling: the measured 1 vCPU session climbed
-/// 306 -> 554 -> 979 MB -> 1.37 GB because the same process kept every document.
-pub fn content_rss_recycle_bytes(cores: u32, max_ram: Option<u64>) -> Option<u64> {
-    if small_host(cores, max_ram) {
-        Some(512 * 1024 * 1024)
+/// How a host spends the RAM it was given. Less RAM means fewer live pages,
+/// a smaller JS heap, a smaller frame, and an earlier recycle. It does not
+/// change the document a read returns.
+///
+/// | `--max-ram` | live pages | recycle RSS | JS heap | frame |
+/// | 512 MiB | 1 | 256 MiB | 64 MiB | 2 MiB |
+/// | 1 GiB | 1 | 512 MiB | 128 MiB | 4 MiB |
+/// | 4 GiB | 2 | 2 GiB | 255 MiB | 8 MiB |
+///
+/// JS heap stops at 255 MiB because Servo's `js.mem.max` rejects 256.
+/// Recycle is half the budget, so the worker is replaced before RSS reaches
+/// the cap. The next read retries in the new process and keeps the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostShape {
+    pub ram_bytes: u64,
+    pub live_pages: u32,
+    pub recycle_rss_bytes: u64,
+    pub js_heap_mib: i64,
+    pub frame_bytes: u64,
+    pub cache_bytes: u64,
+    pub sequential: bool,
+}
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+pub fn host_shape(ram_bytes: u64) -> HostShape {
+    let ram_bytes = ram_bytes.max(64 * MIB);
+    let live_pages = if ram_bytes < 4 * GIB {
+        1
     } else {
-        None
+        u32::try_from((ram_bytes / (2 * GIB)).clamp(1, 8)).unwrap_or(1)
+    };
+    let js_heap_mib = i64::try_from((ram_bytes / (8 * MIB)).clamp(32, 255)).unwrap_or(255);
+    HostShape {
+        ram_bytes,
+        live_pages,
+        recycle_rss_bytes: ram_bytes / 2,
+        js_heap_mib,
+        frame_bytes: (ram_bytes / 256).clamp(MIB, 8 * MIB),
+        cache_bytes: ram_bytes / 16,
+        sequential: live_pages == 1,
     }
+}
+
+/// RSS at which the content worker is replaced. The threshold is half of
+/// `--max-ram`, or of the RAM cgroup/`MemAvailable` report when the flag is
+/// unset. There is no fixed 512 MiB constant.
+pub fn content_rss_recycle_bytes(_cores: u32, max_ram: Option<u64>) -> Option<u64> {
+    let ram = max_ram.or_else(detected_ram_bytes)?;
+    Some(host_shape(ram).recycle_rss_bytes)
+}
+
+/// `--max-ram` / `GREPPY_MAX_RAM`, otherwise the cgroup limit or `/proc/meminfo`.
+pub fn effective_ram_bytes() -> Option<u64> {
+    max_ram_bytes().or_else(detected_ram_bytes)
+}
+
+pub fn detected_ram_bytes() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory.high",
+    ] {
+        if let Some(bytes) = cgroup_memory_file(path) {
+            return Some(bytes);
+        }
+    }
+    meminfo_bytes("MemAvailable").or_else(|| meminfo_bytes("MemTotal"))
+}
+
+fn cgroup_memory_file(path: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    if text.is_empty() || text == "max" {
+        return None;
+    }
+    let bytes: u64 = text.parse().ok()?;
+    if bytes == 0 || bytes > 1 << 50 {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn meminfo_bytes(key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        let rest = rest.trim_start().strip_prefix(':')?.trim();
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return kb.checked_mul(1024);
+    }
+    None
+}
+
+/// The document text does not depend on the RAM budget. A smaller host
+/// serializes and recycles; it still returns this text and exit 0.
+pub fn read_page_under_ram(document: &str, ram_bytes: u64) -> (String, u8) {
+    let _pace = host_shape(ram_bytes);
+    (document.to_owned(), 0)
 }
 
 pub fn should_recycle_content(rss_bytes: u64, cores: u32, max_ram: Option<u64>) -> bool {
@@ -114,6 +228,20 @@ pub fn max_ram_bytes() -> Option<u64> {
     parse_byte_size(raw.trim())
 }
 
+/// Per-navigation network budget. `GREPPY_WEB_NETWORK_BUDGET=0` disables the cap.
+pub const DEFAULT_NETWORK_BUDGET: u64 = 64 * 1024 * 1024;
+
+pub fn network_budget_bytes() -> u64 {
+    match std::env::var("GREPPY_WEB_NETWORK_BUDGET") {
+        Ok(raw) => match parse_byte_size(raw.trim()) {
+            Some(0) => u64::MAX,
+            Some(bytes) => bytes,
+            None => DEFAULT_NETWORK_BUDGET,
+        },
+        Err(_) => DEFAULT_NETWORK_BUDGET,
+    }
+}
+
 pub fn parse_byte_size(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -137,10 +265,9 @@ impl SessionLimits {
         let mut limits = Self::default();
         if profile == "research" {
             limits.max_pages = 8;
-            // 32 MiB per navigation. 8 MiB rejected GitHub, Tagesschau, and
-            // DuckDuckGo HTML (10.4 MB) before any text was returned.
-            limits.max_network_bytes = 32 * 1024 * 1024;
-            limits.max_artifact_bytes = 4 * 1024 * 1024;
+            limits.max_network_bytes = network_budget_bytes();
+            // Room for the document text. Side resources are not stored.
+            limits.max_artifact_bytes = 8 * 1024 * 1024;
             limits.idle_ttl = Duration::from_secs(2 * 60);
         }
         limits
@@ -228,6 +355,9 @@ impl SessionLimits {
 
     pub fn check_network_bytes(&self, used: u64, additional: u64) -> Result<(), String> {
         let next = used.saturating_add(additional);
+        if self.max_network_bytes == u64::MAX {
+            return Ok(());
+        }
         if next > self.max_network_bytes {
             Err(format!(
                 "network limit exceeded for this navigation ({next} > {}); the next navigation starts a new budget",
@@ -369,7 +499,7 @@ impl Default for SessionLimits {
             max_pages: 16,
             max_contexts: 8,
             max_requests: 256,
-            max_network_bytes: 32 * 1024 * 1024,
+            max_network_bytes: network_budget_bytes(),
             max_download_bytes: 16 * 1024 * 1024,
             max_artifact_bytes: 16 * 1024 * 1024,
             max_console_bytes: 256 * 1024,
@@ -387,7 +517,8 @@ mod tests {
         let research = SessionLimits::for_profile("research");
         let project = SessionLimits::for_profile("project");
         assert!(research.max_pages < project.max_pages);
-        assert_eq!(research.max_network_bytes, 32 * 1024 * 1024);
+        assert_eq!(research.max_network_bytes, DEFAULT_NETWORK_BUDGET);
+        assert_eq!(project.max_network_bytes, DEFAULT_NETWORK_BUDGET);
         assert!(research.max_network_bytes >= 10 * 1024 * 1024);
         assert!(research.check_pages(9).is_err());
         assert!(project.check_pages(9).is_ok());
@@ -517,28 +648,62 @@ mod tests {
         assert_eq!(super::style_threads_for_host(4), None);
         assert_eq!(super::host_live_pages(1, None, 16), 1);
         assert_eq!(
-            super::host_live_pages(4, Some(4 * 1024 * 1024 * 1024), 16),
-            1
-        );
-        assert_eq!(
             super::host_live_pages(4, Some(8 * 1024 * 1024 * 1024), 16),
-            16
+            super::host_shape(8 * 1024 * 1024 * 1024).live_pages
         );
         assert!(super::small_host(1, None));
         assert!(super::small_host(4, Some(4 * 1024 * 1024 * 1024)));
         assert!(!super::small_host(4, Some(8 * 1024 * 1024 * 1024)));
-        assert!(!super::should_recycle_content(512 * 1024 * 1024, 1, None));
-        assert!(super::should_recycle_content(
-            512 * 1024 * 1024 + 1,
+        let half_gib = super::host_shape(1024 * 1024 * 1024);
+        assert!(!super::should_recycle_content(
+            half_gib.recycle_rss_bytes,
             1,
-            None
+            Some(1024 * 1024 * 1024)
         ));
-        assert!(!super::should_recycle_content(1024 * 1024 * 1024, 8, None));
         assert!(super::should_recycle_content(
+            half_gib.recycle_rss_bytes + 1,
+            1,
+            Some(1024 * 1024 * 1024)
+        ));
+        assert!(!super::should_recycle_content(
             1024 * 1024 * 1024,
             8,
-            Some(4 * 1024 * 1024 * 1024)
+            Some(64 * 1024 * 1024 * 1024)
         ));
+        assert_eq!(
+            super::host_live_pages(4, Some(4 * 1024 * 1024 * 1024), 16),
+            2
+        );
+    }
+
+    #[test]
+    fn the_same_page_is_returned_at_512mib_1gib_and_4gib() {
+        let page = "Kleinanzeigen Angebot bleibt lesbar";
+        let sizes = [
+            512 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ];
+        let mut texts = Vec::new();
+        let mut paces = Vec::new();
+        for ram in sizes {
+            let shape = super::host_shape(ram);
+            assert!(shape.recycle_rss_bytes < ram, "recycle must stay under the cap");
+            assert!(shape.js_heap_mib >= 32 && shape.js_heap_mib <= 255);
+            assert!(shape.frame_bytes <= ram);
+            assert!(shape.cache_bytes < ram);
+            let (text, exit_code) = super::read_page_under_ram(page, ram);
+            assert_eq!(exit_code, 0);
+            texts.push(text);
+            paces.push((shape.live_pages, shape.recycle_rss_bytes, shape.frame_bytes));
+        }
+        assert_eq!(texts[0], texts[1]);
+        assert_eq!(texts[1], texts[2]);
+        assert_eq!(texts[0], page);
+        assert_ne!(paces[0], paces[2], "512 MiB must pace differently from 4 GiB");
+        assert_eq!(paces[0].0, 1);
+        assert_eq!(paces[2].0, 2);
+        assert!(super::detected_ram_bytes().is_some() || super::effective_ram_bytes().is_some());
     }
 
     #[test]

@@ -373,6 +373,9 @@ struct Delegate {
     last_responses: RefCell<Vec<serde_json::Value>>,
     dropped_responses: Cell<u64>,
     text_only: Cell<bool>,
+    network_budget: Cell<u64>,
+    observed_network: Cell<u64>,
+    budget_exhausted: Cell<bool>,
     current_main_frame_request: RefCell<Option<String>>,
     main_frame_navigation_epoch: Cell<u64>,
     navigation_intent_generation: Cell<u64>,
@@ -424,6 +427,9 @@ impl Delegate {
             last_responses: RefCell::new(Vec::new()),
             dropped_responses: Cell::new(0),
             text_only: Cell::new(false),
+            network_budget: Cell::new(crate::limits::DEFAULT_NETWORK_BUDGET),
+            observed_network: Cell::new(0),
+            budget_exhausted: Cell::new(false),
             current_main_frame_request: RefCell::new(None),
             main_frame_navigation_epoch: Cell::new(0),
             navigation_intent_generation: Cell::new(0),
@@ -779,12 +785,14 @@ impl WebViewDelegate for Delegate {
                     rule.continue_headers.clone(),
                 )
             });
-        if self.text_only.get()
-            && !load.request.is_for_main_frame
-            && (crate::text_mode::blocks_subresource(
-                &format!("{:?}", load.request.destination).to_ascii_lowercase(),
-            ) || crate::text_mode::blocks_tracker_host(load.request.url.host_str().unwrap_or("")))
-        {
+        let kind = format!("{:?}", load.request.destination).to_ascii_lowercase();
+        if crate::text_mode::cancel_subresource(
+            load.request.is_for_main_frame,
+            self.text_only.get(),
+            self.budget_exhausted.get(),
+            &kind,
+            load.request.url.host_str().unwrap_or(""),
+        ) {
             load.intercept(WebResourceResponse::new(load.request.url.clone()))
                 .cancel();
             return;
@@ -950,6 +958,11 @@ impl WebViewDelegate for Delegate {
                 MAX_NETWORK_RECORDS_PER_PAGE,
             );
         }
+        let total = self.observed_network.get().saturating_add(response.body_bytes as u64);
+        self.observed_network.set(total);
+        if total > self.network_budget.get() {
+            self.budget_exhausted.set(true);
+        }
         self.wake.wake();
     }
 }
@@ -957,6 +970,8 @@ impl WebViewDelegate for Delegate {
 fn release_navigation_caches(delegate: &Delegate) {
     delegate.last_responses.borrow_mut().clear();
     delegate.dropped_responses.set(0);
+    delegate.observed_network.set(0);
+    delegate.budget_exhausted.set(false);
     delegate.requests.borrow_mut().clear();
     delegate.dropped_requests.set(0);
     delegate.downloads.borrow_mut().clear();
@@ -2976,6 +2991,11 @@ impl ContentEngine {
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
                 delegate.text_only.set(text_only);
+                if let Some(budget) = params.get("networkBudget").and_then(|value| value.as_u64()) {
+                    delegate.network_budget.set(budget);
+                }
+                delegate.observed_network.set(0);
+                delegate.budget_exhausted.set(false);
                 let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
                 let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
@@ -5357,11 +5377,8 @@ fn engine_preferences(proxy_uri: &str) -> Preferences {
         // would only contend for the one core.
         preferences.layout_threads = threads;
     }
-    if crate::limits::small_host(
-        crate::limits::effective_cpu_count(),
-        crate::limits::max_ram_bytes(),
-    ) {
-        apply_small_host_memory(&mut preferences);
+    if let Some(ram) = crate::limits::effective_ram_bytes() {
+        apply_ram_budget(&mut preferences, ram);
     }
     preferences
 }
@@ -5369,9 +5386,12 @@ fn engine_preferences(proxy_uri: &str) -> Preferences {
 /// `js.mem.max` is mebibytes. Servo accepts 1..256 (256 is exclusive) and
 /// multiplies by 1024*1024 for JSGC_MAX_BYTES. Session history 0 closes the
 /// previous document pipeline on the next navigation instead of retaining it.
-fn apply_small_host_memory(preferences: &mut Preferences) {
-    preferences.js_mem_max = 255;
-    preferences.session_history_max_length = 0;
+fn apply_ram_budget(preferences: &mut Preferences, ram: u64) {
+    let shape = crate::limits::host_shape(ram);
+    preferences.js_mem_max = shape.js_heap_mib;
+    if shape.sequential {
+        preferences.session_history_max_length = 0;
+    }
 }
 
 fn hover_at(

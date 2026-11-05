@@ -53,11 +53,126 @@ pub fn worker_frame_message() -> &'static str {
 
 /// A navigation that timed out or ran out of budget may still have text.
 pub fn navigation_can_salvage(message: &str) -> bool {
+    degrade_reason(message).is_some()
+}
+
+/// Unreachable hosts and sandbox or policy violations stay errors.
+pub fn hard_failure(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("timed out")
-        || message.contains("timeout")
-        || message.contains("network limit")
-        || message.contains("cpu time exceeded")
+    message.contains("policy_denied")
+        || message.contains("sandbox")
+        || message.contains("not permitted")
+        || message.contains("unreachable")
+        || message.contains("connection refused")
+        || message.contains("failed to connect")
+        || message.contains("no route to host")
+        || message.contains("name or service not known")
+        || message.contains("certificate")
+}
+
+/// Budget and transport caps become a successful, degraded read.
+pub fn degrade_reason(message: &str) -> Option<&'static str> {
+    if hard_failure(message) {
+        return None;
+    }
+    let message = message.to_ascii_lowercase();
+    if message.contains("network limit") || message.contains("network budget") {
+        Some("network_budget")
+    } else if message.contains("cpu time") || message.contains("timed out") || message.contains("timeout") {
+        Some("content_cpu")
+    } else if message.contains("frame") || message.contains("too large") || message.contains("max_frame") {
+        Some("frame")
+    } else if message.contains("limit exceeded") || message.contains("resource_limit") {
+        Some("session_limit")
+    } else {
+        None
+    }
+}
+
+/// Drop a subresource. The main document is never dropped.
+///
+/// Text reads skip images, media, fonts, and trackers immediately. After the
+/// network budget is spent, every later side resource (including scripts) is
+/// dropped so the document text can still be returned.
+pub fn cancel_subresource(
+    main_frame: bool,
+    text_only: bool,
+    budget_exhausted: bool,
+    kind: &str,
+    host: &str,
+) -> bool {
+    if main_frame {
+        return false;
+    }
+    if budget_exhausted {
+        return true;
+    }
+    text_only && (blocks_subresource(kind) || blocks_tracker_host(host))
+}
+
+/// Keep response text inside the 8 MiB IPC frame.
+pub const RESPONSE_TEXT_CAP: usize = 6 * 1024 * 1024;
+
+pub fn cap_text_for_frame(text: &str) -> (&str, bool) {
+    if text.len() <= RESPONSE_TEXT_CAP {
+        return (text, false);
+    }
+    let mut end = RESPONSE_TEXT_CAP;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// What a read returns after a navigation. Exit 0 unless the failure is real.
+pub struct DocumentRead {
+    pub text: String,
+    pub degraded: bool,
+    pub reason: &'static str,
+    pub exit_code: u8,
+}
+
+pub fn finish_document_read(
+    text: &str,
+    side_bytes: u64,
+    budget: u64,
+    engine_error: Option<&str>,
+) -> DocumentRead {
+    if let Some(message) = engine_error {
+        if hard_failure(message) {
+            return DocumentRead {
+                text: String::new(),
+                degraded: false,
+                reason: "",
+                exit_code: 34,
+            };
+        }
+    }
+    let (fitted, framed) = cap_text_for_frame(text);
+    let mut reason = "";
+    let mut degraded = false;
+    if side_bytes > budget && budget != u64::MAX {
+        degraded = true;
+        reason = "network_budget";
+    }
+    if let Some(message) = engine_error {
+        if let Some(found) = degrade_reason(message) {
+            degraded = true;
+            reason = found;
+        }
+    }
+    if framed {
+        degraded = true;
+        if reason.is_empty() {
+            reason = "frame";
+        }
+    }
+    DocumentRead {
+        text: fitted.to_owned(),
+        degraded,
+        reason,
+        exit_code: 0,
+    }
 }
 
 pub fn result_has_text(result: &serde_json::Value) -> bool {
@@ -77,6 +192,9 @@ pub fn mark_partial(result: &mut serde_json::Value, reason: &str) {
         Some(result)
     };
     if let Some(object) = target.and_then(|value| value.as_object_mut()) {
+        let code = degrade_reason(reason).unwrap_or("session_limit");
+        object.insert("degraded".into(), serde_json::json!(true));
+        object.insert("reason".into(), serde_json::json!(code));
         object.insert("partial".into(), serde_json::json!(true));
         object.insert("partial_reason".into(), serde_json::json!(reason));
     }
@@ -216,7 +334,34 @@ mod tests {
         assert!(result_has_text(&result));
         mark_partial(&mut result, "timeout");
         assert_eq!(result["source"]["partial"], true);
+        assert_eq!(result["source"]["degraded"], true);
+        assert_eq!(result["source"]["reason"], "content_cpu");
         assert_eq!(result["source"]["text"], "Berlin");
+    }
+
+    #[test]
+    fn twenty_megabytes_of_side_resources_keep_the_document() {
+        let document = "Kleinanzeigen Angebot bleibt lesbar";
+        let side = 21 * 1024 * 1024;
+        assert!(side > 20 * 1024 * 1024);
+        assert!(cancel_subresource(false, true, false, "image", "cdn.example"));
+        assert!(cancel_subresource(false, true, false, "font", "fonts.example"));
+        assert!(cancel_subresource(false, true, false, "video", "media.example"));
+        assert!(cancel_subresource(false, false, true, "script", "example.com"));
+        assert!(!cancel_subresource(true, true, true, "document", "example.com"));
+        let tight = finish_document_read(document, side, 8 * 1024 * 1024, None);
+        let wide = finish_document_read(document, side, 64 * 1024 * 1024, None);
+        assert_eq!(tight.exit_code, 0);
+        assert_eq!(wide.exit_code, 0);
+        assert_eq!(tight.text, document);
+        assert_eq!(wide.text, tight.text);
+        let refused = finish_document_read(document, side, 64 * 1024 * 1024, Some("connection refused"));
+        assert_eq!(refused.exit_code, 34);
+        assert!(!refused.degraded);
+        let timed = finish_document_read(document, 0, 64 * 1024 * 1024, Some("timed out after 30s"));
+        assert_eq!(timed.exit_code, 0);
+        assert_eq!(timed.reason, "content_cpu");
+        assert_eq!(timed.text, document);
     }
 
     #[test]

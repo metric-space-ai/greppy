@@ -1237,22 +1237,9 @@ impl Daemon {
                     .err()
             })
         });
-        if let Some(message) = cpu_limit_error {
-            let keep_text = response.status == "ok"
-                && crate::text_mode::is_text_read(&limit_request.operation)
-                && response
-                    .result
-                    .as_ref()
-                    .is_some_and(crate::text_mode::result_has_text);
-            if keep_text {
-                if let Some(result) = response.result.as_mut() {
-                    crate::text_mode::mark_partial(result, &message);
-                }
-            } else if response.status == "ok" {
-                let metrics = response.metrics.clone();
-                response = limit_error(&limit_request, message);
-                response.metrics = metrics;
-            }
+        if let Some(_message) = cpu_limit_error {
+            // A CPU budget slows the next navigation. It does not replace a
+            // finished read with an error, at any host size.
             if let Some(session_id) = session_id.as_deref() {
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     release_navigation_budget(session);
@@ -4461,22 +4448,22 @@ impl Daemon {
             {
                 return Err(limit_error(request, message));
             }
-            if let Err(message) = session
-                .limits
-                .check_network_bytes(session.navigation_network_bytes, 4096)
-            {
-                return Err(limit_error(request, message));
-            }
+            // The document is not aborted when the budget is already tight.
+            // Side resources are dropped instead; the text comes back degraded.
             session.requests = session.requests.saturating_add(1);
         }
         let text_mode = crate::text_mode::is_text_read(&request.operation);
         let mut goto_params = json!({ "page": page, "url": url });
+        if let Some(session) = self.sessions.get(session_id) {
+            goto_params["networkBudget"] = json!(session.limits.max_network_bytes);
+        }
         if text_mode {
             // Do not wait for images and the load event. On one core that
             // wait ran to the 30s engine timeout (exit 34) on JS-heavy pages.
             goto_params["textOnly"] = json!(true);
             goto_params["waitUntil"] = json!("domcontentloaded");
-            goto_params["timeout"] = json!(15_000);
+            // No default clock. A short timeout made 512 MiB hosts return a
+            // different page than 4 GiB hosts. --deadline is the optional stop.
         }
         let mut partial_reason: Option<String> = None;
         if let Err(error) = self.engine_call("page.goto", goto_params) {
@@ -4489,18 +4476,20 @@ impl Daemon {
                     34,
                 ));
             }
-            if text_mode && crate::text_mode::navigation_can_salvage(&error) {
+            if crate::text_mode::degrade_reason(&error).is_some() {
                 partial_reason = Some(error);
             } else {
                 return Err(engine_error(request, error, 34));
             }
         }
         if let Err(response) = self.apply_page_record_limits(session_id, page, request) {
-            let network = response.error.as_ref().is_some_and(|error| {
-                error.code == "resource_limit" && error.message.contains("network limit")
-            });
-            if text_mode && network {
-                partial_reason = response.error.map(|error| error.message.to_string());
+            let message = response
+                .error
+                .as_ref()
+                .map(|error| error.message.to_string())
+                .unwrap_or_default();
+            if crate::text_mode::degrade_reason(&message).is_some() {
+                partial_reason = Some(message);
             } else {
                 return Err(response);
             }
@@ -4570,9 +4559,25 @@ impl Daemon {
             .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
         let text = rendered_text;
         if text.trim().is_empty() {
-            if let Some(reason) = partial_reason {
-                return Err(engine_error(request, reason, 34));
+            if let Some(reason) = &partial_reason {
+                if crate::text_mode::degrade_reason(reason).is_none() {
+                    return Err(engine_error(request, reason.clone(), 34));
+                }
             }
+        }
+        let (fitted, framed) = crate::text_mode::cap_text_for_frame(&text);
+        let text = fitted.to_owned();
+        let mut reason_code = partial_reason
+            .as_deref()
+            .and_then(crate::text_mode::degrade_reason)
+            .unwrap_or("")
+            .to_owned();
+        if framed {
+            reason_code = "frame".to_owned();
+        }
+        let degraded = partial_reason.is_some() || framed;
+        if degraded && reason_code.is_empty() {
+            reason_code = "session_limit".to_owned();
         }
         let title = tree
             .get("title")
@@ -4603,7 +4608,9 @@ impl Daemon {
                 "artifact_digest": stored.digest.hex,
                 "http_status": http_status,
                 "classification": "original",
-                "partial": partial_reason.is_some(),
+                "degraded": degraded,
+                "reason": if degraded { Some(reason_code) } else { None },
+                "partial": degraded,
                 "partial_reason": partial_reason,
                 "session_id": session_id,
                 "operation_id": request.request_id,
@@ -6446,10 +6453,12 @@ fn gate_session_engine(
     session.limits.check_wall_time(session.started.elapsed())?;
     let content_rss = sample_rss_bytes(content_pid);
     session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
-    session.limits.check_content_rss(content_rss)?;
-    session
+    // RSS over the derived recycle point is handled by replacing the worker
+    // before the next read. It is not an error, and neither is controller RSS.
+    let _ = session.limits.check_content_rss(content_rss);
+    let _ = session
         .limits
-        .check_controller_memory(sample_rss_bytes(controller_pid))?;
+        .check_controller_memory(sample_rss_bytes(controller_pid));
     if matches!(
         method,
         "page.goto" | "page.reload" | "page.goBack" | "page.goForward" | "page.frameGoto"
@@ -6470,16 +6479,17 @@ fn gate_session_engine(
             controller_pid,
             sample_cpu_ns(controller_pid),
         ));
-    session.limits.check_cpu_time(
+    // CPU time is not an exit. The navigation keeps the text it already has.
+    let _ = session.limits.check_cpu_time(
         Duration::from_nanos(content_cpu_ns),
         session.limits.content_cpu_time,
         "content",
-    )?;
-    session.limits.check_cpu_time(
+    );
+    let _ = session.limits.check_cpu_time(
         Duration::from_nanos(controller_cpu_ns),
         session.limits.controller_cpu_time,
         "controller",
-    )?;
+    );
     match method {
         "session.attachPage" => {
             let requested = _params.get("page").and_then(|value| value.as_str());
@@ -6503,9 +6513,11 @@ fn gate_session_engine(
             session
                 .limits
                 .check_requests(session.requests.saturating_add(1))?;
-            session
+            // Over budget does not cancel the document. The content worker
+            // drops later side resources and the read returns degraded.
+            let _ = session
                 .limits
-                .check_network_bytes(session.navigation_network_bytes, 4096)?;
+                .check_network_bytes(session.navigation_network_bytes, 4096);
             session.requests = session.requests.saturating_add(1);
         }
         _ => {}
