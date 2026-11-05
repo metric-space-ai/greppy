@@ -1028,6 +1028,23 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
+            // Browser commands may mutate a session or navigate a page. Never
+            // guess away a rejected selector, flag or positional argument and
+            // dispatch a different operation against the current session.
+            if sub == "web" {
+                println!(
+                    "invalid web arguments: {}",
+                    first.trim_start_matches("error: ")
+                );
+                if let Some(usage) = msg
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("Usage:"))
+                {
+                    println!("{}", usage.trim());
+                }
+                println!("no web operation was performed");
+                return 64;
+            }
             if sub == "expand"
                 && unknown_flag_name(first)
                     .as_deref()
