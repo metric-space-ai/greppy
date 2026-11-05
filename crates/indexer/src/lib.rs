@@ -3047,8 +3047,8 @@ pub fn recover_persisted_js_ts_usages(
         // Marking the repair complete despite the skip is safe: the bytes were
         // just verified against their recorded sha256, so the same extractor
         // fails the same way on every retry. A changed file is re-extracted by
-        // ordinary indexing, and an extractor change bumps INDEXER_VERSION_BASE,
-        // which forces a full re-extraction.
+        // ordinary indexing. Compatibility extractor changes advance this repair
+        // key so affected cached references are revalidated without a global rebuild.
         let extraction =
             match validated_js_ts_repair_extraction(language, &state.rel_path, extraction) {
                 Ok(extraction) => extraction,

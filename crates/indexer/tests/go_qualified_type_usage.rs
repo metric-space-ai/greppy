@@ -137,6 +137,13 @@ fn preserved_cache(store: &Store) -> Vec<String> {
                 .unwrap()
                 .into_iter()
                 .filter(|edge| !edge.file_path.ends_with(".go"))
+                .map(|edge| (
+                    edge.file_path,
+                    edge.source_qname,
+                    edge.target_qname,
+                    edge.edge_type,
+                    edge.properties
+                ))
                 .collect::<Vec<_>>()
         ),
     ];
@@ -206,6 +213,45 @@ fn old_go_cache_repairs_private_and_overlay_without_invalidating_mixed_base() {
             &greppy_store::VisibilityIndex::default(),
         )
         .unwrap();
+        // A v4-certified Delta may already mask/re-export JS/TS Base facts.
+        // The Go-only upgrade must extend that namespace, not overwrite it.
+        let js_rows: Vec<_> = overlay
+            .list_raw_edges("anko")
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.file_path == "retained.tsx" && edge.edge_type == "USAGE")
+            .map(|edge| {
+                serde_json::json!({
+                    "file_path": edge.file_path, "source_qname": edge.source_qname,
+                    "target_qname": edge.target_qname, "properties": edge.properties,
+                })
+            })
+            .collect();
+        assert!(!js_rows.is_empty());
+        overlay
+            .conn()
+            .execute(
+                "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)",
+                rusqlite::params![
+                    "greppy.js_ts_usage_override_files.anko",
+                    r#"["retained.tsx"]"#
+                ],
+            )
+            .unwrap();
+        overlay
+            .conn()
+            .execute(
+                "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)",
+                rusqlite::params![
+                    "greppy.js_ts_usage_override_rows.anko",
+                    serde_json::to_string(&js_rows).unwrap()
+                ],
+            )
+            .unwrap();
+        overlay.conn().execute(
+            "INSERT INTO main.schema_meta(key,value) VALUES('greppy.js_ts_usage_repair_v4','complete')",
+            [],
+        ).unwrap();
         assert_go_cache_repair(&mut overlay, repo.path());
         assert!(overlay.list_delta_raw_edges("anko").unwrap().is_empty());
         assert_eq!(
