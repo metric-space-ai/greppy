@@ -31,6 +31,16 @@ the composition version and generator hash alongside the harness git identity.
 The entry is checked again after execution; modification disqualifies the run.
 Preserve this entry with its receipt before cleaning the owned output directory.
 
+The native adapter accepts exactly the shared workload's `{headless: true}`
+launch intent and maps it to the runtime's fixed headless mode via `launch()`.
+It rejects every other launch option or intent, including viewport/proxy options;
+none are silently discarded. `native_entry_provenance.native_launch_policy`
+records this mapping. Context creation and all shared task assertions are unchanged.
+The native engine is not a general Playwright drop-in: `textContent()` currently
+aliases `innerText()` (the fixture uses visible pre/p text), context options and
+launch options are restricted, and no viewport override is used. Equal viewport
+conditions must be verified separately before a reference performance comparison.
+
 ```sh
 python3 crates/web-runtime/scripts/measure-web-efficiency.py \
   --engine native --runtime "$RUNTIME_BINARY" \
@@ -92,7 +102,11 @@ remain necessary before claiming general efficiency leadership.
 fixture HTTP interactions, forged success without an effect, valid Unicode POSTs,
 duplicate effects, malformed receipts, failed processes and bounded termination.
 The native entry contract uses Node's parser to reject additional module imports
-without executing a browser. A real probe child verifies the actual `--script`
+without executing a browser. It also loads the actual controller wrapper and runs
+the generated entry only up to its deliberately refused first engine operation,
+checking the exact launch mapping and rejection of additional options. This is a
+controller-boundary contract, not proof of DOM/navigation/Storage/fetch behavior.
+A real probe child verifies the actual `--script`
 entry/hash and sends forged success receipts without a POST effect; the complete
 harness must exit unsuccessfully. This probe is not a runtime acceptance result.
 A mutation making `effect_verified` unconditionally true must fail

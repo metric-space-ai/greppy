@@ -37,7 +37,8 @@ class OutcomeContract(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=3) as response:
                 return response.status
         except urllib.error.HTTPError as error:
-            return error.code
+            with error:
+                return error.code
 
     def completed_receipt(self):
         row = {'round': 0, 'duration_ms': 50, 'succeeded': 1, 'attempted': 1,
@@ -87,13 +88,15 @@ class NativeEntryContract(unittest.TestCase):
             self.assertEqual(provenance['sha256'], measurement.digest(entry))
             self.assertEqual(provenance['adapter_sha256'], measurement.digest(pathlib.Path(provenance['adapter_path'])))
             self.assertEqual(provenance['workload_sha256'], measurement.digest(pathlib.Path(provenance['workload_path'])))
-            result = subprocess.run(['node', '--experimental-vm-modules', '-e',
-                                     "const fs=require('node:fs'),vm=require('node:vm');"
-                                     "const m=new vm.SourceTextModule(fs.readFileSync(process.argv[1],'utf8'));"
-                                     "console.log(JSON.stringify(m.dependencySpecifiers));", str(entry)],
-                                    capture_output=True, text=True, timeout=5)
+            result = subprocess.run(['node', '--experimental-vm-modules',
+                                     str(measurement.ROOT / 'scripts/check-efficiency-native-entry.mjs'),
+                                     str(entry), str(measurement.ROOT / 'runtime/js/playwright.mjs')],
+                                    capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), ['playwright'])
+            checked = json.loads(result.stdout)
+            self.assertEqual(checked['dependencies'], ['playwright'])
+            self.assertEqual(checked['launch_policy'], provenance['native_launch_policy']['version'])
+            self.assertEqual(checked['wrapper_sha256'], measurement.digest(measurement.ROOT / 'runtime/js/playwright.mjs'))
             self.assertIn(pathlib.Path(provenance['workload_path']).read_bytes(), entry.read_bytes())
 
     def test_native_argv_uses_hashed_entry_and_forged_success_without_post_still_fails(self):

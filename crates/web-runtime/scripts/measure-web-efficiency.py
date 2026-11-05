@@ -285,7 +285,13 @@ def prepare_native_entry(path):
             'composition': 'inline-native-workload-v1',
             'adapter_path': str(adapter_path), 'adapter_sha256': hashlib.sha256(adapter).hexdigest(),
             'workload_path': str(workload_path), 'workload_sha256': hashlib.sha256(workload).hexdigest(),
-            'generator_sha256': digest(pathlib.Path(__file__))}
+            'generator_sha256': digest(pathlib.Path(__file__)),
+            'native_launch_policy': {'version': 'native-fixed-headless-v1',
+                                     'requested': {'headless': True},
+                                     'effective': 'fixed native headless execution through launch() without options',
+                                     'other_options': 'rejected, not dropped',
+                                     'viewport': 'runtime default, no override',
+                                     'contexts': 'unchanged newContext() per worker'}}
 
 
 def main():
