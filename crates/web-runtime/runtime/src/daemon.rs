@@ -1811,10 +1811,10 @@ impl Daemon {
         let run_budget = Duration::from_millis(request.deadline_ms.max(1_000));
         let run_deadline = started + run_budget;
         if crate::supervisor::phase_trace_enabled() {
-            eprintln!("web-runtime: phase run-wait point=set-profile worker=content session={} deadline_ms={}",
-            session_id,
-            run_budget.as_millis()
-        );
+            eprintln!(
+                "web-runtime: phase run-wait point=set-profile worker=content deadline_ms={}",
+                run_budget.as_millis()
+            );
         }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
