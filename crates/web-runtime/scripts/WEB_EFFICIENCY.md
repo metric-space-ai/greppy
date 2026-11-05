@@ -20,6 +20,17 @@ artifact volume. Use the existing resource-admission/build path for the host.
 Provide the actual existing runtime binary and Playwright package; this tool
 neither builds nor downloads either engine.
 
+Native runs create a deterministic single module beside the output JSON:
+`native.json.entry.mjs` for `native.json`. The generator replaces exactly the
+native adapter's relative workload import with the **unchanged** shared source.
+Only the runtime's built-in `playwright` import remains; no production module
+policy is relaxed. The generated entry is retained on failure and success,
+never overwritten, and passed directly through the existing `--script` port.
+`native_entry_provenance` records its actual SHA256, both input source hashes,
+the composition version and generator hash alongside the harness git identity.
+The entry is checked again after execution; modification disqualifies the run.
+Preserve this entry with its receipt before cleaning the owned output directory.
+
 ```sh
 python3 crates/web-runtime/scripts/measure-web-efficiency.py \
   --engine native --runtime "$RUNTIME_BINARY" \
@@ -80,5 +91,9 @@ remain necessary before claiming general efficiency leadership.
 `python3 crates/web-runtime/scripts/test-measure-web-efficiency.py` checks real
 fixture HTTP interactions, forged success without an effect, valid Unicode POSTs,
 duplicate effects, malformed receipts, failed processes and bounded termination.
+The native entry contract uses Node's parser to reject additional module imports
+without executing a browser. A real probe child verifies the actual `--script`
+entry/hash and sends forged success receipts without a POST effect; the complete
+harness must exit unsuccessfully. This probe is not a runtime acceptance result.
 A mutation making `effect_verified` unconditionally true must fail
 `test_claimed_success_without_post_effect_never_counts`.

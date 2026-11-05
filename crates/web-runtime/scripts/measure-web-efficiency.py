@@ -269,6 +269,25 @@ def execute(command, directory, timeout, started=None):
             'stderr_tail': log_tail(directory / 'stderr.log')}
 
 
+def prepare_native_entry(path):
+    """Inline the exact shared source at the native adapter's sole file import."""
+    adapter_path = ROOT / 'runtime/fixtures/efficiency-native.mjs'
+    workload_path = ROOT / 'runtime/fixtures/efficiency-workload.mjs'
+    adapter = adapter_path.read_bytes()
+    workload = workload_path.read_bytes()
+    import_line = b"import { runEfficiency } from './efficiency-workload.mjs';"
+    if adapter.count(import_line) != 1:
+        raise ValueError('native adapter must contain exactly one shared-workload import')
+    source = adapter.replace(import_line, workload, 1)
+    with path.open('xb') as entry:
+        entry.write(source)
+    return {'path': str(path), 'sha256': hashlib.sha256(source).hexdigest(),
+            'composition': 'inline-native-workload-v1',
+            'adapter_path': str(adapter_path), 'adapter_sha256': hashlib.sha256(adapter).hexdigest(),
+            'workload_path': str(workload_path), 'workload_sha256': hashlib.sha256(workload).hexdigest(),
+            'generator_sha256': digest(pathlib.Path(__file__))}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', choices=('native', 'chromium'), required=True)
@@ -287,7 +306,6 @@ def main():
         parser.error('absolute output path and bounded workload required (at most1000 total tasks)')
     if args.output.exists():
         parser.error('output already exists; preserve existing measurement')
-    native = ROOT / 'runtime/fixtures/efficiency-native.mjs'
     reference = ROOT / 'scripts/efficiency-reference.mjs'
     executable = args.runtime.resolve() if args.runtime else pathlib.Path(shutil.which(args.node) or args.node)
     if args.engine == 'native' and not args.runtime:
@@ -297,12 +315,18 @@ def main():
     executable_before = executable.stat()
     provenance = source_identity()
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    native_entry = None
+    if args.engine == 'native':
+        try:
+            native_entry = prepare_native_entry(args.output.with_name(args.output.name + '.entry.mjs'))
+        except (FileExistsError, ValueError) as error:
+            parser.error(str(error))
     config = {key: getattr(args, key) for key in ('rounds', 'tasks', 'concurrency', 'nodes')}
     fixture = Fixture(config)
     thread = threading.Thread(target=fixture.serve_forever, name='owned-efficiency-fixture', daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{fixture.server_port}/'
-    command = ([str(executable), '--script', str(native), '--fixture-url', url] if args.engine == 'native'
+    command = ([str(executable), '--script', native_entry['path'], '--fixture-url', url] if native_entry
                else [str(executable), str(reference), url])
     try:
         with tempfile.TemporaryDirectory(prefix='web-efficiency-', dir=args.output.parent) as temporary:
@@ -317,6 +341,13 @@ def main():
         if (executable_before.st_dev, executable_before.st_ino, executable_before.st_size, executable_before.st_mtime_ns) != (
                 executable_after.st_dev, executable_after.st_ino, executable_after.st_size, executable_after.st_mtime_ns):
             valid, reason = False, 'engine executable changed during measurement'
+        if native_entry:
+            try:
+                entry_unchanged = digest(pathlib.Path(native_entry['path'])) == native_entry['sha256']
+            except OSError:
+                entry_unchanged = False
+            if not entry_unchanged:
+                valid, reason = False, 'executed native entry changed during measurement'
         measured['verified_completed_tasks_per_second_including_all_process_time'] = (
             audit['independently_verified_completed_tasks'] * 1000 / measured['process_cold_total_ms'])
         boundaries = [fixture.started_at] + [event[0] for event in fixture.round_events]
@@ -330,7 +361,8 @@ def main():
                    'configuration': config, 'host_envelope': host_envelope(),
                    'executable_sha256': digest(executable),
                    'source_provenance': provenance,
-                   'workload_sha256': digest(ROOT / 'runtime/fixtures/efficiency-workload.mjs'),
+                   'workload_sha256': (native_entry['workload_sha256'] if native_entry
+                                       else digest(ROOT / 'runtime/fixtures/efficiency-workload.mjs')),
                    'execution_surface': 'standalone runtime/Playwright; excludes LLM and CLI daemon session limits',
                    'cold_scope': 'new process/browser; OS caches are not cleared or claimed cold',
                    'metrics': measured, 'audit': audit,
@@ -340,6 +372,8 @@ def main():
                                        'request_body_bytes': fixture.request_body_bytes,
                                        'response_body_bytes': fixture.response_body_bytes,
                                        'network_scope': 'fixture HTTP bodies only; excludes headers, TCP/TLS and IPC'}}
+        if native_entry:
+            receipt['native_entry_provenance'] = native_entry
         if args.engine == 'chromium':
             try:
                 metadata = json.loads(measured['stdout_tail'].splitlines()[0])['engine_metadata']
