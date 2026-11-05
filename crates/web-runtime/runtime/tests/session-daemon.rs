@@ -1163,18 +1163,48 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
             let releases = Arc::clone(&server_releases);
             let handler_stop = Arc::clone(&server_stop);
             let handler = thread::spawn(move || {
-                let mut buffer = [0_u8; 2048];
-                let n = match stream.read(&mut buffer) {
-                    Ok(n) => n,
-                    Err(error) => {
-                        diagnostics
-                            .lock()
-                            .unwrap()
-                            .push(format!("request read error: {error}"));
-                        0
+                // macOS reports SO_RCVTIMEO as EAGAIN (os error 35) and then
+                // keeps returning it until the timeout is armed again. One
+                // such read is not an empty request for "/".
+                let deadline = Instant::now() + Duration::from_secs(8);
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 2048];
+                while Instant::now() < deadline && buffer.len() < 16_384 {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buffer.extend_from_slice(&chunk[..n]);
+                            if buffer.windows(4).any(|window| window == b"\r\n\r\n")
+                                || buffer.contains(&b'\n')
+                            {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::Interrupted
+                                || error.kind() == std::io::ErrorKind::WouldBlock
+                                || error.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => {
+                            diagnostics
+                                .lock()
+                                .unwrap()
+                                .push(format!("request read error: {error}"));
+                            break;
+                        }
                     }
-                };
-                let request = String::from_utf8_lossy(&buffer[..n]);
+                }
+                if buffer.is_empty() {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push("request read produced no bytes".to_owned());
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer);
                 let path = request
                     .lines()
                     .next()
@@ -11896,17 +11926,26 @@ fn locator_filter_has_text_and_scroll() {
 
 fn read_http_request_head(stream: &mut std::net::TcpStream) -> String {
     use std::io::Read;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut data = Vec::new();
     let mut buf = [0_u8; 512];
-    loop {
+    while Instant::now() < deadline && data.len() <= 16_384 {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 data.extend_from_slice(&buf[..n]);
-                if data.windows(4).any(|window| window == b"\r\n\r\n") || data.len() > 16_384 {
+                if data.windows(4).any(|window| window == b"\r\n\r\n") {
                     break;
                 }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    || error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                thread::sleep(Duration::from_millis(5));
             }
             Err(_) => break,
         }
