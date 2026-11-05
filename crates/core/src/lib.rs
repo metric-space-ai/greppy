@@ -43,7 +43,9 @@
 ///   v10 -> v11: CALLS for nine more languages, Rust calls into inline `mod`
 ///   blocks, workspace-crate / language-scoped / alias call resolution; their
 ///   new node and edge properties exist only after full re-extraction.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v11";
+/// - v12: Go package-qualified type usages are no longer mistaken for definitions.
+///   Unchanged source must be re-extracted to repair previously missing usage edges.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v12";
 
 pub mod cache;
 pub mod diag;
