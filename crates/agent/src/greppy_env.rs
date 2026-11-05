@@ -353,6 +353,12 @@ impl GreppyEnv {
         if let Some(msg) = greppy_guard(&args) {
             return ToolOutcome::err(msg);
         }
+        let desktop_screenshot = args.first().map(String::as_str) == Some("desktop")
+            && args.get(1).map(String::as_str) == Some("screenshot");
+        // The desktop CLI defaults to human text; images require its stable envelope.
+        if desktop_screenshot && !args.iter().any(|arg| arg == "--json") {
+            args.push("--json".to_owned());
+        }
 
         let configured_timeout = if args.first().map(String::as_str) == Some("bash-smart") {
             self.bash_timeout
@@ -443,14 +449,12 @@ impl GreppyEnv {
                                 .lines()
                                 .next()
                                 .is_some_and(|line| line.starts_with("FAILED — exit "))));
-                let desktop_screenshot = args.first().map(String::as_str) == Some("desktop")
-                    && args.get(1).map(String::as_str) == Some("screenshot");
                 let screenshot = if args.first().map(String::as_str) == Some("web")
                     && args.get(1).map(String::as_str) == Some("screenshot")
                 {
                     extract_png_base64(&merge_stdio(&captured.stdout, &captured.stderr))
-                } else if desktop_screenshot {
-                    extract_png_base64(&String::from_utf8_lossy(&captured.stdout))
+                } else if desktop_screenshot && actual_success {
+                    extract_desktop_png_base64(&String::from_utf8_lossy(&captured.stdout))
                 } else {
                     None
                 };
@@ -468,6 +472,13 @@ impl GreppyEnv {
                     outcome.image_png_base64 = Some(data);
                     outcome.content = "screenshot attached as image for the model".to_owned();
                 } else if args.first().map(String::as_str) == Some("desktop") {
+                    if desktop_screenshot && actual_success {
+                        outcome.is_error = true;
+                        outcome.content.push_str(
+                            "\ndesktop screenshot returned no usable PNG image in greppy.desktop.v1; \
+                             no image was attached and visual verification did not occur",
+                        );
+                    }
                     outcome.content = crate::prompt::fence_untrusted_desktop(&outcome.content);
                 }
                 if args.first().map(String::as_str) == Some("desktop") {
@@ -1107,6 +1118,28 @@ fn capability_enable_name(args: &[String]) -> Option<&'static str> {
     }
 }
 
+fn extract_desktop_png_base64(stdout: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdout).ok()?;
+    if value.get("schema")?.as_str()? != "greppy.desktop.v1"
+        || !value.get("ok")?.as_bool()?
+        || value.get("command")?.as_str()? != "screenshot"
+        || value.get("truncated").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let data = value.get("data")?;
+    if data.get("format")?.as_str()? != "png"
+        || data.get("width")?.as_u64()? == 0
+        || data.get("height")?.as_u64()? == 0
+    {
+        return None;
+    }
+    data.get("png_base64")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 fn extract_png_base64(stdout: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
     let result = value.get("result").unwrap_or(&value);
@@ -1600,6 +1633,132 @@ done
         );
         assert!(!out.is_error, "content={}", out.content);
         assert_eq!(out.content, "who-calls\nmy_func\n--code\n");
+    }
+
+    #[test]
+    fn desktop_screenshot_attaches_envelope_image_without_logging_pixels() {
+        for explicit_json in [false, true] {
+            let (mut env, _, _) = env_with_stub(
+                r#"
+case " $* " in *" --json "*) ;; *) exit 2 ;; esac
+printf '%s\n' '{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","truncated":false,"data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}'
+printf 'capture diagnostic\n' >&2
+"#,
+            );
+            // A screenshot exceeds the normal text budget; extraction precedes folding.
+            env.max_output_bytes = 64;
+            let mut args = vec!["desktop", "screenshot", "--app", "Greppy Desktop Fixture"];
+            if explicit_json {
+                args.push("--json");
+            }
+            let out = env.call_tool("greppy", &json!({"args": args}));
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(out.image_png_base64.as_deref(), Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="));
+            assert!(!out.content.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="));
+            assert!(out.content.contains("attached as image"));
+        }
+    }
+
+    #[test]
+    fn desktop_screenshot_failure_never_becomes_an_image_success() {
+        for (body, exit) in [
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":false,"command":"screenshot","data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},"error":{"code":"permission_denied"}}"#,
+                40,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}"#,
+                1,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","data":{"format":"png","width":1,"height":1}}"#,
+                0,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":false,"command":"screenshot","error":{"code":"permission_denied"}}"#,
+                0,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","truncated":true,"data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}"#,
+                0,
+            ),
+        ] {
+            let (mut env, _, _) = env_with_stub(&format!("printf '%s\\n' '{body}'\nexit {exit}"));
+            let out = env.call_tool("greppy", &json!({"args": ["desktop", "screenshot"]}));
+            assert!(out.is_error, "{exit}: {}", out.content);
+            assert!(out.image_png_base64.is_none());
+            assert!(!out.content.contains("attached as image"));
+            let logged = crate::prompt::omit_untrusted_desktop_for_log(&out.content);
+            assert!(!logged.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="));
+            if body.contains("permission_denied") {
+                assert!(out.content.contains("permission_denied"));
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_screenshot_reaches_next_model_request_in_both_modes() {
+        use crate::{
+            run_agent_loop, AgentConfig, BuiltinPromptMode, ClientError, ContentPart, Message,
+            ModelRequest, ModelStream, Role, StopReason, StreamEvent, TurnResult, Usage,
+        };
+        struct InspectImage(bool);
+        impl ModelStream for InspectImage {
+            fn stream_turn(
+                &mut self,
+                request: &ModelRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> Result<TurnResult, ClientError> {
+                let content = if !self.0 {
+                    self.0 = true;
+                    vec![ContentPart::ToolCall {
+                        id: "capture".into(),
+                        name: "greppy".into(),
+                        arguments: json!({"args": ["desktop", "screenshot"]}),
+                    }]
+                } else {
+                    assert!(request.messages.iter().flat_map(|m| &m.content).any(|part| {
+                        matches!(part, ContentPart::Image { media_type, data }
+                            if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==")
+                    }), "the model's next request lost the desktop image");
+                    vec![ContentPart::Text {
+                        text: "image received".into(),
+                    }]
+                };
+                let stop_reason = if matches!(content[0], ContentPart::ToolCall { .. }) {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                };
+                Ok(TurnResult {
+                    message: Message {
+                        role: Role::Assistant,
+                        content,
+                    },
+                    stop_reason,
+                    usage: Usage::default(),
+                })
+            }
+        }
+        for mode in [BuiltinPromptMode::OneShot, BuiltinPromptMode::Interactive] {
+            let (mut env, _, _) = env_with_stub(
+                r#"
+printf '%s\n' '{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}'
+"#,
+            );
+            let config = AgentConfig::default()
+                .with_model("scripted-contract")
+                .with_system(crate::system_prompt_for_mode(mode));
+            let result = run_agent_loop(
+                &mut InspectImage(false),
+                &mut env,
+                &config,
+                "capture",
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.stop, crate::LoopStop::EndTurn);
+        }
     }
 
     #[test]
