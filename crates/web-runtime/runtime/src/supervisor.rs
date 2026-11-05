@@ -377,7 +377,7 @@ fn fixture_url_grants_project_loopback(fixture_url: &str) -> bool {
 
 pub(crate) trait EngineGate {
     fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String>;
-    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+    fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {
         let _ = records;
         Ok(())
     }
@@ -640,36 +640,16 @@ fn poll_session_records(
     let Some(page) = params.get("page").and_then(|value| value.as_str()) else {
         return Ok(());
     };
-    let console = sidecar_engine_call(
+    let usage = sidecar_engine_call(
         content,
         sidecar,
-        "page.consoleMessages",
+        "page.recordUsage",
         serde_json::json!({ "page": page }),
         timeout,
         parked,
     )?;
-    let downloads = sidecar_engine_call(
-        content,
-        sidecar,
-        "page.downloads",
-        serde_json::json!({ "page": page }),
-        timeout,
-        parked,
-    )?;
-    let responses = sidecar_engine_call(
-        content,
-        sidecar,
-        "page.responses",
-        serde_json::json!({ "page": page }),
-        timeout,
-        parked,
-    )?;
-    let records = serde_json::json!({
-        "messages": console.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "downloads": downloads.get("downloads").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "responses": responses.get("responses").cloned().unwrap_or_else(|| serde_json::json!([])),
-    });
-    gate.after_records(&records)
+    let usage = serde_json::from_value(usage).map_err(|error| format!("invalid record usage: {error}"))?;
+    gate.after_records(&usage)
 }
 
 fn sidecar_engine_call(
