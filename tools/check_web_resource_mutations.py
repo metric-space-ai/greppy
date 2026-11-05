@@ -26,7 +26,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.records:
         prove(ROOT / "crates/web-runtime/runtime/src/retained_records.rs",
-              "|| self.bytes.saturating_add(size) > self.max_bytes", "|| false",
+              "if self.budget.reserve(size)", "if true",
               ["cargo", "test", "--locked", "--manifest-path", "crates/web-runtime/Cargo.toml",
                "-p", "web-runtime", "--lib", "--no-default-features",
                "retained_records_bound_bytes_before_retaining_and_account_updates", "--", "--test-threads=1"],

@@ -1749,7 +1749,7 @@ impl Daemon {
         ); }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
-            json!({ "profile": profile.as_str() }),
+            json!({ "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
             run_deadline.saturating_duration_since(Instant::now()),
         ) {
             self.finish_session(&session_id);
@@ -1822,7 +1822,7 @@ impl Daemon {
         if let Some(page) = bound_page.as_deref() {
             if let Err(error) = self.engine_call_timed(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str() }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
                 run_deadline.saturating_duration_since(Instant::now()),
             ) {
                 self.finish_session(&session_id);
@@ -4285,7 +4285,7 @@ impl Daemon {
             } else {
                 self.engine_call_timed_with_recovery(
                     "session.setProfile",
-                    json!({"page":page,"profile":profile.as_str()}),
+                    json!({"page":page,"profile":profile.as_str(),"record_memory_bytes":self.record_memory_limit(&session_id)}),
                     remaining,
                     false,
                 )
@@ -4293,7 +4293,7 @@ impl Daemon {
         } else {
             self.engine_call(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str() }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
             )
         };
         if let Err(error) = profile_result {
@@ -4747,6 +4747,11 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    fn record_memory_limit(&self, session_id: &str) -> u64 {
+        self.sessions.get(session_id).map(|session| session.limits.content_rss_bytes)
+            .unwrap_or_else(|| crate::limits::SessionLimits::default().content_rss_bytes)
     }
 
     fn apply_page_record_limits(

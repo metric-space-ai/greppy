@@ -38,7 +38,7 @@ const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
 const NAVIGATION_DOCUMENT_PROBE: &str = include_str!("../js/navigation-document-probe.js");
 const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
-use crate::retained_records::RetainedRecords;
+use crate::retained_records::{RecordBudget, RetainedRecords};
 #[cfg(debug_assertions)]
 static LIVE_DELEGATES: AtomicU64 = AtomicU64::new(0);
 
@@ -356,6 +356,7 @@ enum DialogAction {
 
 struct Delegate {
     new_frame_ready: RefCell<bool>,
+    record_budget: Rc<RecordBudget>,
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<RetainedRecords>,
@@ -413,19 +414,24 @@ impl Delegate {
         profile: SharedProfile,
         wake: WakeFlag,
         user_content: Rc<UserContentManager>,
+        record_budget: Rc<RecordBudget>,
     ) -> Self {
         #[cfg(debug_assertions)]
         LIVE_DELEGATES.fetch_add(1, Ordering::Relaxed);
         Self {
             new_frame_ready: RefCell::new(false),
+            record_budget: Rc::clone(&record_budget),
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
-            requests: RefCell::new(RetainedRecords::new(
+            requests: RefCell::new(RetainedRecords::with_budget(
                 MAX_NETWORK_RECORDS_PER_PAGE,
-                4 * 1024 * 1024,
+                Rc::clone(&record_budget),
             )),
             dropped_requests: Cell::new(0),
-            downloads: RefCell::new(RetainedRecords::new(2_000, 24 * 1024 * 1024)),
+            downloads: RefCell::new(RetainedRecords::with_budget(
+                usize::MAX,
+                Rc::clone(&record_budget),
+            )),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
             dialog_action: RefCell::new(DialogAction::Accept),
@@ -433,13 +439,16 @@ impl Delegate {
             init_scripts: RefCell::new(Vec::new()),
             viewport: RefCell::new((1280, 720)),
             extra_headers: RefCell::new(Vec::new()),
-            last_console: RefCell::new(RetainedRecords::new(10_000, 4 * 1024 * 1024)),
+            last_console: RefCell::new(RetainedRecords::with_budget(
+                usize::MAX,
+                Rc::clone(&record_budget),
+            )),
             profile,
             denied_navigation: RefCell::new(None),
             last_file_choosers: RefCell::new(Vec::new()),
-            last_responses: RefCell::new(RetainedRecords::new(
+            last_responses: RefCell::new(RetainedRecords::with_budget(
                 MAX_NETWORK_RECORDS_PER_PAGE,
-                4 * 1024 * 1024,
+                Rc::clone(&record_budget),
             )),
             dropped_responses: Cell::new(0),
             current_main_frame_request: RefCell::new(None),
@@ -626,6 +635,7 @@ impl WebViewDelegate for Delegate {
             self.profile.clone(),
             self.wake.clone(),
             Rc::clone(&self.user_content),
+            Rc::clone(&self.record_budget),
         ));
         let child = request
             .builder(Rc::clone(&self.rendering_context))
@@ -1113,6 +1123,7 @@ struct EngineBundle {
     profile: SharedProfile,
     wake: WakeFlag,
     user_content: Rc<UserContentManager>,
+    record_budget: Rc<RecordBudget>,
     _proxy: PolicyProxy,
 }
 
@@ -1204,6 +1215,7 @@ struct ContentEngine {
     retired_network_bytes: u64,
     session_contexts: HashMap<String, String>,
     next_id: u64,
+    record_memory_limit: usize,
     pump_nonce: Cell<u64>,
     pump_pending: RefCell<Vec<String>>,
     renderer_error: RefCell<Option<String>>,
@@ -1316,6 +1328,10 @@ impl ContentEngine {
             retired_network_bytes: 0,
             session_contexts: HashMap::new(),
             next_id: 1,
+            record_memory_limit: crate::limits::SessionLimits::default()
+                .content_rss_bytes
+                .try_into()
+                .unwrap_or(usize::MAX),
             pump_nonce: Cell::new(1),
             pump_pending: RefCell::new(Vec::new()),
             renderer_error: RefCell::new(None),
@@ -1400,6 +1416,7 @@ impl ContentEngine {
             profile,
             wake,
             user_content,
+            record_budget: Rc::new(RecordBudget::new(self.record_memory_limit)),
             _proxy: proxy,
         }))
     }
@@ -2689,6 +2706,7 @@ impl ContentEngine {
                     .get("browser")
                     .and_then(|value| value.as_str())
                     .map(str::to_owned);
+                let bundle = self.build_bundle(&context)?;
                 self.contexts.insert(
                     context.clone(),
                     ObjectLife::Live {
@@ -2696,7 +2714,6 @@ impl ContentEngine {
                         parent: browser_id,
                     },
                 );
-                let bundle = self.build_bundle(&context)?;
                 self.context_bundles.insert(context.clone(), bundle);
                 Ok(json!({ "context": context, "generation": 1 }))
             }
@@ -2762,11 +2779,13 @@ impl ContentEngine {
                         Rc::clone(&self.user_content),
                     ),
                 };
+                let record_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.record_budget)).unwrap_or_else(|| Rc::new(RecordBudget::new(self.record_memory_limit)));
                 let delegate = Rc::new(Delegate::new(
                     Rc::clone(&rendering_context),
                     profile,
                     wake.clone(),
                     Rc::clone(&user_content),
+                    record_budget,
                 ));
                 let webview = WebViewBuilder::new(servo, rendering_context)
                     .delegate(delegate.clone())
@@ -2806,15 +2825,18 @@ impl ContentEngine {
                         "profile must be research or project",
                     )
                 })?;
+                let record_limit = params.get("record_memory_bytes").and_then(|value| value.as_u64()).map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
                 if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
                     if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
                         bundle.profile.set(parsed);
+                        if let Some(limit) = record_limit { bundle.record_budget.set_limit(limit); }
                         return Ok(json!({ "profile": bundle.profile.get().as_str() }));
                     }
                 }
                 // Controller scripts set the default before constructing their
                 // explicit contexts. A bundled daemon page never mutates it.
                 self.profile.set(parsed);
+                if let Some(limit) = record_limit { self.record_memory_limit = limit; }
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
             "session.attachPage" => {
@@ -4697,12 +4719,17 @@ impl ContentEngine {
         })();
         // IDs are never reused. Missing IDs already reject as object_disposed;
         // keeping one tombstone per historical object only grows daemon memory.
-        self.pages
-            .retain(|_, life| matches!(life, PageSlot::Live { .. }));
-        self.contexts
-            .retain(|_, life| matches!(life, ObjectLife::Live { .. }));
-        self.browsers
-            .retain(|_, life| matches!(life, ObjectLife::Live { .. }));
+        if matches!(
+            method,
+            "page.close" | "session.closePage" | "context.close" | "browser.close"
+        ) {
+            self.pages
+                .retain(|_, life| matches!(life, PageSlot::Live { .. }));
+            self.contexts
+                .retain(|_, life| matches!(life, ObjectLife::Live { .. }));
+            self.browsers
+                .retain(|_, life| matches!(life, ObjectLife::Live { .. }));
+        }
         if let Some(error) = self.renderer_error.borrow_mut().take() {
             return Err(io::Error::other(error));
         }
