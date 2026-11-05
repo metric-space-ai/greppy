@@ -10,7 +10,7 @@ on:
       - 'crates/cli/src/web/**'
       - 'crates/web-runtime/**'
   push:
-    branches: ['**']
+    branches: ['main']
 
 permissions:
   contents: read
@@ -36,6 +36,9 @@ jobs:
 
       - name: Check bounded navigation document probes
         run: node --test crates/web-runtime/runtime/tests/navigation-document-probe.cjs
+
+      - name: Check waiter timeout slot lifecycle
+        run: node --test crates/web-runtime/runtime/tests/wait-slot-lifecycle.cjs
 
       - name: Check bounded worker capability framing
         shell: bash
