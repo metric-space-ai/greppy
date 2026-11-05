@@ -640,17 +640,13 @@ fn settle_aborted_script(
     }
     let mut completed = false;
     while !completed || !pending.is_empty() {
-        gate.poll_control();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || gate.is_cancelled() {
-            retire(controller, content, !pending.is_empty());
-            return;
-        }
-        let incoming = if let Some(message) = parked.pop_front() {
-            Ok(Incoming::Content(message))
-        } else {
-            recv_any(controller, content, remaining)
-        };
+        let incoming = recv_aborted_script(gate, deadline, |slice| {
+            if let Some(message) = parked.pop_front() {
+                Ok(Incoming::Content(message))
+            } else {
+                recv_any(controller, content, slice)
+            }
+        });
         match incoming {
             Ok(Incoming::Controller(Message::ScriptComplete { .. })) => completed = true,
             Ok(Incoming::Controller(Message::EngineCall { request_id, .. })) => {
@@ -670,6 +666,29 @@ fn settle_aborted_script(
                 retire(controller, content, !pending.is_empty());
                 return;
             }
+        }
+    }
+}
+
+fn recv_aborted_script(
+    gate: &mut impl EngineGate,
+    deadline: Instant,
+    mut receive: impl FnMut(Duration) -> io::Result<Incoming>,
+) -> io::Result<Incoming> {
+    loop {
+        gate.poll_control();
+        if gate.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled aborted script"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "aborted script deadline exhausted"));
+        }
+        // As in the normal router, silence is only a poll timeout. Observe
+        // control again without extending the operation's absolute deadline.
+        match receive(remaining.min(Duration::from_millis(50))) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            incoming => return incoming,
         }
     }
 }
@@ -2449,6 +2468,62 @@ mod tests {
         assert!(future.exists(), "clock skew is not proof of staleness");
         assert!(fs::symlink_metadata(linked).unwrap().file_type().is_symlink());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn aborted_script_receives_cancellation_while_protocol_is_silent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Gate(Arc<AtomicBool>);
+        impl EngineGate for Gate {
+            fn before_call(&mut self, _: &str, _: &serde_json::Value) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut gate = Gate(Arc::clone(&cancelled));
+        let (entered, first_receive) = mpsc::channel();
+        let (sender, silent) = mpsc::channel::<Incoming>();
+        let cancellation = thread::spawn(move || {
+            first_receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = recv_aborted_script(&mut gate, started + Duration::from_secs(2), |budget| {
+            let _ = entered.send(());
+            silent.recv_timeout(budget).map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
+                mpsc::RecvTimeoutError::Disconnected => io::Error::from(io::ErrorKind::BrokenPipe),
+            })
+        });
+        cancellation.join().unwrap();
+        drop(sender);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent controller unexpectedly completed"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(750), "cancellation waited for the script deadline");
+    }
+
+    #[test]
+    fn aborted_script_poll_timeouts_keep_the_original_absolute_deadline() {
+        let mut gate = AllowAllGate;
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(130);
+        let result = recv_aborted_script(&mut gate, deadline, |budget| {
+            thread::sleep(budget);
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent controller unexpectedly completed"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now() >= deadline, "a slice timeout ended cleanup prematurely");
+        assert!(started.elapsed() < Duration::from_millis(750), "cleanup extended its original deadline");
     }
 
     #[test]
