@@ -743,13 +743,13 @@ fn plus_json_refuses_current_request_while_small_drift_refreshes() {
     )
     .unwrap();
 
-    let background_stderr = _cleanup.root.join("background-stderr.log");
+    let background_stderr = _cleanup.root.join("background-output.log");
     let (code, out, err) = run_with_env(
         &["plus", "do_it", "--json", "--diagnostics", "--k", "3"],
         &repo,
         &store,
         &[(
-            "GREPPY_TEST_BACKGROUND_STDERR",
+            "GREPPY_TEST_BACKGROUND_OUTPUT",
             background_stderr.to_str().unwrap(),
         )],
     );
@@ -772,7 +772,7 @@ fn plus_json_refuses_current_request_while_small_drift_refreshes() {
     };
     assert_eq!(
         code, 75,
-        "refreshing plus must return EX_TEMPFAIL; stderr={err}\nbackground_stderr={child_error}\nstdout={out}"
+        "refreshing plus must return EX_TEMPFAIL; stderr={err}\nbackground_output={child_error}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));

@@ -6472,8 +6472,8 @@ fn spawn_background_job_handle_scoped(
     // release diagnostics or replacing the configured admission runner's log.
     #[cfg(all(debug_assertions, feature = "ci-test-assets"))]
     if admission_stderr.is_none() {
-        if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_STDERR") {
-            command.env_remove("GREPPY_TEST_BACKGROUND_STDERR");
+        if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_OUTPUT") {
+            command.env_remove("GREPPY_TEST_BACKGROUND_OUTPUT");
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -6481,9 +6481,12 @@ fn spawn_background_job_handle_scoped(
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            match options.open(path) {
-                Ok(stderr) => {
-                    command.stderr(stderr);
+            match options.open(path).and_then(|stderr| {
+                let stdout = stderr.try_clone()?;
+                Ok((stdout, stderr))
+            }) {
+                Ok((stdout, stderr)) => {
+                    command.stdout(stdout).stderr(stderr);
                 }
                 Err(error) => {
                     value["state"] = serde_json::json!("failed");
