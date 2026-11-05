@@ -7,6 +7,38 @@ use std::io::{self, Read, Write};
 mod capability_frame;
 
 pub const CAPABILITY_FD: i32 = 3;
+
+/// macOS workers inherit the capability and protocol sockets at high fd
+/// numbers (`posix_spawn` cannot run a `pre_exec` dup2 without falling back
+/// to `fork`). Move them onto the fixed slots before anything reads fd 3 or 5.
+pub fn adopt_inherited_worker_fds() -> io::Result<()> {
+    fn adopt(var: &str, target: i32) -> io::Result<()> {
+        let Ok(value) = std::env::var(var) else {
+            return Ok(());
+        };
+        let fd: i32 = value.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{var} is not a file descriptor"),
+            )
+        })?;
+        if fd < 0 || fd == target {
+            return Ok(());
+        }
+        let rc = unsafe { libc::dup2(fd, target) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            libc::close(fd);
+            libc::fcntl(target, libc::F_SETFD, 0);
+        }
+        Ok(())
+    }
+    adopt("GREPPY_INHERIT_CAP_FD", CAPABILITY_FD)?;
+    adopt("GREPPY_INHERIT_PROTO_FD", PROTOCOL_FD)?;
+    Ok(())
+}
 /// Parent-issued client/supervisor attach token. Not derivable from the socket path.
 pub const ATTACH_TOKEN_FD: i32 = 4;
 /// Bidirectional framed protocol socket. stdin/stdout are a log channel, not the frame channel.

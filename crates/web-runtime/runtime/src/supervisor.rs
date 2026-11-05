@@ -1186,24 +1186,42 @@ fn spawn_unix(
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
         command.process_group(0);
-        let sandbox_exe = path.clone();
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if cap_read_fd != crate::worker::CAPABILITY_FD {
-                    libc::close(cap_read_fd);
-                }
-                if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if proto_child_fd != crate::worker::PROTOCOL_FD {
-                    libc::close(proto_child_fd);
-                }
-                let _ = sandbox_exe;
-                Ok(())
-            });
+        // macOS `Command::spawn` uses posix_spawn unless a `pre_exec` hook is
+        // registered. `pre_exec` forces `fork` of this multithreaded supervisor.
+        // The parent can then sit inside `fork` forever while the child is
+        // already blocked in read-hello, so `web.status` stays "starting".
+        // Inherit the high fds and let the child dup2 them before it reads.
+        #[cfg(target_os = "macos")]
+        {
+            unsafe {
+                libc::fcntl(cap_read_fd, libc::F_SETFD, 0);
+                libc::fcntl(proto_child_fd, libc::F_SETFD, 0);
+            }
+            command
+                .env("GREPPY_INHERIT_CAP_FD", cap_read_fd.to_string())
+                .env("GREPPY_INHERIT_PROTO_FD", proto_child_fd.to_string());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let sandbox_exe = path.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if cap_read_fd != crate::worker::CAPABILITY_FD {
+                        libc::close(cap_read_fd);
+                    }
+                    if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if proto_child_fd != crate::worker::PROTOCOL_FD {
+                        libc::close(proto_child_fd);
+                    }
+                    let _ = sandbox_exe;
+                    Ok(())
+                });
+            }
         }
         let image = crate::worker::apply_same_image_reexec(&mut command)?;
         // Cache parent identity before exec so the first child cannot race the digest.

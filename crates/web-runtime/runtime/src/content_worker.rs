@@ -6798,6 +6798,7 @@ fn trace_startup(stage: &str) {
 }
 
 pub fn run() -> io::Result<()> {
+    crate::worker::adopt_inherited_worker_fds()?;
     trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
     trace_startup("sandbox");

@@ -422,6 +422,7 @@ pub fn run() -> io::Result<()> {
 }
 
 fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
+    crate::worker::adopt_inherited_worker_fds()?;
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
