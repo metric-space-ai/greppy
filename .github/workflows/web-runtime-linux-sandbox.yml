@@ -48,3 +48,33 @@ jobs:
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
+
+      - name: Check complete-workflow measurement contracts without launching browsers
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 crates/web-runtime/scripts/test-measure-web-efficiency.py
+          node --check crates/web-runtime/runtime/fixtures/efficiency-workload.mjs
+          node --check crates/web-runtime/runtime/fixtures/efficiency-native.mjs
+          node --check crates/web-runtime/scripts/efficiency-reference.mjs
+
+      - name: Prove outcome verifier rejects invented successful work
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = 'effect_verified = self.token(*identity) in self.effects'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'OutcomeContract.test_claimed_success_without_post_effect_never_counts']
+          try:
+              source.write_text(original.replace(old, 'effect_verified = True'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'AssertionError: 1 != 0' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
