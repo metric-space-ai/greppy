@@ -1,0 +1,40 @@
+[package]
+name = "greppy-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Thin greppy adapter over agent-desktop. Upstream types stay inside this crate."
+
+# The only agent-desktop version pin. Every git dependency below must use this
+# tag, and package.metadata.greppy records the commit the tag resolved to.
+# Contract test `upstream_pin_is_single_tag` fails if they diverge.
+# Update steps: THIRD_PARTY.md, section "agent-desktop".
+[package.metadata.greppy]
+agent-desktop-repo = "https://github.com/vercel-labs/agent-desktop"
+agent-desktop-tag = "v1.1.0"
+agent-desktop-commit = "d3dc190afbf34cd2377252398ddd5c30efbd093a"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Shared command core. It does not link a platform accessibility bus.
+agent-desktop-core = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+
+# One adapter per target OS. Cargo activates only the matching table, so a
+# macOS build does not compile agent-desktop-linux or its zbus/x11rb stack,
+# and a Linux build does not compile the macOS or Windows adapters.
+[target.'cfg(target_os = "linux")'.dependencies]
+agent-desktop-linux = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Calls libc::proc_bsdshortinfo. Cargo.lock must keep libc >= 0.2.189
+# (the version agent-desktop v1.1.0 locks). See THIRD_PARTY.md.
+agent-desktop-macos = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+agent-desktop-windows = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

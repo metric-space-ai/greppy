@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, system_prompt_for_mode, AgentConfig, BuiltinPromptMode, Client,
-    ClientError, ExecutionEnv, GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest,
-    ModelStream, StreamEvent, ToolOutcome, TurnResult,
+    run_agent_loop_with_history, AgentConfig, BuiltinPromptMode, Client, ClientError, ExecutionEnv,
+    GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent,
+    ToolOutcome, TurnResult,
 };
 use serde_json::{json, Value};
 
@@ -58,6 +58,7 @@ pub(crate) struct AcpConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub max_turns: usize,
+    pub capabilities: greppy_agent::CapabilitySet,
     pub data_root: Option<PathBuf>,
     #[cfg(test)]
     pub after_messages: Option<PersistenceFault>,
@@ -76,6 +77,7 @@ impl Default for AcpConfig {
                 .ok()
                 .filter(|key| !key.is_empty()),
             max_turns: DEFAULT_MAX_TURNS,
+            capabilities: greppy_agent::CapabilitySet::default(),
             data_root: None,
             #[cfg(test)]
             after_messages: None,
@@ -102,6 +104,9 @@ struct StdioArgs {
     /// Maximum assistant turns for one prompt.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
     max_turns: usize,
+    /// Include a capability manual from the first turn (`web`, `desktop`, or both).
+    #[arg(long, value_name = "web|desktop")]
+    enable: Vec<String>,
 }
 
 /// Parse and serve `greppy agent stdio`.
@@ -129,11 +134,19 @@ pub(crate) fn run(rest: &[std::ffi::OsString]) -> u8 {
             return EXIT_USAGE;
         }
     };
+    let capabilities = match greppy_agent::CapabilitySet::parse_list(&args.enable) {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            eprintln!("greppy agent stdio: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let defaults = AcpConfig::default();
     let config = AcpConfig {
         endpoint: args.endpoint,
         model: args.model.unwrap_or(defaults.model),
         max_turns: args.max_turns,
+        capabilities,
         ..defaults
     };
     let stdin = io::stdin();
@@ -1042,7 +1055,8 @@ fn run_prompt(
     } else {
         Box::new(
             GreppyEnv::new(prepared.cwd.clone())
-                .map_err(|error| format!("cannot build the tool environment: {error}"))?,
+                .map_err(|error| format!("cannot build the tool environment: {error}"))?
+                .with_capabilities(config.capabilities),
         )
     };
     let mut env = GatingEnv {
@@ -1056,7 +1070,10 @@ fn run_prompt(
     };
     let agent_config = AgentConfig {
         max_turns: config.max_turns,
-        system: Some(system_prompt_for_mode(BuiltinPromptMode::Acp)),
+        system: Some(greppy_agent::system_prompt_with_capabilities(
+            BuiltinPromptMode::Acp,
+            config.capabilities,
+        )),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
         ..AgentConfig::default()

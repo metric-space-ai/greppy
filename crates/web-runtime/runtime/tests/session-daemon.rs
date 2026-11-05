@@ -12361,6 +12361,54 @@ fn popup_opener_returns_creating_page() {
 }
 
 #[test]
+fn oversized_console_is_a_limit_error_without_restarting_content() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-largecon-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_largecon", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let before = content_worker_pid(guard.child.id()).expect("content worker before limit");
+    let started = Instant::now();
+    let ran = run_playwright_source_with_limits(
+        &socket,
+        "run_largecon",
+        r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.evaluate(() => console.log("x".repeat(2 * 1024 * 1024)));
+"#,
+        None,
+        Duration::from_secs(40),
+        json!({ "max_console_bytes": 8 }),
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    let error = ran.error.as_ref().expect("limit error");
+    eprintln!("OVERSIZED_ACCOUNTING latency_ms={} metrics={:?} error={:?}", started.elapsed().as_millis(), ran.metrics, error);
+    assert_eq!(error.code, "resource_limit", "{ran:?}");
+    assert!(error.message.contains("console limit"), "{ran:?}");
+    assert_eq!(content_worker_pid(guard.child.id()), Some(before), "accounting must not crash the worker");
+    // A fresh operation must execute successfully in the same live worker.
+    let recovered = run_playwright_source(
+        &socket,
+        "run_largecon",
+        r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.setContent('<input id="q"><button onclick="document.title=document.querySelector(\'#q\').value">save</button>');
+await page.fill('#q', 'recovered');
+await page.click('button');
+if (await page.title() !== 'recovered') throw new Error('missing side effect');
+await browser.close();
+"#,
+        None,
+        Duration::from_secs(40),
+    );
+    assert_eq!(recovered.status, "ok", "{recovered:?}");
+    assert_eq!(content_worker_pid(guard.child.id()), Some(before));
+}
+
+#[test]
 fn max_console_bytes_limit_is_enforced_from_recorded_logs() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-maxcon-{}.sock", std::process::id()));
