@@ -36,6 +36,28 @@ jobs:
         with:
           toolchain: "1.95.0"
 
+      - name: Check real process-family PSS and cleanup
+        run: python3 bench/test_process_memory.py
+
+      - name: Prove shared pages cannot be reported as summed RSS
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('bench/process_memory.py')
+          original = source.read_text()
+          old = 'pss_bytes += metrics["Pss"]'
+          assert original.count(old) == 1
+          command = ['python3', 'bench/test_process_memory.py']
+          try:
+              source.write_text(original.replace(old, 'pss_bytes += metrics["Rss"]'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'AssertionError' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=45)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Run Linux sandbox and fexecve gates
         run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh
 
