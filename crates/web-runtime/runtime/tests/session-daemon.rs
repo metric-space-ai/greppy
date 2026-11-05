@@ -12305,6 +12305,16 @@ fn console_messages_are_captured_from_page_evaluate() {
 }
 
 #[test]
+fn live_context_releases_pages_and_native_object_metadata() {
+    run_named_fixture("resource-lifecycle.mjs", "run_resource_lifecycle");
+}
+
+#[test]
+fn console_history_does_not_silently_rotate_at_a_new_row_cap() {
+    run_named_fixture("console-retention.mjs", "run_console_retention");
+}
+
+#[test]
 fn hydrated_spa_wait_for_function_sees_async_dom_update() {
     run_named_fixture("spa-hydrate.mjs", "run_spa");
 }

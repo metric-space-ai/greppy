@@ -84,6 +84,13 @@ jobs:
           --test session-daemon
           --no-run
 
+      - name: Check native object lifecycle in a live context
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          live_context_releases_pages_and_native_object_metadata -- --test-threads=1 --nocapture
+
       - name: Check oversized accounting and same-worker recovery
         shell: bash
         run: >-

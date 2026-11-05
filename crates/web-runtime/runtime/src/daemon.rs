@@ -1818,7 +1818,7 @@ impl Daemon {
         }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
-            json!({ "profile": profile.as_str() }),
+            json!({ "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
             run_deadline.saturating_duration_since(Instant::now()),
         ) {
             self.finish_session(&session_id);
@@ -1893,7 +1893,7 @@ impl Daemon {
         if let Some(page) = bound_page.as_deref() {
             if let Err(error) = self.engine_call_timed(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str() }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
                 run_deadline.saturating_duration_since(Instant::now()),
             ) {
                 self.finish_session(&session_id);
@@ -4501,7 +4501,7 @@ impl Daemon {
             } else {
                 self.engine_call_timed_with_recovery(
                     "session.setProfile",
-                    json!({"page":page,"profile":profile.as_str()}),
+                    json!({"page":page,"profile":profile.as_str(),"record_memory_bytes":self.record_memory_limit(&session_id)}),
                     remaining,
                     false,
                 )
@@ -4509,7 +4509,7 @@ impl Daemon {
         } else {
             self.engine_call(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str() }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
             )
         };
         if let Err(error) = profile_result {
@@ -4985,6 +4985,11 @@ impl Daemon {
         }
     }
 
+    fn record_memory_limit(&self, session_id: &str) -> u64 {
+        self.sessions.get(session_id).map(|session| session.limits.content_rss_bytes)
+            .unwrap_or_else(|| crate::limits::SessionLimits::default().content_rss_bytes)
+    }
+
     fn apply_page_record_limits(
         &mut self,
         session_id: &str,
@@ -5013,11 +5018,19 @@ impl Daemon {
 
     fn record_crash(&mut self, worker: &str, reason: &str, recovered: bool) {
         let reason = redact_secrets(reason);
+        let reason = if reason.len() > 4096 {
+            format!("{} [truncated]", reason.chars().take(1024).collect::<String>())
+        } else {
+            reason
+        };
         self.last_crash = Some(reason.clone());
         let recovered_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
+        if self.crash_receipts.len() == 64 {
+            self.crash_receipts.remove(0);
+        }
         self.crash_receipts.push(json!({
             "kind": "worker_crash",
             "worker": worker,
@@ -6297,6 +6310,9 @@ fn apply_record_limits(
     session_id: &str,
     records: &crate::record_usage::RecordUsage,
 ) -> Result<(), String> {
+    if records.retention_overflow {
+        return Err("retained page records exceeded their memory budget; close the page or session to release its history".to_owned());
+    }
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());
     };

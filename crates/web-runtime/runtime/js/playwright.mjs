@@ -24,9 +24,6 @@ function throwObjectDisposed(kind) {
   throw error;
 }
 
-const disposedPages = new Set();
-const disposedContexts = new Set();
-const disposedBrowsers = new Set();
 let activeTrace = null;
 const pageContexts = new Map();
 const traceLimitBytes = Number(ops.op_trace_limit_bytes()) || 8 * 1024 * 1024;
@@ -75,19 +72,17 @@ function screenshotBuffer(result) {
 
 function engineCall(method, params) {
   const payload = params ? Object.assign({}, params) : {};
-  if (
-    method !== "page.close" &&
-    method !== "page.isClosed" &&
-    payload.page &&
-    disposedPages.has(payload.page)
-  ) {
-    throwObjectDisposed("Page");
-  }
-  if (method !== "context.close" && payload.context && disposedContexts.has(payload.context)) {
-    throwObjectDisposed("BrowserContext");
-  }
-  if (method !== "browser.close" && payload.browser && disposedBrowsers.has(payload.browser)) {
-    throwObjectDisposed("Browser");
+  // Carry the owning object only as far as this boundary. Closed-object
+  // validation needs no permanent set of every ID ever allocated.
+  for (const [key, kind] of [["page", "Page"], ["context", "BrowserContext"], ["browser", "Browser"]]) {
+    const owner = payload[key];
+    if (owner && typeof owner === "object" && typeof owner._id === "string") {
+      const closed = key === "browser" ? !owner._connected : owner._closed;
+      if (closed && method !== key + ".close" && method !== "page.isClosed") {
+        throwObjectDisposed(kind);
+      }
+      payload[key] = owner._id;
+    }
   }
   if (payload.timeout == null) {
     payload.timeout = 30_000;
@@ -127,7 +122,7 @@ async function rejectActionNavigationFailure(page, actionResult) {
   const navigationEpoch = actionResult && actionResult.navigation_epoch;
   if (navigationEpoch == null) return;
   const result = await engineCall("page.take_navigation_failure", {
-    page: page._id,
+    page: page,
     navigation_epoch: navigationEpoch,
   });
   const failure = result && result.failure;
@@ -152,7 +147,7 @@ function locatorParams(locator, extra) {
     throwObjectDisposed("Page");
   }
   const params = {
-    page: locator._page._id,
+    page: locator._page,
     selector: locator._selector,
     timeout: locator._page._timeout || 30_000,
     generation: locator._page._generation || 1,
@@ -530,7 +525,7 @@ class Dialog {
 
   async accept(prompt) {
     return engineCall("page.setDialogPolicy", {
-      page: this._page._id,
+      page: this._page,
       action: "accept",
       prompt: prompt ?? null,
     });
@@ -538,7 +533,7 @@ class Dialog {
 
   async dismiss() {
     return engineCall("page.setDialogPolicy", {
-      page: this._page._id,
+      page: this._page,
       action: "dismiss",
     });
   }
@@ -645,7 +640,7 @@ class Locator {
       arguments.length >= 2,
     );
     const result = await engineCall("page.waitForFunction", {
-      page: this._page._id,
+      page: this._page,
       generation: this._page._generation || 1,
       source,
       timeout: (options && options.timeout) || this._page._timeout || 30_000,
@@ -1229,7 +1224,7 @@ class Frame {
         ? serializeEvaluate(pageFunction)
         : serializeEvaluate(pageFunction, arg);
     return engineCall("page.frameEvaluate", {
-      page: this._page._id,
+      page: this._page,
       index: Number(this._id),
       source,
     }).then((result) => decodeEvaluateResult(result));
@@ -1307,7 +1302,7 @@ class Frame {
     if (this._id !== "main") {
       const timeout = navigationTimeout(this._page._timeout, options, "Frame.goto");
       const result = await engineCall("page.frameGoto", {
-        page: this._page._id,
+        page: this._page,
         index: Number(this._id),
         url: String(url),
         timeout,
@@ -1535,13 +1530,13 @@ class Frame {
     const timeout = (options && options.timeout) || this._page._timeout || 30_000;
     const result = this._isMain()
       ? await engineCall("page.waitForFunction", {
-          page: this._page._id,
+          page: this._page,
           generation: this._page._generation || 1,
           source,
           timeout,
         })
       : await engineCall("page.frameWaitForFunction", {
-          page: this._page._id,
+          page: this._page,
           generation: this._page._generation || 1,
           index: Number(this._id),
           source,
@@ -1636,7 +1631,7 @@ class Page {
     this.touchscreen = withUnsupported(
       {
         tap: async (x, y) => {
-          await engineCall("page.touch.tap", { page: this._id, x, y });
+          await engineCall("page.touch.tap", { page: this, x, y });
         },
       },
       "Touchscreen",
@@ -1647,7 +1642,7 @@ class Page {
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
         await engineCall("page.mouse.click", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
         });
@@ -1657,7 +1652,7 @@ class Page {
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
         await engineCall("page.mouse.move", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
         });
@@ -1665,7 +1660,7 @@ class Page {
       down: async (options) => {
         refuseLocatorOptions("Mouse.down", options, []);
         await engineCall("page.mouse.down", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
         });
@@ -1673,7 +1668,7 @@ class Page {
       up: async (options) => {
         refuseLocatorOptions("Mouse.up", options, []);
         await engineCall("page.mouse.up", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
         });
@@ -1681,7 +1676,7 @@ class Page {
       wheel: async (deltaX, deltaY, options) => {
         refuseLocatorOptions("Mouse.wheel", options, []);
         await engineCall("page.mouse.wheel", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
           deltaX: Number(deltaX) || 0,
@@ -1693,12 +1688,12 @@ class Page {
         this._mouseX = Number(x) || 0;
         this._mouseY = Number(y) || 0;
         await engineCall("page.mouse.click", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
         });
         await engineCall("page.mouse.click", {
-          page: this._id,
+          page: this,
           x: this._mouseX,
           y: this._mouseY,
         });
@@ -1893,7 +1888,7 @@ class Page {
 
   async addScriptTag(options = {}) {
     await engineCall("page.addScriptTag", {
-      page: this._id,
+      page: this,
       content: options.content || "",
       url: options.url || "",
     });
@@ -1901,7 +1896,7 @@ class Page {
 
   async addStyleTag(options = {}) {
     await engineCall("page.addStyleTag", {
-      page: this._id,
+      page: this,
       content: options.content || "",
     });
   }
@@ -1914,7 +1909,7 @@ class Page {
       arguments.length >= 2,
     );
     const result = await engineCall("page.waitForFunction", {
-      page: this._id,
+      page: this,
       generation: this._generation || 1,
       source,
       timeout: (options && options.timeout) || this._timeout || 30_000,
@@ -1944,7 +1939,7 @@ class Page {
     const needle = String(pattern);
     const timeout = (options && options.timeout) || this._timeout || 30_000;
     const result = await engineCall("page.waitForRequest", {
-      page: this._id,
+      page: this,
       needle,
       timeout,
     });
@@ -1956,7 +1951,7 @@ class Page {
     const timeout = this._timeout || 30_000;
     try {
       const result = await engineCall("page.waitForResponse", {
-        page: this._id,
+        page: this,
         needle,
         timeout,
       });
@@ -1979,7 +1974,7 @@ class Page {
       // 7.6MB document that meant sitting through a 30s+ layout the agent
       // never asked for.
       const waitUntil = (options && options.waitUntil) || "load";
-      const result = await engineCall("page.goto", { page: this._id, url, timeout, waitUntil });
+      const result = await engineCall("page.goto", { page: this, url, timeout, waitUntil });
       this._url = result.url || String(url);
       // Issue the post-navigation state syncs concurrently: the engine
       // handles queued calls back-to-back, so five sequential round trips
@@ -2014,10 +2009,9 @@ class Page {
     }
   }
 
-  _requestFromRecord(rec, all) {
+  _requestFromRecord(rec) {
     const headerList = rec.headers || [];
-    const records = all || [];
-    const index = records.indexOf(rec);
+
     const headerMap = () => {
       const out = {};
       headerList.forEach((h) => {
@@ -2057,7 +2051,7 @@ class Page {
       sizes: () => throwUnsupported("Request.sizes"),
       frame: () => this.mainFrame(),
       response: async () => {
-        const result = await engineCall("page.responses", { page: this._id });
+        const result = await engineCall("page.responses", { page: this });
         const hit = (result.responses || []).find(
           (row) => String(row.requestId || "") === String(rec.requestId || ""),
         );
@@ -2109,7 +2103,7 @@ class Page {
       cancel: async () => unsupported("Download.cancel")(),
       saveAs: async (path) => {
         const result = await engineCall("page.saveDownload", {
-          page: page._id,
+          page: page,
           url: rec.url,
           path: String(path),
         });
@@ -2130,19 +2124,20 @@ class Page {
   async _dispatchNetwork(settle) {
     // Independent reads; fetch both in one hop instead of two.
     const [result, responsesResult] = await Promise.all([
-      engineCall("page.requests", { page: this._id }),
-      engineCall("page.responses", { page: this._id }),
+      engineCall("page.requests", { page: this }),
+      engineCall("page.responses", { page: this }),
     ]);
     const responses = responsesResult.responses || [];
     const requests = result.requests || [];
+    const responseById = new Map(responses.map(row => [String(row.requestId || ""), row]));
+    const retainedKeys = new Set();
     this._emittedNetwork = this._emittedNetwork || new Set();
     for (let index = 0; index < requests.length; index++) {
       const rec = requests[index];
-      const key = String(rec.method || "GET") + " " + String(rec.url) + " " + index;
-      const request = this._requestFromRecord(rec, requests);
-      const hit = responses.find(
-        (row) => String(row.requestId || "") === String(rec.requestId || ""),
-      );
+      const key = String(rec.requestId || String(rec.method || "GET") + " " + String(rec.url) + " " + index);
+      retainedKeys.add(key);
+      const request = this._requestFromRecord(rec);
+      const hit = responseById.get(String(rec.requestId || ""));
       if (!this._emittedNetwork.has(key + " req")) {
         this._emittedNetwork.add(key + " req");
         this._emit("request", request);
@@ -2165,17 +2160,26 @@ class Page {
         }
       }
     }
+    // Deduplication follows the retained native history, rather than every
+    // request made during the entire lifetime of a long-running script.
+    for (const key of this._emittedNetwork) {
+      if (!retainedKeys.has(key.slice(0, key.lastIndexOf(" ")))) this._emittedNetwork.delete(key);
+    }
     return requests.length;
   }
 
   async _dispatchNetworkUntilSettled() {
+    const events = ["request", "response", "requestfailed", "requestfinished"];
+    if (!events.some(event =>
+      (this._handlers[event] || []).length ||
+      (this._context && (this._context._handlers[event] || []).length))) return;
     const already = await this._dispatchNetwork(true);
     if (already) {
       return;
     }
     try {
       await engineCall("page.waitForRequest", {
-        page: this._id,
+        page: this,
         needle: "",
         timeout: 2000,
       });
@@ -2250,7 +2254,7 @@ class Page {
         ? serializeEvaluate(pageFunction)
         : serializeEvaluate(pageFunction, arg);
     const result = await engineCall("page.evaluate", {
-      page: this._id,
+      page: this,
       generation: this._generation || 1,
       source,
       // The content worker owns a 30s Promise deadline. Leave time for its
@@ -2267,7 +2271,7 @@ class Page {
   async _dispatchConsole() {
     this._consoleWaiters = this._consoleWaiters || [];
     this._pendingConsole = this._pendingConsole || [];
-    const result = await engineCall("page.consoleMessages", { page: this._id });
+    const result = await engineCall("page.consoleMessages", { page: this });
     const messages = result.messages || [];
     for (let i = this._consoleSeen; i < messages.length; i++) {
       const rec = messages[i];
@@ -2305,7 +2309,7 @@ class Page {
   async _dispatchDialogs() {
     this._dialogWaiters = this._dialogWaiters || [];
     this._pendingDialogs = this._pendingDialogs || [];
-    const result = await engineCall("page.dialogs", { page: this._id });
+    const result = await engineCall("page.dialogs", { page: this });
     const dialogs = result.dialogs || [];
     for (let i = this._dialogSeen; i < dialogs.length; i++) {
       const dialog = new Dialog(this, dialogs[i]);
@@ -2354,7 +2358,7 @@ class Page {
   async _flushPopups() {
     this._pendingPopups = this._pendingPopups || [];
     this._popupWaiters = this._popupWaiters || [];
-    const result = await engineCall("page.popups", { page: this._id });
+    const result = await engineCall("page.popups", { page: this });
     const recs = result.pages || [];
     for (const rec of recs) {
       const popup = this._adoptPopup(rec);
@@ -2384,12 +2388,12 @@ class Page {
   }
 
   async title() {
-    const result = await engineCall("page.title", { page: this._id });
+    const result = await engineCall("page.title", { page: this });
     return result.title;
   }
 
   async content() {
-    const result = await engineCall("page.content", { page: this._id });
+    const result = await engineCall("page.content", { page: this });
     return result.html;
   }
 
@@ -2407,13 +2411,13 @@ class Page {
         height: Number(options.clip.height) || 1,
       };
     }
-    const result = await engineCall("page.screenshot", { page: this._id, clip });
+    const result = await engineCall("page.screenshot", { page: this, clip });
     return screenshotBuffer(result);
   }
 
   async setContent(html, options) {
     navigationTimeout(this._timeout, options, "Page.setContent");
-    await engineCall("page.setContent", { page: this._id, html: String(html) });
+    await engineCall("page.setContent", { page: this, html: String(html) });
     await this._dispatchFrames();
     this._emitLoad("load");
   }
@@ -2421,7 +2425,7 @@ class Page {
   async reload(options) {
     const timeout = navigationTimeout(this._timeout, options, "Page.reload");
     const waitUntil = (options && options.waitUntil) || "load";
-    await engineCall("page.reload", { page: this._id, timeout, waitUntil });
+    await engineCall("page.reload", { page: this, timeout, waitUntil });
     await this._flushNavigation();
     await this._dispatchFrames();
     this._emitLoad(waitUntil);
@@ -2443,7 +2447,7 @@ class Page {
     refuseLocatorOptions("Page.waitForLoadState", options, ["timeout"]);
     const timeout = (options && options.timeout) || this._timeout || 30_000;
     await engineCall("page.waitForLoadState", {
-      page: this._id,
+      page: this,
       timeout,
       waitUntil: state || "load",
     });
@@ -2461,7 +2465,7 @@ class Page {
   }
 
   async _flushNavigation() {
-    const result = await engineCall("page.url", { page: this._id });
+    const result = await engineCall("page.url", { page: this });
     if (result && result.url) {
       this._url = result.url;
     }
@@ -2476,7 +2480,7 @@ class Page {
 
   async frames() {
     const result = await engineCall("page.frames", {
-      page: this._id,
+      page: this,
       timeout: this._timeout || 30_000,
     });
     const children = (result.frames || []).map((info) => new Frame(this, info));
@@ -2507,7 +2511,7 @@ class Page {
 
   async goBack(options) {
     const timeout = navigationTimeout(this._timeout, options, "Page.goBack");
-    const result = await engineCall("page.goBack", { page: this._id, timeout });
+    const result = await engineCall("page.goBack", { page: this, timeout });
     await this._flushNavigation();
     await this._dispatchNetwork();
     return result.ok ? result : null;
@@ -2515,7 +2519,7 @@ class Page {
 
   async goForward(options) {
     const timeout = navigationTimeout(this._timeout, options, "Page.goForward");
-    const result = await engineCall("page.goForward", { page: this._id, timeout });
+    const result = await engineCall("page.goForward", { page: this, timeout });
     await this._flushNavigation();
     await this._dispatchNetwork();
     return result.ok ? result : null;
@@ -2526,18 +2530,27 @@ class Page {
       return;
     }
     try {
-      await engineCall("page.close", { page: this._id, generation: this._generation || 1 });
+      await engineCall("page.close", { page: this, generation: this._generation || 1 });
     } finally {
       this._closed = true;
       this._generation = (this._generation || 1) + 1;
-      disposedPages.add(this._id);
-      this._emit("close", this);
+      try {
+        this._emit("close", this);
+      } finally {
+        pageContexts.delete(this._id);
+        if (this._context) this._context._pages = this._context._pages.filter(page => page !== this);
+        this._handlers = {};
+        this._seenFrames = {};
+        this._emittedNetwork.clear();
+        for (const key of ["_pendingPopups", "_popupWaiters", "_navWaiters",
+          "_consoleWaiters", "_pendingConsole", "_dialogWaiters", "_pendingDialogs"]) this[key] = [];
+      }
     }
   }
 
   async isClosed() {
     if (this._closed) return true;
-    const result = await engineCall("page.isClosed", { page: this._id });
+    const result = await engineCall("page.isClosed", { page: this });
     return !!result.closed;
   }
 
@@ -2547,7 +2560,7 @@ class Page {
     }
     if (event === "filechooser") {
       const result = await engineCall("page.waitForFileChooser", {
-        page: this._id,
+        page: this,
         timeout: this._timeout || 30_000,
       });
       const chooser = new FileChooser(this, result.chooser);
@@ -2562,7 +2575,7 @@ class Page {
     }
     if (event === "download") {
       const result = await engineCall("page.waitForDownload", {
-        page: this._id,
+        page: this,
         timeout: this._timeout || 30_000,
       });
       const download = this._downloadFromRecord(result.download);
@@ -2630,7 +2643,7 @@ class Page {
   async setInputFiles(selector, files) {
     const list = Array.isArray(files) ? files : [files];
     return engineCall("page.setInputFiles", {
-      page: this._id,
+      page: this,
       selector: String(selector),
       files: list.map(String),
     });
@@ -2718,7 +2731,7 @@ class Page {
   }
 
   async consoleMessages() {
-    const result = await engineCall("page.consoleMessages", { page: this._id });
+    const result = await engineCall("page.consoleMessages", { page: this });
     return (result.messages || []).map((rec) => withUnsupported({
       type: () => rec.type || "log",
       text: () => rec.text || "",
@@ -2738,16 +2751,16 @@ class Page {
   }
 
   async clearPageErrors() {
-    await engineCall("page.clearPageErrors", { page: this._id });
+    await engineCall("page.clearPageErrors", { page: this });
   }
 
   async clearConsoleMessages() {
-    await engineCall("page.clearConsoleMessages", { page: this._id });
+    await engineCall("page.clearConsoleMessages", { page: this });
     this._consoleSeen = 0;
   }
 
   async requests() {
-    const result = await engineCall("page.requests", { page: this._id });
+    const result = await engineCall("page.requests", { page: this });
     const records = result.requests || [];
     return records.map((rec) => this._requestFromRecord(rec, records));
   }
@@ -2763,7 +2776,7 @@ class Page {
       if (this._context) pageContexts.set(this._openerId, this._context._id);
       return page;
     }
-    const result = await engineCall("page.opener", { page: this._id });
+    const result = await engineCall("page.opener", { page: this });
     if (!result.page) return null;
     if (this._context && this._context._pages) {
       const found = this._context._pages.find((page) => page._id === result.page);
@@ -2776,11 +2789,11 @@ class Page {
   }
 
   async unroute(url) {
-    await engineCall("page.unroute", { page: this._id, pattern: String(url) });
+    await engineCall("page.unroute", { page: this, pattern: String(url) });
   }
 
   async unrouteAll() {
-    await engineCall("page.unrouteAll", { page: this._id });
+    await engineCall("page.unrouteAll", { page: this });
   }
 
   async routeFromHAR() {
@@ -2811,7 +2824,7 @@ class Page {
       this._extraHeaders,
     );
     await engineCall("page.setExtraHTTPHeaders", {
-      page: this._id,
+      page: this,
       headers: merged,
     });
   }
@@ -2824,13 +2837,13 @@ class Page {
     const route = withUnsupported(
       {
         abort: () =>
-          engineCall("page.addRoute", { page: this._id, pattern: String(url), action: "abort" }),
+          engineCall("page.addRoute", { page: this, pattern: String(url), action: "abort" }),
         continue: (options = {}) => {
           if (options.url != null || options.method != null || options.postData != null) {
             return unsupported("Route.continue.overrides")();
           }
           return engineCall("page.addRoute", {
-            page: this._id,
+            page: this,
             pattern: String(url),
             action: "continue",
             headers: options.headers || {},
@@ -2838,7 +2851,7 @@ class Page {
         },
         fulfill: (options = {}) =>
           engineCall("page.addRoute", {
-            page: this._id,
+            page: this,
             pattern: String(url),
             action: "fulfill",
             bodyBase64: encodeBase64(bytesFromFulfillBody(options.body)),
@@ -2858,30 +2871,30 @@ class Page {
   keyboard = withUnsupported({
     type: async (text, options) => {
       refuseLocatorOptions("Keyboard.type", options, []);
-      await engineCall("page.keyboard.type", { page: this._id, text: String(text) });
+      await engineCall("page.keyboard.type", { page: this, text: String(text) });
     },
     press: async (key, options) => {
       refuseLocatorOptions("Keyboard.press", options, []);
-      await engineCall("page.keyboard.press", { page: this._id, key: String(key) });
+      await engineCall("page.keyboard.press", { page: this, key: String(key) });
     },
     down: async (key, options) => {
       refuseLocatorOptions("Keyboard.down", options, []);
-      await engineCall("page.keyboard.down", { page: this._id, key: String(key) });
+      await engineCall("page.keyboard.down", { page: this, key: String(key) });
     },
     up: async (key, options) => {
       refuseLocatorOptions("Keyboard.up", options, []);
-      await engineCall("page.keyboard.up", { page: this._id, key: String(key) });
+      await engineCall("page.keyboard.up", { page: this, key: String(key) });
     },
     insertText: async (text, options) => {
       refuseLocatorOptions("Keyboard.insertText", options, []);
-      await engineCall("page.keyboard.insertText", { page: this._id, text: String(text) });
+      await engineCall("page.keyboard.insertText", { page: this, text: String(text) });
     },
   }, "Keyboard");
 
   async addInitScript(script) {
     const source =
       typeof script === "function" ? "(" + script.toString() + ")()" : String(script);
-    await engineCall("page.addInitScript", { page: this._id, source });
+    await engineCall("page.addInitScript", { page: this, source });
   }
 
   async setViewportSize(size) {
@@ -2890,11 +2903,11 @@ class Page {
     if (width < 1 || height < 1) {
       throw new Error("Page.setViewportSize requires width and height");
     }
-    await engineCall("page.setViewportSize", { page: this._id, width, height });
+    await engineCall("page.setViewportSize", { page: this, width, height });
   }
 
   async viewportSize() {
-    const result = await engineCall("page.viewportSize", { page: this._id });
+    const result = await engineCall("page.viewportSize", { page: this });
     return { width: result.width, height: result.height };
   }
 }
@@ -2958,7 +2971,7 @@ class BrowserContext {
       refuseLocatorOptions("BrowserContext.newPage", options, ["extraHTTPHeaders"]);
     }
     const result = await engineCall("context.newPage", {
-      context: this._id,
+      context: this,
       generation: this._generation || 1,
     });
     const page = new Page(result.page, result.generation);
@@ -2981,7 +2994,7 @@ class BrowserContext {
       await page.setExtraHTTPHeaders(page._extraHeaders);
     }
     for (const source of this._initScripts || []) {
-      await engineCall("page.addInitScript", { page: page._id, source });
+      await engineCall("page.addInitScript", { page: page, source });
     }
     this._emit("page", page);
     return page;
@@ -3072,7 +3085,7 @@ class BrowserContext {
     const out = [];
     const seen = new Set();
     for (const page of pages) {
-      const result = await engineCall("page.cookies", { page: page._id });
+      const result = await engineCall("page.cookies", { page: page });
       const raw = result.cookie || "";
       if (!raw) continue;
       for (const part of raw.split(";")) {
@@ -3099,13 +3112,13 @@ class BrowserContext {
       }
     }
     for (const page of pages) {
-      await engineCall("page.addCookies", { page: page._id, cookies });
+      await engineCall("page.addCookies", { page: page, cookies });
     }
   }
 
   async clearCookies() {
     for (const page of this.pages()) {
-      await engineCall("page.clearCookies", { page: page._id });
+      await engineCall("page.clearCookies", { page: page });
     }
   }
 
@@ -3181,18 +3194,23 @@ class BrowserContext {
     if (this._closed) {
       return;
     }
-    for (const page of this.pages()) {
-      await page.close();
+    let closeError;
+    for (const page of this.pages().slice()) {
+      try { await page.close(); } catch (error) { closeError ||= error; }
     }
     this._pages = [];
     this._closed = true;
     this._generation = (this._generation || 1) + 1;
-    disposedContexts.add(this._id);
+
     if (this._browser && Array.isArray(this._browser._contexts)) {
       this._browser._contexts = this._browser._contexts.filter((context) => context !== this);
     }
-    this._emit("close", this);
-    await engineCall("context.close", { context: this._id });
+    try { this._emit("close", this); } catch (error) { closeError ||= error; }
+    this._pendingRoutes = [];
+    this._initScripts = [];
+    this._handlers = {};
+    try { await engineCall("context.close", { context: this }); } catch (error) { closeError ||= error; }
+    if (closeError) throw closeError;
   }
 
   isClosed() {
@@ -3227,7 +3245,7 @@ class BrowserContext {
     this._initScripts = this._initScripts || [];
     this._initScripts.push(source);
     for (const page of this.pages()) {
-      await engineCall("page.addInitScript", { page: page._id, source });
+      await engineCall("page.addInitScript", { page: page, source });
     }
   }
 
@@ -3304,7 +3322,7 @@ class Browser {
       refuseLocatorOptions("Browser.newContext", options, ["storageState", "extraHTTPHeaders"]);
     }
     const result = await engineCall("browser.newContext", {
-      browser: this._id,
+      browser: this,
       generation: this._generation || 1,
     });
     const context = new BrowserContext(result.context, result.generation);
@@ -3338,20 +3356,23 @@ class Browser {
 
   async close() {
     const contexts = this._contexts.slice();
+    let closeError;
     this._contexts = [];
     for (const context of contexts) {
       if (!context._closed) {
-        await context.close();
+        try { await context.close(); } catch (error) { closeError ||= error; }
       }
     }
     const wasConnected = this._connected;
     this._connected = false;
     this._generation = (this._generation || 1) + 1;
-    disposedBrowsers.add(this._id);
+
     if (wasConnected) {
-      this._emit("disconnected");
+      try { this._emit("disconnected"); } catch (error) { closeError ||= error; }
     }
-    await engineCall("browser.close", { browser: this._id });
+    this._handlers = {};
+    try { await engineCall("browser.close", { browser: this }); } catch (error) { closeError ||= error; }
+    if (closeError) throw closeError;
   }
 
   _emit(event, payload) {

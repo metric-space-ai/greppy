@@ -17,6 +17,7 @@ pub mod policy_proxy;
 pub mod playwright_trace;
 pub mod protocol;
 pub mod record_usage;
+pub mod retained_records;
 mod rendering_backend;
 pub mod session;
 pub mod supervisor;
