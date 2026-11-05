@@ -413,6 +413,10 @@ extension!(
 );
 
 pub fn run() -> io::Result<()> {
+    // Install fds 3 and 5 before Tokio's I/O driver claims the lowest free
+    // descriptors. dup2 afterwards closes the driver's registration and the
+    // runtime aborts with EBADF.
+    crate::worker::adopt_inherited_worker_fds()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -422,7 +426,6 @@ pub fn run() -> io::Result<()> {
 }
 
 fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
-    crate::worker::adopt_inherited_worker_fds()?;
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
