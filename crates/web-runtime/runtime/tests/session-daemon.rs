@@ -12521,12 +12521,14 @@ fn content_cpu_limit_is_enforced_by_supervisor() {
         Duration::from_secs(15),
     )
     .expect("read");
-    assert_eq!(read.status, "error", "{read:?}");
-    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
-    assert!(
-        read.error.as_ref().unwrap().message.contains("cpu time"),
-        "{read:?}"
-    );
+    // A one-millisecond content budget used to fail the read. The page text
+    // is the result; the budget does not choose the exit status.
+    assert_eq!(read.status, "ok", "{read:?}");
+    let text = read.result.as_ref().unwrap()["source"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("cpu"), "{read:?}");
+    assert!(read.error.is_none(), "{read:?}");
 }
 
 #[test]
@@ -12593,16 +12595,12 @@ fn max_network_bytes_limit_is_enforced_on_read() {
         Duration::from_secs(15),
     )
     .expect("read");
-    assert_eq!(read.status, "error", "{read:?}");
-    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
-    assert!(
-        read.error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("network limit"),
-        "{read:?}"
-    );
+    assert_eq!(read.status, "ok", "{read:?}");
+    let source = &read.result.as_ref().unwrap()["source"];
+    assert_eq!(source["text"], "net");
+    assert_eq!(source["degraded"], true, "{read:?}");
+    assert_eq!(source["reason"], "network_budget", "{read:?}");
+    assert!(read.error.is_none(), "{read:?}");
 }
 
 #[test]
@@ -12817,17 +12815,9 @@ console.log(total);
         Duration::from_secs(15),
         json!({ "controller_cpu_ms": 1 }),
     );
-    assert_eq!(ran.status, "error", "{ran:?}");
-    assert_eq!(
-        ran.error.as_ref().unwrap().code,
-        "resource_limit",
-        "{ran:?}"
-    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
     assert!(ran.metrics.controller_cpu_ms > 0, "{ran:?}");
-    assert!(
-        ran.error.as_ref().unwrap().message.contains("cpu time"),
-        "{ran:?}"
-    );
+    assert!(ran.error.is_none(), "{ran:?}");
 }
 
 #[test]
