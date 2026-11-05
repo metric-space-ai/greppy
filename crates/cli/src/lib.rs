@@ -64,7 +64,9 @@ macro_rules! println {
     }};
 }
 
+mod capabilities;
 mod cli_surface;
+mod desktop;
 mod self_update;
 mod web;
 mod web_attach;
@@ -608,6 +610,8 @@ const SUBCOMMANDS: &[&str] = &[
     "agent",
     "workspace",
     "web",
+    "desktop",
+    "capabilities",
     "trial",
     "stats",
     "diagnostics",
@@ -1430,6 +1434,8 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "web" => {
             "greppy web status|doctor|session|run|observe|screenshot|search|read|research|artifacts [--json]"
         }
+        "desktop" => "greppy desktop status|snapshot|click|type|screenshot [--json]",
+        "capabilities" => "greppy capabilities enable|show web|desktop",
         _ => return None,
     })
 }
@@ -2933,6 +2939,11 @@ fn dispatch_subcommand(
         }
         Command::Update { version } => Ok(self_update::run(version)),
         Command::Web { command } => web::dispatch(command, root),
+        Command::Desktop { command } => {
+            let json = command.requests_json();
+            desktop::dispatch(json, command, CLI_MAX_BYTES.with(std::cell::Cell::get))
+        }
+        Command::Capabilities { command } => capabilities::dispatch(command),
         Command::WhoCalls {
             symbols,
             path_opts,

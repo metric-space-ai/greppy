@@ -619,6 +619,9 @@ verifiable and report the rest."
                     break;
                 }
 
+                // Enabling web or desktop returns the manual as the tool result.
+                // The system prompt stays byte-identical so its cache is kept.
+
                 // Continue the outer loop for the next assistant turn.
                 // After the last action turn, the next request permits only a final report.
                 continue;
@@ -999,6 +1002,45 @@ mod tests {
             description: "run a command".to_string(),
             input_schema: json!({"type": "object"}),
         }
+    }
+
+    #[test]
+    fn enable_result_does_not_rewrite_the_system_prompt() {
+        struct EnablingEnv {
+            enabled: bool,
+        }
+        impl ExecutionEnv for EnablingEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![echo_tool()]
+            }
+            fn call_tool(&mut self, _name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.enabled = true;
+                ToolOutcome::ok(crate::prompt::capability_manual("web", true).unwrap())
+            }
+        }
+        let base = "BASE PROMPT\n";
+        let mut model = FakeModel::new(vec![
+            tool_turn(None, vec![("1", "echo", json!({}))], usage(1, 1)),
+            text_turn("done", usage(1, 1)),
+        ]);
+        let mut env = EnablingEnv { enabled: false };
+        let config = AgentConfig::default().with_model("mock").with_system(base);
+        let result = run_agent_loop(&mut model, &mut env, &config, "task", &mut |_| {}).unwrap();
+        assert!(env.enabled);
+        assert_eq!(model.requests.len(), 2);
+        assert_eq!(model.requests[0].system.as_deref(), Some(base));
+        assert_eq!(model.requests[1].system.as_deref(), Some(base));
+        let tool_text = result
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|part| match part {
+                crate::protocol::ContentPart::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(tool_text.contains("BROWSER:"));
+        assert!(!tool_text.contains("UNTRUSTED_DESKTOP_CONTENT"));
     }
 
     fn echo_tool() -> ToolDefinition {

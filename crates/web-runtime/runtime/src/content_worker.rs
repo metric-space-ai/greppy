@@ -3979,6 +3979,16 @@ impl ContentEngine {
                 };
                 Ok(json!({ "dialogs": dialogs }))
             }
+            "page.recordUsage" => {
+                let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                serde_json::to_value(crate::record_usage::RecordUsage::from_rows(
+                    &delegate.last_console.borrow(),
+                    &delegate.downloads.borrow(),
+                    &delegate.last_responses.borrow(),
+                ))
+                .map_err(io::Error::other)
+            }
             "page.consoleMessages" => {
                 let page_id = required_str(&params, "page")?;
                 Ok(json!({
