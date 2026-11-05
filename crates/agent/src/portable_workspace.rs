@@ -4368,6 +4368,17 @@ fn publish_task_branch(
             error.kind(),
             format!("cannot publish task branch {}: {error}", path.display()),
         ))
+    })?;
+    let head = private_git_dir.join("HEAD");
+    fs::write(
+        &head,
+        format!("ref: refs/heads/{}\n", task_branch_name(run_id)),
+    )
+    .map_err(|error| {
+        WorkspaceError::Io(io::Error::new(
+            error.kind(),
+            format!("cannot check out task branch {}: {error}", head.display()),
+        ))
     })
 }
 
@@ -5425,6 +5436,8 @@ mod tests {
             let branch = workspace.task_branch();
             let branch_file = workspace.private_git_dir.join("refs/heads").join(&branch);
             assert_eq!(fs::read_to_string(&branch_file).unwrap().trim().len(), 40);
+            let head = fs::read_to_string(workspace.private_git_dir.join("HEAD")).unwrap();
+            assert!(head.contains(&branch), "{head}");
             let path = workspace.worktree_path().to_path_buf();
             workspace.cleanup().unwrap();
             (seen, branch, path)
