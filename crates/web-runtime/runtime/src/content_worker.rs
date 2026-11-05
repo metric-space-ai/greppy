@@ -793,7 +793,8 @@ impl WebViewDelegate for Delegate {
             &kind,
             load.request.url.host_str().unwrap_or(""),
         ) {
-            load.intercept(WebResourceResponse::new(load.request.url.clone()))
+            let request_url = load.request.url.clone();
+            load.intercept(WebResourceResponse::new(request_url))
                 .cancel();
             return;
         }
