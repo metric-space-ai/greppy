@@ -25,6 +25,9 @@ bench/** linguist-vendored
 crates/cli/assets/** -text
 
 # Stable owner-signed prompt bytes on every platform.
+# AGENTS.md, the adapter, and the capability manuals are SHA-256 checked at
+# build time. Windows checkout must not turn those LF bytes into CRLF.
 AGENTS.md text eol=lf
 assets/prompts/agent-adapter.md text eol=lf
+assets/prompts/capabilities/*.md text eol=lf
 assets/prompts/contract.rs text eol=lf

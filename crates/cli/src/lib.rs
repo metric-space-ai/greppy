@@ -57,7 +57,9 @@ macro_rules! println {
     }};
 }
 
+mod capabilities;
 mod cli_surface;
+mod desktop;
 mod self_update;
 mod web;
 mod web_attach;
@@ -601,6 +603,8 @@ const SUBCOMMANDS: &[&str] = &[
     "agent",
     "workspace",
     "web",
+    "desktop",
+    "capabilities",
     "trial",
     "stats",
     "diagnostics",
@@ -1434,6 +1438,8 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "web" => {
             "greppy web status|doctor|session|run|observe|screenshot|search|read|research|artifacts [--json]"
         }
+        "desktop" => "greppy desktop status|snapshot|click|type|screenshot [--json]",
+        "capabilities" => "greppy capabilities enable|show web|desktop",
         _ => return None,
     })
 }
@@ -2019,19 +2025,34 @@ mod max_ram_flag_tests {
         assert_eq!(parse_max_ram_flag("4G"), Some(4 * 1024 * 1024 * 1024));
         assert_eq!(parse_max_ram_flag("4096M"), Some(4 * 1024 * 1024 * 1024));
         assert!(parse_max_ram_flag("nope").is_none());
-        let argv = ["greppy", "--max-ram", "4G", "web", "read", "https://example.com"]
-            .map(OsString::from)
-            .to_vec();
+        let argv = [
+            "greppy",
+            "--max-ram",
+            "4G",
+            "web",
+            "read",
+            "https://example.com",
+        ]
+        .map(OsString::from)
+        .to_vec();
         let (kept, raw) = take_max_ram_flag(argv).unwrap();
         assert_eq!(raw.as_deref(), Some("4G"));
         assert_eq!(
             kept,
             ["greppy", "web", "read", "https://example.com"].map(OsString::from)
         );
-        assert!(take_max_ram_flag(vec![OsString::from("greppy"), OsString::from("--max-ram=nope")]).is_err());
+        assert!(take_max_ram_flag(vec![
+            OsString::from("greppy"),
+            OsString::from("--max-ram=nope")
+        ])
+        .is_err());
         let help = std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
-            .spawn(|| Cli::try_parse_from(["greppy", "--help"]).unwrap_err().to_string())
+            .spawn(|| {
+                Cli::try_parse_from(["greppy", "--help"])
+                    .unwrap_err()
+                    .to_string()
+            })
             .unwrap()
             .join()
             .unwrap();
@@ -3027,6 +3048,11 @@ fn dispatch_subcommand(
         }
         Command::Update { version } => Ok(self_update::run(version)),
         Command::Web { command } => web::dispatch(command, root),
+        Command::Desktop { command } => {
+            let json = command.requests_json();
+            desktop::dispatch(json, command, CLI_MAX_BYTES.with(std::cell::Cell::get))
+        }
+        Command::Capabilities { command } => capabilities::dispatch(command),
         Command::WhoCalls {
             symbols,
             path_opts,

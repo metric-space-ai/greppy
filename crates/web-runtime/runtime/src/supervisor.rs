@@ -377,7 +377,7 @@ fn fixture_url_grants_project_loopback(fixture_url: &str) -> bool {
 
 pub(crate) trait EngineGate {
     fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String>;
-    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+    fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {
         let _ = records;
         Ok(())
     }
@@ -512,6 +512,10 @@ pub(crate) fn route_until_script_complete_gated(
                     ..
                 }) => {
                     if let Err(message) = gate.before_call(&method, &params) {
+                        settle_aborted_script(
+                            controller, content, request_id, &mut pending, &mut parked,
+                            deadline, &message, &mut gate,
+                        );
                         return Err(io::Error::other(format!("resource_limit: {message}")));
                     }
                     wait_point = format!("content:{method}");
@@ -558,12 +562,10 @@ pub(crate) fn route_until_script_complete_gated(
                             &mut gate,
                             &mut parked,
                         ) {
-                            let _ = controller.send(&Message::engine_result(
-                                request_id,
-                                false,
-                                serde_json::json!({}),
-                                Some(format!("resource_limit: {message}")),
-                            ));
+                            settle_aborted_script(
+                                controller, content, request_id, &mut pending, &mut parked,
+                                deadline, &message, &mut gate,
+                            );
                             return Err(io::Error::other(format!("resource_limit: {message}")));
                         }
                     }
@@ -606,6 +608,91 @@ pub(crate) fn route_until_script_complete_gated(
     }
 }
 
+/// A failed engine gate returns before the controller's awaiting JavaScript
+/// has completed. Finish that script before reusing its protocol stream, or
+/// its late ScriptComplete can be mistaken for the next web.run's result.
+/// No further page actions are dispatched and the original deadline is kept.
+fn settle_aborted_script(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    rejected_id: u64,
+    pending: &mut HashMap<u64, (String, serde_json::Value)>,
+    parked: &mut VecDeque<Message>,
+    deadline: Instant,
+    reason: &str,
+    gate: &mut impl EngineGate,
+) {
+    let failure = |id| Message::engine_result(
+        id, false, serde_json::Value::Null, Some(format!("resource_limit: {reason}")),
+    );
+    let retire = |controller: &mut WorkerProcess, content: &mut WorkerProcess, inflight: bool| {
+        controller.kill_tree_now();
+        if inflight {
+            content.kill_tree_now();
+        }
+    };
+    for id in std::iter::once(rejected_id).chain(pending.keys().copied()) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || controller.send_timeout(&failure(id), remaining).is_err() {
+            retire(controller, content, !pending.is_empty());
+            return;
+        }
+    }
+    let mut completed = false;
+    while !completed || !pending.is_empty() {
+        let incoming = recv_aborted_script(gate, deadline, |slice| {
+            if let Some(message) = parked.pop_front() {
+                Ok(Incoming::Content(message))
+            } else {
+                recv_any(controller, content, slice)
+            }
+        });
+        match incoming {
+            Ok(Incoming::Controller(Message::ScriptComplete { .. })) => completed = true,
+            Ok(Incoming::Controller(Message::EngineCall { request_id, .. })) => {
+                // A script can catch the rejection; it still cannot resume
+                // page actions after this operation's resource gate failed.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || controller.send_timeout(&failure(request_id), remaining).is_err() {
+                    retire(controller, content, !pending.is_empty());
+                    return;
+                }
+            }
+            Ok(Incoming::Content(Message::EngineResult { request_id, ok, error, .. })) => {
+                pending.remove(&request_id);
+                gate.note_discarded_engine_result(request_id, ok, error);
+            }
+            _ => {
+                retire(controller, content, !pending.is_empty());
+                return;
+            }
+        }
+    }
+}
+
+fn recv_aborted_script(
+    gate: &mut impl EngineGate,
+    deadline: Instant,
+    mut receive: impl FnMut(Duration) -> io::Result<Incoming>,
+) -> io::Result<Incoming> {
+    loop {
+        gate.poll_control();
+        if gate.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled aborted script"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "aborted script deadline exhausted"));
+        }
+        // As in the normal router, silence is only a poll timeout. Observe
+        // control again without extending the operation's absolute deadline.
+        match receive(remaining.min(Duration::from_millis(50))) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            incoming => return incoming,
+        }
+    }
+}
+
 fn tally_after(method: &str) -> bool {
     matches!(
         method,
@@ -640,36 +727,16 @@ fn poll_session_records(
     let Some(page) = params.get("page").and_then(|value| value.as_str()) else {
         return Ok(());
     };
-    let console = sidecar_engine_call(
+    let usage = sidecar_engine_call(
         content,
         sidecar,
-        "page.consoleMessages",
+        "page.recordUsage",
         serde_json::json!({ "page": page }),
         timeout,
         parked,
     )?;
-    let downloads = sidecar_engine_call(
-        content,
-        sidecar,
-        "page.downloads",
-        serde_json::json!({ "page": page }),
-        timeout,
-        parked,
-    )?;
-    let responses = sidecar_engine_call(
-        content,
-        sidecar,
-        "page.responses",
-        serde_json::json!({ "page": page }),
-        timeout,
-        parked,
-    )?;
-    let records = serde_json::json!({
-        "messages": console.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "downloads": downloads.get("downloads").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "responses": responses.get("responses").cloned().unwrap_or_else(|| serde_json::json!([])),
-    });
-    gate.after_records(&records)
+    let usage = serde_json::from_value(usage).map_err(|error| format!("invalid record usage: {error}"))?;
+    gate.after_records(&usage)
 }
 
 fn sidecar_engine_call(
@@ -2496,6 +2563,62 @@ mod tests {
         assert!(future.exists(), "clock skew is not proof of staleness");
         assert!(fs::symlink_metadata(linked).unwrap().file_type().is_symlink());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn aborted_script_receives_cancellation_while_protocol_is_silent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Gate(Arc<AtomicBool>);
+        impl EngineGate for Gate {
+            fn before_call(&mut self, _: &str, _: &serde_json::Value) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut gate = Gate(Arc::clone(&cancelled));
+        let (entered, first_receive) = mpsc::channel();
+        let (sender, silent) = mpsc::channel::<Incoming>();
+        let cancellation = thread::spawn(move || {
+            first_receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = recv_aborted_script(&mut gate, started + Duration::from_secs(2), |budget| {
+            let _ = entered.send(());
+            silent.recv_timeout(budget).map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
+                mpsc::RecvTimeoutError::Disconnected => io::Error::from(io::ErrorKind::BrokenPipe),
+            })
+        });
+        cancellation.join().unwrap();
+        drop(sender);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent controller unexpectedly completed"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(750), "cancellation waited for the script deadline");
+    }
+
+    #[test]
+    fn aborted_script_poll_timeouts_keep_the_original_absolute_deadline() {
+        let mut gate = AllowAllGate;
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(130);
+        let result = recv_aborted_script(&mut gate, deadline, |budget| {
+            thread::sleep(budget);
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent controller unexpectedly completed"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now() >= deadline, "a slice timeout ended cleanup prematurely");
+        assert!(started.elapsed() < Duration::from_millis(750), "cleanup extended its original deadline");
     }
 
     #[test]

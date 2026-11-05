@@ -11687,6 +11687,93 @@ fn controller_exception_redacts_authorization_secrets() {
 }
 
 #[test]
+fn known_http_navigation_does_not_copy_document_text_or_html() {
+    let origin = serve_fixture(
+        r#"<!doctype html><html><head><title>Navigation probe</title><script>
+window.navigationProbeReads = { text: 0, html: 0, elements: 0 };
+Object.defineProperty(document.documentElement, 'outerHTML', {
+  get() { window.navigationProbeReads.html++; return 'x'.repeat(3 * 1024 * 1024); }
+});
+const selectAll = document.querySelectorAll.bind(document);
+document.querySelectorAll = function(selector) {
+  if (['*:not(html):not(head):not(body)', 'h1,h2,h3,h4', 'a[href]'].includes(selector)) window.navigationProbeReads.elements++;
+  return selectAll(selector);
+};
+document.addEventListener('DOMContentLoaded', function() {
+  Object.defineProperty(document.body, 'innerText', {
+    get() { window.navigationProbeReads.text++; return 'x'.repeat(3 * 1024 * 1024); }
+  });
+});
+</script></head><body><p>Known response</p></body></html>"#,
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-nav-probe-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_nav_probe", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = format!(
+        r#"
+import {{ chromium }} from 'playwright';
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({});
+const reads = await page.evaluate(() => window.navigationProbeReads);
+if (reads.text !== 0 || reads.html !== 0 || reads.elements !== 0) {{
+  throw new Error('navigation copied document evidence: ' + JSON.stringify(reads));
+}}
+await browser.close();
+"#,
+        serde_json::to_string(&origin).unwrap()
+    );
+    let result = run_playwright_source(
+        &socket,
+        "run_nav_probe",
+        &source,
+        None,
+        Duration::from_secs(60),
+    );
+    assert_eq!(result.status, "ok", "{result:?}");
+
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_nav_probe", method, payload),
+            Duration::from_secs(60),
+        )
+        .expect("navigation probe request")
+    };
+    let created = call("web.session.create", json!({"profile": "project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let read = call("web.read", json!({"session_id": session, "url": origin}));
+    assert_eq!(read.status, "ok", "{read:?}");
+    let extracted = &read.result.as_ref().unwrap()["source"];
+    assert_eq!(extracted["title"], "Navigation probe");
+    assert_eq!(extracted["final_url"], origin);
+    assert_eq!(extracted["text_truncated"], true);
+    let inspected = call(
+        "web.evaluate",
+        json!({
+            "session_id": session,
+            "source": "JSON.stringify(window.navigationProbeReads)",
+        }),
+    );
+    assert_eq!(inspected.status, "ok", "{inspected:?}");
+    let counts: serde_json::Value = serde_json::from_str(
+        inspected.result.as_ref().unwrap()["value"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(counts, json!({"text": 1, "html": 0, "elements": 0}));
+    assert_eq!(
+        call("web.session.close", json!({"session_id": session})).status,
+        "ok"
+    );
+}
+
+#[test]
 fn large_read_is_truncated_and_artifact_backed() {
     let body = format!(
         "<!DOCTYPE html><html><body><p>{}</p></body></html>",
@@ -12271,6 +12358,54 @@ fn file_chooser_wait_for_event_sets_dom_files() {
 #[test]
 fn popup_opener_returns_creating_page() {
     run_named_fixture("popup-opener.mjs", "run_opener");
+}
+
+#[test]
+fn oversized_console_is_a_limit_error_without_restarting_content() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-largecon-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_largecon", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let before = content_worker_pid(guard.child.id()).expect("content worker before limit");
+    let started = Instant::now();
+    let ran = run_playwright_source_with_limits(
+        &socket,
+        "run_largecon",
+        r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.evaluate(() => console.log("x".repeat(2 * 1024 * 1024)));
+"#,
+        None,
+        Duration::from_secs(40),
+        json!({ "max_console_bytes": 8 }),
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    let error = ran.error.as_ref().expect("limit error");
+    eprintln!("OVERSIZED_ACCOUNTING latency_ms={} metrics={:?} error={:?}", started.elapsed().as_millis(), ran.metrics, error);
+    assert_eq!(error.code, "resource_limit", "{ran:?}");
+    assert!(error.message.contains("console limit"), "{ran:?}");
+    assert_eq!(content_worker_pid(guard.child.id()), Some(before), "accounting must not crash the worker");
+    // A fresh operation must execute successfully in the same live worker.
+    let recovered = run_playwright_source(
+        &socket,
+        "run_largecon",
+        r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.setContent('<input id="q"><button onclick="document.title=document.querySelector(\'#q\').value">save</button>');
+await page.fill('#q', 'recovered');
+await page.click('button');
+if (await page.title() !== 'recovered') throw new Error('missing side effect');
+await browser.close();
+"#,
+        None,
+        Duration::from_secs(40),
+    );
+    assert_eq!(recovered.status, "ok", "{recovered:?}");
+    assert_eq!(content_worker_pid(guard.child.id()), Some(before));
 }
 
 #[test]

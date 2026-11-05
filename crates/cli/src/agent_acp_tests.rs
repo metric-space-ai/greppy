@@ -125,6 +125,7 @@ fn fixture(root: &Path) -> (Server, Receiver<Value>) {
         model: "fixture-model".into(),
         api_key: None,
         max_turns: 2,
+        capabilities: greppy_agent::CapabilitySet::default(),
         data_root: Some(root.join("state")),
         after_messages: None,
         after_import_rename: None,

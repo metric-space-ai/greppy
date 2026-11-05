@@ -92,6 +92,7 @@ fn main() {
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .join("../..");
     let prompt_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    // Both build paths verify the signed manuals and all sixteen start variants.
     prompt_contract::write_snapshots(&prompt_root, &prompt_out).unwrap_or_else(|e| panic!("{e}"));
     let profile = std::env::var("PROFILE").expect("PROFILE");
     println!("cargo:rustc-check-cfg=cfg(greppy_debug_profile)");

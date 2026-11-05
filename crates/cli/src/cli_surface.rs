@@ -840,6 +840,16 @@ pub enum Command {
         #[command(subcommand)]
         command: WebCommand,
     },
+    /// Accessibility-tree computer use. Off in the built-in agent until enabled.
+    Desktop {
+        #[command(subcommand)]
+        command: crate::desktop::DesktopVerb,
+    },
+    /// Enable or show the web or desktop manual.
+    Capabilities {
+        #[command(subcommand)]
+        command: crate::capabilities::CapabilitiesVerb,
+    },
     /// Internal: warm Qwen3.5 summarization daemon for `brief`.
     #[cfg(any(unix, windows))]
     #[command(hide = true, name = "summarize-daemon")]

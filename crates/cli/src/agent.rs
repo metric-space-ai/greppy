@@ -12,12 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use greppy_agent::BuiltinPromptMode;
 use greppy_agent::{
     run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
     GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
     StreamEvent, Usage, WorkspaceError,
 };
-use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 
 use crate::agent_control::{socket_path_for, ControlServer};
 use crate::agent_tui::{
@@ -84,6 +84,7 @@ Usage:
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--isolated] [--no-sandbox] [--skip-selfcheck]
                    [--continue | --resume ID] [--json]
+                   [--enable web|desktop]
   greppy -p --help
 
 Flags:
@@ -104,6 +105,8 @@ Flags:
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
   --json              Stream newline-delimited JSON events on stdout (`greppy -p` only)
+  --enable CAP        Include web and/or desktop manuals from the first turn
+                      (`--enable web`, `--enable desktop`, or `--enable web,desktop`)
 
 Interactive keys and commands (`greppy agent`):
   Enter               Send the prompt
@@ -232,6 +235,14 @@ pub struct AgentArgs {
     /// Stream newline-delimited JSON events on stdout (`greppy -p` only).
     #[arg(long)]
     pub json: bool,
+
+    /// Include a capability manual from the first turn.
+    ///
+    /// Repeat the flag, or pass a comma-separated list: `--enable web,desktop`.
+    /// Without it, the built-in agent sees only the short hint and desktop
+    /// commands stay refused until `greppy capabilities enable`.
+    #[arg(long, value_name = "web|desktop")]
+    pub enable: Vec<String>,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -274,6 +285,9 @@ struct ServeArgs {
         require_equals = true,
     )]
     skip_selfcheck: bool,
+    /// Include a capability manual from the first turn (`web`, `desktop`, or both).
+    #[arg(long, value_name = "web|desktop")]
+    enable: Vec<String>,
 }
 
 /// Data root and logical project used by the agent session store for `repo_root`.
@@ -375,6 +389,7 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             continue_session: serve.continue_session,
             resume: serve.resume,
             json: true,
+            enable: serve.enable,
         };
         run_agent(
             args,
@@ -1032,12 +1047,21 @@ fn run_agent(
     std::env::set_var("TMP", &scratch_dir);
     std::env::set_var("TEMP", &scratch_dir);
 
+    let capabilities = match greppy_agent::CapabilitySet::parse_list(&args.enable) {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            eprintln!("greppy -p: {error}");
+            return EXIT_USAGE;
+        }
+    };
+
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
         Ok(env) => env
             .with_deadline(deadline)
             .with_output_owner(cwd.clone())
             .with_output_storage(output_storage)
             .with_sandbox(sandbox_mode.clone())
+            .with_capabilities(capabilities)
             .with_context_status(
                 workspace.run_id().to_owned(),
                 crate::context_status::agent_notice,
@@ -1087,18 +1111,22 @@ fn run_agent(
         }
     }
 
+    let prompt_mode = if serve {
+        BuiltinPromptMode::Serve
+    } else if interactive {
+        BuiltinPromptMode::Interactive
+    } else {
+        BuiltinPromptMode::OneShot
+    };
     let mut config = AgentConfig {
         max_turns: args.max_turns,
         context_summary: headless_session
             .as_ref()
             .and_then(|(record, _)| record.context_summary.clone()),
-        system: Some(system_prompt_for_mode(if serve {
-            BuiltinPromptMode::Serve
-        } else if interactive {
-            BuiltinPromptMode::Interactive
-        } else {
-            BuiltinPromptMode::OneShot
-        })),
+        system: Some(greppy_agent::system_prompt_with_capabilities(
+            prompt_mode,
+            capabilities,
+        )),
         model: model.clone(),
         deadline,
         deadline_total,
@@ -3552,6 +3580,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
@@ -3574,6 +3603,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
@@ -3856,6 +3886,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
@@ -3893,6 +3924,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();

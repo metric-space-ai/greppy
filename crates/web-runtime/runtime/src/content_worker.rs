@@ -36,6 +36,7 @@ const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
+const NAVIGATION_DOCUMENT_PROBE: &str = include_str!("../js/navigation-document-probe.js");
 const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
 
 struct SlowOp<'a> {
@@ -3127,50 +3128,27 @@ impl ContentEngine {
                     .and_then(|value| value.as_str())
                     .map(str::to_owned);
                 drop(recorded);
-                // A failed probe means UNKNOWN, never "empty": on a page
-                // whose script thread is still busy (a 7.6MB spec mid-parse)
-                // these evaluates time out, and treating that as an empty
-                // document declared a 98s successful navigation failed.
-                let text = match self.evaluate(
-                    webview.clone(),
-                    "(document.body && document.body.innerText) || \"\"",
-                ) {
-                    Ok(JSValue::String(text)) => Some(text),
-                    _ => None,
-                };
                 if let Some(failure) = recorded_failure {
                     delegate.navigation_failure.borrow_mut().take();
                     return Err(io::Error::other(format!(
                         "navigation failed: {failure}"
                     )));
                 }
-                let html =
-                    match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
-                        Ok(JSValue::String(html)) => Some(html),
-                        _ => None,
-                    };
                 // CONNECT-tunneled fetches often never match last_responses, so a
                 // missing recorded status is not proof of failure. A typed
                 // terminal transport failure is rejected above; otherwise accept
                 // a rendered document.
                 //
-                // Empty innerText plus tiny HTML is not proof either: a
-                // <frameset> page has no body at all, so its innerText is
-                // empty and the markup fits in a couple hundred bytes (bench
-                // page 024). Count elements beyond the implied html/head/body
-                // shell before declaring the response missing.
-                let rendered_elements = match self.evaluate(
-                    webview.clone(),
-                    "document.querySelectorAll('*:not(html):not(head):not(body)').length",
-                ) {
-                    Ok(JSValue::Number(count)) => Some(count as u64),
-                    _ => None,
-                };
+                // A known response needs no document probe. For an unrecorded
+                // HTTP response, return one boolean from the page instead of
+                // copying its entire rendered text and HTML through JSValue.
+                // A failed probe remains UNKNOWN, never proof of an empty page.
                 if http
                     && recorded_status.is_none()
-                    && text.as_deref().is_some_and(|t| t.trim().is_empty())
-                    && html.as_deref().is_some_and(|h| h.len() < 500)
-                    && rendered_elements == Some(0)
+                    && matches!(
+                        self.evaluate(webview.clone(), NAVIGATION_DOCUMENT_PROBE),
+                        Ok(JSValue::Boolean(true))
+                    )
                 {
                     return Err(io::Error::other(format!(
                         "navigation failed: no HTTP response for {url}"
@@ -3524,6 +3502,19 @@ impl ContentEngine {
                     } else {
                         detail
                     }));
+                }
+                // Read/research only need this metadata before their existing
+                // bounded text transfer. Do not build an unused observation
+                // (layout text, headings, links, scopes and refs) for them.
+                if params.get("metadata_only").and_then(|value| value.as_bool()) == Some(true) {
+                    return match self.evaluate(
+                        webview,
+                        "JSON.stringify({url: location.href, title: document.title})",
+                    )? {
+                        JSValue::String(encoded) => serde_json::from_str(&encoded)
+                            .map_err(|error| io::Error::other(format!("page metadata json: {error}"))),
+                        other => Err(io::Error::other(format!("page metadata returned {other:?}"))),
+                    };
                 }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
@@ -4034,6 +4025,16 @@ impl ContentEngine {
                     self.page(&page_id)?.1.last_dialogs.borrow().clone()
                 };
                 Ok(json!({ "dialogs": dialogs }))
+            }
+            "page.recordUsage" => {
+                let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                serde_json::to_value(crate::record_usage::RecordUsage::from_rows(
+                    &delegate.last_console.borrow(),
+                    &delegate.downloads.borrow(),
+                    &delegate.last_responses.borrow(),
+                ))
+                .map_err(io::Error::other)
             }
             "page.consoleMessages" => {
                 let page_id = required_str(&params, "page")?;

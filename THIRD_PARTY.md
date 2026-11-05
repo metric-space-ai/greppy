@@ -141,6 +141,70 @@ all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
   `licenses/WIX-MS-RL.txt`. The MSI authoring in `platform/windows/Greppy.wxs`
   is original Greppy source and contains no copied WiX source code.
 
+## Linked third-party crates
+
+### agent-desktop (accessibility computer use)
+
+- Purpose: platform accessibility adapters used by `greppy desktop` (macOS AX,
+  Windows UIA, Linux AT-SPI). Greppy links the crates. It does not copy their
+  source into greppy files.
+- Upstream: [vercel-labs/agent-desktop](https://github.com/vercel-labs/agent-desktop)
+  tag `v1.1.0`, commit `d3dc190afbf34cd2377252398ddd5c30efbd093a`.
+- Pin: `crates/desktop/Cargo.toml` is the only place that names the tag and
+  commit (`package.metadata.greppy` plus the git dependencies, which must all
+  use that tag). `Cargo.lock` records the resolved commit.
+- License: Apache-2.0. The upstream license text is
+  `licenses/agent-desktop-LICENSE`. Greppy is also Apache-2.0. Keep that
+  license file, this notice, and the pin with any redistribution that includes
+  the desktop adapter. Do not present agent-desktop's output schema as
+  greppy's; the stable document is `greppy.desktop.v1`.
+- Adapter: `crates/desktop` is the only crate that calls agent-desktop. Its
+  public types are greppy's. Upstream types do not appear in `greppy` or
+  `greppy-agent`.
+- Per-OS compile: `agent-desktop-linux`, `agent-desktop-macos`, and
+  `agent-desktop-windows` are `[target.'cfg(target_os = ...)'.dependencies]`.
+  A macOS build compiles only the macOS adapter, a Linux build only the Linux
+  adapter, a Windows build only the Windows adapter. `zbus` and `x11rb` are
+  Linux-only transitive dependencies; they are not in the macOS or Windows
+  graph. `Cargo.lock` still lists all three adapters so the pin is the same
+  on every machine; those crates are not compiled into the other OS binary.
+  `agent-desktop-core` is shared and does not link a platform bus. Check with
+  `cargo tree -p greppy-desktop --target <triple>`. The test
+  `platform_adapters_are_target_cfg_dependencies_only` refuses an
+  unconditional platform dependency.
+- Audit: Linux AT-SPI brings `zvariant` (RUSTSEC-2026-0370), `zbus_names`
+  (RUSTSEC-2026-0371), and `zvariant_derive` (RUSTSEC-2026-0372). RustSec
+  marks those crates unmaintained. They are not vulnerabilities. The audit
+  workflow ignores those three IDs; the removal condition is in SECURITY.md.
+  Re-check the list when this pin moves.
+- libc: `Cargo.lock` keeps workspace `libc` at 0.2.189 or newer, matching
+  the lock in agent-desktop v1.1.0. `agent-desktop-macos` calls
+  `proc_bsdshortinfo` and `PROC_PIDT_SHORTBSDINFO`, which libc 0.2.186 does
+  not define. The requirement stays `libc = "0.2"`. The test
+  `locked_libc_defines_macos_proc_bsdshortinfo` fails if the lock drops below
+  0.2.189.
+
+#### Updating the pin
+
+1. Read the upstream changelog between the pinned tag and the new tag.
+2. In `crates/desktop/Cargo.toml`, set `agent-desktop-tag` and
+   `agent-desktop-commit`, and set every `tag = "..."` on an agent-desktop git
+   dependency to that same tag. The test `upstream_pin_is_single_tag` fails if
+   those strings diverge or if `Cargo.lock` does not contain the commit.
+3. Run `cargo update -p greppy-desktop` (or regenerate the lock only if a
+   shared crate such as `rustix` or `futures-util` must move to satisfy an
+   exact upstream pin). Do not bump unrelated crates.
+4. `cargo test -p greppy-desktop`. A compile error in `crates/desktop/src/upstream.rs`
+   means a used `commands::*::execute` signature changed. A `schema_mismatch`
+   or a changed fixture in the unit tests means a mapped output field moved.
+   Update the mapping in that one file, then update the fixture on purpose.
+5. Re-run `cargo test -p greppy-agent` so prompt assembly still passes.
+   macOS and Windows adapters are `cfg`-gated; a Linux run does not compile
+   them. Before a release that ships desktop, also build `greppy-desktop` on
+   macOS and Windows.
+6. The ignored test `linux_status_against_the_real_adapter_is_still_greppy_json`
+   needs Xvfb and at-spi2-core. It is not part of the default unit run.
+
 ## Ported third-party code
 
 ### pi (agent loop semantics)

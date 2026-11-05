@@ -3593,7 +3593,24 @@ fn ensure_owned_ordinary_root(data_root: &Path, root: &Path) -> Result<(), Works
                 detail: "ordinary workspace root is not an owned physical directory".into(),
             });
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(root)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Two tasks can create the shared store root together. The loser
+            // sees the directory the winner just created.
+            match fs::create_dir(root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(root)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(WorkspaceError::Tampered {
+                            path: root.into(),
+                            detail: "ordinary workspace root is not an owned physical directory"
+                                .into(),
+                        });
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         Err(error) => return Err(error.into()),
     }
     let canonical_data = fs::canonicalize(data_root)?;

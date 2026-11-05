@@ -16,6 +16,7 @@ pub mod profile_lock;
 pub mod policy_proxy;
 pub mod playwright_trace;
 pub mod protocol;
+pub mod record_usage;
 mod rendering_backend;
 pub mod session;
 pub mod supervisor;

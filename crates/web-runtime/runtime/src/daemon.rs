@@ -3571,7 +3571,15 @@ impl Daemon {
         let Some(timeout_ms) = request.payload.get("timeout_ms").and_then(|v| v.as_u64()) else {
             return protocol_error(request, "web.wait requires an unsigned integer timeout_ms");
         };
-        let request_deadline = started.checked_add(Duration::from_millis(request.deadline_ms.min(timeout_ms)))
+        // deadline_ms 0 is unset. delay/40 carries timeout_ms and must not
+        // expire while the session page is still being acquired.
+        let bounded_ms = if request.deadline_ms == 0 {
+            timeout_ms
+        } else {
+            request.deadline_ms.min(timeout_ms)
+        };
+        let request_deadline = started
+            .checked_add(Duration::from_millis(bounded_ms))
             .unwrap_or(started);
         let (session_id, page) = match self.with_session_page_until(request, "web.wait", Some(request_deadline)) {
             Ok(context) => context,
@@ -4498,7 +4506,7 @@ impl Daemon {
             }
         }
         let tree = self
-            .engine_call("page.observe", json!({ "page": page }))
+            .engine_call("page.observe", json!({ "page": page, "metadata_only": true }))
             .map_err(|error| engine_error(request, error, 34))?;
         let max_transfer_bytes = self
             .sessions
@@ -4916,21 +4924,12 @@ impl Daemon {
         page: &str,
         request: &Request,
     ) -> Result<(), Response> {
-        let console = self
-            .engine_call("page.consoleMessages", json!({ "page": page }))
+        let usage = self
+            .engine_call("page.recordUsage", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
-        let downloads = self
-            .engine_call("page.downloads", json!({ "page": page }))
-            .map_err(|error| engine_error(request, error, 34))?;
-        let recorded_responses = self
-            .engine_call("page.responses", json!({ "page": page }))
-            .map_err(|error| engine_error(request, error, 34))?;
-        let records = json!({
-            "messages": console.get("messages").cloned().unwrap_or(json!([])),
-            "downloads": downloads.get("downloads").cloned().unwrap_or(json!([])),
-            "responses": recorded_responses.get("responses").cloned().unwrap_or(json!([])),
-        });
-        match apply_record_limits(&mut self.sessions, session_id, &records) {
+        let usage = serde_json::from_value(usage)
+            .map_err(|error| engine_error(request, format!("invalid record usage: {error}"), 34))?;
+        match apply_record_limits(&mut self.sessions, session_id, &usage) {
             Ok(()) => Ok(()),
             Err(message) => Err(limit_error(request, message)),
         }
@@ -5998,10 +5997,12 @@ fn model_facing_source(
     if let Some(text) = source
         .get("text")
         .and_then(|value| value.as_str())
-        .map(str::to_owned)
     {
-        let truncated = text.chars().count() > MODEL_TEXT_CHARS;
-        let snippet: String = text.chars().take(MODEL_TEXT_CHARS).collect();
+        // Inspect only the bounded prefix. Counting every character and
+        // cloning the whole artifact here made even a 4 KiB answer pay for
+        // another complete multi-megabyte text pass and allocation.
+        let truncate_at = text.char_indices().nth(MODEL_TEXT_CHARS).map(|(byte, _)| byte);
+        let truncated = truncate_at.is_some();
         if truncated {
             let digest_ok = source
                 .get("digest")
@@ -6014,7 +6015,9 @@ fn model_facing_source(
             }
         }
         if let Some(object) = source.as_object_mut() {
-            object.insert("text".into(), json!(snippet));
+            if let (Some(end), Some(Value::String(text))) = (truncate_at, object.get_mut("text")) {
+                text.truncate(end);
+            }
             object.insert("text_truncated".into(), json!(truncated));
             if truncated {
                 object.insert("full_text".into(), json!("artifact"));
@@ -6611,7 +6614,7 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
         )
     }
 
-    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+    fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {
         apply_record_limits(self.sessions, &self.session_id, records)
     }
 }
@@ -6619,54 +6622,34 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
 fn apply_record_limits(
     sessions: &mut HashMap<String, Session>,
     session_id: &str,
-    records: &serde_json::Value,
+    records: &crate::record_usage::RecordUsage,
 ) -> Result<(), String> {
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());
     };
-    let console_bytes = records
-        .get("messages")
-        .and_then(|value| value.as_array())
-        .map(|rows| sum_text_bytes(rows))
-        .unwrap_or(0);
-    let download_bytes = records
-        .get("downloads")
-        .and_then(|value| value.as_array())
-        .map(|rows| sum_byte_lengths(rows))
-        .unwrap_or(0);
+    let console_bytes = records.console_bytes;
+    let download_bytes = records.download_bytes;
     session.limits.check_console_bytes(0, console_bytes)?;
     session.limits.check_download_bytes(0, download_bytes)?;
     session.console_bytes = console_bytes;
     session.download_bytes = download_bytes;
-    if let Some(rows) = records.get("responses").and_then(|value| value.as_array()) {
-        session.charge_new_responses(rows);
-        session
-            .limits
-            .check_network_bytes(0, session.navigation_network_bytes)?;
+    // `network_bytes` is the current document's retained total (main's
+    // payload-free record usage). The navigation counter is a high-water
+    // mark that `begin_navigation` clears, so the next page gets a new
+    // budget. The session total only grows, for metrics.
+    let snapshot = records.network_bytes;
+    if snapshot > session.navigation_network_bytes {
+        let delta = snapshot - session.navigation_network_bytes;
+        session.navigation_network_bytes = snapshot;
+        session.network_bytes = session.network_bytes.saturating_add(delta);
     }
+    session
+        .limits
+        .check_network_bytes(0, session.navigation_network_bytes)?;
     Ok(())
 }
 
-fn sum_text_bytes(rows: &[serde_json::Value]) -> u64 {
-    rows.iter()
-        .map(|row| {
-            row.get("text")
-                .and_then(|value| value.as_str())
-                .map(|text| text.len() as u64)
-                .unwrap_or(0)
-        })
-        .sum()
-}
 
-fn sum_byte_lengths(rows: &[serde_json::Value]) -> u64 {
-    rows.iter()
-        .map(|row| {
-            row.get("byteLength")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0)
-        })
-        .sum()
-}
 
 impl Daemon {
     fn attach_session_metrics(&self, session_id: &str, response: &mut Response) {
@@ -7236,24 +7219,26 @@ mod redirect_chain_tests {
         session.limits.max_network_bytes = 100;
         session.transition(super::SessionState::Ready).unwrap();
         sessions.insert("nav".to_owned(), session);
-        let first = json!({"responses":[{"requestId":"a","byteLength":80}]});
-        super::apply_record_limits(&mut sessions, "nav", &first).unwrap();
+        let usage = |network_bytes| crate::record_usage::RecordUsage {
+            console_bytes: 0,
+            download_bytes: 0,
+            network_bytes,
+        };
+        super::apply_record_limits(&mut sessions, "nav", &usage(80)).unwrap();
         assert_eq!(sessions["nav"].navigation_network_bytes, 80);
         assert_eq!(sessions["nav"].network_bytes, 80);
-        let grown = json!({"responses":[
-            {"requestId":"a","byteLength":80},
-            {"requestId":"b","byteLength":40}
-        ]});
-        let exceeded = super::apply_record_limits(&mut sessions, "nav", &grown).unwrap_err();
+        // The same snapshot is the retained log, not a second copy of those bytes.
+        super::apply_record_limits(&mut sessions, "nav", &usage(80)).unwrap();
+        assert_eq!(sessions["nav"].network_bytes, 80);
+        let exceeded = super::apply_record_limits(&mut sessions, "nav", &usage(120)).unwrap_err();
         assert!(exceeded.contains("network limit"), "{exceeded}");
         assert_eq!(sessions["nav"].state, super::SessionState::Ready);
+        assert_eq!(sessions["nav"].network_bytes, 120);
         sessions.get_mut("nav").unwrap().begin_navigation();
         assert_eq!(sessions["nav"].navigation_network_bytes, 0);
         assert_eq!(sessions["nav"].network_bytes, 120);
-        super::apply_record_limits(&mut sessions, "nav", &grown).unwrap();
-        assert_eq!(sessions["nav"].navigation_network_bytes, 0);
-        let next = json!({"responses":[{"requestId":"c","byteLength":60}]});
-        super::apply_record_limits(&mut sessions, "nav", &next).unwrap();
+        // Goto clears the previous document, so the next snapshot is a new page.
+        super::apply_record_limits(&mut sessions, "nav", &usage(60)).unwrap();
         assert_eq!(sessions["nav"].navigation_network_bytes, 60);
         assert_eq!(sessions["nav"].network_bytes, 180);
         assert_ne!(sessions["nav"].state, super::SessionState::Failed);
@@ -7414,6 +7399,20 @@ mod redirect_chain_tests {
         assert_eq!(compact["path"], "objects/sha256/abc");
         assert_eq!(compact["label"], "web.read");
         assert_eq!(compact["redaction_status"], "not_redacted");
+    }
+
+    #[test]
+    fn model_facing_source_preserves_unicode_at_the_character_boundary() {
+        let manifest = sample_manifest(false, "abc");
+        for (length, truncated) in [(4095, false), (4096, false), (4097, true)] {
+            let compact = super::model_facing_source(
+                json!({"text": "🦀".repeat(length), "digest": "abc"}),
+                &manifest,
+            ).unwrap();
+            assert_eq!(compact["text"], "🦀".repeat(length.min(4096)));
+            assert_eq!(compact["text_truncated"], truncated);
+            assert_eq!(compact["full_text"].is_null(), !truncated);
+        }
     }
 
     #[test]

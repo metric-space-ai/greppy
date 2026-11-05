@@ -29,7 +29,11 @@ pub(crate) fn remaining_wait_budget(
 ) -> Duration {
     // A missing deadline (0) must not collapse a real wait. delay/40 with
     // timeout_ms 40000 was returning in under a second when deadline_ms was 0.
-    let request_ms = if request_ms == 0 { timeout_ms } else { request_ms };
+    let request_ms = if request_ms == 0 {
+        timeout_ms
+    } else {
+        request_ms
+    };
     let request_remaining =
         Duration::from_millis(request_ms.min(timeout_ms)).saturating_sub(elapsed);
     session_remaining
@@ -152,9 +156,15 @@ mod tests {
             remaining_wait_budget(1000, 800, Duration::from_millis(800), session),
             Duration::ZERO
         );
+        // deadline 0 is unset, so the wait timeout applies. The session
+        // remainder still caps it: this must not grow past timeout_ms.
         assert_eq!(
             remaining_wait_budget(0, 800, Duration::ZERO, session),
-            Duration::ZERO
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            remaining_wait_budget(0, 800, Duration::ZERO, Some(Duration::from_millis(100))),
+            Duration::from_millis(100)
         );
         assert_eq!(
             remaining_wait_budget(1_000, 800, Duration::from_millis(300), None),

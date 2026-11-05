@@ -114,7 +114,7 @@ advisories are not allowlisted unless the affected capability is made
 unreachable in the shipped binary and that fail-closed boundary has a release
 test.
 
-`RUSTSEC-2024-0436` is the sole informational exception. It reports that the
+`RUSTSEC-2024-0436` is an informational exception. It reports that the
 `paste` proc-macro crate is no longer maintained; it does not describe a
 vulnerability. Greppy does not depend on `paste` directly. The locked version
 is used transitively by `gemm`, `pulp`, `tokenizers`, and
@@ -123,6 +123,14 @@ runtime code. The exception must be removed as soon as those upstream crates
 offer a compatible maintained replacement. Any source, version, or dependency
 path change remains visible in `Cargo.lock`, Dependency Review, SBOMs, and the
 release provenance checks.
+
+`RUSTSEC-2026-0370` (`zvariant`), `RUSTSEC-2026-0371` (`zbus_names`), and
+`RUSTSEC-2026-0372` (`zvariant_derive`) are informational unmaintained
+warnings from the pinned agent-desktop v1.1.0 Linux AT-SPI stack. They do
+not describe a vulnerability. Those crates are Linux-only transitive
+dependencies of `agent-desktop-linux`; the pin and the per-OS compile rule
+are in THIRD_PARTY.md. Remove the exceptions when that pin no longer depends
+on the unmaintained zbus line.
 
 `RUSTSEC-2023-0071` is a temporary, capability-disabled exception for the
 embedded Servo 0.5.0 dependency line. Servo pins `rsa 0.10.0-rc.18` and no
