@@ -18,7 +18,7 @@ use servo::{
     WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -4273,6 +4273,19 @@ impl ContentEngine {
                     },
                 )?;
                 Ok(json!({ "chooser": hit }))
+            }
+            "page.networkBaseline" => {
+                let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                let responses = delegate.last_responses.borrow();
+                let finished: HashSet<&str> = responses.snapshot()?.iter()
+                    .filter_map(|row| row.get("requestId").and_then(|id| id.as_str())).collect();
+                let seen = delegate.requests.borrow().snapshot()?.iter().map(|row| {
+                    let id = row.get("requestId").and_then(|id| id.as_str()).unwrap_or("");
+                    let failed = row.get("failure").is_some_and(|failure| !failure.is_null());
+                    json!({ "id": id, "failed": failed, "finished": finished.contains(id) })
+                }).collect::<Vec<_>>();
+                Ok(json!({ "seen": seen }))
             }
             "page.requests" => {
                 let page_id = required_str(&params, "page")?;

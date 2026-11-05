@@ -81,6 +81,10 @@ function engineCall(method, params) {
       if (closed && method !== key + ".close" && method !== "page.isClosed") {
         throwObjectDisposed(kind);
       }
+      if (key === "page" && !["page.close", "page.isClosed", "page.networkBaseline"].includes(method)) {
+        if (owner._networkBaselineError) throw owner._networkBaselineError;
+        if (owner._networkBaseline) return owner._networkBaseline.then(() => engineCall(method, params));
+      }
       payload[key] = owner._id;
     }
   }
@@ -2121,6 +2125,26 @@ class Page {
     }, "Download");
   }
 
+  _primeNetworkHistory() {
+    if (!this._networkNeedsBaseline || this._networkBaseline || this._closed) return;
+    const pending = engineCall("page.networkBaseline", { page: this }).then(result => {
+      if (this._closed) return;
+      this._emittedNetwork.clear();
+      for (const row of result.seen || []) {
+        const key = String(row.id);
+        this._emittedNetwork.add(key + " req");
+        if (row.failed) this._emittedNetwork.add(key + " fail");
+        if (row.finished) this._emittedNetwork.add(key + " fin");
+      }
+      this._networkNeedsBaseline = false;
+    });
+    this._networkBaseline = pending;
+    pending.then(
+      () => { this._networkBaseline = null; },
+      error => { this._networkBaselineError = error; this._networkBaseline = null; },
+    );
+  }
+
   async _dispatchNetwork(settle) {
     // Independent reads; fetch both in one hop instead of two.
     const [result, responsesResult] = await Promise.all([
@@ -2172,7 +2196,10 @@ class Page {
     const events = ["request", "response", "requestfailed", "requestfinished"];
     if (!events.some(event =>
       (this._handlers[event] || []).length ||
-      (this._context && (this._context._handlers[event] || []).length))) return;
+      (this._context && (this._context._handlers[event] || []).length))) {
+      this._networkNeedsBaseline = true;
+      return;
+    }
     const already = await this._dispatchNetwork(true);
     if (already) {
       return;
@@ -2542,6 +2569,8 @@ class Page {
         this._handlers = {};
         this._seenFrames = {};
         this._emittedNetwork.clear();
+        this._networkBaseline = null;
+        this._networkBaselineError = null;
         for (const key of ["_pendingPopups", "_popupWaiters", "_navWaiters",
           "_consoleWaiters", "_pendingConsole", "_dialogWaiters", "_pendingDialogs"]) this[key] = [];
       }
@@ -2680,6 +2709,7 @@ class Page {
     ) {
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);
+      if (["request", "response", "requestfailed", "requestfinished"].includes(event)) this._primeNetworkHistory();
       return this;
     }
     return unsupported(`Page.on.${event}`)();
@@ -3028,6 +3058,9 @@ class BrowserContext {
       this._handlers = this._handlers || {};
       this._handlers[event] = this._handlers[event] || [];
       this._handlers[event].push(handler);
+      if (["request", "response", "requestfailed", "requestfinished"].includes(event)) {
+        for (const page of this.pages()) page._primeNetworkHistory();
+      }
       return this;
     }
     throwUnsupported(`BrowserContext.on.${event}`);

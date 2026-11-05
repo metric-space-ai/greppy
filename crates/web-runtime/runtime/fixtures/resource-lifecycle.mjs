@@ -32,6 +32,8 @@ for (let i = 0; i < 3; i++) {
   await Deno.core.ops.op_engine_call("page.evaluate", {
     page: opener._id, source: "window.open('about:blank'); true",
   });
+  const pending = await sample();
+  if (pending.delegates <= before.delegates + 1) throw new Error("fixture did not create a pending popup");
   await opener.close();
 }
 const pendingClosed = await sample();
