@@ -67,4 +67,80 @@ mod tests {
         assert_eq!(RecordUsage::from_rows(&[], &rows, &rows).network_bytes, u64::MAX);
         assert_eq!(RecordUsage::from_rows(&[], &rows, &rows).download_bytes, u64::MAX);
     }
+
+    /// An explicit IPC comparison, not a page-load benchmark. Both peers use
+    /// the production framing and identical retained records on one CPU.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "measurement; run explicitly with --ignored --nocapture"]
+    fn record_usage_transport_comparison() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+        fn process_usage() -> (u64, i64) {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
+            let usage = unsafe { usage.assume_init() };
+            let cpu_us = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64 * 1_000_000
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
+            (cpu_us, usage.ru_maxrss)
+        }
+        let console = vec![json!({"text": "é".repeat(32_768)})];
+        let downloads = vec![json!({"byteLength": 393_216, "bodyBase64": "a".repeat(524_288)})];
+        let responses = vec![json!({"byteLength": 65_536, "headers": {"x-padding": "b".repeat(65_536)}})];
+        let usage = RecordUsage::from_rows(&console, &downloads, &responses);
+        let cases = [
+            ("full_records", vec![
+                ("page.consoleMessages", json!({"messages": console})),
+                ("page.downloads", json!({"downloads": downloads})),
+                ("page.responses", json!({"responses": responses})),
+            ]),
+            ("record_usage", vec![("page.recordUsage", serde_json::to_value(usage).unwrap())]),
+        ];
+        for (label, replies) in cases {
+            let cpu_before = process_usage().0;
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let calls = replies.len();
+            let rounds = 40;
+            let peer = std::thread::spawn(move || {
+                let mut bytes = 0usize;
+                for _ in 0..rounds {
+                    for (_, result) in &replies {
+                        let request = read_message(&mut server).unwrap();
+                        let Message::EngineCall { request_id, .. } = request else { panic!("engine call") };
+                        let reply = Message::engine_result(request_id, true, result.clone(), None);
+                        let mut frame = Vec::new();
+                        write_message(&mut frame, &reply).unwrap();
+                        bytes += frame.len();
+                        std::io::Write::write_all(&mut server, &frame).unwrap();
+                    }
+                }
+                bytes
+            });
+            let started = Instant::now();
+            let mut request_bytes = 0usize;
+            let mut samples = Vec::new();
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for index in 0..calls {
+                    let method = if calls == 1 { "page.recordUsage" } else {
+                        ["page.consoleMessages", "page.downloads", "page.responses"][index]
+                    };
+                    let request = Message::engine_call(index as u64, method.into(), json!({"page": "page-1"}));
+                    let mut frame = Vec::new();
+                    write_message(&mut frame, &request).unwrap();
+                    request_bytes += frame.len();
+                    std::io::Write::write_all(&mut client, &frame).unwrap();
+                    let Message::EngineResult { result, ok, .. } = read_message(&mut client).unwrap() else { panic!("engine result") };
+                    assert!(ok);
+                    if calls == 1 { assert_eq!(serde_json::from_value::<RecordUsage>(result).unwrap(), usage); }
+                }
+                samples.push(start.elapsed().as_micros());
+            }
+            let bytes = request_bytes + peer.join().unwrap();
+            samples.sort();
+            let (cpu_after, peak_rss_kib) = process_usage();
+            eprintln!("RECORD_USAGE_TRANSPORT mode={label} rounds={rounds} frames={} bytes={bytes} wall_us={} median_us={} p95_us={} cpu_us={} process_peak_rss_kib={peak_rss_kib} network_bytes=0",
+                rounds * calls * 2, started.elapsed().as_micros(), samples[rounds / 2], samples[rounds * 95 / 100], cpu_after - cpu_before);
+        }
+    }
 }
