@@ -24,7 +24,7 @@ use crate::agent_tui::{
     bounded_pair, messages_from_protocol, new_session_id, protocol_from_persisted, redact_json,
     SessionCommand, SessionEvent, SessionRecord, SessionStore, TuiConfig,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Exit: success (clean, proposal, or applied).
@@ -48,7 +48,11 @@ const LONG_HELP: &str = "\
 Coding agent with interactive and one-shot modes. Uses an isolated workspace;
 a healthy portable Chunk-CoW provider accelerates it when available. Without
 an activated provider, ordinary private directories provide the same agent
-workflow. FSKit activation is optional. The immutable baseline includes the pinned
+workflow. Each task gets its own worktree and branch under the store
+(`--isolated`, the default), including when the current directory is not a
+Git repository: a scratch repository is created first, then one worktree per
+task. The worktree is removed when the task finishes unless `--keep-worktree`.
+FSKit activation is optional. The immutable baseline includes the pinned
 commit plus visible staged, unstaged and untracked state;
 ignored files are excluded. It delivers a baseline-bound proposal ref
 (refs/greppy/agent/<run_id>); inspect it with `git show` or apply it with
@@ -78,7 +82,7 @@ Usage:
   greppy agent stdio [--model M] [--endpoint URL]
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
-                   [--no-sandbox] [--skip-selfcheck]
+                   [--isolated] [--no-sandbox] [--skip-selfcheck]
                    [--continue | --resume ID] [--json]
   greppy -p --help
 
@@ -96,6 +100,7 @@ Flags:
                       the existing Git index remains byte-identical
   --diff              Print the full proposal patch after the stat
   --keep-worktree     Preserve the isolated workspace and private delta
+  --isolated          One worktree and branch per task (default; required)
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
   --json              Stream newline-delimited JSON events on stdout (`greppy -p` only)
@@ -169,6 +174,17 @@ pub struct AgentArgs {
     /// Preserve the portable namespace and private delta after a successful run.
     #[arg(long)]
     pub keep_worktree: bool,
+
+    /// Give this task its own worktree and branch. This is the default.
+    /// `--isolated=false` is rejected: parallel tasks must not share a checkout.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+    )]
+    pub isolated: bool,
 
     /// Disable shared immutable Base Store reuse for this run and build a
     /// complete private index. Intended for diagnostics and safe fallback.
@@ -352,6 +368,7 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             apply: false,
             diff: false,
             keep_worktree: false,
+            isolated: true,
             private_store: serve.private_store,
             no_sandbox: serve.no_sandbox,
             skip_selfcheck: serve.skip_selfcheck,
@@ -563,6 +580,12 @@ fn run_agent(
     mut bootstrap: Option<crate::agent_tui::BootstrapScreen>,
     settings: crate::agent_tui::AgentSettings,
 ) -> u8 {
+    if !args.isolated {
+        eprintln!(
+            "greppy -p: each task uses its own worktree (--isolated is the default and cannot be turned off)"
+        );
+        return EXIT_USAGE;
+    }
     let task = args.task.as_deref().unwrap_or("").trim().to_string();
     let mut model = args.model.as_deref().unwrap_or("").trim().to_string();
     let endpoint = args.endpoint.trim().to_string();
@@ -577,7 +600,11 @@ fn run_agent(
     let cwd = match greppy_agent::ensure_agent_repository(&cwd) {
         Ok((path, scratch)) => {
             if scratch {
-                let label = if interactive { "greppy agent" } else { "greppy -p" };
+                let label = if interactive {
+                    "greppy agent"
+                } else {
+                    "greppy -p"
+                };
                 eprintln!(
                     "{label}: current directory is not a Git repository; using scratch workspace {}",
                     path.display()
@@ -586,9 +613,7 @@ fn run_agent(
             path
         }
         Err(error) => {
-            eprintln!(
-                "greppy -p: cannot prepare a workspace outside a Git repository: {error}"
-            );
+            eprintln!("greppy -p: cannot prepare a workspace outside a Git repository: {error}");
             return EXIT_AGENT;
         }
     };
@@ -763,7 +788,7 @@ fn run_agent(
         }
     }
     json_session.worktree = workspace.worktree_path().display().to_string();
-    json_session.branch = git_branch(&cwd);
+    json_session.branch = workspace.task_branch();
     if bootstrap
         .as_ref()
         .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
@@ -1116,7 +1141,7 @@ fn run_agent(
             InteractiveLaunch {
                 model,
                 repository,
-                branch: git_branch(&cwd),
+                branch: workspace.task_branch(),
                 worktree: workspace.worktree_path().display().to_string(),
                 sandbox: sandbox_label(&sandbox_mode),
                 run_id: workspace.run_id().to_string(),
@@ -1192,7 +1217,7 @@ fn run_agent(
             }
         };
         record.worktree = workspace.worktree_path().display().to_string();
-        record.branch = git_branch(&cwd);
+        record.branch = workspace.task_branch();
         json_session.worktree = record.worktree.clone();
         json_session.branch = record.branch.clone();
         json_session.model = model.clone();
@@ -2831,12 +2856,13 @@ fn map_cleanup_error(err: &WorkspaceError, worktree: Option<&Path>, stderr: &mut
 }
 
 fn make_run_id() -> String {
-    let secs = SystemTime::now()
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let pid = std::process::id();
-    format!("agent-{secs}-{pid}")
+    format!("agent-{}-{nanos}-{seq}", std::process::id())
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -3432,7 +3458,17 @@ mod tests {
         assert!(!a.apply);
         assert!(!a.diff);
         assert!(!a.keep_worktree);
+        assert!(a.isolated);
         assert!(!a.no_sandbox);
+        let shared = parse(&["do it", "--model", "m", "--isolated=false"]).expect("parse");
+        assert!(!shared.isolated);
+        let flag = parse(&["do it", "--model", "m", "--isolated"]).expect("parse");
+        assert!(flag.isolated);
+        let first = make_run_id();
+        let second = make_run_id();
+        assert_ne!(first, second);
+        assert!(first.starts_with("agent-"));
+        assert!(first.len() <= 128);
         match prev {
             Some(v) => std::env::set_var("GREPPY_DEADLINE_SECS", v),
             None => std::env::remove_var("GREPPY_DEADLINE_SECS"),
@@ -3509,6 +3545,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            isolated: true,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
@@ -3530,6 +3567,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            isolated: true,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
@@ -3811,6 +3849,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            isolated: true,
             private_store: false,
             no_sandbox: true,
             skip_selfcheck: false,
@@ -3847,6 +3886,7 @@ mod tests {
             apply: false,
             diff: false,
             keep_worktree: false,
+            isolated: true,
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
