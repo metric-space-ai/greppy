@@ -22,8 +22,8 @@ use std::time::Duration;
 use clap::Parser;
 use greppy_agent::{
     run_agent_loop_with_history, AgentConfig, BuiltinPromptMode, Client, ClientError, ExecutionEnv,
-    GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent,
-    ToolOutcome, TurnResult,
+    GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream,
+    OutputTokenLimit, StreamEvent, ToolOutcome, TurnResult,
 };
 use serde_json::{json, Value};
 
@@ -56,6 +56,8 @@ type PersistenceFault = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 pub(crate) struct AcpConfig {
     pub endpoint: String,
     pub model: String,
+    /// Verified response limit for the initial model at this endpoint, not a global cap.
+    pub max_output_tokens: Option<OutputTokenLimit>,
     pub api_key: Option<String>,
     pub max_turns: usize,
     pub capabilities: greppy_agent::CapabilitySet,
@@ -73,6 +75,7 @@ impl Default for AcpConfig {
             endpoint: std::env::var("GREPPY_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string()),
             model: std::env::var("GREPPY_MODEL").unwrap_or_default(),
+            max_output_tokens: None,
             api_key: std::env::var("GREPPY_API_KEY")
                 .ok()
                 .filter(|key| !key.is_empty()),
@@ -101,6 +104,10 @@ struct StdioArgs {
     /// Anthropic-Messages gateway base URL.
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    /// Caller-verified response limit for the initial --model at this endpoint.
+    /// Model changes discard it; a new route requires freshly verified metadata.
+    #[arg(long, value_name = "N", requires = "model")]
+    max_output_tokens: Option<OutputTokenLimit>,
     /// Maximum assistant turns for one prompt.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
     max_turns: usize,
@@ -145,6 +152,7 @@ pub(crate) fn run(rest: &[std::ffi::OsString]) -> u8 {
     let config = AcpConfig {
         endpoint: args.endpoint,
         model: args.model.unwrap_or(defaults.model),
+        max_output_tokens: args.max_output_tokens,
         max_turns: args.max_turns,
         capabilities,
         ..defaults
@@ -187,6 +195,7 @@ struct Session {
     project: String,
     model: String,
     messages: Vec<Message>,
+    max_output_tokens: Option<OutputTokenLimit>,
     import_ack: Vec<ImportAck>,
     cancel: Arc<AtomicBool>,
 
@@ -614,6 +623,7 @@ impl Server {
             project,
             model: model.clone(),
             messages: Vec::new(),
+            max_output_tokens: self.config.max_output_tokens,
             import_ack: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
 
@@ -677,6 +687,10 @@ impl Server {
             project,
             model: model.clone(),
             messages,
+            max_output_tokens: self
+                .config
+                .max_output_tokens
+                .filter(|_| model == self.config.model),
             import_ack: record.import_ack,
             cancel: Arc::new(AtomicBool::new(false)),
 
@@ -852,6 +866,9 @@ impl Server {
         if let Err(error) = store.set_model(session_id, model_id) {
             return rpc_error(id, -32603, &format!("cannot persist model: {error}"));
         }
+        if session.model != model_id {
+            session.max_output_tokens = None;
+        }
         session.model = model_id.to_string();
         rpc_ok(id, json!({}))
     }
@@ -918,6 +935,7 @@ impl Server {
                 project: session.project.clone(),
                 model: session.model.clone(),
                 history: session.messages.clone(),
+                max_output_tokens: session.max_output_tokens,
                 cancel: Arc::clone(&session.cancel),
                 perms: Arc::clone(&session.perms),
             }
@@ -1009,6 +1027,7 @@ struct PreparedPrompt {
     project: String,
     model: String,
     history: Vec<Message>,
+    max_output_tokens: Option<OutputTokenLimit>,
     cancel: Arc<AtomicBool>,
     perms: Arc<Mutex<PermMemory>>,
 }
@@ -1077,7 +1096,12 @@ fn run_prompt(
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
         ..AgentConfig::default()
-    };
+    }
+    .with_max_tokens(
+        prepared
+            .max_output_tokens
+            .map_or(u64::MAX, OutputTokenLimit::get),
+    );
     let session_id = prepared.session_id.clone();
     let mut on_event = |event: LoopEvent| {
         if let LoopEvent::ToolStart { call_id, .. } = &event {

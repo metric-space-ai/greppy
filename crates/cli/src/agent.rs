@@ -15,8 +15,8 @@ use clap::Parser;
 use greppy_agent::BuiltinPromptMode;
 use greppy_agent::{
     run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
-    GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
-    StreamEvent, Usage, WorkspaceError,
+    GreppyEnv, LoopEvent, LoopStop, OutputTokenLimit, ProbeError, RunOutcome, SandboxError,
+    SandboxMode, StopReason, StreamEvent, Usage, WorkspaceError,
 };
 
 use crate::agent_control::{socket_path_for, ControlServer};
@@ -40,9 +40,21 @@ pub const EXIT_INCOMPLETE: u8 = 5;
 /// Exit: user cancelled interactive startup.
 pub const EXIT_CANCELLED: u8 = 130;
 
+#[cfg(test)]
+#[path = "agent_output_limit_tests.rs"]
+mod output_limit_tests;
+
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
 const DEFAULT_MAX_TURNS: usize = 0;
 const TOOL_LINE_MAX: usize = 120;
+
+/// Response metadata belongs to one selected model, including reasoning suffixes.
+fn select_session_model(config: &mut AgentConfig, model: String) {
+    if config.model != model {
+        config.max_tokens = u64::MAX;
+    }
+    config.model = model;
+}
 
 const LONG_HELP: &str = "\
 Coding agent with interactive and one-shot modes. Uses an isolated workspace;
@@ -88,6 +100,12 @@ Flags:
                       and persist this through /setup)
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
+  --max-output-tokens N
+                      Verified finite positive per-response limit for --model
+                      at this endpoint; also accepted by agent serve/stdio.
+                      Omit to resolve provider metadata. Unknown limits fail
+                      clearly. Model/endpoint changes discard this value;
+                      it is not persisted, a context size, or a turn budget.
   --max-turns N       Optional cap on action turns, followed by one tool-free
                       report turn (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
@@ -150,6 +168,10 @@ pub struct AgentArgs {
     /// Anthropic-Messages gateway base URL.
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
+
+    /// Caller-verified finite positive response limit for this model and endpoint.
+    #[arg(long, value_name = "N", requires = "model")]
+    pub max_output_tokens: Option<OutputTokenLimit>,
 
     /// Maximum assistant turns.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
@@ -239,6 +261,9 @@ struct ServeArgs {
     model: Option<String>,
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    /// Caller-verified response limit; discarded on model/endpoint changes.
+    #[arg(long, value_name = "N", requires = "model")]
+    max_output_tokens: Option<OutputTokenLimit>,
     #[arg(long = "continue")]
     continue_session: bool,
     #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
@@ -361,6 +386,7 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             task: serve.task,
             model: serve.model,
             endpoint: serve.endpoint,
+            max_output_tokens: serve.max_output_tokens,
             max_turns: serve.max_turns,
             deadline_secs: None,
             apply: false,
@@ -1088,7 +1114,11 @@ fn run_agent(
         deadline,
         deadline_total,
         ..AgentConfig::default()
-    };
+    }
+    .with_max_tokens(
+        args.max_output_tokens
+            .map_or(u64::MAX, OutputTokenLimit::get),
+    );
     #[cfg(unix)]
     let _headless_signals = if !interactive && !serve {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2011,7 +2041,7 @@ pub(crate) fn spawn_session_worker(
             let gateway_ready = match client.list_models() {
                 Ok(models) if !models.is_empty() => {
                     if config.model == "auto" {
-                        config.model = models[0].clone();
+                        select_session_model(&mut config, models[0].clone());
                         if let Err(error) = store_for_worker.set_model(&session_id, &config.model) {
                             worker_bridge.send_discrete(SessionEvent::Warning(format!(
                                 "session save failed: {error}"
@@ -2062,7 +2092,7 @@ pub(crate) fn spawn_session_worker(
                         cancel.store(true, Ordering::Relaxed);
                     }
                     SessionCommand::SetModel(model) => {
-                        config.model = model.clone();
+                        select_session_model(&mut config, model.clone());
                         if let Err(error) = store_for_worker.set_model(&session_id, &model) {
                             worker_bridge.send_discrete(SessionEvent::Warning(format!(
                                 "session save failed: {error}"
@@ -2077,11 +2107,14 @@ pub(crate) fn spawn_session_worker(
                         );
                         match candidate.list_models() {
                             Ok(models) if !models.is_empty() => {
+                                if current_endpoint != endpoint {
+                                    config.max_tokens = u64::MAX;
+                                }
                                 current_endpoint = endpoint;
                                 if config.model == "auto"
                                     || !models.iter().any(|model| model == &config.model)
                                 {
-                                    config.model = models[0].clone();
+                                    select_session_model(&mut config, models[0].clone());
                                 }
                                 client = client_for_endpoint(
                                     &current_endpoint,
@@ -2122,7 +2155,7 @@ pub(crate) fn spawn_session_worker(
                                 summary.usage = next.usage;
                                 summary.turns = next.turns;
                                 summary.last_stop = None;
-                                config.model = next.model;
+                                select_session_model(&mut config, next.model);
                                 session_id = next.id;
                                 summary.session_id = session_id.clone();
                                 cancel.store(false, Ordering::Relaxed);
@@ -2417,7 +2450,7 @@ fn run_interactive_session(
 
     let cancel = Arc::new(AtomicBool::new(false));
     config.cancel = Some(Arc::clone(&cancel));
-    config.model = launch.model.clone();
+    select_session_model(&mut config, launch.model.clone());
     let ui_cancel = Arc::clone(&cancel);
     let startup_worktree = PathBuf::from(&launch.worktree);
     // Gateway/model discovery also runs in the visible setup phase, even when
@@ -3514,6 +3547,7 @@ mod tests {
             task: Some("hi".into()),
             model: None,
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3536,6 +3570,7 @@ mod tests {
             task: Some("   ".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3818,6 +3853,7 @@ mod tests {
             task: Some("t".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3855,6 +3891,7 @@ mod tests {
             task: Some("t".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,

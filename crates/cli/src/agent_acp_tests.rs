@@ -3,6 +3,35 @@ mod imported_history;
 #[path = "agent_acp_import_durability_tests.rs"]
 mod imported_history_durability;
 #[test]
+fn caller_output_limit_belongs_only_to_the_selected_acp_model() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut server, rx) = fixture(root.path());
+    server.config.max_output_tokens = Some(OutputTokenLimit::try_from(65536).unwrap());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens.unwrap().get(),
+        65536
+    );
+    // Both existing model-selection ports discard previous-model metadata.
+    for (method, params) in [
+        (
+            "session/set_model",
+            json!({"sessionId":id, "modelId":"MiniMax-M3"}),
+        ),
+        (
+            "session/set_config_option",
+            json!({"sessionId":id, "configId":"model", "value":"fixture-model"}),
+        ),
+    ] {
+        assert!(request(&server, &rx, "switch", method, params)
+            .get("error")
+            .is_none());
+        assert_eq!(prepared_for(&server, &id).max_output_tokens, None);
+    }
+}
+
+#[test]
 fn rejected_model_changes_preserve_the_active_and_persisted_model() {
     let root = tempfile::tempdir().unwrap();
     let (server, rx) = fixture(root.path());
@@ -67,6 +96,7 @@ fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
             data_root: session.data_root.clone(),
             project: session.project.clone(),
             model: session.model.clone(),
+            max_output_tokens: session.max_output_tokens,
             history: vec![],
             cancel: Arc::clone(&session.cancel),
             perms: Arc::clone(&session.perms),
@@ -125,6 +155,7 @@ fn fixture(root: &Path) -> (Server, Receiver<Value>) {
         model: "fixture-model".into(),
         api_key: None,
         max_turns: 2,
+        max_output_tokens: None,
         capabilities: greppy_agent::CapabilitySet::default(),
         data_root: Some(root.join("state")),
         after_messages: None,
@@ -384,6 +415,7 @@ fn prepared_for(server: &Server, id: &str) -> PreparedPrompt {
         data_root: session.data_root.clone(),
         project: session.project.clone(),
         model: session.model.clone(),
+        max_output_tokens: session.max_output_tokens,
         history: session.messages.clone(),
         cancel: Arc::clone(&session.cancel),
         perms: Arc::clone(&session.perms),

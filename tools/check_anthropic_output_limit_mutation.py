@@ -6,13 +6,16 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 WIRE = ROOT / "crates/agent/src/wire.rs"
 CLIENT = ROOT / "crates/agent/src/client.rs"
+CLI = ROOT / "crates/cli/src/agent.rs"
 FILTER = "required_anthropic_output_limit"
 
 
-def run(filter_name, red=None):
+def run(filter_name, red=None, cli=False):
+    target = (["-p", "greppy", "--features", "ci-test-assets", "--test", "agent_p"]
+              if cli else ["-p", "greppy-agent", "--lib"])
     result = subprocess.run(
-        ["cargo", "test", "--locked", "--jobs", "2", "-p", "greppy-agent",
-         "--lib", filter_name, "--", "--test-threads=1"],
+        ["cargo", "test", "--locked", "--jobs", "2", *target,
+         filter_name, "--", "--test-threads=1"],
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=600,
     )
@@ -22,15 +25,22 @@ def run(filter_name, red=None):
     elif not (result.returncode == 101 and "test result: FAILED" in result.stdout
               and red + " ... FAILED" in result.stdout):
         raise AssertionError("Wrong mutation failure or unexpected success:\n" + result.stdout)
+    return result
 
 
-def mutate(path, fixed, mutant, red, label):
+def mutate(path, fixed, mutant, red, label, filter_name=FILTER, cli=False):
     original = path.read_text()
     if original.count(fixed) != 1:
         raise AssertionError("Mutation anchor must be unique: " + fixed)
     try:
         path.write_text(original.replace(fixed, mutant, 1))
-        run(FILTER, red)
+        result = run(filter_name, red, cli)
+        if cli:
+            diagnostic = "no advertised or registered output limit"
+            if diagnostic not in result.stdout:
+                raise AssertionError("Wrong caller-limit failure:\n" + result.stdout)
+            print("mutation: " + red + " exits101; missing caller bound fails locally: "
+                  + diagnostic, flush=True)
         print("mutation: " + label + " turns the real request contract red", flush=True)
     finally:
         path.write_text(original)
@@ -60,3 +70,13 @@ mutate(
 run(FILTER)
 run("max_tokens_continues")
 print("mutation: restored schema/metadata contracts green; truncated response continues", flush=True)
+run("caller_output_limit", cli=True)
+mutate(
+    CLI, '.map_or(u64::MAX, OutputTokenLimit::get)',
+    '.map_or(u64::MAX, |_| u64::MAX)',
+    "caller_output_limit_reaches_wire_and_continues",
+    "dropping the caller's verified response limit",
+    filter_name="caller_output_limit", cli=True,
+)
+run("caller_output_limit", cli=True)
+print("mutation: restored CLI caller limit reaches actual HTTP requests and continuation", flush=True)
