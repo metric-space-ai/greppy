@@ -50,6 +50,13 @@ mutate(
     "client::metadata_tests::required_anthropic_output_limit_uses_exact_metadata_or_registry",
     "dropping the source-backed registry limit",
 )
+mutate(
+    CLIENT,
+    '        base\n    } else {\n        model\n    }\n}',
+    '        model\n    } else {\n        model\n    }\n}',
+    "client::metadata_tests::required_anthropic_output_limit_preserves_gateway_reasoning_suffix",
+    "restoring literal-only capability lookup",
+)
 run(FILTER)
 run("max_tokens_continues")
 print("mutation: restored schema/metadata contracts green; truncated response continues", flush=True)

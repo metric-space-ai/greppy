@@ -587,25 +587,46 @@ fn advertised_output_limit(data: &str, model: &str) -> Option<u64> {
         .get("data")
         .or_else(|| value.get("models"))?
         .as_array()?;
-    let metadata = models
+    let lookup = |id: &str| {
+        let metadata = models
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(id))?;
+        [
+            "/max_completion_tokens",
+            "/max_output_tokens",
+            "/output_token_limit",
+            "/max_tokens",
+            "/limits/max_output_tokens",
+        ]
         .iter()
-        .find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
-    [
-        "/max_completion_tokens",
-        "/max_output_tokens",
-        "/output_token_limit",
-        "/max_tokens",
-        "/limits/max_output_tokens",
-    ]
-    .iter()
-    .filter_map(|path| metadata.pointer(path).and_then(Value::as_u64))
-    .find(|n| *n > 0 && *n != u64::MAX)
+        .filter_map(|path| metadata.pointer(path).and_then(Value::as_u64))
+        .find(|n| *n > 0 && *n != u64::MAX)
+    };
+    lookup(model).or_else(|| lookup(capability_model_id(model)))
+}
+
+/// Recognize only gateway thinking grammar for capability lookup; never rewrite the wire ID.
+/// https://github.com/router-for-me/CLIProxyAPI/blob/585f97deac9aa57c700301221fb1a7085e1827cc/internal/thinking/suffix.go
+fn capability_model_id(model: &str) -> &str {
+    let Some((base, suffix)) = model.strip_suffix(')').and_then(|m| m.rsplit_once('(')) else {
+        return model;
+    };
+    let level = suffix.to_ascii_lowercase();
+    let valid = matches!(
+        level.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "none" | "auto" | "-1"
+    ) || suffix.parse::<i64>().is_ok_and(|n| n >= 0);
+    if valid && !base.is_empty() {
+        base
+    } else {
+        model
+    }
 }
 
 /// Exact model IDs from the gateway's primary registry, not context-size guesses.
 /// https://github.com/router-for-me/CLIProxyAPI/blob/585f97deac9aa57c700301221fb1a7085e1827cc/internal/registry/models/models.json
 fn registered_output_limit(model: &str) -> Option<u64> {
-    match model {
+    match capability_model_id(model) {
         "kimi-k3.1-pro" | "kimi-k3.1-pro-highspeed" => Some(65536),
         "grok-4.7" | "grok-4.7-build-fast" => Some(500000),
         _ => None,
@@ -690,10 +711,25 @@ mod metadata_tests {
         assert_eq!(advertised_output_limit(metadata, model), Some(22222));
         let base_only = r#"{"data":[{"id":"kimi-k3.1-pro","max_completion_tokens":11111}]}"#;
         assert_eq!(advertised_output_limit(base_only, model), Some(11111));
+        for suffix in ["HIGH", "4096", "08192", "+1", "0", "-1", "none", "auto"] {
+            req.model = format!("kimi-k3.1-pro({suffix})");
+            client
+                .output_limits
+                .lock()
+                .unwrap()
+                .insert(req.model.clone(), None);
+            let body = client.request_body(&req).expect("formal gateway suffix");
+            assert_eq!(body["model"], req.model);
+            assert_eq!(body["max_tokens"], 65536);
+        }
         for unknown in [
             "kimi-k3.1-pro-extra(high)",
             "kimi-k3.1-pro(unknown)",
             "kimi-k3.1-pro(high)extra",
+            "unknown-model(high)",
+            "kimi-k3.1-pro(9223372036854775808)",
+            "kimi-k3.1-pro(１２３)",
+            "kimi-k3.1-pro(١٢٣)",
         ] {
             req.model = unknown.into();
             client
