@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::protocol::{ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, Usage};
-use crate::wire::{to_messages_request_body, SseItem, SseParser};
+use crate::wire::{to_messages_request_body_with_limit, SseItem, SseParser};
 
 #[cfg(test)]
 #[path = "client_cancel_tests.rs"]
@@ -214,9 +214,7 @@ impl Client {
                 req.model
             ))
         })?;
-        let mut bounded = req.clone();
-        bounded.max_tokens = limit;
-        to_messages_request_body(&bounded).map_err(ClientError::Transport)
+        to_messages_request_body_with_limit(req, limit).map_err(ClientError::Transport)
     }
 
     /// List model ids advertised by `GET {base}/v1/models`.

@@ -38,7 +38,7 @@ def mutate(path, fixed, mutant, red, label):
 
 run(FILTER)
 mutate(
-    WIRE, '    body["max_tokens"] = json!(req.max_tokens);',
+    WIRE, '    body["max_tokens"] = json!(max_tokens);',
     '    // mutation: omit required max_tokens',
     "wire::tests::required_anthropic_output_limit_is_numeric_and_finite",
     "omitting max_tokens",

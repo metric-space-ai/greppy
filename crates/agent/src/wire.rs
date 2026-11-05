@@ -17,7 +17,14 @@ use crate::protocol::{
 /// system/tool/history cache breakpoints; other models receive no cache fields.
 /// `tool_choice` maps as `auto` / `none` / `any` (Anthropic's "required").
 pub fn to_messages_request_body(req: &ModelRequest) -> Result<Value, String> {
-    if req.max_tokens == 0 || req.max_tokens == u64::MAX {
+    to_messages_request_body_with_limit(req, req.max_tokens)
+}
+
+pub(crate) fn to_messages_request_body_with_limit(
+    req: &ModelRequest,
+    max_tokens: u64,
+) -> Result<Value, String> {
+    if max_tokens == 0 || max_tokens == u64::MAX {
         return Err("Anthropic Messages requires a resolved finite positive max_tokens".into());
     }
     let mut body = json!({
@@ -26,7 +33,7 @@ pub fn to_messages_request_body(req: &ModelRequest) -> Result<Value, String> {
         "stream": true,
     });
 
-    body["max_tokens"] = json!(req.max_tokens);
+    body["max_tokens"] = json!(max_tokens);
     let cache = req.model.starts_with("claude-") || req.model.starts_with("anthropic/claude-");
     if let Some(system) = &req.system {
         body["system"] = if cache {
