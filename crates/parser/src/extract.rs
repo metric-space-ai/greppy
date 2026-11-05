@@ -6242,9 +6242,9 @@ fn extract_go(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionR
                 // A qualified type's `name:` field is a reference (ast.VarStmt),
                 // not a declaration. Other definition-name filtering is unchanged.
                 if is_definition_name(node)
-                    && !node
+                    && node
                         .parent()
-                        .is_some_and(|parent| parent.kind() == "qualified_type")
+                        .is_none_or(|parent| parent.kind() != "qualified_type")
                 {
                     continue;
                 }

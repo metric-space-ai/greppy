@@ -6,9 +6,9 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "crates/parser/src/extract.rs"
 FIXED = b"""                if is_definition_name(node)
-                    && !node
+                    && node
                         .parent()
-                        .is_some_and(|parent| parent.kind() == "qualified_type")
+                        .is_none_or(|parent| parent.kind() != "qualified_type")
                 {"""
 MUTANT = b"                if is_definition_name(node) {"
 CASES = [
