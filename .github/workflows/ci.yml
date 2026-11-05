@@ -119,6 +119,10 @@ jobs:
       - name: cargo build --workspace (fast test assets)
         run: cargo build --workspace --features greppy/ci-test-assets
 
+      - name: Go qualified-type usage mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_go_qualified_type_mutation.py
+
       # Several crates' unit tests mutate process-global env via set_var
       # (GREPPY_* config knobs). set_var is process-wide across the test
       # harness's parallel threads, so one test's override leaks into another
@@ -133,10 +137,6 @@ jobs:
         env:
           RUST_MIN_STACK: "8388608"
         run: cargo test --workspace --no-fail-fast --features greppy/ci-test-assets -- --test-threads=1
-
-      - name: Go qualified-type usage mutation proof
-        if: runner.os == 'Linux'
-        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_go_qualified_type_mutation.py
 
       - name: x86 portable CPU dispatch gate
         if: runner.os == 'Linux'
