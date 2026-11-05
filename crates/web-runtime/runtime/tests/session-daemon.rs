@@ -12375,7 +12375,7 @@ fn oversized_console_is_a_limit_error_without_restarting_content() {
 import { chromium } from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
-await page.evaluate(() => console.log("x".repeat(2 * 1024 * 1024)));
+await page.evaluate(() => console.log("x".repeat(9 * 1024 * 1024)));
 "#,
         None,
         Duration::from_secs(40),
