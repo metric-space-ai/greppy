@@ -1228,6 +1228,14 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                         "text/html; charset=utf-8",
                         b"<!doctype html><html><body><p id='parsed'>dom-content-loaded</p><img src='/dcl-load-gate.png'></body></html>".to_vec(),
                     ),
+                    "/read" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head><title>Read lifecycle</title><script defer src='/read-defer-gate.js'></script></head><body><script>try { window.__greppyDOMContentLoaded = true; } catch (_) {} document.dispatchEvent(new Event('DOMContentLoaded'));</script><p id='read-article'>parser-ready</p><img src='/read-image-gate.png'></body></html>".to_vec(),
+                    ),
+                    "/read-defer-gate.js" => (
+                        "text/javascript",
+                        b"document.querySelector('#read-article').textContent='deferred-text-ready';".to_vec(),
+                    ),
                     "/phrase" => (
                         "text/html; charset=utf-8",
                         b"<!DOCTYPE html><html><head><title>Quoted documentation</title></head><body><p>Documentation may say: Could not load the requested page.</p><p id=loaded>ordinary-page-loaded</p></body></html>".to_vec(),
@@ -5570,6 +5578,50 @@ await browser.close();
         "{paths:?}"
     );
     assert!(paths.iter().any(|path| path == "/landed?v=2"), "{paths:?}");
+}
+
+#[test]
+fn web_read_waits_for_deferred_text_but_not_unrelated_images() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let socket = std::env::temp_dir().join(format!("greppy-web-read-ready-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let run = "run_web_read_ready";
+    let _guard = Supervisor::spawn(&socket, run, |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ready = unix_request(&socket, &Request::new(run, "handshake", json!({})), Duration::from_secs(30)).unwrap();
+    assert_eq!(ready.status, "ok", "{ready:?}");
+    let created = unix_request(&socket, &Request::new(run, "web.session.create", json!({"profile":"project"})), Duration::from_secs(10)).unwrap();
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap().to_owned();
+    let read = Request::new(run, "web.read", json!({"session_id":session,"url":format!("{}/read",fixture.origin)}));
+    let (sent, received) = std::sync::mpsc::channel();
+    let socket_read = socket.clone();
+    let worker = thread::spawn(move || {
+        let outcome = unix_request(&socket_read, &read, Duration::from_secs(30));
+        let _ = sent.send(outcome);
+    });
+    fixture.wait_for_all(&["/read-defer-gate.js", "/read-image-gate.png"]);
+    let early = received.recv_timeout(Duration::from_millis(300));
+    let waited_for_defer = matches!(&early,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    fixture.release("/read-defer-gate.js");
+    let before_image_release = if waited_for_defer {
+        received.recv_timeout(Duration::from_secs(10))
+    } else { early };
+    let returned_while_image_held = before_image_release.is_ok();
+    fixture.release("/read-image-gate.png");
+    let response = before_image_release.unwrap_or_else(|_| received.recv_timeout(Duration::from_secs(20)).unwrap()).unwrap();
+    worker.join().unwrap();
+    assert!(waited_for_defer, "read skipped deferred document work");
+    assert!(returned_while_image_held, "text reader waited for an unrelated image resource");
+    assert_eq!(response.status, "ok", "{response:?}");
+    let source = &response.result.as_ref().unwrap()["source"];
+    assert!(source.to_string().contains("deferred-text-ready"), "{source}");
+    assert!(!source.to_string().contains("parser-ready"), "read returned the pre-deferred text: {source}");
+    let closed = unix_request(&socket, &Request::new(run, "web.session.close", json!({"session_id":session})), Duration::from_secs(10)).unwrap();
+    assert_eq!(closed.status, "ok", "{closed:?}");
 }
 
 #[test]

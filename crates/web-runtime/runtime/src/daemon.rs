@@ -4587,7 +4587,9 @@ impl Daemon {
             session.requests = session.requests.saturating_add(1);
             session.network_bytes = session.network_bytes.saturating_add(4096);
         }
-        self.engine_call("page.goto", json!({ "page": page, "url": url }))
+        // Text extraction needs the complete parsed/deferred document, not
+        // every image/font finishing. The engine verifies the trusted DCL receipt.
+        self.engine_call("page.goto", json!({ "page": page, "url": url, "waitUntil": "domcontentloaded" }))
             .map_err(|error| engine_error(request, error, 34))?;
         self.apply_page_record_limits(session_id, page, request)?;
         let tree = self
