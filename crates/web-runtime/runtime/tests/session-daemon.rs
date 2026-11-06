@@ -1165,13 +1165,14 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
             let handler = thread::spawn(move || {
                 let mut buffer = [0_u8; 2048];
                 let n = match stream.read(&mut buffer) {
+                    Ok(0) => return,
                     Ok(n) => n,
                     Err(error) => {
                         diagnostics
                             .lock()
                             .unwrap()
                             .push(format!("request read error: {error}"));
-                        0
+                        return;
                     }
                 };
                 let request = String::from_utf8_lossy(&buffer[..n]);
@@ -1282,6 +1283,25 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
         server: Some(server),
         handlers,
     }
+}
+
+#[test]
+fn navigation_fixture_closes_silent_connections_without_response() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+    let fixture = serve_navigation_lifecycle_fixture();
+    let address = fixture.origin.strip_prefix("http://").unwrap();
+    // An EOF and an idle preconnection are not GET / requests. Neither may
+    // manufacture a server-side navigation receipt or an unsolicited HTTP 200.
+    for eof in [true, false] {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        if eof { stream.shutdown(Shutdown::Write).unwrap(); }
+        let mut response = [0_u8; 1];
+        let count = stream.read(&mut response).expect("silent fixture connection should close within its existing read budget");
+        assert_eq!(count, 0, "fixture fabricated an HTTP response without a request (eof={eof})");
+    }
+    fixture.assert_not_requested("/", Duration::from_millis(50));
 }
 
 fn serve_site() -> String {
