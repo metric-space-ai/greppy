@@ -69,6 +69,28 @@ def extract_selected(package, destination, evidence):
     return total
 
 
+def inspect_environment(package, cli):
+    """Record declared dependencies and isolated host loader probes before a task."""
+    control = subprocess.run(['dpkg-deb', '-f', str(package), 'Package', 'Version', 'Depends'],
+                             capture_output=True, text=True, timeout=15, check=True)
+    version = subprocess.run([str(cli), '--version'], capture_output=True, text=True, timeout=15)
+    if version.returncode != 0:
+        raise RuntimeError('released CLI version probe failed')
+    # Run in separate processes: do not retain graphics libraries in the meter.
+    # This is preparation, not a measured cold-start or sandbox validation.
+    probes = {}
+    for library in ('libEGL.so.1', 'libEGL.so'):
+        result = subprocess.run(
+            [sys.executable, '-B', '-c',
+             'import ctypes, sys; ctypes.CDLL(sys.argv[1])', library],
+            capture_output=True, text=True, timeout=10)
+        probes[library] = {'exit_code': result.returncode, 'stderr': result.stderr[-4096:]}
+    return {'package_control': control.stdout.strip(), 'cli_version': version.stdout.strip(),
+            'host_egl_loader_probes': probes,
+            'scope': 'preparation outside timed worker; no OS-cache-cold or sandbox claim',
+            'egl_loadable_on_host': any(p['exit_code'] == 0 for p in probes.values())}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--release', required=True)
@@ -121,6 +143,14 @@ def main():
             path = runtime_root / name
             if path.is_file() and path.stat().st_size <= 128 * 1024:
                 report['sdk_metadata'][name] = json.loads(path.read_text())
+        report['environment'] = inspect_environment(package, cli)
+        if not report['environment']['egl_loadable_on_host']:
+            report['status'] = 'environment_preflight_failed'
+            report['quality_verified'] = False
+            report['quality_error'] = 'host cannot load either standard libEGL library; no workload was started'
+            (evidence / 'profile.json').write_text(json.dumps(report, indent=2) + chr(10))
+            print('RELEASE_PROFILE ' + json.dumps(report))
+            return 0
         # The normal meter creates its own private state below this short parent.
         # Keep state separate from public evidence; never archive owner tokens.
         state_parent = Path(tempfile.mkdtemp(prefix='gwp-', dir='/tmp'))
