@@ -19,6 +19,71 @@ measurement = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(measurement)
 
 
+class HostEnvelopeContract(unittest.TestCase):
+    def fixture(self, directory):
+        proc_self = directory / 'proc-self'
+        proc_self.mkdir()
+        mount = directory / 'mounted hierarchy'
+        leaf = mount / 'parent/leaf'
+        leaf.mkdir(parents=True)
+        (proc_self / 'cgroup').write_text('0::/tenant/parent/leaf\n')
+        escaped = str(mount).replace('\\', '\\134').replace(' ', '\\040')
+        (proc_self / 'mountinfo').write_text(
+            f'24 23 0:28 /tenant {escaped} rw - cgroup2 cgroup rw\n')
+        for group, cpu, memory, swap in (
+                (leaf, 'max 100000', 'max', 'max'),
+                (leaf.parent, '50000 100000', '1024', '40'),
+                (mount, '200000 100000', '4096', '400')):
+            for name, value in (('cpu.max', cpu), ('memory.max', memory), ('memory.swap.max', swap)):
+                (group / name).write_text(value)
+        return proc_self, mount, leaf
+
+    def test_visible_ancestor_ceilings_cannot_be_relaxed_by_leaf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_self, mount, leaf = self.fixture(pathlib.Path(directory))
+            observed = measurement.cgroup_v2_envelope(proc_self)
+            self.assertEqual(observed['errors'], [])
+            self.assertEqual(observed['leaf']['cpu.max'], 'max 100000')
+            self.assertEqual(
+                observed['cpu_quota_upper_bound_ratio'], [1, 2],
+                'leaf-only CPU observation loses the tighter ancestor ceiling')
+            self.assertEqual(observed['memory_max_upper_bound_bytes'], 1024)
+            self.assertEqual(observed['swap_max_upper_bound_bytes'], 40)
+            self.assertEqual(
+                [row['path'] for row in observed['visible_ancestors']],
+                [str(leaf), str(leaf.parent), str(mount)])
+
+    def test_invalid_or_unmapped_metadata_is_explicitly_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_self, mount, leaf = self.fixture(pathlib.Path(directory))
+            (leaf.parent / 'cpu.max').write_text('10000 0')
+            observed = measurement.cgroup_v2_envelope(proc_self)
+            self.assertTrue(observed['errors'], 'invalid CPU metadata must remain visible')
+            (proc_self / 'cgroup').write_text('0::/different-namespace\n')
+            observed = measurement.cgroup_v2_envelope(proc_self)
+            self.assertIsNone(observed['leaf'])
+            self.assertIsNone(observed['cpu_quota_upper_bound'])
+            self.assertTrue(observed['errors'], 'unmapped cgroup must not be called unlimited')
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and shutil.which('taskset'),
+                         'requires actual Linux CPU affinity')
+    def test_real_single_cpu_affinity_bounds_the_observed_capacity(self):
+        cpu = min(os.sched_getaffinity(0))
+        code = (
+            "import importlib.util,json,pathlib;"
+            f"s=importlib.util.spec_from_file_location('meter',{str(pathlib.Path(measurement.__file__))!r});"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "print(json.dumps(m.host_envelope()))")
+        child = subprocess.run(
+            ['taskset', '-c', str(cpu), sys.executable, '-c', code],
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        observed = json.loads(child.stdout)
+        self.assertEqual(observed['cpu_affinity'], [cpu])
+        self.assertLessEqual(observed['sustained_cpu_capacity_upper_bound'], 1)
+        self.assertFalse(observed['limits_modified_by_harness'])
+
+
 class OutcomeContract(unittest.TestCase):
     def setUp(self):
         self.fixture = measurement.Fixture({'rounds': 1, 'tasks': 1, 'concurrency': 1, 'nodes': 3})

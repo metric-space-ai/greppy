@@ -49,19 +49,111 @@ def source_identity():
                                          'runtime/fixtures/efficiency-native.mjs', ':(top)bench/process_memory.py')}
 
 
-def host_envelope():
-    result = {'platform': platform.platform(), 'logical_cpus': os.cpu_count(),
-              'cpu_affinity': sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
-              'limits_modified_by_harness': False, 'cgroup_v2': None}
+def cgroup_v2_envelope(proc_self=pathlib.Path('/proc/self')):
+    """Observe visible ancestor ceilings, never reserved or guaranteed capacity."""
+    from fractions import Fraction
+
+    result = {'leaf': None, 'visible_ancestors': [], 'errors': [],
+              'cpu_quota_upper_bound': None, 'cpu_quota_upper_bound_ratio': None,
+              'memory_max_upper_bound_bytes': None, 'swap_max_upper_bound_bytes': None,
+              'scope': 'visible cgroup-v2 ancestor ceilings; hidden namespace ancestors and competing workloads are unknown'}
+
+    def bounded_text(path, maximum=1024 * 1024):
+        with path.open(encoding='utf-8') as source:
+            value = source.read(maximum + 1)
+        if len(value) > maximum:
+            raise ValueError('resource metadata exceeds observation bound')
+        return value.strip()
+
+    def mount_field(value):
+        for escaped, literal in (('\\040', ' '), ('\\011', '\t'), ('\\012', '\n'), ('\\134', '\\')):
+            value = value.replace(escaped, literal)
+        return value
+
     try:
-        entries = pathlib.Path('/proc/self/cgroup').read_text().splitlines()
-        relative = next(row[3:] for row in entries if row.startswith('0::'))
-        if '..' not in pathlib.PurePosixPath(relative).parts:
-            group = pathlib.Path('/sys/fs/cgroup') / relative.lstrip('/')
-            result['cgroup_v2'] = {name: (group / name).read_text().strip()
-                                   for name in ('cpu.max', 'memory.max', 'memory.swap.max')}
-    except (OSError, StopIteration):
-        pass
+        rows = bounded_text(proc_self / 'cgroup').splitlines()
+        member = next(row[3:] for row in rows if row.startswith('0::'))
+        membership = pathlib.PurePosixPath(member)
+        if not membership.is_absolute() or '..' in membership.parts:
+            raise ValueError('invalid cgroup-v2 membership')
+        candidates = []
+        for row in bounded_text(proc_self / 'mountinfo').splitlines():
+            before, separator, after = row.partition(' - ')
+            if not separator or not after.split() or after.split()[0] != 'cgroup2':
+                continue
+            fields = before.split()
+            if len(fields) < 6:
+                raise ValueError('invalid cgroup-v2 mount metadata')
+            root = pathlib.PurePosixPath(mount_field(fields[3]))
+            mount = pathlib.Path(mount_field(fields[4]))
+            if not root.is_absolute() or '..' in root.parts or not mount.is_absolute() or '..' in mount.parts:
+                raise ValueError('invalid cgroup-v2 mount path')
+            if membership.is_relative_to(root):
+                candidates.append((root, mount))
+        if not candidates:
+            raise ValueError('cgroup-v2 membership cannot be mapped to a visible mount')
+        root, mount = max(candidates, key=lambda item: len(item[0].parts))
+        group = mount / membership.relative_to(root)
+        result.update(membership=member, mount_root=str(root), mount_point=str(mount))
+        quotas, memory, swap = [], [], []
+        for _ in range(256):
+            values = {'path': str(group)}
+            for name in ('cpu.max', 'memory.max', 'memory.swap.max'):
+                try:
+                    values[name] = bounded_text(group / name, 4096)
+                except FileNotFoundError:
+                    # The hierarchy root, or a disabled controller, has no file.
+                    values[name] = None
+                except (OSError, UnicodeError, ValueError) as error:
+                    values[name] = None
+                    result['errors'].append(f'{group / name}: {error}')
+            if result['leaf'] is None:
+                result['leaf'] = {name: values[name] for name in ('cpu.max', 'memory.max', 'memory.swap.max')}
+            result['visible_ancestors'].append(values)
+            try:
+                if values['cpu.max'] is not None:
+                    quota, period = values['cpu.max'].split()
+                    if int(period) <= 0 or (quota != 'max' and int(quota) <= 0):
+                        raise ValueError('nonpositive CPU quota or period')
+                    if quota != 'max':
+                        quotas.append(Fraction(int(quota), int(period)))
+                for name, target in (('memory.max', memory), ('memory.swap.max', swap)):
+                    value = values[name]
+                    if value is not None and value != 'max':
+                        if int(value) < 0:
+                            raise ValueError('negative memory ceiling')
+                        target.append(int(value))
+            except ValueError as error:
+                result['errors'].append(f'{group}: {error}')
+            if group == mount:
+                break
+            group = group.parent
+        else:
+            result['errors'].append('visible cgroup ancestry exceeds 256 levels')
+        if quotas:
+            quota = min(quotas)
+            result['cpu_quota_upper_bound'] = float(quota)
+            result['cpu_quota_upper_bound_ratio'] = [quota.numerator, quota.denominator]
+        result['memory_max_upper_bound_bytes'] = min(memory) if memory else None
+        result['swap_max_upper_bound_bytes'] = min(swap) if swap else None
+    except StopIteration:
+        result['errors'].append('no cgroup-v2 membership')
+    except (OSError, UnicodeError, ValueError) as error:
+        result['errors'].append(str(error))
+    return result
+
+
+def host_envelope():
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
+    result = {'platform': platform.platform(), 'logical_cpus': os.cpu_count(),
+              'cpu_affinity': affinity, 'limits_modified_by_harness': False, 'cgroup_v2': None}
+    cgroup = cgroup_v2_envelope()
+    result['cgroup_v2'] = cgroup['leaf']
+    result['cgroup_v2_observation'] = cgroup
+    bounds = [value for value in (len(affinity) if affinity else os.cpu_count(),
+                                  cgroup['cpu_quota_upper_bound']) if value is not None]
+    result['sustained_cpu_capacity_upper_bound'] = min(bounds) if bounds else None
+    result['capacity_scope'] = 'receipt-time affinity/logical-CPU and visible quota rates averaged over their periods; no reserved capacity, hidden-ancestor or interval-stability claim'
     return result
 
 
