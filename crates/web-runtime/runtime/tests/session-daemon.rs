@@ -17,6 +17,8 @@ use web_runtime::worker::give_child_attach_token;
 
 #[path = "cases/workflow_cases.rs"]
 mod workflow_cases;
+#[path = "support/recorded_http_fixture.rs"]
+mod recorded_http_fixture;
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const SOCKET_WAIT: Duration = Duration::from_secs(30);
@@ -4685,62 +4687,23 @@ fn download_is_recorded_from_fulfilled_binary() {
 
 #[test]
 fn real_http_download_wait_allows_click_and_owns_complete_file() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let origin = format!("http://{}/", listener.local_addr().unwrap());
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopped = Arc::clone(&stop);
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&requests);
+    use recorded_http_fixture::{http_response, HttpFixture};
     let payload: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
     let served_payload = payload.clone();
     let second_payload: Vec<u8> = payload.iter().map(|byte| byte ^ 0xa5).collect();
     let served_second = second_payload.clone();
-    let server = thread::spawn(move || {
-        while !stopped.load(Ordering::Relaxed) {
-            let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("download fixture accept: {error}"),
-            };
-            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
-            let mut header = Vec::new();
-            let mut chunk = [0; 1024];
-            while header.len() < 8192 && !header.windows(4).any(|part| part == b"\r\n\r\n") {
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => header.extend_from_slice(&chunk[..n]),
-                }
-            }
-            if !header.windows(4).any(|part| part == b"\r\n\r\n") { continue; }
-            let header = String::from_utf8_lossy(&header);
-            let path = header.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("");
-            observed.lock().unwrap().push(path.to_owned());
-            let (body, content_type, disposition) = if path == "/file-second" {
-                (served_second.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"second.bin\"\r\n")
-            } else if path == "/file" || path == "/background.bin" {
-                (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
-            } else {
-                (b"<!doctype html><button id='trigger' onclick=\"fetch('/signal')\">Trigger</button><a id='download' href='/file' download>Download</a><a id='second' href='/file-second' download>Second</a>".as_slice(), "text/html", "")
-            };
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-            let _ = stream.write_all(response.as_bytes()).and_then(|_| stream.write_all(body));
-        }
+    let _server = HttpFixture::start(move |path| {
+        let (body, content_type, disposition) = if path == "/file-second" {
+            (served_second.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"second.bin\"\r\n")
+        } else if path == "/file" || path == "/background.bin" {
+            (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
+        } else {
+            (b"<!doctype html><button id='trigger' onclick=\"fetch('/signal')\">Trigger</button><a id='download' href='/file' download>Download</a><a id='second' href='/file-second' download>Second</a>".as_slice(), "text/html", "")
+        };
+        http_response(body, content_type, disposition)
     });
-    struct ServerGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
-    impl Drop for ServerGuard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-            self.1.take().unwrap().join().unwrap();
-        }
-    }
-    let _server = ServerGuard(stop, Some(server));
+    let origin = _server.origin.clone();
+    let requests = Arc::clone(&_server.requests);
     let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-http-download-{}", std::process::id())));
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("runtime.sock");

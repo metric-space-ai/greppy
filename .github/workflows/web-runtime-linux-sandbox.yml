@@ -36,6 +36,34 @@ jobs:
         with:
           toolchain: "1.95.0"
 
+      - name: Prove a silent HTTP connection cannot block another request
+        shell: python
+        run: |
+          import os, pathlib, subprocess, tempfile
+          source = pathlib.Path('crates/web-runtime/runtime/tests/support/recorded_http_fixture.rs')
+          original = source.read_text()
+          old = 'while index < clients.len() {'
+          assert original.count(old) == 1
+          with tempfile.TemporaryDirectory(prefix='http-fixture-', dir=os.environ['RUNNER_TEMP']) as directory:
+              binary = pathlib.Path(directory) / 'contract'
+              def build():
+                  subprocess.run(['rustc', '--edition=2021', '--test', str(source), '-o', str(binary)],
+                                 check=True, timeout=30)
+              command = [str(binary), '--test-threads=1', '--nocapture']
+              build()
+              subprocess.run(command, check=True, timeout=10)
+              try:
+                  source.write_text(original.replace(old, 'while index < clients.len().min(1) {'))
+                  build()
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and 'independent HTTP request was blocked by silent connection' in result.stdout + result.stderr
+              finally:
+                  source.write_text(original)
+              build()
+              subprocess.run(command, check=True, timeout=10)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Check typed status over private Unix sockets
         run: cargo test --locked -p greppy-web-client --lib status_probe_ -- --test-threads=1
 
