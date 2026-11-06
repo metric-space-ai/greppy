@@ -91,6 +91,12 @@ jobs:
           --package web-runtime --test session-daemon
           real_http_download_wait_allows_click_and_owns_complete_file -- --test-threads=1 --nocapture
 
+      - name: Check native download staging shares session quota across contexts
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          native_download_staging_shares_session_quota_across_contexts -- --test-threads=1 --nocapture
+
       - name: Prove a later download wait cannot reuse the first retained file
         shell: python
         run: |

@@ -357,6 +357,7 @@ enum DialogAction {
 struct Delegate {
     new_frame_ready: RefCell<bool>,
     record_budget: Rc<RecordBudget>,
+    download_budget: Rc<RefCell<Arc<servo::DownloadBudget>>>,
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<RetainedRecords>,
@@ -416,12 +417,14 @@ impl Delegate {
         wake: WakeFlag,
         user_content: Rc<UserContentManager>,
         record_budget: Rc<RecordBudget>,
+        download_budget: Rc<RefCell<Arc<servo::DownloadBudget>>>,
     ) -> Self {
         #[cfg(debug_assertions)]
         LIVE_DELEGATES.fetch_add(1, Ordering::Relaxed);
         Self {
             new_frame_ready: RefCell::new(false),
             record_budget: Rc::clone(&record_budget),
+            download_budget,
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(RetainedRecords::with_budget(
@@ -638,6 +641,7 @@ impl WebViewDelegate for Delegate {
             self.wake.clone(),
             Rc::clone(&self.user_content),
             Rc::clone(&self.record_budget),
+            Rc::clone(&self.download_budget),
         ));
         let child = request
             .builder(Rc::clone(&self.rendering_context))
@@ -803,9 +807,7 @@ impl WebViewDelegate for Delegate {
             });
         let Some((action, body, status, content_type, continue_headers)) = matched else {
             let extras = extra_request_headers(&self.extra_headers.borrow());
-            if !extras.is_empty() {
-                load.continue_with_headers(extras);
-            }
+            load.continue_with_download_budget(extras, Arc::clone(&self.download_budget.borrow()));
             return;
         };
         let request_url = load.request.url.clone();
@@ -882,10 +884,7 @@ impl WebViewDelegate for Delegate {
                 let mut merged = self.extra_headers.borrow().clone();
                 merged.extend(continue_headers);
                 let extras = extra_request_headers(&merged);
-                if extras.is_empty() {
-                    return;
-                }
-                load.continue_with_headers(extras);
+                load.continue_with_download_budget(extras, Arc::clone(&self.download_budget.borrow()));
             }
             _ => {}
         }
@@ -1151,6 +1150,7 @@ struct EngineBundle {
     wake: WakeFlag,
     user_content: Rc<UserContentManager>,
     record_budget: Rc<RecordBudget>,
+    download_budget: Rc<RefCell<Arc<servo::DownloadBudget>>>,
     _proxy: PolicyProxy,
 }
 
@@ -1243,6 +1243,8 @@ struct ContentEngine {
     session_contexts: HashMap<String, String>,
     next_id: u64,
     record_memory_limit: usize,
+    download_budget: Arc<servo::DownloadBudget>,
+    download_budgets: servo::DownloadBudgets,
     pump_nonce: Cell<u64>,
     pump_pending: RefCell<Vec<String>>,
     renderer_error: RefCell<Option<String>>,
@@ -1359,6 +1361,9 @@ impl ContentEngine {
                 .content_rss_bytes
                 .try_into()
                 .unwrap_or(usize::MAX),
+            download_budget: Arc::new(servo::DownloadBudget::new(
+                crate::limits::SessionLimits::default().max_download_bytes)),
+            download_budgets: servo::DownloadBudgets::default(),
             pump_nonce: Cell::new(1),
             pump_pending: RefCell::new(Vec::new()),
             renderer_error: RefCell::new(None),
@@ -1444,6 +1449,7 @@ impl ContentEngine {
             wake,
             user_content,
             record_budget: Rc::new(RecordBudget::new(self.record_memory_limit)),
+            download_budget: Rc::new(RefCell::new(Arc::clone(&self.download_budget))),
             _proxy: proxy,
         }))
     }
@@ -2807,12 +2813,15 @@ impl ContentEngine {
                     ),
                 };
                 let record_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.record_budget)).unwrap_or_else(|| Rc::new(RecordBudget::new(self.record_memory_limit)));
+                let download_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.download_budget))
+                    .unwrap_or_else(|| Rc::new(RefCell::new(Arc::clone(&self.download_budget))));
                 let delegate = Rc::new(Delegate::new(
                     Rc::clone(&rendering_context),
                     profile,
                     wake.clone(),
                     Rc::clone(&user_content),
                     record_budget,
+                    download_budget,
                 ));
                 let webview = WebViewBuilder::new(servo, rendering_context)
                     .delegate(delegate.clone())
@@ -2853,10 +2862,25 @@ impl ContentEngine {
                     )
                 })?;
                 let record_limit = params.get("record_memory_bytes").and_then(|value| value.as_u64()).map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+                let download_budget = match (
+                    params.get("__download_session").and_then(|value| value.as_str()),
+                    params.get("max_download_bytes").and_then(|value| value.as_u64()),
+                ) {
+                    (Some(session), Some(limit)) if !session.is_empty() =>
+                        Some(self.download_budgets.for_session(session, limit)),
+                    (None, None) => None,
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid download session authority")),
+                };
                 if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+                    if let Some(PageSlot::Live { pair, .. }) = self.pages.get(page) {
+                        if let Some(budget) = &download_budget {
+                            pair.1.download_budget.replace(Arc::clone(budget));
+                        }
+                    }
                     if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
                         bundle.profile.set(parsed);
                         if let Some(limit) = record_limit { bundle.record_budget.set_limit(limit); }
+
                         return Ok(json!({ "profile": bundle.profile.get().as_str() }));
                     }
                 }
@@ -2864,6 +2888,7 @@ impl ContentEngine {
                 // explicit contexts. A bundled daemon page never mutates it.
                 self.profile.set(parsed);
                 if let Some(limit) = record_limit { self.record_memory_limit = limit; }
+                if let Some(budget) = download_budget { self.download_budget = budget; }
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
             "session.attachPage" => {

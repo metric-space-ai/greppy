@@ -698,17 +698,19 @@ pub struct WebResourceRequest {
     pub is_redirect: bool,
 }
 
-/// The in-process completion channel shares custody of a private download
-/// file. The last owner removes it, even if the WebView died before delivery.
-/// No body enters controller RPCs.
-#[derive(Debug)]
-pub struct CapturedWebResourceDownload {
-    pub path: Option<std::path::PathBuf>,
-    pub failure: Option<String>,
-}
+/// Shared session authority and file custody; the implementation is also
+/// compiled without Servo for its real filesystem/ownership contracts.
+#[path = "../../runtime/src/download_staging.rs"]
+mod download_staging;
+pub use download_staging::{DownloadBudget, DownloadBudgets};
+pub type CapturedWebResourceDownload = download_staging::CapturedDownload;
 
-impl CapturedWebResourceDownload {
-    pub fn capture(headers: &HeaderMap, body: &[u8]) -> Option<std::sync::Arc<Self>> {
+impl download_staging::CapturedDownload {
+    pub fn capture(
+        headers: &HeaderMap,
+        body: &[u8],
+        budget: Option<std::sync::Arc<DownloadBudget>>,
+    ) -> Option<std::sync::Arc<Self>> {
         let attachment = headers.get(http::header::CONTENT_DISPOSITION)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("attachment"));
@@ -716,8 +718,10 @@ impl CapturedWebResourceDownload {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/octet-stream"));
         if !attachment && !binary { return None; }
-        let result = (|| -> std::io::Result<std::path::PathBuf> {
-            use std::io::Write;
+        // Synthetic/intercepted responses retain their existing body record;
+        // only a real request carrying native staging authority creates a file.
+        let budget = budget?;
+        Some(Self::stage(body, Some(budget), || {
             for _ in 0..16 {
                 let path = std::env::temp_dir().join(format!("greppy-download-{}.bin", Uuid::new_v4()));
                 let mut options = std::fs::OpenOptions::new();
@@ -726,30 +730,14 @@ impl CapturedWebResourceDownload {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(0o600);
                 }
-                let mut file = match options.open(&path) {
-                    Ok(file) => file,
+                match options.open(&path) {
+                    Ok(file) => return Ok((path, file)),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(error),
-                };
-                if let Err(error) = file.write_all(body) {
-                    drop(file);
-                    let _ = std::fs::remove_file(&path);
-                    return Err(error);
                 }
-                return Ok(path);
             }
             Err(std::io::Error::other("download temporary-file collision limit"))
-        })();
-        Some(std::sync::Arc::new(match result {
-            Ok(path) => Self { path: Some(path), failure: None },
-            Err(error) => Self { path: None, failure: Some(error.to_string()) },
         }))
-    }
-}
-
-impl Drop for CapturedWebResourceDownload {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path { let _ = std::fs::remove_file(path); }
     }
 }
 
@@ -797,6 +785,8 @@ pub enum WebResourceResponseMsg {
             serialize_with = "::hyper_serde::serialize"
         )]
         headers: HeaderMap,
+        #[serde(skip)]
+        download_budget: Option<std::sync::Arc<DownloadBudget>>,
     },
 }
 

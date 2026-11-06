@@ -1,4 +1,6 @@
 pub mod artifacts;
+#[cfg(test)]
+mod download_staging;
 #[cfg(feature = "controller-runtime")]
 pub mod controller_worker;
 #[cfg(feature = "content-runtime")]

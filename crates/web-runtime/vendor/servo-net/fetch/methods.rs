@@ -910,10 +910,11 @@ pub async fn main_fetch(
             )
         };
     let download = if failure.is_none() && matches!(&request.destination, content_security_policy::Destination::Document) {
+        let download_budget = context.request_interceptor.lock().await.download_budget();
         let actual = response.actual_response();
         let body = actual.body.lock();
         match &*body {
-            ResponseBody::Done(bytes) => embedder_traits::CapturedWebResourceDownload::capture(&headers, bytes),
+            ResponseBody::Done(bytes) => embedder_traits::CapturedWebResourceDownload::capture(&headers, bytes, download_budget),
             _ => None,
         }
     } else { None };

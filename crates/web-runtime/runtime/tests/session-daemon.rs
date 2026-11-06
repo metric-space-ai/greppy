@@ -4859,6 +4859,137 @@ console.log(JSON.stringify({ original, saved: await download.path(), second: sec
 }
 
 #[test]
+fn native_download_staging_shares_session_quota_across_contexts() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("quota fixture accept: {error}"),
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut header = Vec::new();
+            let mut chunk = [0; 1024];
+            while header.len() < 8192 && !header.windows(4).any(|part| part == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => header.extend_from_slice(&chunk[..n]),
+                }
+            }
+            if !header.windows(4).any(|part| part == b"\r\n\r\n") { continue; }
+            let file = String::from_utf8_lossy(&header).lines().next()
+                .is_some_and(|line| line.starts_with("GET /file "));
+            let (body, kind, disposition) = if file {
+                (b"12345678".as_slice(), "application/octet-stream",
+                 "Content-Disposition: attachment; filename=quota.bin\r\n")
+            } else {
+                (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(),
+                 "text/html", "")
+            };
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = stream.write_all(response.as_bytes()).and_then(|_| stream.write_all(body));
+        }
+    });
+    struct ServerGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let _server = ServerGuard(stop, Some(server));
+    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("gq-{}", std::process::id())));
+    let capture = dir.join("capture");
+    std::fs::create_dir_all(&capture).unwrap();
+    let socket = dir.join("runtime.sock");
+    let _guard = Supervisor::spawn(&socket, "native_quota", |command| {
+        command.arg("--fixture-url").arg(&origin).env("TMPDIR", &capture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let create = || {
+        let result = unix_request(&socket, &Request::new("native_quota", "web.session.create",
+            json!({"profile":"project","limits":{"max_download_bytes":10}})), Duration::from_secs(10)).unwrap();
+        assert_eq!(result.status, "ok", "{result:?}");
+        result.result.unwrap()["session_id"].as_str().unwrap().to_owned()
+    };
+    let run = |session: &str, name: &str, source: &str| {
+        let script = dir.join(name);
+        std::fs::write(&script, source).unwrap();
+        let mut request = Request::new("native_quota", "web.run", json!({
+            "session_id":session,"script_source":"file","script_file":script,"script_text":source,
+        }));
+        request.deadline_ms = 30_000;
+        unix_request(&socket, &request, Duration::from_secs(35)).unwrap()
+    };
+    let first = r##"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+page.setDefaultTimeout(2000);
+const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#download").click()]);
+if (await download.failure()) throw new Error("first download failed");
+console.log(JSON.stringify({ path: await download.path() }));
+"##;
+    let a = create();
+    let b = create();
+    let first_a = run(&a, "a-first.mjs", first);
+    assert_eq!(first_a.status, "ok", "{first_a:?}");
+    let path = |response: &greppy_web_client::Response| {
+        let stdout = response.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        PathBuf::from(value["path"].as_str().unwrap())
+    };
+    let a_path = path(&first_a);
+    assert_eq!(std::fs::read(&a_path).unwrap(), b"12345678");
+    let first_b = run(&b, "b-first.mjs", first);
+    assert_eq!(first_b.status, "ok", "foreign session consumed download quota: {first_b:?}");
+    let b_path = path(&first_b);
+    assert_ne!(a_path, b_path);
+    assert_eq!(std::fs::read(&b_path).unwrap(), b"12345678");
+    let refused = run(&a, "a-second-context.mjs", r##"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+page.setDefaultTimeout(2000);
+const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#download").click()]);
+if (!String(await download.failure()).includes("resource_limit"))
+  throw new Error("cross-context staging quota bypassed");
+let rejected = false;
+try { await download.path(); } catch { rejected = true; }
+if (!rejected) throw new Error("refused download exposed a successful path");
+"##);
+    if refused.status != "ok" {
+        assert_eq!(refused.error.as_ref().unwrap().code, "resource_limit", "{refused:?}");
+    }
+    assert_eq!(std::fs::read(&b_path).unwrap(), b"12345678",
+        "quota refusal in A damaged session B");
+    for session in [&a, &b] {
+        let closed = unix_request(&socket, &Request::new("native_quota", "web.session.close",
+            json!({"session_id":session})), Duration::from_secs(10)).unwrap();
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(!a_path.exists() && !b_path.exists(), "session closure retained staged files");
+    assert_eq!(std::fs::read_dir(&capture).unwrap().filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("greppy-download-")).count(), 0,
+        "native staging retained a refused or closed file");
+}
+
+#[test]
 fn file_chooser_accepts_set_input_files() {
     // Component evidence only: worker-visible path storage. Compatibility
     // requires file_chooser_populates_dom_filelist_and_change_events.

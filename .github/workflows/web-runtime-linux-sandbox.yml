@@ -106,6 +106,20 @@ jobs:
       - name: Prove live page closure returns only its own quota
         run: python3 tools/check_web_resource_mutations.py --slots
 
+      - name: Check shared session download staging before file creation
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features download_staging -- --test-threads=1
+
+      - name: Check controller cannot replace download quota authority
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features
+          controller_cannot_replace_download_session_authority -- --test-threads=1
+
+      - name: Prove session quota, last file owner and controller authority invariants
+        run: python3 tools/check_web_download_staging_mutations.py
+
       - name: Check bounded retained records
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml

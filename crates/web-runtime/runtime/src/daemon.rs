@@ -1825,7 +1825,7 @@ impl Daemon {
         }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
-            json!({ "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
+            json!({ "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id), "__download_session": session_id.clone(), "max_download_bytes": self.download_byte_limit(&session_id) }),
             run_deadline.saturating_duration_since(Instant::now()),
         ) {
             self.finish_session(&session_id);
@@ -1900,7 +1900,7 @@ impl Daemon {
         if let Some(page) = bound_page.as_deref() {
             if let Err(error) = self.engine_call_timed(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id), "__download_session": session_id.clone(), "max_download_bytes": self.download_byte_limit(&session_id) }),
                 run_deadline.saturating_duration_since(Instant::now()),
             ) {
                 self.finish_session(&session_id);
@@ -4509,7 +4509,7 @@ impl Daemon {
             } else {
                 self.engine_call_timed_with_recovery(
                     "session.setProfile",
-                    json!({"page":page,"profile":profile.as_str(),"record_memory_bytes":self.record_memory_limit(&session_id)}),
+                    json!({"page":page,"profile":profile.as_str(),"record_memory_bytes":self.record_memory_limit(&session_id),"__download_session":session_id.clone(),"max_download_bytes":self.download_byte_limit(&session_id)}),
                     remaining,
                     false,
                 )
@@ -4517,7 +4517,7 @@ impl Daemon {
         } else {
             self.engine_call(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id), "__download_session": session_id.clone(), "max_download_bytes": self.download_byte_limit(&session_id) }),
             )
         };
         if let Err(error) = profile_result {
@@ -4993,6 +4993,10 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    fn download_byte_limit(&self, session_id: &str) -> u64 {
+        self.sessions.get(session_id).map(|session| session.limits.max_download_bytes).unwrap_or(0)
     }
 
     fn record_memory_limit(&self, session_id: &str) -> u64 {
