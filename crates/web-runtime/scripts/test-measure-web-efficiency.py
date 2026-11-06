@@ -224,12 +224,15 @@ class CliBoundaryContract(unittest.TestCase):
                 probe = directory / 'cli-boundary-probe'
                 probe.write_text(f'#!{sys.executable}\n' + """
 import hashlib, json, os, pathlib, sys, urllib.parse, urllib.request
+if sys.argv[1:] == ['web', 'runtime', 'stop', '--json']:
+    # This adversarial probe creates no runtime; its owned cleanup is a no-op.
+    raise SystemExit(0)
 assert sys.argv[1:10] == ['web', 'do', '--json', 'session', 'new', '--profile', 'project', '::', 'run']
 assert sys.argv[10:13] == ['--mode', 'standalone', '--script-file']
 entry = pathlib.Path(sys.argv[13])
 assert sys.argv[14:16] == ['--timeout', '3000']
 state = pathlib.Path(os.environ['GREPPY_WEB_RUNTIME_DIR'])
-assert pathlib.Path.cwd() == state / 'workspace'
+assert pathlib.Path.cwd().samefile(state / 'workspace')
 assert os.environ['GREPPY_RUNTIME_DIR'] == str(state)
 assert 'GREPPY_WEB_SESSION' not in os.environ and 'GREPPY_RUN_ID' not in os.environ
 runtime = pathlib.Path(os.environ['GREPPY_WEB_RUNTIME'])
@@ -267,7 +270,11 @@ print(json.dumps({'entry_sha256': hashlib.sha256(entry.read_bytes()).hexdigest()
                 try:
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertEqual(receipt['metrics']['exit_code'], 0, receipt['metrics'])
-                    self.assertFalse(receipt['quality_verified'])
+                    self.assertEqual(receipt['metrics']['cleanup_exit_code'], 0)
+                    self.assertFalse(
+                        receipt['quality_verified'],
+                        'changed runtime must fail even with verified POST effects' if changed_runtime
+                        else 'forged success must fail without an independent POST effect')
                     expected = ('CLI runtime executable changed during measurement' if changed_runtime else
                                 'task has no independent server-side POST effect')
                     self.assertEqual(receipt['quality_error'], expected)
@@ -443,7 +450,7 @@ finally:
             self.assertEqual(memory['samples_sha256'], measurement.digest(samples_path))
         self.assertEqual(result['exit_code'], 0, result)
         pids = set(json.loads(result['stdout_tail']).values())
-        self.assertTrue(any({p['pid'] for p in s['processes']} == pids and (s['private_bytes'] or 0) >= 36 * 1024 * 1024 for s in samples), samples)
+        self.assertTrue(any({p['pid'] for p in s['processes']} == pids and (s['private_bytes'] or 0) >= 36 * 1024 * 1024 for s in samples), f'owned parent/child mappings were not sampled: {samples}')
         self.assertGreaterEqual(memory['peak_sampled_private_bytes'], 36 * 1024 * 1024)
         self.assertGreater(memory['monitor_thread_cpu_seconds'], 0)
 

@@ -2,7 +2,8 @@
 
 No processes/threads are launched or stopped here. Call sample() from an
 existing bounded monitor. Register verified PID/starttime roots directly or
-use the exclusive Linux child-subreaper scope to adopt daemonized descendants. Very short-lived unobserved children can
+use the exclusive Linux child-subreaper scope to adopt daemonized descendants.
+Very short-lived unobserved children can
 be missed: sampled peaks are lower bounds, never OS-enforced memory ceilings.
 """
 

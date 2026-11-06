@@ -363,14 +363,16 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
                 continue
             except ChildProcessError:
                 known_direct.pop(pid)
-                if pid in controls:
-                    controls[pid].returncode = -1
+                process = controls.pop(pid, None)
+                if process is not None:
+                    process.returncode = -1
                 raise RuntimeError('measurement child was reaped outside its custody scope')
             if not exited:
                 continue
             known_direct.pop(pid)
-            if pid in controls:
-                controls[pid].returncode = os.waitstatus_to_exitcode(status)
+            process = controls.pop(pid, None)
+            if process is not None:
+                process.returncode = os.waitstatus_to_exitcode(status)
             totals[0] += usage.ru_utime
             totals[1] += usage.ru_stime
             totals[2] = max(totals[2], usage.ru_maxrss)
@@ -474,6 +476,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
         'exit_code': child.returncode, 'timed_out': terminated_at is not None,
         'cleanup_exit_code': cleanup.returncode if cleanup is not None else None,
         'process_cold_total_ms': (time.monotonic() - started) * 1000,
+        'lifecycle_accounting_version': 'kernel-custody-v1',
         'user_cpu_seconds': totals[0], 'system_cpu_seconds': totals[1],
         'max_individual_process_rss_bytes': peak,
         'cpu_scope': 'wait4 original child, cleanup CLI and adopted roots plus their waited descendants; excludes fixture and monitor; auto-reaped unobserved CPU remains outside this accounting',
@@ -696,7 +699,7 @@ def main():
                    'source_provenance': provenance,
                    'workload_sha256': (native_entry['workload_sha256'] if native_entry
                                        else digest(ROOT / 'runtime/fixtures/efficiency-workload.mjs')),
-                   'execution_surface': ('public CLI web do/session/run plus runtime; excludes LLM/model-provider work'
+                   'execution_surface': ('public CLI web do/session/run and owned runtime stop; excludes LLM/model-provider work'
                                          if state is not None else
                                          'standalone runtime/Playwright; excludes LLM and CLI daemon session limits'),
                    'cold_scope': 'new process/browser; OS caches are not cleared or claimed cold',
