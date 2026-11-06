@@ -45,7 +45,7 @@ mod tests {
         receipt.begin(Rc::clone(&first));
         assert_eq!(Rc::strong_count(&first), 2);
         assert!(!receipt.is_complete(), "pending history was treated as complete");
-        assert!(!receipt.complete(&second));
+        assert!(!receipt.complete(&second), "foreign history receipt was accepted");
         assert!(!receipt.is_complete(), "foreign history receipt was accepted");
         assert!(receipt.complete(&first));
         assert!(receipt.is_complete());
@@ -59,6 +59,6 @@ mod tests {
         receipt.clear();
         assert_eq!(Rc::strong_count(&second), 1);
         assert!(!receipt.is_complete());
-        assert!(!receipt.complete(&second));
+        assert!(!receipt.complete(&second), "foreign history receipt was accepted");
     }
 }
