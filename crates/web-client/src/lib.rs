@@ -5,6 +5,10 @@
 mod frame;
 mod observation_scope;
 mod protocol;
+mod status_probe;
+#[cfg(unix)]
+pub use status_probe::probe_runtime_status;
+pub use status_probe::{RuntimeStatus, RuntimeStatusProbe, StatusProbeError};
 pub mod record_query;
 pub mod workflow;
 
@@ -33,4 +37,7 @@ pub use protocol::{
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{request as unix_request, serve_connection, UnixClientError};
+pub use unix::{
+    connect_timeout as unix_connect_timeout, request as unix_request, serve_connection,
+    UnixClientError,
+};

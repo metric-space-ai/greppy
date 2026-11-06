@@ -1,0 +1,11 @@
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+let received = 0;
+page.on("console", () => received++);
+await page.evaluate(() => { for (let i = 0; i < 10005; i++) console.log(""); });
+if (received !== 10005) throw new Error("console history silently rotated at a new row cap: " + received);
+await page.evaluate(() => console.log(""));
+if (received !== 10006) throw new Error("console cursor lost the next event");
+await browser.close();
+console.log("CONSOLE_RETENTION_OK");

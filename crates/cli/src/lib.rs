@@ -1028,6 +1028,60 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
+            // Browser commands may mutate a session or navigate a page. Never
+            // guess away a rejected selector, flag or positional argument and
+            // dispatch a different operation against the current session.
+            if sub == "web" {
+                if let Some(stray) = first
+                    .strip_prefix("error: unexpected argument '")
+                    .and_then(|rest| rest.split('\'').next())
+                {
+                    if sub == "web" && stray == "::" {
+                        println!(
+                            "`::` chains browser steps only after `web do`. No browser action was run. \
+                             Use `greppy web do fill TARGET VALUE :: click TARGET`; do not repeat \
+                             the executable or `web` after `::`."
+                        );
+                    } else if sub == "web"
+                        && grep_passthrough_args(&argv)
+                            .get(1)
+                            .and_then(|arg| arg.to_str())
+                            == Some("observe")
+                        && !stray.starts_with('-')
+                    {
+                        println!(
+                            "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
+                             No observation was run. Use `greppy web observe QUERY` for matching visible \
+                             regions, or omit QUERY for the unfiltered page."
+                        );
+                    } else if sub == "web"
+                        && grep_passthrough_args(&argv)
+                            .get(1)
+                            .and_then(|arg| arg.to_str())
+                            == Some("wait")
+                        && !stray.starts_with('-')
+                    {
+                        println!(
+                            "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
+                             No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                             `greppy web wait 'text~/WORD/i'` for partial text, or \
+                             `greppy web wait --url '~/PATTERN/'` for a URL."
+                        );
+                    }
+                }
+                println!(
+                    "invalid web arguments: {}",
+                    first.trim_start_matches("error: ")
+                );
+                if let Some(usage) = msg
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("Usage:"))
+                {
+                    println!("{}", usage.trim());
+                }
+                println!("no web operation was performed");
+                return 64;
+            }
             if sub == "expand"
                 && unknown_flag_name(first)
                     .as_deref()
@@ -1149,38 +1203,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             {
                 // The usage line below already shows the shape that works;
                 // leading with `error:` only tells the agent it failed.
-                if sub == "web" && stray == "::" {
-                    println!(
-                        "`::` chains browser steps only after `web do`. No browser action was run. \
-                         Use `greppy web do fill TARGET VALUE :: click TARGET`; do not repeat \
-                         the executable or `web` after `::`."
-                    );
-                } else if sub == "web"
-                    && grep_passthrough_args(&argv)
-                        .get(1)
-                        .and_then(|arg| arg.to_str())
-                        == Some("observe")
-                    && !stray.starts_with('-')
-                {
-                    println!(
-                        "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
-                         No observation was run. Use `greppy web observe QUERY` for matching visible \
-                         regions, or omit QUERY for the unfiltered page."
-                    );
-                } else if sub == "web"
-                    && grep_passthrough_args(&argv)
-                        .get(1)
-                        .and_then(|arg| arg.to_str())
-                        == Some("wait")
-                    && !stray.starts_with('-')
-                {
-                    println!(
-                        "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
-                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
-                         `greppy web wait 'text~/WORD/i'` for partial text, or \
-                         `greppy web wait --url '~/PATTERN/'` for a URL."
-                    );
-                } else if sub == "path" && stray == "--code" {
+                if sub == "path" && stray == "--code" {
                     println!(
                         "`path` prints the bounded call-site chain and does not accept `--code`; \
                          run it without `--code`, then use `greppy read SYMBOL` for a returned \
@@ -6467,6 +6490,36 @@ fn spawn_background_job_handle_scoped(
         .stdout(std::process::Stdio::null());
     if admission_stderr.is_none() {
         command.stderr(std::process::Stdio::null());
+    }
+    // Keep the real child's cause for this owned CI fixture, without changing
+    // release diagnostics or replacing the configured admission runner's log.
+    #[cfg(all(debug_assertions, feature = "ci-test-assets"))]
+    if admission_stderr.is_none() {
+        if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_OUTPUT") {
+            command.env_remove("GREPPY_TEST_BACKGROUND_OUTPUT");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(path).and_then(|stderr| {
+                let stdout = stderr.try_clone()?;
+                Ok((stdout, stderr))
+            }) {
+                Ok((stdout, stderr)) => {
+                    command.stdout(stdout).stderr(stderr);
+                }
+                Err(error) => {
+                    value["state"] = serde_json::json!("failed");
+                    value["last_error"] =
+                        serde_json::json!(format!("create owned background test log: {error}"));
+                    let _ = write_background_job(&job_path, &value);
+                    return None;
+                }
+            }
+        }
     }
     let configured_workers =
         configure_automatic_index_workers(&mut command, inherited_workers.as_deref());

@@ -2,7 +2,7 @@ name: Portable CoW
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:

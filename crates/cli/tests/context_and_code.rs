@@ -743,14 +743,36 @@ fn plus_json_refuses_current_request_while_small_drift_refreshes() {
     )
     .unwrap();
 
-    let (code, out, err) = run(
+    let background_stderr = _cleanup.root.join("background-output.log");
+    let (code, out, err) = run_with_env(
         &["plus", "do_it", "--json", "--diagnostics", "--k", "3"],
         &repo,
         &store,
+        &[(
+            "GREPPY_TEST_BACKGROUND_OUTPUT",
+            background_stderr.to_str().unwrap(),
+        )],
     );
+    // This wait only gathers diagnostics after an already failed query. It
+    // never retries the command or changes the required exit/state/empty hits.
+    let diagnostic_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let child_error = loop {
+        let text = std::fs::File::open(&background_stderr)
+            .map(|file| {
+                use std::io::Read;
+                let mut text = String::new();
+                let _ = file.take(8192).read_to_string(&mut text);
+                text
+            })
+            .unwrap_or_else(|error| format!("owned child log unavailable: {error}"));
+        if code == 75 || !text.is_empty() || std::time::Instant::now() >= diagnostic_deadline {
+            break text;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(
         code, 75,
-        "refreshing plus must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+        "refreshing plus must return EX_TEMPFAIL; stderr={err}\nbackground_output={child_error}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));

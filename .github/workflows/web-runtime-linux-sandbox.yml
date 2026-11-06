@@ -6,7 +6,7 @@ name: web-runtime Linux sandbox
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -36,6 +36,55 @@ jobs:
         with:
           toolchain: "1.95.0"
 
+      - name: Check typed status over private Unix sockets
+        run: cargo test --locked -p greppy-web-client --lib status_probe_ -- --test-threads=1
+
+      - name: Prove transport failure cannot be called an ownership denial
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-client/src/status_probe.rs')
+          original = source.read_text()
+          old = '_ => StatusProbeError::Transport,'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '-p', 'greppy-web-client', '--lib',
+                     'status_probe_silent_connected_peer_is_not_an_ownership_denial', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, '_ => StatusProbeError::NotOwned,'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'NotOwned' in result.stdout and 'Transport' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check nonretrying engine recovery
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features engine_failure_guidance_is_nonretrying -- --test-threads=1
+
+      - name: Prove engine recovery rejects the old replay recommendation
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          old = 'inspect greppy web doctor and the current page state; do not automatically repeat the failed operation'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'engine_failure_guidance_is_nonretrying', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'retry the operation or inspect web.doctor'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'engine_failure_guidance_is_nonretrying' in result.stdout and 'FAILED' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Run Linux sandbox and fexecve gates
         run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh
 
@@ -48,6 +97,28 @@ jobs:
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
+
+      - name: Check identity-based live object quota
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features object_usage -- --test-threads=1
+
+      - name: Prove live page closure returns only its own quota
+        run: python3 tools/check_web_resource_mutations.py --slots
+
+      - name: Check bounded retained records
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features retained_records -- --test-threads=1
+
+      - name: Prove retained-record byte bounds
+        run: python3 tools/check_web_resource_mutations.py --records
+
+      - name: Check wrapper resource lifecycle
+        run: node --test crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs
+
+      - name: Prove closed-page retention is detected
+        run: python3 tools/check_web_resource_mutations.py
 
       - name: Check payload-free record accounting
         run: >-
@@ -112,3 +183,76 @@ jobs:
                           '--no-default-features', 'record_usage_transport_comparison', '--',
                           '--ignored', '--test-threads=1', '--nocapture'], check=True)
           PY
+
+      - name: Check complete-workflow measurement contracts without launching browsers
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 crates/web-runtime/scripts/test-measure-web-efficiency.py
+          node --check crates/web-runtime/runtime/fixtures/efficiency-workload.mjs
+          node --check crates/web-runtime/runtime/fixtures/efficiency-native.mjs
+          node --check crates/web-runtime/scripts/efficiency-reference.mjs
+          node --check crates/web-runtime/scripts/check-efficiency-native-entry.mjs
+
+      - name: Prove outcome verifier rejects invented successful work
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = 'effect_verified = self.token(*identity) in self.effects'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'OutcomeContract.test_claimed_success_without_post_effect_never_counts']
+          try:
+              source.write_text(original.replace(old, 'effect_verified = True'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'AssertionError: 1 != 0' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+      - name: Prove native entry rejects a restored relative module import
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = 'source = adapter.replace(import_line, workload, 1)'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'NativeEntryContract.test_entry_parses_with_only_the_native_playwright_import']
+          try:
+              source.write_text(original.replace(old, 'source = adapter'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and "'./efficiency-workload.mjs'" in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+      - name: Prove native adapter cannot forward unsupported launch options
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/runtime/fixtures/efficiency-native.mjs')
+          original = source.read_text()
+          old = 'return browserType.launch();'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'NativeEntryContract.test_entry_parses_with_only_the_native_playwright_import']
+          try:
+              source.write_text(original.replace(old, 'return browserType.launch(options);'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'BrowserType.launch.options' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
