@@ -12759,6 +12759,27 @@ fn hover_reload_check_and_history_accept_timeout_options() {
 }
 
 #[test]
+fn native_history_waits_for_matching_traversal() {
+    let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-history-receipt-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_history_receipt", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("goback.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_history_receipt",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "native history traversal: {ran:?}");
+}
+
+#[test]
 fn wall_time_limit_is_enforced_by_supervisor() {
     let socket = std::env::temp_dir().join(format!("greppy-web-wall-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);

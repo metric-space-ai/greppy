@@ -106,6 +106,14 @@ jobs:
       - name: Prove live page closure returns only its own quota
         run: python3 tools/check_web_resource_mutations.py --slots
 
+      - name: Check bounded native history receipt ownership
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features history_receipt -- --test-threads=1
+
+      - name: Prove history receipts reject foreign tokens and release ownership
+        run: python3 tools/check_web_history_receipt_mutation.py
+
       - name: Check bounded retained records
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml

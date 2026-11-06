@@ -117,6 +117,15 @@ jobs:
           subprocess.run(command, check=True, timeout=300)
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
+      - name: Check native history waits for its matching traversal
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          native_history_waits_for_matching_traversal -- --test-threads=1 --nocapture
+
+      - name: Prove old completed page state cannot satisfy new history traversal
+        run: python3 tools/check_web_history_receipt_mutation.py --native
+
       - name: Check closing one session preserves its live neighbor and recovery worker
         shell: bash
         run: |

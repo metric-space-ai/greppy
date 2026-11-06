@@ -11,6 +11,8 @@ pub mod linux_sandbox;
 mod observed_refs;
 mod locator_diagnostics;
 mod wait_contract;
+#[cfg(any(feature = "content-runtime", test))]
+mod history_receipt;
 pub mod policy;
 pub mod profile_lock;
 pub mod policy_proxy;

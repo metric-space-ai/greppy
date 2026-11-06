@@ -1,3 +1,4 @@
+use crate::history_receipt::HistoryReceipt;
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
 use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
@@ -13,7 +14,7 @@ use servo::{
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
     RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
-    TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, TraversalId, UserContentManager, UserScript,
     WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
     WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
@@ -389,6 +390,7 @@ struct Delegate {
     /// Main-document lifecycle, owned by Servo rather than page script. A
     /// navigation discards the old Window and all of its installed waiters.
     document_generation: Cell<u64>,
+    history_receipt: RefCell<HistoryReceipt<TraversalId>>,
     /// Receipts for synthetic input: Servo acknowledges every input event,
     /// and a painter-side drop (no display list yet -> empty hit test)
     /// arrives as InputEventResult::DispatchFailed. Confirmed delivery
@@ -461,6 +463,7 @@ impl Delegate {
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
             document_generation: Cell::new(0),
+            history_receipt: RefCell::new(HistoryReceipt::new()),
             input_receipts: RefCell::new(HashMap::new()),
             wake,
             user_content,
@@ -583,6 +586,12 @@ impl WebViewDelegate for Delegate {
                 .set(self.document_generation.get().wrapping_add(1));
         }
         self.wake.wake();
+    }
+
+    fn notify_traversal_complete(&self, _webview: WebView, traversal_id: TraversalId) {
+        if self.history_receipt.borrow_mut().complete(&traversal_id) {
+            self.wake.wake();
+        }
     }
 
     fn notify_input_event_handled(
@@ -4501,12 +4510,18 @@ impl ContentEngine {
             }
             "page.goBack" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let ok = webview.can_go_back();
                 if ok {
-                    webview.go_back(1);
+                    delegate.history_receipt.borrow_mut().begin(webview.go_back(1));
                     let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
+                    let loaded = self.spin_until_loaded(&loading, call_timeout(&params), || {
+                        delegate.history_receipt.borrow().is_complete()
+                    });
+                    delegate.history_receipt.borrow_mut().clear();
+                    if !loaded? {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "history traversal timed out"));
+                    }
                     webview.paint();
                     self.spin_all_event_loops();
                 }
@@ -4517,12 +4532,18 @@ impl ContentEngine {
             }
             "page.goForward" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let ok = webview.can_go_forward();
                 if ok {
-                    webview.go_forward(1);
+                    delegate.history_receipt.borrow_mut().begin(webview.go_forward(1));
                     let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
+                    let loaded = self.spin_until_loaded(&loading, call_timeout(&params), || {
+                        delegate.history_receipt.borrow().is_complete()
+                    });
+                    delegate.history_receipt.borrow_mut().clear();
+                    if !loaded? {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "history traversal timed out"));
+                    }
                     webview.paint();
                     self.spin_all_event_loops();
                 }
