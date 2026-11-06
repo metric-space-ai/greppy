@@ -199,6 +199,14 @@ pub struct EmbeddingIndexProgress {
     pub current_symbol: Option<String>,
 }
 
+/// A definition whose document validation (including skips and reuse checks)
+/// has finished. Candidate counts are not embedding-document counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingValidationProgress {
+    pub completed_candidates: usize,
+    pub current_symbol: String,
+}
+
 /// Count definitions that can contribute one or more embedding documents.
 /// This cheap count is used before model load for an initial conservative ETA
 /// and for deciding whether foreground indexing should defer a large job.
@@ -278,9 +286,31 @@ pub fn count_code_embedding_work_for_scope(
     options: EmbeddingIndexOptions,
     prefixes: &[String],
 ) -> Result<EmbeddingWorkload> {
+    count_code_embedding_work_with_progress(store, root, project, provider, options, prefixes, None)
+}
+
+fn count_code_embedding_work_with_progress(
+    store: &Store,
+    root: &Path,
+    project: &str,
+    provider: &dyn CodeEmbeddingProvider,
+    options: EmbeddingIndexOptions,
+    prefixes: &[String],
+    mut progress: Option<&mut dyn FnMut(EmbeddingValidationProgress)>,
+) -> Result<EmbeddingWorkload> {
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = 0usize;
     let mut work = EmbeddingWorkload::default();
+    let mut completed_candidates = 0usize;
+    let mut candidate_completed = |node: &greppy_store::Node| {
+        completed_candidates += 1;
+        if let Some(callback) = progress.as_mut() {
+            callback(EmbeddingValidationProgress {
+                completed_candidates,
+                current_symbol: node.qualified_name.clone(),
+            });
+        }
+    };
 
     loop {
         let nodes = if store.is_overlay() && prefixes.is_empty() {
@@ -301,11 +331,15 @@ pub fn count_code_embedding_work_for_scope(
             }
             let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
                 Ok(Some(source)) => source,
-                Ok(None) | Err(_) => continue,
+                Ok(None) | Err(_) => {
+                    candidate_completed(&node);
+                    continue;
+                }
             };
             const MAX_EMBED_LINE_BYTES: usize = 2048;
             if span_has_overlong_line(source, node.start_line, node.end_line, MAX_EMBED_LINE_BYTES)
             {
+                candidate_completed(&node);
                 continue;
             }
             let title = format!(
@@ -335,6 +369,7 @@ pub fn count_code_embedding_work_for_scope(
                     work.reusable_documents += 1;
                 }
             }
+            candidate_completed(&node);
         }
     }
     Ok(work)
@@ -393,6 +428,7 @@ pub fn index_code_embeddings_for_project_with_progress(
         EmbeddingIndexProgressContext {
             total_documents,
             callback: progress,
+            validation_callback: None,
         },
         &[],
     )
@@ -404,6 +440,7 @@ pub fn index_code_embeddings_for_project_with_progress(
 pub struct EmbeddingIndexProgressContext<'a> {
     pub total_documents: usize,
     pub callback: &'a mut dyn FnMut(EmbeddingIndexProgress),
+    pub validation_callback: Option<&'a mut dyn FnMut(EmbeddingValidationProgress)>,
 }
 
 /// Scoped passes reuse the same vectors/cache and never prune unrelated rows.
@@ -419,10 +456,18 @@ pub fn index_code_embeddings_for_scope_with_progress(
     let EmbeddingIndexProgressContext {
         total_documents: _,
         callback: progress,
+        validation_callback,
     } = progress_context;
     // Publish a complete reuse assessment before giving an inference ETA.
-    let work =
-        count_code_embedding_work_for_scope(store, root, project, provider, options, prefixes)?;
+    let work = count_code_embedding_work_with_progress(
+        store,
+        root,
+        project,
+        provider,
+        options,
+        prefixes,
+        validation_callback,
+    )?;
     let total_documents = work.total_documents;
     let mut report = EmbeddingIndexReport::default();
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
@@ -1717,6 +1762,7 @@ mod tests {
                 EmbeddingIndexProgressContext {
                     total_documents: total,
                     callback: &mut |value| scoped_progress.push(value),
+                    validation_callback: None,
                 },
                 &prefixes,
             )
@@ -1781,6 +1827,7 @@ mod tests {
                 EmbeddingIndexProgressContext {
                     total_documents: 2,
                     callback: &mut |_| {},
+                    validation_callback: None,
                 },
                 &all_visible,
             )
@@ -1800,6 +1847,96 @@ mod tests {
             overlay.integrity_check().unwrap();
             assert_eq!(std::fs::read(&base_path).unwrap(), immutable);
         }
+    }
+
+    #[test]
+    fn validation_progress_counts_completed_candidates_before_exact_spans() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = long_function_source("long", 30, None);
+        std::fs::write(root.join("src/a.rs"), &source).unwrap();
+        std::fs::write(root.join("src/oversize.rs"), "x".repeat(2049)).unwrap();
+        let mut store = store_with_project(&root);
+        insert_node(
+            &mut store,
+            "p.a",
+            "a",
+            "Function",
+            "src/a.rs",
+            1,
+            source.lines().count() as i64,
+        );
+        insert_node(
+            &mut store,
+            "p.b_missing",
+            "b",
+            "Function",
+            "src/missing.rs",
+            1,
+            1,
+        );
+        insert_node(
+            &mut store,
+            "p.c_oversize",
+            "c",
+            "Function",
+            "src/oversize.rs",
+            1,
+            1,
+        );
+        insert_node(
+            &mut store,
+            "p.d_invalid",
+            "d",
+            "Function",
+            "src/a.rs",
+            999,
+            999,
+        );
+        insert_node(
+            &mut store,
+            "p.e_outside",
+            "e",
+            "Function",
+            "other/a.rs",
+            1,
+            1,
+        );
+        insert_node(&mut store, "p.f_file", "f", "File", "src/a.rs", 1, 1);
+        let mut provider = TokenBudgetProvider::new(40);
+        let events = std::cell::RefCell::new(Vec::new());
+        // Share only the inference observations, not a borrow of the provider.
+        let docs = provider.docs.clone();
+        let mut validating = |event: EmbeddingValidationProgress| {
+            assert!(docs.borrow().is_empty());
+            events.borrow_mut().push((event.completed_candidates, None));
+        };
+        let mut embedding = |event: EmbeddingIndexProgress| {
+            events.borrow_mut().push((0, Some(event.total_documents)));
+        };
+        let report = index_code_embeddings_for_scope_with_progress(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            EmbeddingIndexOptions::for_generation(1),
+            EmbeddingIndexProgressContext {
+                total_documents: 999,
+                callback: &mut embedding,
+                validation_callback: Some(&mut validating),
+            },
+            &["src".into()],
+        )
+        .unwrap();
+        let events = events.into_inner();
+        assert_eq!(events.get(..4), Some([(1, None), (2, None), (3, None), (4, None)].as_slice()),
+            "every scoped candidate must finish validation before the exact span total is published");
+        assert!(
+            events[4].1.unwrap() > 1,
+            "one candidate can produce multiple spans"
+        );
+        assert_eq!(events[4].1, Some(report.nodes_embedded));
+        assert!(report.is_complete());
     }
 
     #[test]
@@ -1939,6 +2076,7 @@ mod tests {
             EmbeddingIndexProgressContext {
                 total_documents: cold_total,
                 callback: &mut |value| cold_progress.push(value),
+                validation_callback: None,
             },
             &cold_prefixes,
         )
@@ -1992,6 +2130,7 @@ mod tests {
             EmbeddingIndexProgressContext {
                 total_documents: total,
                 callback: &mut |value| reused_progress.push(value),
+                validation_callback: None,
             },
             &prefixes,
         )
