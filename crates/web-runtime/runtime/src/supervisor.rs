@@ -1111,6 +1111,16 @@ fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::Owned
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
+#[cfg(unix)]
+fn trace_worker_spawn(worker: &WorkerKind, stage: &str) {
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+        eprintln!(
+            "web-runtime: spawn supervisor={} worker={worker:?} stage={stage}",
+            std::process::id()
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static FAIL_WORKER_IMAGE_PREPARATION: std::cell::Cell<bool> = const {
@@ -1215,9 +1225,12 @@ fn spawn_unix(
                 "injected worker image preparation failure",
             ));
         }
+        trace_worker_spawn(&worker, "image-prepare");
         let image = crate::worker::apply_same_image_reexec(&mut command)?;
         // Cache parent identity before exec so the first child cannot race the digest.
+        trace_worker_spawn(&worker, "parent-image");
         let _ = parent_image()?;
+        trace_worker_spawn(&worker, "spawn");
         let mut child = command.spawn().map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -1229,13 +1242,16 @@ fn spawn_unix(
         })?;
         drop(cap_read);
         drop(proto_child);
+        trace_worker_spawn(&worker, "image-prove");
         image.prove_child_or_kill(&mut child)?;
+        trace_worker_spawn(&worker, "executable-prove");
         if let Err(error) = prove_same_executable(child.id()) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
 
+        trace_worker_spawn(&worker, "protocol-clone");
         let proto_read = match proto_parent.try_clone() {
             Ok(read) => read,
             Err(error) => {
@@ -1296,6 +1312,7 @@ fn spawn_unix(
         };
 
         register_owned_worker(child.id());
+        trace_worker_spawn(&worker, "spawn-complete");
         Ok(WorkerProcess {
             worker,
             capability,
