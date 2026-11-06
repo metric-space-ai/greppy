@@ -1,0 +1,39 @@
+{
+  "generator": "tree-sitter 0.25.10 (da6fe9beb4f7f67beb75914ca8e0d48ae48d6406)",
+  "generator_url": "https://github.com/tree-sitter/tree-sitter/releases/download/v0.25.10/tree-sitter-linux-x64.gz",
+  "generator_gzip_sha256": "8283ddba69253c698f6e987ba0e2f9285e079c8db4d36ebe1394b5bb3a0ebdfd",
+  "node": "v22.23.4",
+  "abi": 15,
+  "command": [
+    "tree-sitter",
+    "generate",
+    "--abi",
+    "15",
+    "grammar.js"
+  ],
+  "grammar_js_sha256": "749cbc488002107a22d6c0364a77f8c64d9d7ed1020f83a034924b11f67bdfa5",
+  "outputs": {
+    "src/parser.c": {
+      "sha256": "aef298dffc2444999e2d9abcd370e95e0afc0a8c6e9b7ec0e50a6578a6dae839",
+      "bytes": 9901999
+    },
+    "src/grammar.json": {
+      "sha256": "65061ed1f6aa3102a5ac0069f536a67291e249087820d3988e20e8940681553b",
+      "bytes": 179590
+    },
+    "src/node-types.json": {
+      "sha256": "b644629f7f9460cb0af080cb88f3bef898e6c47b6f8a76ed512b67ae16ef5ac5",
+      "bytes": 51167
+    },
+    "src/tree_sitter/parser.h": {
+      "sha256": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2",
+      "bytes": 7624
+    }
+  },
+  "upstream_crate_sha256": "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062",
+  "source_artifact": {
+    "run": 42194399650,
+    "artifact_id": 13490663879,
+    "head": "40df4c235ffaf4464d214dac1173242b62efbd61"
+  }
+}

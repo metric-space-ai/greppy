@@ -33,10 +33,10 @@ Reproduction (on the existing Linux x86_64 CI host):
 The helper verifies the pinned generator archive, records the actual generator,
 Node version, ABI, grammar hash and all generated output hashes, and requires
 byte-identical committed outputs. CI retains the generation receipt and exact
-outputs. A draft bootstrap commit without parser.c intentionally fails that
-comparison; it is not qualified product source until those outputs are imported.
-The final source package must contain parser.c, grammar.json, node-types.json and
-parser.h produced together by that invocation.
+outputs. The checked-in parser.c, grammar.json, node-types.json and parser.h were
+produced together by CI run42194399650, artifact13490663879. GENERATION.json records
+the actual tools and input/output byte hashes; subsequent CI regenerates and
+checks the committed files rather than accepting hand-edited generated C.
 
 The CLI regression exercises actual write/dry-run/refusal and unchanged bytes,
 with Bash -n as an independent syntax oracle. Its mutation temporarily selects

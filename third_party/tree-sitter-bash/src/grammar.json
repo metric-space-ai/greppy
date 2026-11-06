@@ -3097,17 +3097,8 @@
                     "type": "FIELD",
                     "name": "operator",
                     "content": {
-                      "type": "CHOICE",
-                      "members": [
-                        {
-                          "type": "STRING",
-                          "value": "="
-                        },
-                        {
-                          "type": "STRING",
-                          "value": "=~"
-                        }
-                      ]
+                      "type": "STRING",
+                      "value": "=~"
                     }
                   },
                   {
@@ -3306,6 +3297,10 @@
                     "content": {
                       "type": "CHOICE",
                       "members": [
+                        {
+                          "type": "STRING",
+                          "value": "="
+                        },
                         {
                           "type": "STRING",
                           "value": "=="
@@ -3634,6 +3629,10 @@
                 "content": {
                   "type": "CHOICE",
                   "members": [
+                    {
+                      "type": "STRING",
+                      "value": "="
+                    },
                     {
                       "type": "STRING",
                       "value": "=="
