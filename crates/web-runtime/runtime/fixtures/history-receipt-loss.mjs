@@ -16,8 +16,11 @@ try {
   if (!timedOut) {
     throw new Error("history traversal completed without a matching native receipt");
   }
-  if (await page.url() !== first) {
-    throw new Error("receipt-loss fixture did not actually traverse to its target");
+  // A refused traversal does not publish its successful result into Page._url.
+  // Read the real document independently of that controller-side cache.
+  const actual = await page.evaluate(() => location.href);
+  if (actual !== first) {
+    throw new Error(`receipt-loss fixture did not actually traverse to its target: expected ${first}, document ${actual}, cached ${page.url()}`);
   }
 } finally {
   await browser.close();
