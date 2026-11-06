@@ -5793,7 +5793,7 @@ impl BackgroundJobGuard {
         validation.completed_candidates = progress.completed_candidates;
         validation.last_work_progress_at_unix_secs = Some(unix_now_secs_cli());
         self.current_detail = Some(format!(
-            "validated {} candidate symbols; last={}; exact span total is pending",
+            "processed {} candidate symbols; last={}; exact span total is pending",
             progress.completed_candidates, progress.current_symbol,
         ));
         // Coalesce journal writes; the validation callback itself runs only

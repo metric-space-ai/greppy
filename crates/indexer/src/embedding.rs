@@ -1499,6 +1499,7 @@ mod tests {
     struct TokenBudgetProvider {
         max_tokens: usize,
         docs: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+        on_token_count: Option<Box<dyn Fn()>>,
     }
 
     impl TokenBudgetProvider {
@@ -1506,6 +1507,7 @@ mod tests {
             Self {
                 max_tokens,
                 docs: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                on_token_count: None,
             }
         }
 
@@ -1553,6 +1555,9 @@ mod tests {
         }
 
         fn document_token_len(&self, title: Option<&str>, content: &str) -> Result<usize> {
+            if let Some(observe) = &self.on_token_count {
+                observe();
+            }
             Ok(self.token_count(title, content))
         }
     }
@@ -1905,13 +1910,28 @@ mod tests {
         insert_node(&mut store, "p.f_file", "f", "File", "src/a.rs", 1, 1);
         let mut provider = TokenBudgetProvider::new(40);
         let events = std::cell::RefCell::new(Vec::new());
+        let completed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let embedding_started = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_completed = completed.clone();
+        let observed_embedding = embedding_started.clone();
+        provider.on_token_count = Some(Box::new(move || {
+            if !observed_embedding.get() {
+                assert_eq!(
+                    observed_completed.get(),
+                    0,
+                    "candidate completion must follow actual token validation"
+                );
+            }
+        }));
         // Share only the inference observations, not a borrow of the provider.
         let docs = provider.docs.clone();
         let mut validating = |event: EmbeddingValidationProgress| {
             assert!(docs.borrow().is_empty());
+            completed.set(event.completed_candidates);
             events.borrow_mut().push((event.completed_candidates, None));
         };
         let mut embedding = |event: EmbeddingIndexProgress| {
+            embedding_started.set(true);
             events.borrow_mut().push((0, Some(event.total_documents)));
         };
         let report = index_code_embeddings_for_scope_with_progress(

@@ -55,6 +55,16 @@ mutation(
     "suppressing actual completed-candidate events",
 )
 mutation(
+    ROOT / "crates/indexer/src/embedding.rs",
+    "            let source = match cached_file_source(&mut file_cache, root, &node.file_path) {\n"
+    "                Ok(Some(source)) => source,\n                Ok(None) | Err(_) => {",
+    "            candidate_completed(&node); // Mutation: report work before validating it.\n"
+    "            let source = match cached_file_source(&mut file_cache, root, &node.file_path) {\n"
+    "                Ok(Some(source)) => source,\n                Ok(None) | Err(_) => {",
+    "greppy-indexer", WALK, "candidate completion must follow actual token validation",
+    "publishing a candidate before its real token validation",
+)
+mutation(
     ROOT / "crates/cli/src/lib.rs",
     "    publish_locked_background_job(path, &current)\n}",
     "    object.insert(\"last_work_progress_at_unix_secs\".into(), serde_json::json!(unix_now_secs_cli()));\n"
