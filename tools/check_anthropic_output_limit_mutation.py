@@ -13,7 +13,7 @@ FILTER = "required_anthropic_output_limit"
 
 def run(filter_name, red=None, cli=False, acp=False):
     if acp:
-        target = ["-p", "greppy", "--features", "ci-test-assets", "--bin", "greppy"]
+        target = ["-p", "greppy", "--features", "ci-test-assets", "--lib"]
     elif cli:
         target = ["-p", "greppy", "--features", "ci-test-assets", "--test", "agent_p"]
     else:
@@ -27,6 +27,8 @@ def run(filter_name, red=None, cli=False, acp=False):
     if red is None:
         if result.returncode != 0:
             raise AssertionError(result.stdout)
+        if acp and "agent_acp::tests::" + filter_name + " ... ok" not in result.stdout:
+            raise AssertionError("ACP contract did not execute successfully:\n" + result.stdout)
     elif not (result.returncode == 101 and "test result: FAILED" in result.stdout
               and red + " ... FAILED" in result.stdout):
         raise AssertionError("Wrong mutation failure or unexpected success:\n" + result.stdout)
