@@ -1396,7 +1396,7 @@ pub fn prepare_agent_runtime(args: &[String], worktree: &Path) -> io::Result<()>
         search_endpoint: None,
     };
     let ctx = ensure_supervisor_with_identity(Some(root), cli.root.as_deref(), &spawn)
-        .map_err(|error| io::Error::other(error.message))?;
+        .map_err(|error| io::Error::other(error.message.into_string()))?;
     agent_runtimes()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
