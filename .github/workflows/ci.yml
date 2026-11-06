@@ -125,6 +125,10 @@ jobs:
           cargo --version
           cargo clippy --version
 
+      - name: Unix request absolute-deadline mutation proof
+        if: runner.os == 'Linux'
+        run: python3 tools/check_unix_deadline_mutation.py
+
       - name: cargo build --workspace (fast test assets)
         run: cargo build --workspace --features greppy/ci-test-assets
 
