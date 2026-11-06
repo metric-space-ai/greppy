@@ -37,6 +37,58 @@ jobs:
           toolchain: "1.95.0"
 
 
+      - name: Calibrate the actual web meter with real private memory and CPU
+        run: >-
+          python3 -B bench/calibrate_web_meter.py
+          --output "$RUNNER_TEMP/web-meter-calibration.json" --pairs 6
+
+      - name: Prove omitted CPU and PSS counters invalidate calibration
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'web-meter-counterproof'
+          root.mkdir()
+          def run_case(label, capture=False):
+              command = ['python3', '-B', '-X', 'pycache_prefix=' + str(root / (label + '.pycache')),
+                         'bench/calibrate_web_meter.py', '--contracts-only',
+                         '--output', str(root / (label + '.json'))]
+              result = subprocess.run(command, capture_output=capture, text=True,
+                                      timeout=35, check=not capture)
+              if capture:
+                  print(result.stdout, result.stderr)
+              return result
+          cases = [
+              ('cpu', pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py'),
+               'totals[0] += usage.ru_utime', 'totals[0] += 0.0', 'calibration.cpu_accounting'),
+              ('pss', pathlib.Path('bench/process_memory.py'),
+               'pss_bytes += metrics["Pss"]', 'pss_bytes += 0', 'calibration.pss_step'),
+          ]
+          for label, source, old, new, expected in cases:
+              original = source.read_text()
+              assert original.count(old) == 1
+              try:
+                  source.write_text(original.replace(old, new))
+                  result = run_case(label, capture=True)
+                  record = json.loads((root / (label + '.json')).read_text())
+                  assert result.returncode == 1 and record['status'] == 'failed'
+                  assert expected in record['error'], record
+                  print('WEB_METER_COUNTER_REJECTED', label, expected)
+              finally:
+                  source.write_text(original)
+          run_case('restored')
+          subprocess.run(['git', 'diff', '--exit-code', '--',
+                          'crates/web-runtime/scripts/measure-web-efficiency.py',
+                          'bench/process_memory.py'], check=True)
+
+      - name: Preserve raw meter calibration and counterproofs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: web-meter-calibration
+          path: ${{ runner.temp }}/web-meter-*
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Check real process-family PSS and cleanup
         run: python3 bench/test_process_memory.py
 
