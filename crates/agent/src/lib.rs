@@ -13,8 +13,8 @@
 //! - [`workspace`] — per-repository agent worktree isolation and review-patch proposals.
 //! - [`agent_loop`] — ported multi-turn agent loop (pi v0.80.2 semantics, MIT).
 //!
-//! Dependencies are deliberately minimal (`serde` / `serde_json` / plain-HTTP
-//! `ureq`). No async runtime.
+//! Plain-HTTP gateway requests use `reqwest` on a request-local Tokio runtime;
+//! the public synchronous API and interruptible turns share that transport.
 
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]

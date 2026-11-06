@@ -1135,12 +1135,40 @@ fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::Owned
 }
 
 #[cfg(unix)]
+fn trace_worker_spawn(worker: &WorkerKind, stage: &str) {
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+        eprintln!(
+            "web-runtime: spawn supervisor={} worker={worker:?} stage={stage}",
+            std::process::id()
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_WORKER_IMAGE_PREPARATION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(unix)]
 fn spawn_unix(
     worker: WorkerKind,
     capability: String,
     persistent_profiles: Option<PathBuf>,
 ) -> io::Result<WorkerProcess> {
-        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    crate::fork_exec_window::exclusive(|| {
+        spawn_unix_in_window(worker, capability, persistent_profiles)
+    })
+}
+
+#[cfg(unix)]
+fn spawn_unix_in_window(
+    worker: WorkerKind,
+    capability: String,
+    persistent_profiles: Option<PathBuf>,
+) -> io::Result<WorkerProcess> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
         let path = std::env::current_exe().map_err(|error| {
@@ -1178,12 +1206,11 @@ fn spawn_unix(
         let proto_parent = unsafe { OwnedFd::from_raw_fd(proto[1]) };
         let proto_child = duplicate_above_worker_protocol_fds(proto_child_source.as_raw_fd())?;
         drop(proto_child_source);
-        let cap_read_fd = cap_read.into_raw_fd();
-        let proto_child_fd = proto_child.into_raw_fd();
+        let cap_read_fd = cap_read.as_raw_fd();
+        let proto_child_fd = proto_child.as_raw_fd();
         unsafe {
             libc::fcntl(proto_parent.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let proto_parent_fd = proto_parent.into_raw_fd();
 
         let mut command = Command::new(&path);
         command
@@ -1223,15 +1250,22 @@ fn spawn_unix(
                 Ok(())
             });
         }
+        // Keep all descriptor owners alive across every fallible preparation step.
+        // Raw fd numbers above are borrowed only for the child pre_exec closure.
+        #[cfg(all(test, target_os = "linux"))]
+        if FAIL_WORKER_IMAGE_PREPARATION.with(|fail| fail.replace(false)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected worker image preparation failure",
+            ));
+        }
+        trace_worker_spawn(&worker, "image-prepare");
         let image = crate::worker::apply_same_image_reexec(&mut command)?;
         // Cache parent identity before exec so the first child cannot race the digest.
+        trace_worker_spawn(&worker, "parent-image");
         let _ = parent_image()?;
+        trace_worker_spawn(&worker, "spawn");
         let mut child = command.spawn().map_err(|error| {
-            unsafe {
-                libc::close(cap_read_fd);
-                libc::close(proto_child_fd);
-                libc::close(proto_parent_fd);
-            }
             io::Error::new(
                 error.kind(),
                 format!(
@@ -1240,35 +1274,28 @@ fn spawn_unix(
                 ),
             )
         })?;
-        unsafe {
-            libc::close(cap_read_fd);
-            libc::close(proto_child_fd);
-        }
+        drop(cap_read);
+        drop(proto_child);
+        trace_worker_spawn(&worker, "image-prove");
         image.prove_child_or_kill(&mut child)?;
+        trace_worker_spawn(&worker, "executable-prove");
         if let Err(error) = prove_same_executable(child.id()) {
-            unsafe {
-                libc::close(proto_parent_fd);
-            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
 
-        let proto_read_fd = unsafe { libc::dup(proto_parent_fd) };
-        if proto_read_fd < 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                libc::close(proto_parent_fd);
+        trace_worker_spawn(&worker, "protocol-clone");
+        let proto_read = match proto_parent.try_clone() {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        unsafe {
-            libc::fcntl(proto_read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        let protocol_write = File::from(unsafe { OwnedFd::from_raw_fd(proto_parent_fd) });
-        let protocol_read = File::from(unsafe { OwnedFd::from_raw_fd(proto_read_fd) });
+        };
+        let protocol_write = File::from(proto_parent);
+        let protocol_read = File::from(proto_read);
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdout was not piped")
         })?;
@@ -1319,6 +1346,7 @@ fn spawn_unix(
         };
 
         register_owned_worker(child.id());
+        trace_worker_spawn(&worker, "spawn-complete");
         Ok(WorkerProcess {
             worker,
             capability,
@@ -2295,6 +2323,34 @@ fn stage_input_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_worker_image_preparation_releases_kernel_descriptors() {
+        fn fail_after_descriptors_are_allocated() {
+            FAIL_WORKER_IMAGE_PREPARATION.with(|fail| fail.set(true));
+            let result = spawn_unix(WorkerKind::Controller, "fd-lifetime-contract".into(), None);
+            FAIL_WORKER_IMAGE_PREPARATION.with(|fail| fail.set(false));
+            let error = result.err().expect("worker preparation must fail before exec");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "injected worker image preparation failure");
+        }
+        fn descriptor_count() -> usize {
+            fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        // Warm one-time process setup before measuring repeated failed starts.
+        fail_after_descriptors_are_allocated();
+        let before = descriptor_count();
+        for _ in 0..4 {
+            fail_after_descriptors_are_allocated();
+            assert_eq!(
+                descriptor_count(),
+                before,
+                "failed worker image preparation leaked kernel descriptors"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

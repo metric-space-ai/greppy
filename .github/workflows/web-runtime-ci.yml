@@ -20,6 +20,10 @@ concurrency:
   # Finish active browser suites; only queued superseded revisions may be replaced.
   cancel-in-progress: false
 
+env:
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "1"
+
 jobs:
   session-daemon:
     name: session daemon three-run stability
@@ -39,6 +43,35 @@ jobs:
 
       - name: Check waiter timeout slot lifecycle
         run: node --test crates/web-runtime/runtime/tests/wait-slot-lifecycle.cjs
+
+      - name: Check concurrent fork exec cannot capture unsealed sibling descriptors
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features
+          concurrent_fork_exec_does_not_capture_an_unsealed_descriptor
+          -- --test-threads=1 --nocapture
+
+      - name: Prove early spawn unlock leaks a real descriptor across exec
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/fork_exec_window.rs')
+          original = source.read_text()
+          old = '    let _guard = WINDOW.lock().unwrap_or_else(|error| error.into_inner());'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'concurrent_fork_exec_does_not_capture_an_unsealed_descriptor',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, old + '\n    drop(_guard);'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'child inherited a descriptor from another spawn window' in (result.stdout + result.stderr)
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
       - name: Check bounded worker capability framing
         shell: bash
@@ -199,7 +232,17 @@ jobs:
                   source.write_text(original.replace(old, old.replace('if matches!', 'if method != "' + method + '" && matches!')))
                   result = subprocess.run(command, capture_output=True, text=True, timeout=300)
                   print(result.stdout, result.stderr)
-                  assert result.returncode == 101 and marker in result.stdout + result.stderr, method
+                  output = result.stdout + result.stderr
+                  # In the shared Promise.all case, a blocked response wait can
+                  # starve the click until the earlier request timer reports first.
+                  sibling_timeout = (method == 'page.waitForResponse'
+                      and 'download Promise.all failed' in output
+                      and 'TimeoutError:' in output
+                      and 'Proxy.waitForRequest' in output
+                      and 'HTTP paths=["/"]' in output)
+                  assert result.returncode == 101 and (marker in output or sibling_timeout), method
+                  if sibling_timeout:
+                      print('mutation: blocking response wait prevented the real /signal trigger; request timer fired first')
               finally:
                   source.write_text(original)
               subprocess.run(command, check=True, timeout=300)
