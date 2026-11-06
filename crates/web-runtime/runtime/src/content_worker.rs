@@ -6797,6 +6797,13 @@ fn trace_startup(stage: &str) {
     }
 }
 
+struct PendingDownloadWait {
+    request_id: u64,
+    params: serde_json::Value,
+    deadline: Instant,
+    _reservation: crate::retained_records::RecordReservation,
+}
+
 pub fn run() -> io::Result<()> {
     trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
@@ -6857,7 +6864,7 @@ pub fn run() -> io::Result<()> {
             )
         })?;
 
-    let mut download_waiters: Vec<(u64, serde_json::Value, Instant)> = Vec::new();
+    let mut download_waiters: Vec<PendingDownloadWait> = Vec::new();
     loop {
         if engine.parent_dead() {
             return Ok(());
@@ -6865,7 +6872,8 @@ pub fn run() -> io::Result<()> {
         // A wait must not occupy the same protocol loop as the click that
         // produces its event. Keep only request metadata, not a WebView/Rc.
         let mut write_error = None;
-        download_waiters.retain(|(request_id, params, deadline)| {
+        download_waiters.retain(|waiter| {
+            let PendingDownloadWait { request_id, params, deadline, .. } = waiter;
             let result = (|| -> io::Result<Option<serde_json::Value>> {
                 engine.reject_stale_objects("page.waitForDownload", params)?;
                 let page = required_str(params, "page")?;
@@ -6906,8 +6914,21 @@ pub fn run() -> io::Result<()> {
                 ..
             })) => {
                 if method == "page.waitForDownload" {
-                    let deadline = Instant::now() + call_timeout(&params);
-                    download_waiters.push((request_id, params, deadline));
+                    let reservation = (|| {
+                        engine.reject_stale_objects(&method, &params)?;
+                        let page = required_str(&params, "page")?;
+                        let delegate = &engine.page(&page)?.1;
+                        RecordBudget::hold_value(&delegate.record_budget, &params,
+                            std::mem::size_of::<PendingDownloadWait>())
+                    })();
+                    match reservation {
+                        Ok(reservation) => download_waiters.push(PendingDownloadWait {
+                            request_id, deadline: Instant::now() + call_timeout(&params),
+                            params, _reservation: reservation,
+                        }),
+                        Err(error) => write_message(&mut protocol_out,
+                            &Message::engine_result(request_id, false, serde_json::Value::Null, Some(error.to_string())))?,
+                    }
                     continue;
                 }
                 let call_started = NavTrace::enabled().then(|| {

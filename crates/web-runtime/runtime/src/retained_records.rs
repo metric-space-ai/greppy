@@ -19,6 +19,15 @@ impl RecordBudget {
     pub fn set_limit(&self, limit: usize) {
         self.limit.set(limit);
     }
+    /// Pending RPC metadata spends the same context allowance as retained
+    /// records, and returns its reservation on every completion/drop path.
+    pub fn hold_value(budget: &Rc<Self>, value: &Value, overhead: usize) -> io::Result<RecordReservation> {
+        let bytes = row_bytes(value).saturating_add(overhead);
+        if !budget.reserve(bytes) {
+            return Err(io::Error::other("resource_limit: pending event wait exceeds context record budget"));
+        }
+        Ok(RecordReservation { budget: Rc::clone(budget), bytes })
+    }
     fn reserve(&self, bytes: usize) -> bool {
         let Some(next) = self.used.get().checked_add(bytes) else {
             return false;
@@ -35,6 +44,14 @@ impl RecordBudget {
     fn exceeded(&self) -> bool {
         self.used.get() > self.limit.get()
     }
+}
+
+pub struct RecordReservation {
+    budget: Rc<RecordBudget>,
+    bytes: usize,
+}
+impl Drop for RecordReservation {
+    fn drop(&mut self) { self.budget.release(self.bytes); }
 }
 
 #[derive(Debug)]
@@ -192,6 +209,25 @@ impl Serialize for RetainedRecords {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pending_event_wait_returns_its_shared_record_budget() {
+        let budget = Rc::new(RecordBudget::new(100));
+        let value = json!({"page": "p", "timeout": 2000});
+        let wait = RecordBudget::hold_value(&budget, &value, 40).unwrap();
+        assert!(RecordBudget::hold_value(&budget, &value, 40).is_err(),
+            "pending wait bypassed the shared context allowance");
+        let mut records = RetainedRecords::with_budget(4, Rc::clone(&budget));
+        records.push(json!({"text": "x".repeat(40)}));
+        assert!(records.overflowed(), "records and pending waits used separate budgets");
+        drop(wait);
+        assert_eq!(budget.used.get(), 0, "completed wait leaked its budget reservation");
+        records.clear();
+        records.push(json!({"text": "x".repeat(40)}));
+        assert!(!records.overflowed(), "released wait budget was not reusable");
+        drop(records);
+        assert_eq!(budget.used.get(), 0);
+    }
 
     #[test]
     fn retained_records_bound_bytes_before_retaining_and_account_updates() {
