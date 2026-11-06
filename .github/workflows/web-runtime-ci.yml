@@ -84,6 +84,7 @@ jobs:
           --test session-daemon
           --no-run
 
+
       - name: Check an unused runtime releases its workers after the configured idle lease
         shell: bash
         run: >-
@@ -112,6 +113,7 @@ jobs:
               source.write_text(original)
           subprocess.run(command, check=True, timeout=300)
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
 
       - name: Check closing one session preserves its live neighbor and recovery worker
         shell: bash
