@@ -2104,7 +2104,7 @@ class Page {
         const result = await engineCall("page.saveDownload", {
           page: page,
           url: rec.url,
-          downloadId: rec.requestId,
+          downloadId: rec.bodyBase64 == null ? rec.requestId : undefined,
           path: String(path),
         });
         if (Number(result.bytes) !== Number(rec.byteLength || 0)) {
