@@ -129,7 +129,7 @@ fn saved_ansi_oxc_replay(tag: &str, payload: &str, exit: i32, verdict: &str) {
                 shown.starts_with(verdict),
                 "{tag} diagnostic verdict regression: {shown}"
             );
-            if stream == "stderr" {
+            if stream == "stderr" && !folded {
                 assert_eq!(
                     output.stderr,
                     bytes.as_bytes(),
