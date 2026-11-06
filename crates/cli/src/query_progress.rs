@@ -116,14 +116,23 @@ impl JobProgress {
     }
 
     fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let validating = value.get("state")?.as_str()? == "counting_embeddings";
         Some(Self {
             state: value.get("state")?.as_str()?.to_owned(),
             completed: value
-                .get("completed_spans")
+                .get(if validating {
+                    "validation_completed_candidates"
+                } else {
+                    "completed_spans"
+                })
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
             total: value
-                .get("total_spans")
+                .get(if validating {
+                    "validation_total_candidates"
+                } else {
+                    "total_spans"
+                })
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
             unit: value
@@ -282,7 +291,7 @@ impl ProgressReporter {
             let previous_prognosis = self.prognosis;
             let forecast = if job.state == "embedding" {
                 job.published_forecast(now_unix_secs)
-            } else if progress_changed {
+            } else if progress_changed && job.state != "counting_embeddings" {
                 job.total.checked_sub(job.completed).and_then(|remaining| {
                     Prognosis::from_measurement(
                         remaining,
@@ -351,6 +360,8 @@ impl ProgressReporter {
         };
         let prognosis = if stalled {
             format!("no progress reported for {}s", STALL_AFTER.as_secs())
+        } else if job.state == "counting_embeddings" {
+            "exact span total and embedding ETA pending validation".into()
         } else if job.total == 0 {
             "phase ETA unavailable until total is known".into()
         } else if let Some(prognosis) = self.prognosis {
@@ -505,6 +516,50 @@ mod tests {
             )
             .unwrap();
         assert!(new_phase.contains("measuring phase ETA"), "{new_phase}");
+    }
+
+    #[test]
+    fn validation_progress_candidates_stay_distinct_from_spans_without_eta_or_poll_spam() {
+        let mut value = serde_json::json!({
+            "state": "counting_embeddings", "completed_spans": 0, "total_spans": null,
+            "validation_completed_candidates": 1, "validation_total_candidates": 100,
+            "progress_unit": "candidates", "pid": 42, "started_at_unix_secs": 1000,
+        });
+        let mut reporter = ProgressReporter::default();
+        let parsed = JobProgress::from_value(&value).unwrap();
+        let first = reporter
+            .observe("search", Some(parsed.clone()), Duration::from_secs(10))
+            .unwrap();
+        assert!(first.contains("1/100 candidates"));
+        assert!(first.contains("exact span total and embedding ETA pending validation"));
+        assert!(reporter
+            .observe("search", Some(parsed), Duration::from_secs(20))
+            .is_none());
+        value["validation_completed_candidates"] = serde_json::json!(2);
+        reporter.observe(
+            "search",
+            JobProgress::from_value(&value),
+            Duration::from_secs(30),
+        );
+        assert!(
+            reporter.prognosis.is_none(),
+            "candidate throughput must not guess an embedding ETA"
+        );
+        let stalled = reporter
+            .observe(
+                "search",
+                JobProgress::from_value(&value),
+                Duration::from_secs(90),
+            )
+            .unwrap();
+        assert!(stalled.contains("no progress reported for 60s"));
+        assert!(reporter
+            .observe(
+                "search",
+                JobProgress::from_value(&value),
+                Duration::from_secs(100)
+            )
+            .is_none());
     }
 
     #[test]
