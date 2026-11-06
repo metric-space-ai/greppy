@@ -204,6 +204,7 @@ def main():
                    str(ROOT / 'crates/web-runtime/scripts/measure-web-efficiency.py'),
                    '--engine', 'cli', '--cli', str(cli), '--runtime', str(runtime),
                    '--state-parent', str(state_parent), '--kernel-cgroup-parent', parent,
+                   '--capture-owned-runtime-stderr',
                    '--output', str(measurement), '--rounds', '3', '--tasks', '2',
                    '--concurrency', '1', '--nodes', '100', '--timeout', '90']
         with (evidence / 'worker-stdout.log').open('wb') as stdout, (evidence / 'worker-stderr.log').open('wb') as stderr:

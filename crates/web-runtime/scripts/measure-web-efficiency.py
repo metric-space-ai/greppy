@@ -16,6 +16,8 @@ import os
 import pathlib
 import platform
 import resource
+import re
+import stat
 import secrets
 import shutil
 import signal
@@ -334,8 +336,55 @@ def log_tail(path):
         return stream.read(8192).decode('utf-8', 'replace')
 
 
+def capture_owned_runtime_stderr(runtime_seen, runtime_identity, state):
+    """Read a bounded diagnostic tail from our observed Linux runtime's stderr."""
+    result = {'schema': 'greppy.owned-runtime-stderr.v1', 'status': 'unavailable'}
+    descriptor = None
+    try:
+        if platform.system() != 'Linux' or runtime_seen is None or runtime_identity is None:
+            raise ValueError('observed Linux runtime identity is required')
+        pid, birth = runtime_seen['pid'], runtime_seen['starttime_ticks']
+        proc = pathlib.Path('/proc') / str(pid)
+
+        def same_process():
+            identity = _memory_module._stat(pid)
+            image = (proc / 'exe').stat()
+            return (identity is not None and identity[1] == birth
+                    and proc.stat().st_uid == os.getuid()
+                    and (image.st_dev, image.st_ino) == runtime_identity)
+
+        if not same_process():
+            raise ValueError('runtime process identity changed')
+        stderr_path = proc / 'fd/2'
+        target = os.readlink(stderr_path)
+        original = pathlib.Path(target.removesuffix(' (deleted)'))
+        if (not original.is_absolute() or not original.name.startswith('web-startup-')
+                or original.suffix != '.log'
+                or not original.resolve().is_relative_to(state.resolve())):
+            raise ValueError('runtime stderr is outside the newly created private state')
+        descriptor = os.open(stderr_path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError('runtime stderr is not an owned regular log')
+        if os.readlink(stderr_path) != target or not same_process():
+            raise ValueError('runtime stderr identity changed')
+        offset = max(0, info.st_size - 65536)
+        raw = os.pread(descriptor, 65536, offset)
+        text = re.sub(r'[A-Za-z0-9_+/=-]{32,}', '<opaque>', raw.decode('utf-8', 'replace'))
+        result.update(status='captured', source_size_bytes=info.st_size, offset_bytes=offset,
+                      tail_sha256=hashlib.sha256(raw).hexdigest(), stderr_redacted_tail=text,
+                      scope='only our image/birth-verified runtime stderr regular file inside new test state; before cleanup')
+    except (OSError, ValueError, KeyError) as error:
+        result['reason'] = type(error).__name__ + ': ' + str(error)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return result
+
+
 def execute(command, directory, timeout, started=None, memory_log_path=None, *,
-            env=None, cwd=None, cleanup_command=None, runtime_identity=None, resource_group=None):
+            env=None, cwd=None, cleanup_command=None, runtime_identity=None, resource_group=None,
+            diagnostic_state=None):
     started = time.monotonic() if started is None else started
     monitor_cpu_started = time.thread_time_ns()
     terminated_at = None
@@ -347,6 +396,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
     controls = {}
     totals = [0.0, 0.0, 0]
     runtime_seen = None
+    runtime_diagnostic = None
 
     def refresh_roots():
         if custody.supported:
@@ -431,6 +481,19 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
                 changed = reap()
                 now = time.monotonic()
                 if child.returncode is not None and cleanup_command is not None and cleanup is None and terminated_at is None:
+                    if child.returncode != 0 and diagnostic_state is not None:
+                        refresh_roots()
+                        observe_runtime()
+                        runtime_diagnostic = capture_owned_runtime_stderr(
+                            runtime_seen, runtime_identity, diagnostic_state)
+                        if resource_group is not None:
+                            envelope = {}
+                            for name in ('pids.max', 'pids.current', 'pids.peak', 'pids.events'):
+                                try:
+                                    envelope[name] = (resource_group.path.parent / name).read_text()[:4096].strip()
+                                except OSError:
+                                    envelope[name] = None
+                            runtime_diagnostic['owned_unit_pids_envelope'] = envelope
                     cleanup_arguments = resource_group.wrap_command(cleanup_command) if resource_group else cleanup_command
                     cleanup = subprocess.Popen(
                         cleanup_arguments, stdout=cleanup_stdout, stderr=cleanup_stderr,
@@ -478,6 +541,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
     return {
         'exit_code': child.returncode, 'timed_out': terminated_at is not None,
         'cleanup_exit_code': cleanup.returncode if cleanup is not None else None,
+        'runtime_failure_diagnostic': runtime_diagnostic,
         'process_cold_total_ms': (time.monotonic() - started) * 1000,
         'kernel_resource_accounting': resource_group.snapshot() if resource_group else None,
         'lifecycle_accounting_version': 'kernel-custody-v1',
@@ -569,6 +633,8 @@ def main():
     parser.add_argument('--cli', type=pathlib.Path)
     parser.add_argument('--state-parent', type=pathlib.Path,
                         help='CLI only: existing absolute private-state parent of at most20 bytes')
+    parser.add_argument('--capture-owned-runtime-stderr', action='store_true',
+                        help='CLI/Linux failure only: bounded redacted own-runtime stderr before cleanup')
     parser.add_argument('--node', default='node')
     parser.add_argument('--output', required=True, type=pathlib.Path)
     parser.add_argument('--rounds', type=int, default=3)
@@ -647,7 +713,8 @@ def main():
                                                     if state is not None else None),
                                    runtime_identity=((runtime_before.st_dev, runtime_before.st_ino)
                                                      if runtime_before is not None else None),
-                                   resource_group=resource_group)
+                                   resource_group=resource_group,
+                                   diagnostic_state=state if args.capture_owned_runtime_stderr else None)
             if resource_group is not None:
                 measured['kernel_resource_accounting']['group_removed'] = resource_group.closed
         audit = fixture.audit()
