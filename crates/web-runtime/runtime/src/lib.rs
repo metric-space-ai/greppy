@@ -9,6 +9,8 @@ pub(crate) mod selector_runtime;
 pub mod limits;
 pub mod linux_sandbox;
 mod observed_refs;
+#[cfg(unix)]
+mod operation_control;
 mod locator_diagnostics;
 mod wait_contract;
 pub mod policy;

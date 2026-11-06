@@ -532,9 +532,7 @@ struct LateEngineResult {
 }
 
 struct RunControl {
-    busy: std::sync::Mutex<Option<(String, String)>>,
-    cancel_target: std::sync::Mutex<Option<(String, String)>>,
-    completed: std::sync::Mutex<HashSet<(String, String)>>,
+    operation: crate::operation_control::OperationControl,
     heartbeats: std::sync::Mutex<Vec<String>>,
     session_rows: std::sync::Mutex<Vec<serde_json::Value>>,
     late_engine_result: std::sync::Mutex<Option<LateEngineResult>>,
@@ -548,9 +546,7 @@ struct RunControl {
 impl RunControl {
     fn new() -> Self {
         Self {
-            busy: std::sync::Mutex::new(None),
-            cancel_target: std::sync::Mutex::new(None),
-            completed: std::sync::Mutex::new(HashSet::new()),
+            operation: crate::operation_control::OperationControl::default(),
             heartbeats: std::sync::Mutex::new(Vec::new()),
             session_rows: std::sync::Mutex::new(Vec::new()),
             late_engine_result: std::sync::Mutex::new(None),
@@ -783,41 +779,18 @@ fn accept_loop(
                     let _ = write_frame(&mut stream, &Response::error(&request, error));
                     continue;
                 }
-                let pair = (session_id, target);
-                let completed = control.completed.lock().unwrap_or_else(|e| e.into_inner());
-                if completed.contains(&pair) {
-                    drop(completed);
-                    let _ = write_frame(
-                        &mut stream,
-                        &Response::ok(
-                            &request,
-                            json!({ "cancelled": false, "reason": "already_completed" }),
-                        ),
-                    );
-                    continue;
-                }
-                drop(completed);
-                let busy = control.busy.lock().unwrap_or_else(|e| e.into_inner());
-                if busy.as_ref() != Some(&pair) {
-                    drop(busy);
-                    let _ = write_frame(
-                        &mut stream,
-                        &Response::ok(
-                            &request,
-                            json!({ "cancelled": false, "reason": "no_match" }),
-                        ),
-                    );
-                    continue;
-                }
-                drop(busy);
-                *control
-                    .cancel_target
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(pair);
-                let _ = write_frame(
-                    &mut stream,
-                    &Response::ok(&request, json!({ "cancelled": true })),
-                );
+                let result = match control.operation.cancel(&session_id, &target) {
+                    crate::operation_control::CancelResult::Requested => {
+                        json!({ "cancelled": true })
+                    }
+                    crate::operation_control::CancelResult::AlreadyCompleted => {
+                        json!({ "cancelled": false, "reason": "already_completed" })
+                    }
+                    crate::operation_control::CancelResult::NoMatch => {
+                        json!({ "cancelled": false, "reason": "no_match" })
+                    }
+                };
+                let _ = write_frame(&mut stream, &Response::ok(&request, result));
             }
             "heartbeat" | "web.heartbeat" => {
                 if let Some(session_id) = request
@@ -1950,12 +1923,14 @@ impl Daemon {
                 );
             }
         }
-        *self
-            .run_control
-            .busy
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) =
-            Some((session_id.clone(), request.request_id.clone()));
+        let control = Arc::clone(&self.run_control);
+        let _operation_lease = match control.operation.begin(&session_id, &request.request_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_session(&session_id);
+                return engine_error(request, error, 38);
+            }
+        };
         self.run_control
             .controller_pid
             .store(self.controller.pid(), Ordering::Relaxed);
@@ -2076,7 +2051,6 @@ impl Daemon {
         let controller_pid = self.controller.pid();
         let content_cpu_baseline_ns = sample_cpu_ns(content_pid);
         let controller_cpu_baseline_ns = sample_cpu_ns(controller_pid);
-        let control = Arc::clone(&self.run_control);
         let operation_id = request.request_id.clone();
         let remaining = run_deadline
             .saturating_duration_since(Instant::now())
@@ -2211,27 +2185,8 @@ impl Daemon {
                 let failure_trace_warning = failure_trace_storage.warning;
                 let message = error.to_string();
                 if message.contains("cancelled") {
-                    let pair = (session_id.clone(), operation_id.clone());
-                    control
-                        .completed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(pair.clone());
-                    {
-                        let mut cancel_target = control
-                            .cancel_target
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if cancel_target.as_ref() == Some(&pair) {
-                            *cancel_target = None;
-                        }
-                    }
-                    {
-                        let mut busy = control.busy.lock().unwrap_or_else(|e| e.into_inner());
-                        if busy.as_ref() == Some(&pair) {
-                            *busy = None;
-                        }
-                    }
+                    // The script is settled before draining/replacing its workers.
+                    drop(_operation_lease);
                     self.drain_late_engine_results(&session_id, &operation_id);
                     if had_inflight_engine.is_some() {
                         match self.respawn_content_after_cancel("cancelled content isolate") {
@@ -6212,11 +6167,8 @@ struct SessionEngineGate<'a> {
 impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
     fn is_cancelled(&self) -> bool {
         self.control
-            .cancel_target
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|pair| pair.0 == self.session_id && pair.1 == self.operation_id)
+            .operation
+            .is_cancelled(&self.session_id, &self.operation_id)
     }
 
     fn poll_control(&mut self) {

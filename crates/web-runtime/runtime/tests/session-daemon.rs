@@ -9687,19 +9687,16 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
         controller_generation_after > controller_generation_before,
         "controller generation must increase, before={controller_generation_before} after={controller_generation_after}"
     );
-    let follow = unix_request(
-        &socket,
-        &Request::new(
-            "run_cancel",
-            "web.run",
-            json!({
-                "session_id": other_id,
-                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto(\"about:blank\");\nawait page.evaluate(() => document.readyState);\nawait browser.close();\n"
-            }),
-        ),
-        Duration::from_secs(40),
-    )
-    .expect("follow-up web.run");
+    let follow_request = Request::new(
+        "run_cancel",
+        "web.run",
+        json!({
+            "session_id": other_id,
+            "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto(\"about:blank\");\nawait page.evaluate(() => document.readyState);\nawait browser.close();\n"
+        }),
+    );
+    let follow = unix_request(&socket, &follow_request, Duration::from_secs(40))
+        .expect("follow-up web.run");
     assert_eq!(
         follow.status, "ok",
         "worker must remain usable after cancel: {follow:?}"
@@ -9711,6 +9708,29 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             .and_then(|value| value.get("completed")),
         Some(&json!(true)),
         "{follow:?}"
+    );
+    let after_success = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.cancel",
+            json!({
+                "session_id": other_id,
+                "target_request_id": follow_request.request_id
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("cancel completed successful run");
+    assert_eq!(
+        after_success.result.as_ref().unwrap()["cancelled"],
+        json!(false),
+        "finished successful web.run remained cancellable: {after_success:?}"
+    );
+    assert_eq!(
+        after_success.result.as_ref().unwrap()["reason"],
+        json!("already_completed"),
+        "latest completed operation must retain a bounded diagnostic receipt"
     );
     drop(guard);
     assert_no_leftover_web_runtime_processes("run_cancel");
