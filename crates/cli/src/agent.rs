@@ -3055,16 +3055,6 @@ fn writable_roots_for(
     roots
 }
 
-fn home_dir() -> std::path::PathBuf {
-    #[cfg(target_os = "windows")]
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        return std::path::PathBuf::from(profile);
-    }
-    if let Some(h) = std::env::var_os("HOME") {
-        return std::path::PathBuf::from(h);
-    }
-    std::env::temp_dir()
-}
 
 /// Ensure the worktree's greppy index is usable before the first agent turn.
 ///

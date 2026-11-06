@@ -17,7 +17,9 @@ FIXED = """    // Confined tool children use CARGO_HOME=<run scratch>/cargo and
 LEGACY = """    // Mutation: restore the old, unused operator cache grants.
     let cargo = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".cargo"));
+        .unwrap_or_else(|| std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir).join(".cargo"));
     let cargo_registry = cargo.join("registry");
     let cargo_git = cargo.join("git");
     let _ = std::fs::create_dir_all(&cargo_registry);
