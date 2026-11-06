@@ -5328,8 +5328,7 @@ fn publish_locked_background_job(path: &std::path::Path, value: &serde_json::Val
     Ok(())
 }
 
-/// Bump `updated_at` while document validation is still inside the indexer.
-/// Status treats `counting_embeddings` as stalled after 120s with no write.
+/// Publish liveness without claiming that a validation candidate completed.
 fn refresh_counting_embeddings_liveness(path: &std::path::Path) -> Result<()> {
     let parent = path
         .parent()
@@ -5445,6 +5444,14 @@ fn replace_background_job_file(
     }
 }
 
+#[derive(Debug)]
+struct EmbeddingValidationState {
+    started_at_unix_secs: u64,
+    total_candidates: Option<usize>,
+    completed_candidates: usize,
+    last_work_progress_at_unix_secs: Option<u64>,
+}
+
 struct BackgroundJobGuard {
     path: Option<std::path::PathBuf>,
     detached: bool,
@@ -5470,6 +5477,7 @@ struct BackgroundJobGuard {
     embedding_started: Option<std::time::Instant>,
     index_phase_started: Option<std::time::Instant>,
     index_phase_completed_base: usize,
+    validation: Option<EmbeddingValidationState>,
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
@@ -5598,6 +5606,7 @@ impl BackgroundJobGuard {
             embedding_started: None,
             index_phase_started: None,
             index_phase_completed_base: 0,
+            validation: None,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
@@ -5740,6 +5749,12 @@ impl BackgroundJobGuard {
     /// a null ETA for the whole document walk. Candidate-node count is known
     /// before that walk and is the concrete phase a status reader can show.
     fn begin_counting_embeddings(&mut self, candidate_nodes: Option<usize>) {
+        self.validation = Some(EmbeddingValidationState {
+            started_at_unix_secs: unix_now_secs_cli(),
+            total_candidates: candidate_nodes,
+            completed_candidates: 0,
+            last_work_progress_at_unix_secs: None,
+        });
         self.progress_phase = Some("counting_embeddings");
         self.completed_documents = 0;
         self.total_documents = candidate_nodes.unwrap_or(0);
@@ -5762,6 +5777,35 @@ impl BackgroundJobGuard {
         });
         self.write_state("counting_embeddings", None);
         self.last_progress_write = Some(std::time::Instant::now());
+    }
+
+    fn embedding_validation_progress(
+        &mut self,
+        progress: greppy_indexer::EmbeddingValidationProgress,
+    ) {
+        let Some(validation) = self.validation.as_mut() else {
+            return;
+        };
+        if progress.completed_candidates <= validation.completed_candidates {
+            return;
+        }
+        let first_completed = validation.completed_candidates == 0;
+        validation.completed_candidates = progress.completed_candidates;
+        validation.last_work_progress_at_unix_secs = Some(unix_now_secs_cli());
+        self.current_detail = Some(format!(
+            "processed {} candidate symbols; last={}; exact span total is pending",
+            progress.completed_candidates, progress.current_symbol,
+        ));
+        // Coalesce journal writes; the validation callback itself runs only
+        // after real work, never on the liveness timer.
+        if first_completed
+            || self
+                .last_progress_write
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_millis(500))
+        {
+            self.write_state("counting_embeddings", None);
+            self.last_progress_write = Some(std::time::Instant::now());
+        }
     }
 
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
@@ -5825,6 +5869,9 @@ impl BackgroundJobGuard {
         let eta_unix_secs = self.eta_seconds.map(|eta| now.saturating_add(eta));
         let eta_minutes = self.eta_seconds.map(|eta| eta.saturating_add(59) / 60);
         let embedding = self.progress_phase == Some("embedding");
+        let validation = (self.progress_phase == Some("counting_embeddings"))
+            .then_some(self.validation.as_ref())
+            .flatten();
         let total_spans = if embedding {
             self.total_documents.saturating_sub(self.reusable_documents)
         } else {
@@ -5836,17 +5883,26 @@ impl BackgroundJobGuard {
         } else {
             self.completed_documents
         };
-        let progress_milli_percent = if total_spans == 0 {
+        let (progress_completed, progress_total) = validation
+            .map(|value| {
+                (
+                    value.completed_candidates,
+                    value.total_candidates.unwrap_or(0),
+                )
+            })
+            .unwrap_or((completed_spans, total_spans));
+        let progress_milli_percent = if progress_total == 0 {
             0
         } else {
-            completed_spans
-                .min(total_spans)
+            progress_completed
+                .min(progress_total)
                 .saturating_mul(100_000)
-                .checked_div(total_spans)
+                .checked_div(progress_total)
                 .unwrap_or(0)
         };
         let progress_unit = match self.progress_phase {
             Some("embedding") => Some("spans"),
+            Some("counting_embeddings") => Some("candidates"),
             Some(
                 "classifying_files"
                 | "extracting_files"
@@ -5874,8 +5930,12 @@ impl BackgroundJobGuard {
             "state": state,
             "backend": self.backend,
             "device": self.device,
-            "completed_spans": completed_spans,
-            "total_spans": total_spans,
+            "completed_spans": if validation.is_some() { 0 } else { completed_spans },
+            "total_spans": if validation.is_some() { None } else { Some(total_spans) },
+            "validation_started_at_unix_secs": validation.map(|value| value.started_at_unix_secs),
+            "validation_completed_candidates": validation.map(|value| value.completed_candidates),
+            "validation_total_candidates": validation.and_then(|value| value.total_candidates),
+            "last_work_progress_at_unix_secs": validation.and_then(|value| value.last_work_progress_at_unix_secs),
             "validated_spans": embedding.then_some(self.total_documents),
             "reusable_spans": embedding.then_some(self.reusable_documents),
             "work_assessment": match self.progress_phase {
@@ -6018,6 +6078,7 @@ mod background_progress_tests {
             embedding_started: None,
             index_phase_started: None,
             index_phase_completed_base: 0,
+            validation: None,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
@@ -6107,6 +6168,7 @@ mod background_progress_tests {
             embedding_started: None,
             index_phase_started: None,
             index_phase_completed_base: 0,
+            validation: None,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
@@ -6116,7 +6178,7 @@ mod background_progress_tests {
     }
 
     #[test]
-    fn counting_embeddings_publishes_candidate_total() {
+    fn validation_progress_publishes_candidates_without_heartbeat_work() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("job.json");
         super::start_background_job_record(
@@ -6135,16 +6197,43 @@ mod background_progress_tests {
         guard.begin_counting_embeddings(Some(12));
         let job = super::read_background_job(&path).unwrap();
         assert_eq!(job["state"], "counting_embeddings");
-        assert_eq!(job["total_spans"], 12);
+        assert!(job["total_spans"].is_null());
+        assert_eq!(job["validation_total_candidates"], 12);
+        assert_eq!(job["validation_completed_candidates"], 0);
+        assert!(job["last_work_progress_at_unix_secs"].is_null());
         assert_eq!(job["completed_spans"], 0);
         assert!(job["eta_seconds"].is_null());
         assert!(job["current_detail"]
             .as_str()
             .unwrap()
             .contains("candidate"));
+        guard.embedding_validation_progress(greppy_indexer::EmbeddingValidationProgress {
+            completed_candidates: 1,
+            current_symbol: "p.first".into(),
+        });
+        let mut worked = super::read_background_job(&path).unwrap();
+        assert_eq!(
+            worked["validation_completed_candidates"], 1,
+            "the first completed candidate must publish without waiting for a timer"
+        );
+        assert!(worked["last_work_progress_at_unix_secs"].as_u64().is_some());
+        assert!(worked["validated_spans"].is_null());
+        assert!(worked["eta_seconds"].is_null());
+        worked["last_work_progress_at_unix_secs"] = serde_json::json!(8);
+        worked["updated_at_unix_secs"] = serde_json::json!(9);
+        super::write_background_job(&path, &worked).unwrap();
+        super::refresh_counting_embeddings_liveness(&path).unwrap();
+        let heartbeat = super::read_background_job(&path).unwrap();
+        assert!(heartbeat["updated_at_unix_secs"].as_u64().unwrap() > 9);
+        assert_eq!(
+            heartbeat["last_work_progress_at_unix_secs"], 8,
+            "liveness must not fabricate completed validation work"
+        );
+        assert_eq!(heartbeat["validation_completed_candidates"], 1);
         guard.begin_counting_embeddings(None);
         let unknown = super::read_background_job(&path).unwrap();
         assert_eq!(unknown["state"], "counting_embeddings");
+        assert!(unknown["validation_total_candidates"].is_null());
         assert!(unknown["current_detail"]
             .as_str()
             .unwrap()
