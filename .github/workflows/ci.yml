@@ -125,12 +125,13 @@ jobs:
           cargo --version
           cargo clippy --version
 
+      - name: cargo build --workspace (fast test assets)
+        run: cargo build --workspace --features greppy/ci-test-assets
+
+      # Reuse the existing build before the bounded transport mutation proof.
       - name: Unix request absolute-deadline mutation proof
         if: runner.os == 'Linux'
         run: python3 tools/check_unix_deadline_mutation.py
-
-      - name: cargo build --workspace (fast test assets)
-        run: cargo build --workspace --features greppy/ci-test-assets
 
       - name: Inference watchdog phase and load-budget mutation proof
         if: runner.os == 'Linux'
