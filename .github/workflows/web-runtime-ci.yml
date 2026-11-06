@@ -84,6 +84,35 @@ jobs:
           --test session-daemon
           --no-run
 
+      - name: Check text reads wait for deferred document work without waiting for images
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          web_read_waits_for_deferred_text_but_not_unrelated_images -- --test-threads=1 --nocapture
+
+      - name: Prove text-read regression detects waiting for unrelated image load
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          old = 'json!({ "page": page, "url": url, "waitUntil": "domcontentloaded" })'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '--package', 'web-runtime', '--test', 'session-daemon',
+                     'web_read_waits_for_deferred_text_but_not_unrelated_images',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, old.replace('domcontentloaded', 'load')))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'text reader waited for an unrelated image resource' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Check native object lifecycle in a live context
         shell: bash
         run: >-
