@@ -268,7 +268,9 @@ print(json.dumps({'entry_sha256': hashlib.sha256(entry.read_bytes()).hexdigest()
                 receipt = json.loads(output.read_text())
                 state = pathlib.Path(receipt['cli_provenance']['private_state_directory'])
                 try:
-                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(
+                        result.returncode, 1,
+                        'changed runtime must fail even with verified POST effects' if changed_runtime else result.stderr)
                     self.assertEqual(receipt['metrics']['exit_code'], 0, receipt['metrics'])
                     self.assertEqual(receipt['metrics']['cleanup_exit_code'], 0)
                     self.assertFalse(
