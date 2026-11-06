@@ -131,7 +131,7 @@ jobs:
           assert original.count(old) == 1
           for method, test, marker in [
               ('page.waitForRequest', 'real_http_download_wait_allows_click_and_owns_complete_file', 'timeout: waitForRequest'),
-              ('page.waitForResponse', 'real_http_download_wait_allows_click_and_owns_complete_file', 'Page.waitForResponse.unintercepted'),
+              ('page.waitForResponse', 'real_http_download_wait_allows_click_and_owns_complete_file', 'timeout: waitForResponse'),
               ('page.waitForFileChooser', 'file_chooser_accepts_set_input_files', 'timeout: waitForEvent filechooser'),
           ]:
               command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',

@@ -4755,6 +4755,14 @@ const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
 await page.goto(fixtureUrl);
+page.setDefaultTimeout(50);
+let timedOut = false;
+try { await page.waitForResponse("/never-requested"); }
+catch (error) {
+  if (error.name !== "TimeoutError" || !String(error.message).includes("waitForResponse")) throw error;
+  timedOut = true;
+}
+if (!timedOut) throw new Error("missing response did not preserve its timeout");
 page.setDefaultTimeout(2000);
 const [request, response] = await Promise.all([
   page.waitForRequest("/signal"), page.waitForResponse("/signal"),
@@ -4791,6 +4799,8 @@ console.log(JSON.stringify({ original, saved: await download.path() }));
         "download must use exactly one real HTTP request");
     assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal").count(), 1,
         "recorded request and response waits must allow exactly one triggering fetch");
+    assert!(!requests.lock().unwrap().iter().any(|path| path == "/never-requested"),
+        "a response wait must never issue its own request");
     let stdout = result.result.as_ref().unwrap()["stdout"].as_str().unwrap().trim();
     let files: serde_json::Value = serde_json::from_str(stdout).unwrap();
     let original = PathBuf::from(files["original"].as_str().unwrap());

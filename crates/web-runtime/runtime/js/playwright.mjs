@@ -1953,20 +1953,12 @@ class Page {
   async waitForResponse(pattern) {
     const needle = String(pattern);
     const timeout = this._timeout || 30_000;
-    try {
-      const result = await engineCall("page.waitForResponse", {
-        page: this,
-        needle,
-        timeout,
-      });
-      return this._responseFromRecord(result.response);
-    } catch (error) {
-      const message = String(error && error.message ? error.message : error);
-      if (message.includes("timeout") || message.includes("timed out")) {
-        return unsupported("Page.waitForResponse.unintercepted")();
-      }
-      throw error;
-    }
+    const result = await engineCall("page.waitForResponse", {
+      page: this,
+      needle,
+      timeout,
+    });
+    return this._responseFromRecord(result.response);
   }
 
   async goto(url, options) {
