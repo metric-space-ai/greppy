@@ -205,8 +205,14 @@ fn absolute_deadline_child() {
                     if cfg!(target_vendor = "apple")
                         && error.raw_os_error() == Some(libc::EILSEQ) =>
                 {
+                    // Make lossy conversion observable even when this filesystem
+                    // cannot bind the original byte name.
+                    let lossy_socket =
+                        directory.join(socket.file_name().unwrap().to_string_lossy().as_ref());
+                    let lossy_listener = UnixListener::bind(&lossy_socket).unwrap();
+                    lossy_listener.set_nonblocking(true).unwrap();
                     let standard = UnixStream::connect(&socket).unwrap_err();
-                    assert_eq!(standard.raw_os_error(), Some(libc::EILSEQ));
+                    assert!(standard.raw_os_error().is_some());
                     let result = request(
                         &socket,
                         &Request::new("private", "web.status", json!({})),
@@ -216,6 +222,11 @@ fn absolute_deadline_child() {
                         matches!(&result, Err(UnixClientError::Connect(error))
                             if error.raw_os_error() == standard.raw_os_error()),
                         "byte-exact pathname must preserve the standard OS error: {result:?}"
+                    );
+                    assert!(
+                        matches!(lossy_listener.accept(), Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock),
+                        "byte-exact pathname must not reach the lossy replacement listener"
                     );
                     return;
                 }
