@@ -152,6 +152,23 @@ def main():
             report['quality_verified'] = data['quality_verified']
             report['quality_error'] = data['quality_error']
             report['measurement_sha256'] = sha256(measurement)
+            match = re.search(r'startup stderr retained at ([^;\n]+)',
+                              data['metrics'].get('stdout_tail', ''))
+            if match:
+                startup = Path(match[1])
+                if (startup.is_file() and not startup.is_symlink()
+                        and startup.resolve().is_relative_to(state_parent.resolve())
+                        and startup.stat().st_size <= 64 * 1024):
+                    raw = startup.read_bytes()
+                    text = raw.decode('utf-8', errors='replace')
+                    text = re.sub(r'[A-Za-z0-9_+/=-]{32,}', '<opaque>', text)
+                    (evidence / 'startup-stderr.redacted.log').write_text(text)
+                    report['startup_diagnostic'] = {
+                        'redacted_artifact': 'startup-stderr.redacted.log',
+                        'original_sha256': hashlib.sha256(raw).hexdigest(),
+                        'scope': 'only the explicitly reported log inside our new private state'}
+                else:
+                    report['startup_diagnostic'] = {'status': 'unavailable_or_outside_private_state'}
             report['whole_cli_sampled_surface_verified'] = data['metrics']['process_family_memory'].get(
                 'complete_for_execution_surface', False)
         else:
