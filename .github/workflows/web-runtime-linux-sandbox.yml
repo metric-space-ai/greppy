@@ -20,6 +20,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "1"
   RUST_BACKTRACE: "1"
   GREPPY_REQUIRE_LIVE_LANDLOCK: "1"
 
@@ -224,6 +226,38 @@ jobs:
           subprocess.run(command, check=True)
 
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check concurrent fork exec cannot capture unsealed sibling descriptors
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features
+          concurrent_fork_exec_does_not_capture_an_unsealed_descriptor
+          -- --test-threads=1 --nocapture
+
+      - name: Prove early spawn unlock leaks a real descriptor across exec
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/fork_exec_window.rs')
+          original = source.read_text()
+          old = '    let _guard = WINDOW.lock().unwrap_or_else(|error| error.into_inner());'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'concurrent_fork_exec_does_not_capture_an_unsealed_descriptor',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, old + '\n    drop(_guard);'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'child inherited a descriptor from another spawn window' in (result.stdout + result.stderr)
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove failed worker preparation releases kernel descriptors
+        run: python3 tools/check_worker_fd_mutation.py
 
       - name: Run Linux sandbox and fexecve gates
         run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh
