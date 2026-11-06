@@ -2,7 +2,7 @@
 """Bounded, opt-in comparison of one identical complete browser workload.
 
 Requires existing binaries/packages. Never installs, builds, changes host limits,
-or claims that a standalone runtime measurement covers an LLM agent or CLI daemon.
+or claims that a scripted web measurement covers LLM/model-provider work.
 """
 import argparse
 from collections import Counter
@@ -241,7 +241,7 @@ def log_tail(path):
         return stream.read(8192).decode('utf-8', 'replace')
 
 
-def execute(command, directory, timeout, started=None, memory_log_path=None):
+def execute(command, directory, timeout, started=None, memory_log_path=None, *, env=None, cwd=None):
     started = time.monotonic() if started is None else started
     terminated_at = None
     memory_log_path = memory_log_path or directory / 'process-memory.jsonl'
@@ -249,7 +249,8 @@ def execute(command, directory, timeout, started=None, memory_log_path=None):
     # Both engines use this same bounded monitor. Stream raw receipts instead
     # of retaining a sample history in the harness heap.
     with (directory / 'stdout.log').open('wb') as stdout, (directory / 'stderr.log').open('wb') as stderr, memory_log_path.open('x') as memory_log:
-        child = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+        child = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True,
+                                 env=env, cwd=cwd)
         try:
             memory = ProcessTreeMemorySampler(child.pid)
             next_sample = time.monotonic()
@@ -303,7 +304,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None):
             'stderr_tail': log_tail(directory / 'stderr.log')}
 
 
-def prepare_native_entry(path):
+def prepare_native_entry(path, fixture_url=None):
     """Inline the exact shared source at the native adapter's sole file import."""
     adapter_path = ROOT / 'runtime/fixtures/efficiency-native.mjs'
     workload_path = ROOT / 'runtime/fixtures/efficiency-workload.mjs'
@@ -313,10 +314,15 @@ def prepare_native_entry(path):
     if adapter.count(import_line) != 1:
         raise ValueError('native adapter must contain exactly one shared-workload import')
     source = adapter.replace(import_line, workload, 1)
+    if fixture_url is not None:
+        # The public CLI run verb has no runtime fixture flag. Bind only the
+        # generated loopback URL in the same hashed module as the workload.
+        source = b'const fixtureUrl = ' + json.dumps(fixture_url).encode('utf-8') + b';\n' + source
     with path.open('xb') as entry:
         entry.write(source)
     return {'path': str(path), 'sha256': hashlib.sha256(source).hexdigest(),
             'composition': 'inline-native-workload-v1',
+            'fixture_binding': 'module-local literal' if fixture_url is not None else 'runtime fixture flag',
             'adapter_path': str(adapter_path), 'adapter_sha256': hashlib.sha256(adapter).hexdigest(),
             'workload_path': str(workload_path), 'workload_sha256': hashlib.sha256(workload).hexdigest(),
             'generator_sha256': digest(pathlib.Path(__file__)),
@@ -328,10 +334,36 @@ def prepare_native_entry(path):
                                      'contexts': 'unchanged newContext() per worker'}}
 
 
+def cli_execution(cli, runtime, entry, state, timeout):
+    """Use public CLI composition; never attach to a user's existing owner."""
+    workspace = state / 'workspace'
+    workspace.mkdir()
+    temporary = state / 'tmp'
+    temporary.mkdir()
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith('GREPPY_')}
+    environment.update({
+        'GREPPY_WEB_RUNTIME': str(runtime),
+        'GREPPY_WEB_RUNTIME_DIR': str(state),
+        'GREPPY_RUNTIME_DIR': str(state),
+        'GREPPY_STORE_DIR': str(state / 'store'),
+        'GREPPY_WEB_AGENT': state.name,
+        'TMPDIR': str(temporary),
+    })
+    command = [str(cli), 'web', 'do', '--json',
+               'session', 'new', '--profile', 'project', '::',
+               'run', '--mode', 'standalone', '--script-file', str(entry),
+               '--timeout', str(int(timeout * 1000))]
+    return command, environment, workspace
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--engine', choices=('native', 'chromium'), required=True)
+    parser.add_argument('--engine', choices=('native', 'chromium', 'cli'), required=True)
     parser.add_argument('--runtime', type=pathlib.Path)
+    parser.add_argument('--cli', type=pathlib.Path)
+    parser.add_argument('--state-parent', type=pathlib.Path,
+                        help='CLI only: existing absolute private-state parent of at most20 bytes')
     parser.add_argument('--node', default='node')
     parser.add_argument('--output', required=True, type=pathlib.Path)
     parser.add_argument('--rounds', type=int, default=3)
@@ -347,12 +379,25 @@ def main():
     if args.output.exists():
         parser.error('output already exists; preserve existing measurement')
     reference = ROOT / 'scripts/efficiency-reference.mjs'
-    executable = args.runtime.resolve() if args.runtime else pathlib.Path(shutil.which(args.node) or args.node)
-    if args.engine == 'native' and not args.runtime:
+    executable = (args.cli.resolve() if args.engine == 'cli' and args.cli else
+                  args.runtime.resolve() if args.runtime else pathlib.Path(shutil.which(args.node) or args.node))
+    if args.engine in ('native', 'cli') and not args.runtime:
         parser.error('--runtime must name the existing exact runtime binary')
+    if args.engine == 'cli' and (not args.cli or not args.state_parent
+                                or not args.state_parent.is_absolute()
+                                or not args.state_parent.is_dir()
+                                or len(os.fsencode(args.state_parent)) + 12 > 32):
+        parser.error('CLI mode requires --cli and an existing absolute --state-parent of at most20 bytes')
+    if args.engine != 'cli' and (args.cli or args.state_parent):
+        parser.error('--cli and --state-parent apply only to --engine cli')
     if not executable.is_file():
         parser.error(f'executable does not exist: {executable}')
     executable_before = executable.stat()
+    runtime = args.runtime.resolve() if args.engine == 'cli' else None
+    if runtime is not None and not runtime.is_file():
+        parser.error(f'runtime executable does not exist: {runtime}')
+    runtime_before = runtime.stat() if runtime is not None else None
+    runtime_sha256 = digest(runtime) if runtime is not None else None
     provenance = source_identity()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     native_entry = None
@@ -363,16 +408,29 @@ def main():
             parser.error(str(error))
     config = {key: getattr(args, key) for key in ('rounds', 'tasks', 'concurrency', 'nodes')}
     fixture = Fixture(config)
+    url = f'http://127.0.0.1:{fixture.server_port}/'
+    state = None
+    if args.engine == 'cli':
+        try:
+            native_entry = prepare_native_entry(args.output.with_name(args.output.name + '.entry.mjs'), url)
+            state = pathlib.Path(tempfile.mkdtemp(prefix='gw-', dir=args.state_parent))
+            if len(os.fsencode(state)) > 32:
+                raise ValueError('generated CLI private state exceeds32 bytes; use a shorter --state-parent')
+        except (FileExistsError, ValueError) as error:
+            fixture.server_close()
+            parser.error(str(error))
     thread = threading.Thread(target=fixture.serve_forever, name='owned-efficiency-fixture', daemon=True)
     thread.start()
-    url = f'http://127.0.0.1:{fixture.server_port}/'
     command = ([str(executable), '--script', native_entry['path'], '--fixture-url', url] if native_entry
                else [str(executable), str(reference), url])
     try:
         with tempfile.TemporaryDirectory(prefix='web-efficiency-', dir=args.output.parent) as temporary:
+            environment = cwd = None
+            if state is not None:
+                command, environment, cwd = cli_execution(executable, runtime, native_entry['path'], state, args.timeout)
             fixture.started_at = time.monotonic()
             measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
-                               args.output.with_name(args.output.name + '.memory.jsonl'))
+                               args.output.with_name(args.output.name + '.memory.jsonl'), env=environment, cwd=cwd)
         audit = fixture.audit()
         valid = audit['all_tasks_verified'] and measured['exit_code'] == 0 and not measured['timed_out']
         reason = audit['error']
@@ -389,6 +447,16 @@ def main():
                 entry_unchanged = False
             if not entry_unchanged:
                 valid, reason = False, 'executed native entry changed during measurement'
+        if runtime is not None:
+            runtime_after = runtime.stat()
+            if ((runtime_before.st_dev, runtime_before.st_ino, runtime_before.st_size, runtime_before.st_mtime_ns)
+                    != (runtime_after.st_dev, runtime_after.st_ino, runtime_after.st_size, runtime_after.st_mtime_ns)
+                    or digest(runtime) != runtime_sha256):
+                valid, reason = False, 'CLI runtime executable changed during measurement'
+            measured['process_family_memory']['scope'] = (
+                'observed Linux CLI and runtime descendant mappings; sampled peaks are lower bounds; '
+                'detached descendants are retained only if observed before reparenting; '
+                'excludes kernel/GPU/unmapped cache, fixture, harness and LLM/model providers')
         measured['verified_completed_tasks_per_second_including_all_process_time'] = (
             audit['independently_verified_completed_tasks'] * 1000 / measured['process_cold_total_ms'])
         boundaries = [fixture.started_at] + [event[0] for event in fixture.round_events]
@@ -404,7 +472,9 @@ def main():
                    'source_provenance': provenance,
                    'workload_sha256': (native_entry['workload_sha256'] if native_entry
                                        else digest(ROOT / 'runtime/fixtures/efficiency-workload.mjs')),
-                   'execution_surface': 'standalone runtime/Playwright; excludes LLM and CLI daemon session limits',
+                   'execution_surface': ('public CLI web do/session/run plus runtime; excludes LLM/model-provider work'
+                                         if state is not None else
+                                         'standalone runtime/Playwright; excludes LLM and CLI daemon session limits'),
                    'cold_scope': 'new process/browser; OS caches are not cleared or claimed cold',
                    'metrics': measured, 'audit': audit,
                    'workload': fixture.receipts[0] if len(fixture.receipts) == 1 else None,
@@ -415,6 +485,16 @@ def main():
                                        'network_scope': 'fixture HTTP bodies only; excludes headers, TCP/TLS and IPC'}}
         if native_entry:
             receipt['native_entry_provenance'] = native_entry
+        if state is not None:
+            receipt['cli_provenance'] = {
+                'executable': str(executable), 'sha256': receipt['executable_sha256'],
+                'runtime_executable': str(runtime), 'runtime_sha256': runtime_sha256,
+                'private_state_directory': str(state),
+                'state_cleanup': 'preserved for ownership/lifecycle inspection; not automatically deleted',
+                'lifecycle_scope': 'normal standalone CLI shutdown; no proof that every descendant exited',
+                'session_profile': 'project; explicit loopback fixture, normal session limits',
+                'entry_url_binding': 'module-local generated loopback URL; no production fixture env',
+            }
         if args.engine == 'chromium':
             try:
                 metadata = json.loads(measured['stdout_tail'].splitlines()[0])['engine_metadata']

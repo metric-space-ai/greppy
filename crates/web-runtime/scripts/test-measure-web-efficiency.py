@@ -2,7 +2,9 @@
 """Contracts for independent outcome verification and bounded process accounting."""
 import importlib.util
 import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -138,6 +140,85 @@ for path, value in [('round', row), ('result', {'schema': 'greppy.web-efficiency
             self.assertEqual(entry['sha256'], measurement.digest(pathlib.Path(entry['path'])))
             self.assertNotEqual(entry['path'], str(measurement.ROOT / 'runtime/fixtures/efficiency-native.mjs'))
             self.assertEqual(receipt['workload_sha256'], entry['workload_sha256'])
+
+
+class CliBoundaryContract(unittest.TestCase):
+    def test_hashed_cli_entry_keeps_independent_oracle_and_runtime_identity(self):
+        # These adversarial child processes do not implement or start a browser.
+        # They verify that CLI exit0/claimed success cannot qualify missing work,
+        # and that even genuine POST effects cannot hide changed runtime bytes.
+        state_parent = pathlib.Path(os.environ.get('GREPPY_TEST_SHORT_ROOT', tempfile.gettempdir()))
+        if not state_parent.is_absolute() or len(os.fsencode(state_parent)) > 20:
+            self.skipTest('set GREPPY_TEST_SHORT_ROOT to an absolute existing parent <=20 bytes')
+        for changed_runtime in (False, True):
+            with self.subTest(changed_runtime=changed_runtime), tempfile.TemporaryDirectory() as directory:
+                directory = pathlib.Path(directory)
+                runtime = directory / 'runtime'
+                runtime.write_bytes(b'original runtime identity')
+                probe = directory / 'cli-boundary-probe'
+                probe.write_text(f'#!{sys.executable}\n' + """
+import hashlib, json, os, pathlib, sys, urllib.parse, urllib.request
+assert sys.argv[1:10] == ['web', 'do', '--json', 'session', 'new', '--profile', 'project', '::', 'run']
+assert sys.argv[10:13] == ['--mode', 'standalone', '--script-file']
+entry = pathlib.Path(sys.argv[13])
+assert sys.argv[14:16] == ['--timeout', '3000']
+state = pathlib.Path(os.environ['GREPPY_WEB_RUNTIME_DIR'])
+assert pathlib.Path.cwd() == state / 'workspace'
+assert os.environ['GREPPY_RUNTIME_DIR'] == str(state)
+assert 'GREPPY_WEB_SESSION' not in os.environ and 'GREPPY_RUN_ID' not in os.environ
+runtime = pathlib.Path(os.environ['GREPPY_WEB_RUNTIME'])
+url = json.loads(entry.read_text().splitlines()[0].removeprefix('const fixtureUrl = ').removesuffix(';'))
+def post(path, body):
+    request = urllib.request.Request(url + path, data=body, method='POST')
+    with urllib.request.urlopen(request, timeout=3) as response:
+        assert response.status == 200
+""" + ("""
+with urllib.request.urlopen(url, timeout=3) as response:
+    import html, re
+    config = json.loads(html.unescape(re.search(r'<pre id="workload-config">(.*?)</pre>', response.read().decode()).group(1)))
+token = config['nonce'] + ':r0:w0:t0:é&+'
+post('submit', urllib.parse.urlencode({'q': token}).encode())
+runtime.write_bytes(b'changed runtime identity')
+""" if changed_runtime else "") + """
+row = {'round': 0, 'duration_ms': 1, 'succeeded': 1, 'attempted': 1,
+       'tasks': [{'round': 0, 'worker': 0, 'task': 0, 'ok': True, 'error': None, 'duration_ms': 1}]}
+post('round', json.dumps(row).encode())
+post('result', json.dumps({'schema': 'greppy.web-efficiency.workload.v1', 'rounds': [row]}).encode())
+print(json.dumps({'entry_sha256': hashlib.sha256(entry.read_bytes()).hexdigest()}))
+""")
+                probe.chmod(0o700)
+                output = directory / 'cli.json'
+                environment = dict(os.environ, GREPPY_WEB_SESSION='foreign-session', GREPPY_RUN_ID='foreign-run')
+                result = subprocess.run(
+                    [sys.executable, str(pathlib.Path(measurement.__file__)),
+                     '--engine', 'cli', '--cli', str(probe), '--runtime', str(runtime),
+                     '--state-parent', str(state_parent), '--output', str(output),
+                     '--rounds', '1', '--tasks', '1', '--concurrency', '1', '--nodes', '3', '--timeout', '3'],
+                    env=environment, capture_output=True, text=True, timeout=10)
+                self.assertTrue(output.is_file(), result.stderr)
+                receipt = json.loads(output.read_text())
+                state = pathlib.Path(receipt['cli_provenance']['private_state_directory'])
+                try:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(receipt['metrics']['exit_code'], 0, receipt['metrics'])
+                    self.assertFalse(receipt['quality_verified'])
+                    expected = ('CLI runtime executable changed during measurement' if changed_runtime else
+                                'task has no independent server-side POST effect')
+                    self.assertEqual(receipt['quality_error'], expected)
+                    self.assertEqual(receipt['audit']['independently_verified_completed_tasks'], int(changed_runtime))
+                    self.assertEqual(receipt['cli_provenance']['sha256'], measurement.digest(probe))
+                    self.assertEqual(json.loads(receipt['metrics']['stdout_tail'])['entry_sha256'],
+                                     receipt['native_entry_provenance']['sha256'])
+                    checked = subprocess.run(
+                        ['node', '--experimental-vm-modules',
+                         str(measurement.ROOT / 'scripts/check-efficiency-native-entry.mjs'),
+                         receipt['native_entry_provenance']['path'],
+                         str(measurement.ROOT / 'runtime/js/playwright.mjs')],
+                        capture_output=True, text=True, timeout=15)
+                    self.assertEqual(checked.returncode, 0, checked.stderr)
+                finally:
+                    # The source of this completed probe starts no descendants.
+                    shutil.rmtree(state)
 
 
 class ProcessContract(unittest.TestCase):
