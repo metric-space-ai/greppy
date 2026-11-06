@@ -170,7 +170,7 @@ impl GreppyEnv {
     ///
     /// Defaults to [`SandboxMode::Off`] so non-`-p` callers are unchanged.
     /// `greppy -p` enables [`SandboxMode::Enforce`] with the run's writable
-    /// roots (worktree, temp, greppy data root, `~/.cargo`, platform cache).
+    /// roots (worktree, private Git state, per-run scratch and agent data).
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
         self
@@ -727,6 +727,8 @@ fn prepare_tool_env(cmd: &mut Command) {
 
 /// Keep tool-created package/build caches within this run's writable scratch.
 /// Provider credentials are loaded in the parent, before child HOME changes.
+/// Operator cache aliases are not sandbox grants; CARGO_HOME and target writes
+/// use the same scratch tree granted by the CLI's writable_roots_for.
 fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
     let home = scratch.join("home");
     if let Some(original_home) = std::env::var_os("HOME") {
@@ -2296,6 +2298,31 @@ printf 'ran:%s\n' "$1""#,
         ] {
             assert!(envs[key].starts_with(&scratch), "{key}: {:?}", envs[key]);
         }
+        // Execute a tiny real child using these exact environment assignments,
+        // rather than proving only the shape of Command::get_envs(). No Cargo,
+        // dependency access or model is involved. The CLI regression separately
+        // proves the parent grants only this run's scratch, not operator caches.
+        #[cfg(unix)]
+        {
+            let mut child = Command::new("/bin/sh");
+            child.arg("-c").arg(
+                r#"mkdir -p "$CARGO_HOME/registry" "$CARGO_TARGET_DIR" &&
+                   printf cache > "$CARGO_HOME/registry/probe" &&
+                   printf build > "$CARGO_TARGET_DIR/probe""#,
+            );
+            prepare_tool_cache_env(&mut child, &scratch);
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(envs["CARGO_HOME"].join("registry/probe")).unwrap(),
+                b"cache"
+            );
+            assert_eq!(
+                std::fs::read(envs["CARGO_TARGET_DIR"].join("probe")).unwrap(),
+                b"build"
+            );
+        }
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
