@@ -98,6 +98,14 @@ jobs:
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
 
+      - name: Check identity-based live object quota
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features object_usage -- --test-threads=1
+
+      - name: Prove live page closure returns only its own quota
+        run: python3 tools/check_web_resource_mutations.py --slots
+
       - name: Check bounded retained records
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml

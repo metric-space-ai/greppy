@@ -1708,7 +1708,7 @@ impl Daemon {
                 let ephemeral = session.persistent_profile.is_none();
                 let profile_lock = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
-                let mut close_failed = false;
+                let mut close_failed = self.close_script_objects(&session);
                 if self.content.is_running() {
                     let mut pages = session.tabs.clone();
                     if let Some(page) = session.page_id.take() {
@@ -1760,6 +1760,25 @@ impl Daemon {
                 Response::error(request, error)
             }
         }
+    }
+
+    fn close_script_objects(&mut self, session: &Session) -> bool {
+        if !self.content.is_running() { return false; }
+        // Unknown creation outcomes cannot be orphaned: the existing failed-
+        // close fallback retires Content after attempting every known owner.
+        let mut failed = session.pending_pages != 0 || session.pending_contexts != 0;
+        for page in session.objects.pages_to_close() {
+            failed |= self.engine_call("session.closePage", json!({"page": page})).is_err();
+        }
+        for context in session.objects.contexts_to_close() {
+            if session.engine_context_id.as_deref() != Some(context.as_str()) {
+                failed |= self.engine_call("context.close", json!({"context": context})).is_err();
+            }
+        }
+        for browser in session.objects.browsers_to_close() {
+            failed |= self.engine_call("browser.close", json!({"browser": browser})).is_err();
+        }
+        failed
     }
 
     fn web_run(&mut self, request: &Request) -> Response {
@@ -1879,7 +1898,7 @@ impl Daemon {
                                     .get("context")
                                     .and_then(|value| value.as_str())
                                     .map(str::to_owned);
-                                session.pages = 1;
+                                crate::object_usage::note_default_page(session);
                             }
                             Some(page)
                         }
@@ -3365,7 +3384,7 @@ impl Daemon {
                                     if let Some(session) = self.sessions.get_mut(&session_id) {
                                         session.tabs.push(page.clone());
                                         session.page_id = Some(page.clone());
-                                        session.pages = session.tabs.len() as u32;
+                                        crate::object_usage::reconcile(session);
                                     }
                                     Ok(json!({ "tab": page, "active": true }))
                                 }
@@ -3401,7 +3420,8 @@ impl Daemon {
                                 Some(session) => {
                                     session.tabs.retain(|id| id != &tab);
                                     session.locator_snapshots.remove(&tab);
-                                    session.pages = session.tabs.len() as u32;
+                                    session.objects.forget_page(&tab);
+                                    crate::object_usage::reconcile(session);
                                     if session.page_id.as_deref() == Some(tab.as_str()) {
                                         session.page_id = session.tabs.last().cloned();
                                     }
@@ -4469,7 +4489,7 @@ impl Daemon {
                                 .get("context")
                                 .and_then(|value| value.as_str())
                                 .map(str::to_owned);
-                            session.pages = 1;
+                            crate::object_usage::note_default_page(session);
                         }
                         page
                     }
@@ -5116,7 +5136,7 @@ impl Daemon {
             session.engine_context_id = None;
             session.tabs.clear();
             session.locator_snapshots.clear();
-            session.pages = 0;
+            crate::object_usage::reset(session);
         }
         Ok(ids)
     }
@@ -5129,7 +5149,7 @@ impl Daemon {
             session.engine_context_id = None;
             session.tabs.clear();
             session.locator_snapshots.clear();
-            session.pages = 0;
+            crate::object_usage::reset(session);
             if session.state == SessionState::Busy {
                 let request_id = session.operation_id.clone().unwrap_or_default();
                 let _ = session.transition(SessionState::Ready);
@@ -5255,7 +5275,7 @@ impl Daemon {
             if let Some(mut session) = self.sessions.remove(&session_id) {
                 let ephemeral = session.persistent_profile.is_none();
                 let profile_lock = self.profile_locks.remove(&session_id);
-                let mut close_failed = false;
+                let mut close_failed = self.close_script_objects(&session);
                 let mut pages = session.tabs.clone();
                 if let Some(page) = session.page_id.take() {
                     if !pages.contains(&page) {
@@ -6129,6 +6149,7 @@ fn gate_session_engine(
     method: &str,
     _params: &serde_json::Value,
 ) -> Result<(), String> {
+    crate::object_usage::validate_close(sessions, session_id, method, _params)?;
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session was closed".to_owned());
     };
@@ -6173,16 +6194,20 @@ fn gate_session_engine(
             }
         }
         "browser.newContext" => {
+            crate::object_usage::validate_creation(session, method, _params)?;
             session
                 .limits
                 .check_contexts(session.contexts.saturating_add(1))?;
-            session.contexts = session.contexts.saturating_add(1);
+            session.pending_contexts = session.pending_contexts.saturating_add(1);
+            crate::object_usage::reconcile(session);
         }
         "context.newPage" | "session.ensurePage" => {
+            crate::object_usage::validate_creation(session, method, _params)?;
             session
                 .limits
                 .check_pages(session.pages.saturating_add(1))?;
-            session.pages = session.pages.saturating_add(1);
+            session.pending_pages = session.pending_pages.saturating_add(1);
+            crate::object_usage::reconcile(session);
         }
         "page.goto" | "page.reload" | "page.goBack" | "page.goForward" | "page.frameGoto" => {
             session
@@ -6298,6 +6323,11 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
             method,
             params,
         )
+    }
+
+    fn after_call(&mut self, method: &str, params: &Value, ok: bool, result: &Value) -> Result<(), String> {
+        let session = self.sessions.get_mut(&self.session_id).ok_or("session was closed")?;
+        crate::object_usage::after_call(session, method, params, ok, result)
     }
 
     fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {

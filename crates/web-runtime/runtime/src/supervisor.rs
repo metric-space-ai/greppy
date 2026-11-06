@@ -377,6 +377,9 @@ fn fixture_url_grants_project_loopback(fixture_url: &str) -> bool {
 
 pub(crate) trait EngineGate {
     fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String>;
+    fn after_call(&mut self, _method: &str, _params: &serde_json::Value, _ok: bool, _result: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
     fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {
         let _ = records;
         Ok(())
@@ -453,10 +456,12 @@ pub(crate) fn route_until_script_complete_gated(
                     Ok(Ok(crate::protocol::Message::EngineResult {
                         request_id,
                         ok,
+                        result,
                         error,
                         ..
                     })) => {
-                        if pending.remove(&request_id).is_some() {
+                        if let Some((method, params)) = pending.remove(&request_id) {
+                            let _ = gate.after_call(&method, &params, ok, &result);
                             gate.note_discarded_engine_result(request_id, ok, error);
                         }
                         if pending.is_empty() {
@@ -522,6 +527,7 @@ pub(crate) fn route_until_script_complete_gated(
                     phase!("web-runtime: phase run-wait point={wait_point}");
                     let mut params = params;
                     if let Err(error) = content.prepare_engine_params(&method, &mut params) {
+                        let _ = gate.after_call(&method, &params, false, &serde_json::Value::Null);
                         controller.send_timeout(
                             &Message::engine_result(
                                 request_id,
@@ -553,6 +559,13 @@ pub(crate) fn route_until_script_complete_gated(
                         ); }
                         continue;
                     };
+                    if let Err(message) = gate.after_call(&method, &params, ok, &result) {
+                        settle_aborted_script(
+                            controller, content, request_id, &mut pending, &mut parked,
+                            deadline, &message, &mut gate,
+                        );
+                        return Err(io::Error::other(format!("resource_limit: {message}")));
+                    }
                     if ok && tally_after(&method) {
                         if let Err(message) = poll_session_records(
                             content,
@@ -658,8 +671,10 @@ fn settle_aborted_script(
                     return;
                 }
             }
-            Ok(Incoming::Content(Message::EngineResult { request_id, ok, error, .. })) => {
-                pending.remove(&request_id);
+            Ok(Incoming::Content(Message::EngineResult { request_id, ok, result, error, .. })) => {
+                if let Some((method, params)) = pending.remove(&request_id) {
+                    let _ = gate.after_call(&method, &params, ok, &result);
+                }
                 gate.note_discarded_engine_result(request_id, ok, error);
             }
             _ => {
