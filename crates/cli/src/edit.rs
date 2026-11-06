@@ -5341,6 +5341,30 @@ mod patch_rollback_tests {
     }
 
     #[test]
+    fn unified_patch_eof_empty_hunk_removes_the_range_without_a_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.txt");
+        let diff = b"--- a/example.txt\n+++ b/example.txt\n@@ -2,1 +2,0 @@\n-REMOVE\n";
+        for dry_run in [true, false] {
+            std::fs::write(&path, b"a\nREMOVE\nb\n").unwrap();
+            let record =
+                run_trained_patch(dir.path(), dir.path(), diff.to_vec(), dry_run, false, false)
+                    .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+            assert!(!record.already_as_sent);
+            assert_eq!(record.published, !dry_run);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                if dry_run {
+                    &b"a\nREMOVE\nb\n"[..]
+                } else {
+                    &b"a\nb\n"[..]
+                },
+                "delete-only hunk must remove bytes instead of inserting a blank line"
+            );
+        }
+    }
+
+    #[test]
     fn unified_patch_eof_markers_preserve_each_side_and_surrounding_bytes() {
         let cases: &[(&[u8], &[u8], &[u8])] = &[
             (
