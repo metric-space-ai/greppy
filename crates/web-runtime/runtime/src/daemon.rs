@@ -423,7 +423,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     if crate::supervisor::phase_trace_enabled() {
         eprintln!("web-runtime: phase listening");
     }
-    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
+    let (tx, rx) = request_inbox();
     let accept_attach = attach.clone();
     let accept_control = Arc::clone(&early_control);
     let accept_startup = Arc::clone(&startup);
@@ -480,29 +480,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let operation = request.operation.clone();
-        let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            daemon.handle(request.clone())
-        })) {
-            Ok(response) => response,
-            Err(_) => {
-                if crate::supervisor::phase_trace_enabled() {
-                    if crate::supervisor::phase_trace_enabled() {
-                        eprintln!("web-runtime: phase handle-panic operation={operation}");
-                    }
-                }
-                Response::error(
-                    &request,
-                    ErrorObject::new(
-                        "engine_error",
-                        format!("supervisor panicked while handling {operation}"),
-                        request.request_id.clone(),
-                        38,
-                        "retry greppy web run",
-                    ),
-                )
-            }
-        };
+        let response = dispatch_request(request, |request| daemon.handle(request));
         let _ = write_frame(&mut stream, &response);
         if daemon.exiting {
             break;
@@ -719,9 +697,202 @@ fn bind_socket_healing_stale(path: &Path) -> io::Result<UnixListener> {
     }
 }
 
+type PendingRequest = (UnixStream, Request);
+
+fn request_inbox() -> (
+    mpsc::SyncSender<PendingRequest>,
+    mpsc::Receiver<PendingRequest>,
+) {
+    // One serialized executor needs only one prefetched request. More buffered
+    // payloads cannot execute in parallel and must not accumulate during a run.
+    mpsc::sync_channel(1)
+}
+
+fn dispatch_request(request: Request, handle: impl FnOnce(Request) -> Response) -> Response {
+    // Preserve only response correlation before moving the payload to its handler.
+    let failure = Response::error(
+        &request,
+        ErrorObject::new(
+            "engine_error",
+            format!("supervisor panicked while handling {}", request.operation),
+            request.request_id.clone(),
+            38,
+            "retry greppy web run",
+        ),
+    );
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(request))) {
+        Ok(response) => response,
+        Err(_) => {
+            if crate::supervisor::phase_trace_enabled() {
+                eprintln!(
+                    "web-runtime: phase handle-panic operation={}",
+                    failure.operation
+                );
+            }
+            failure
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_inbox_tests {
+    use super::{accept_loop, dispatch_request, request_inbox, RunControl, StartupGate};
+    use greppy_web_client::{read_frame, write_frame, Request, Response};
+    use serde_json::{json, Value};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::{mpsc, Arc};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    const ATTACH: &str = "private-inbox-contract-capability";
+
+    struct Acceptor {
+        socket: PathBuf,
+        receiver: Option<mpsc::Receiver<super::PendingRequest>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Acceptor {
+        fn start() -> Self {
+            let socket = std::env::temp_dir().join(format!("gi-{}.sock", std::process::id()));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (tx, rx) = request_inbox();
+            let startup = Arc::new(StartupGate::new());
+            startup.mark_ready();
+            let control = Arc::new(RunControl::new());
+            let thread = thread::spawn(move || {
+                accept_loop(listener, tx, control, ATTACH.to_owned(), startup);
+            });
+            Self {
+                socket,
+                receiver: Some(rx),
+                thread: Some(thread),
+            }
+        }
+
+        fn send(&self, operation: &str, payload: Value) -> (Request, UnixStream) {
+            let mut request = Request::new("inbox-contract", operation, payload);
+            request.capability = ATTACH.to_owned();
+            let mut stream = UnixStream::connect(&self.socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write_frame(&mut stream, &request).unwrap();
+            (request, stream)
+        }
+    }
+
+    impl Drop for Acceptor {
+        fn drop(&mut self) {
+            // A disconnected receiver plus one authenticated wakeup terminates
+            // the real accept loop. This fixture leaves no listener thread.
+            drop(self.receiver.take());
+            if self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+            {
+                let _ = self.send("web.read", json!({}));
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    #[test]
+    fn saturated_inbox_rejects_excess_work_without_blocking_control() {
+        let acceptor = Acceptor::start();
+        let (first, _first_stream) = acceptor.send(
+            "web.read",
+            json!({ "url": "about:blank", "probe": "x".repeat(64 * 1024) }),
+        );
+        let (excess, mut excess_stream) =
+            acceptor.send("web.read", json!({ "url": "about:blank" }));
+        let rejected: Response = read_frame(&mut excess_stream)
+            .expect("saturated supervisor inbox did not reject the excess request");
+        assert_eq!(rejected.request_id, excess.request_id);
+        assert_eq!(rejected.status, "error", "{rejected:?}");
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code.as_str()),
+            Some("resource_limit"),
+            "excess request must be refused before execution"
+        );
+        assert!(
+            rejected
+                .error
+                .as_ref()
+                .unwrap()
+                .next_action
+                .contains("not started"),
+            "{rejected:?}"
+        );
+
+        let (_, mut cancel_stream) = acceptor.send(
+            "web.cancel",
+            json!({ "session_id": "absent", "target_request_id": "absent" }),
+        );
+        let cancel: Response = read_frame(&mut cancel_stream)
+            .expect("full inbox blocked the cancellation control path");
+        assert_eq!(cancel.status, "ok", "{cancel:?}");
+        assert_eq!(cancel.result.as_ref().unwrap()["cancelled"], json!(false));
+
+        let (_, queued) = acceptor
+            .receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(queued.request_id, first.request_id);
+        let (next, _next_stream) = acceptor.send("web.read", json!({ "url": "about:blank" }));
+        let (_, queued_next) = acceptor
+            .receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("inbox did not admit work after its slot was released");
+        assert_eq!(queued_next.request_id, next.request_id);
+    }
+
+    #[test]
+    fn dispatch_moves_payload_and_preserves_panic_correlation() {
+        let request = Request::new(
+            "dispatch-contract",
+            "web.run",
+            json!({ "script_text": "x".repeat(1024 * 1024) }),
+        );
+        let allocation = request.payload["script_text"].as_str().unwrap().as_ptr() as usize;
+        let response = dispatch_request(request, |owned| {
+            let same_allocation =
+                owned.payload["script_text"].as_str().unwrap().as_ptr() as usize == allocation;
+            Response::ok(&owned, json!({ "same_allocation": same_allocation }))
+        });
+        assert_eq!(
+            response.result.as_ref().unwrap()["same_allocation"],
+            json!(true),
+            "dispatch copied the full request payload"
+        );
+
+        let failed = Request::new("dispatch-contract", "web.read", json!({}));
+        let request_id = failed.request_id.clone();
+        let operation = failed.operation.clone();
+        let response = dispatch_request(failed, |_| panic!("intentional dispatch contract fault"));
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.operation, operation);
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error.as_ref().unwrap().code, "engine_error");
+        assert_eq!(response.error.as_ref().unwrap().exit_code, 38);
+    }
+}
+
 fn accept_loop(
     listener: UnixListener,
-    tx: mpsc::Sender<(UnixStream, Request)>,
+    tx: mpsc::SyncSender<PendingRequest>,
     control: Arc<RunControl>,
     attach: String,
     startup: Arc<StartupGate>,
@@ -869,11 +1040,23 @@ fn accept_loop(
                     &Response::ok(&request, json!({ "sessions": sessions })),
                 );
             }
-            _ => {
-                if tx.send((stream, request)).is_err() {
-                    return;
+            _ => match tx.try_send((stream, request)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full((mut stream, request))) => {
+                    let error = ErrorObject::new(
+                        "resource_limit",
+                        "runtime request inbox is full",
+                        request.request_id.clone(),
+                        37,
+                        concat!(
+                            "wait for an outstanding runtime operation to finish; ",
+                            "this request was not started"
+                        ),
+                    );
+                    let _ = write_frame(&mut stream, &Response::error(&request, error));
                 }
-            }
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+            },
         }
     }
 }
