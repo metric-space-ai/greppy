@@ -193,7 +193,17 @@ jobs:
                   source.write_text(original.replace(old, old.replace('if matches!', 'if method != "' + method + '" && matches!')))
                   result = subprocess.run(command, capture_output=True, text=True, timeout=300)
                   print(result.stdout, result.stderr)
-                  assert result.returncode == 101 and marker in result.stdout + result.stderr, method
+                  output = result.stdout + result.stderr
+                  # In the shared Promise.all case, a blocked response wait can
+                  # starve the click until the earlier request timer reports first.
+                  sibling_timeout = (method == 'page.waitForResponse'
+                      and 'download Promise.all failed' in output
+                      and 'TimeoutError:' in output
+                      and 'Proxy.waitForRequest' in output
+                      and 'HTTP paths=["/"]' in output)
+                  assert result.returncode == 101 and (marker in output or sibling_timeout), method
+                  if sibling_timeout:
+                      print('mutation: blocking response wait prevented the real /signal trigger; request timer fired first')
               finally:
                   source.write_text(original)
               subprocess.run(command, check=True, timeout=300)
