@@ -80,6 +80,58 @@ jobs:
                           'crates/web-runtime/scripts/measure-web-efficiency.py',
                           'bench/process_memory.py'], check=True)
 
+      - name: Capture transient peaks in fresh owned kernel cgroups
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'web-meter-kernel-counterproof'
+          root.mkdir()
+          def run_case(label, capture=False):
+              unit = 'greppy-meter-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '-' + label
+              parent = '/sys/fs/cgroup/system.slice/' + unit + '.service'
+              command = ['sudo', '-n', 'systemd-run', '--unit=' + unit,
+                         '--wait', '--collect', '--pipe', '--service-type=exec',
+                         '--uid=' + str(os.getuid()), '--gid=' + str(os.getgid()),
+                         '--property=Delegate=memory', '--property=DelegateSubgroup=monitor',
+                         '--property=MemoryMax=256M', '--property=MemorySwapMax=0',
+                         '--property=CPUQuota=100%', '--property=TasksMax=32',
+                         '--property=RuntimeMaxSec=60', '--expand-environment=no',
+                         '--working-directory=' + str(pathlib.Path.cwd()),
+                         'python3', '-B', '-X', 'pycache_prefix=' + str(root / (label + '.pycache')),
+                         'bench/calibrate_web_meter.py', '--contracts-only',
+                         '--kernel-cgroup-parent', parent, '--output', str(root / (label + '.json'))]
+              result = subprocess.run(command, capture_output=capture, text=True,
+                                      timeout=75, check=not capture)
+              if capture:
+                  print(result.stdout, result.stderr)
+              return result
+          # Only this ephemeral hosted-CI unit gets the declared budget and
+          # delegation. No persistent service, parent limit change or host PID
+          # migration. systemd waits, bounds the run and collects the unit.
+          run_case('normal')
+          source = pathlib.Path('bench/process_memory.py')
+          cases = [
+              ('shared', 'or set(map(int, (self.monitor / "cgroup.procs").read_text().split())) != {os.getpid()}', '',
+               'calibration.kernel_foreign_monitor'),
+              ('outside', 'echo "$$" > "$1/cgroup.procs"; ', '', 'calibration.kernel_entry'),
+              ('current', '"memory_peak_bytes": int((self.path / "memory.peak").read_text())',
+               '"memory_peak_bytes": int((self.path / "memory.current").read_text())', 'calibration.kernel_peak'),
+          ]
+          for label, old, new, expected in cases:
+              original = source.read_text()
+              assert original.count(old) == 1
+              try:
+                  source.write_text(original.replace(old, new))
+                  result = run_case(label, capture=True)
+                  record = json.loads((root / (label + '.json')).read_text())
+                  assert result.returncode == 1 and record['status'] == 'failed'
+                  assert expected in record['error'], record
+                  print('WEB_METER_KERNEL_COUNTER_REJECTED', label, expected)
+              finally:
+                  source.write_text(original)
+          run_case('restored')
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Preserve raw meter calibration and counterproofs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

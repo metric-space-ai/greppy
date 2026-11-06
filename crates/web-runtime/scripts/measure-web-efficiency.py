@@ -6,6 +6,7 @@ or claims that a scripted web measurement covers LLM/model-provider work.
 """
 import argparse
 from collections import Counter
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import html
@@ -334,7 +335,7 @@ def log_tail(path):
 
 
 def execute(command, directory, timeout, started=None, memory_log_path=None, *,
-            env=None, cwd=None, cleanup_command=None, runtime_identity=None):
+            env=None, cwd=None, cleanup_command=None, runtime_identity=None, resource_group=None):
     started = time.monotonic() if started is None else started
     monitor_cpu_started = time.thread_time_ns()
     terminated_at = None
@@ -419,7 +420,8 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
               (directory / 'cleanup-stdout.log').open('wb') as cleanup_stdout,
               (directory / 'cleanup-stderr.log').open('wb') as cleanup_stderr,
               memory_log_path.open('x') as memory_log):
-            child = subprocess.Popen(command, stdout=stdout, stderr=stderr,
+            child_command = resource_group.wrap_command(command) if resource_group else command
+            child = subprocess.Popen(child_command, stdout=stdout, stderr=stderr,
                                      start_new_session=True, env=env, cwd=cwd)
             controls[child.pid] = child
             known_direct[child.pid] = None
@@ -429,8 +431,9 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
                 changed = reap()
                 now = time.monotonic()
                 if child.returncode is not None and cleanup_command is not None and cleanup is None and terminated_at is None:
+                    cleanup_arguments = resource_group.wrap_command(cleanup_command) if resource_group else cleanup_command
                     cleanup = subprocess.Popen(
-                        cleanup_command, stdout=cleanup_stdout, stderr=cleanup_stderr,
+                        cleanup_arguments, stdout=cleanup_stdout, stderr=cleanup_stderr,
                         start_new_session=True, env=env, cwd=cwd)
                     controls[cleanup.pid] = cleanup
                     known_direct[cleanup.pid] = None
@@ -476,6 +479,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
         'exit_code': child.returncode, 'timed_out': terminated_at is not None,
         'cleanup_exit_code': cleanup.returncode if cleanup is not None else None,
         'process_cold_total_ms': (time.monotonic() - started) * 1000,
+        'kernel_resource_accounting': resource_group.snapshot() if resource_group else None,
         'lifecycle_accounting_version': 'kernel-custody-v1',
         'user_cpu_seconds': totals[0], 'system_cpu_seconds': totals[1],
         'max_individual_process_rss_bytes': peak,
@@ -572,11 +576,16 @@ def main():
     parser.add_argument('--concurrency', type=int, default=1)
     parser.add_argument('--nodes', type=int, default=100)
     parser.add_argument('--timeout', type=float, default=90)
+    parser.add_argument('--kernel-cgroup-parent', type=pathlib.Path,
+                        help='optional existing delegated cgroup-v2 parent of this sole worker monitor leaf; no privilege escalation')
     args = parser.parse_args()
     if (not args.output.is_absolute() or not 1 <= args.rounds <= 100 or not 1 <= args.tasks <= 100
             or not 1 <= args.concurrency <= 16 or not 1 <= args.nodes <= 100000
             or args.rounds * args.tasks * args.concurrency > 1000 or not 1 <= args.timeout <= 600):
         parser.error('absolute output path and bounded workload required (at most1000 total tasks)')
+    if args.kernel_cgroup_parent and (not args.kernel_cgroup_parent.is_absolute()
+                                     or not args.kernel_cgroup_parent.is_dir()):
+        parser.error('--kernel-cgroup-parent must be an absolute existing delegated directory')
     if args.output.exists():
         parser.error('output already exists; preserve existing measurement')
     reference = ROOT / 'scripts/efficiency-reference.mjs'
@@ -630,15 +639,24 @@ def main():
             if state is not None:
                 command, environment, cwd = cli_execution(executable, runtime, native_entry['path'], state, args.timeout)
             fixture.started_at = time.monotonic()
-            measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
-                               args.output.with_name(args.output.name + '.memory.jsonl'), env=environment, cwd=cwd,
-                               cleanup_command=([str(executable), 'web', 'runtime', 'stop', '--json']
-                                                if state is not None else None),
-                               runtime_identity=((runtime_before.st_dev, runtime_before.st_ino)
-                                                 if runtime_before is not None else None))
+            with (_memory_module.OwnedKernelGroup(args.kernel_cgroup_parent, cgroup_v2_envelope())
+                  if args.kernel_cgroup_parent else nullcontext(None)) as resource_group:
+                measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
+                                   args.output.with_name(args.output.name + '.memory.jsonl'), env=environment, cwd=cwd,
+                                   cleanup_command=([str(executable), 'web', 'runtime', 'stop', '--json']
+                                                    if state is not None else None),
+                                   runtime_identity=((runtime_before.st_dev, runtime_before.st_ino)
+                                                     if runtime_before is not None else None),
+                                   resource_group=resource_group)
+            if resource_group is not None:
+                measured['kernel_resource_accounting']['group_removed'] = resource_group.closed
         audit = fixture.audit()
         valid = audit['all_tasks_verified'] and measured['exit_code'] == 0 and not measured['timed_out']
         reason = audit['error']
+        kernel = measured['kernel_resource_accounting']
+        if kernel is not None and (not kernel['target_entry_observed']
+                                   or kernel['memory_events'].get('oom_kill', 0) != 0):
+            valid, reason = False, 'kernel resource group target entry missing or OOM kill observed'
         if reason is None and not valid:
             reason = 'process timed out' if measured['timed_out'] else 'engine process failed'
         if state is not None and measured['cleanup_exit_code'] != 0:

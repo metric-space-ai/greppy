@@ -6,6 +6,7 @@ a schedule fixed before execution and every sample are retained. Qualification
 covers the declared fixture, never unsampled peaks or arbitrary agent workloads.
 """
 import argparse
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import itertools
@@ -119,14 +120,19 @@ def parsed_fixture(text, expected_checksum, mode):
     return value
 
 
-def execute_case(meter, directory, mode, observed, expected_checksum, deadline):
+def execute_case(meter, directory, mode, observed, expected_checksum, deadline, kernel_parent=None):
     remaining = deadline - time.monotonic()
     require(remaining > 0, 'calibration.deadline', 'total calibration deadline reached')
     timeout = min(12, remaining)
     directory.mkdir()
     command = [sys.executable, '-B', str(Path(__file__).resolve()), '--fixture', mode]
     if observed:
-        measured = meter.execute(command, directory, timeout)
+        with (meter._memory_module.OwnedKernelGroup(kernel_parent, meter.cgroup_v2_envelope())
+              if kernel_parent else nullcontext(None)) as resource_group:
+            measured = meter.execute(command, directory, timeout, resource_group=resource_group)
+            (directory / 'measured.json').write_text(json.dumps(measured, indent=2) + '\n')
+        if resource_group is not None:
+            measured['kernel_resource_accounting']['group_removed'] = resource_group.closed
         (directory / 'measured.json').write_text(json.dumps(measured, indent=2) + '\n')
         require(measured['exit_code'] == 0 and not measured['timed_out'],
                 'calibration.fixture_exit', 'metered fixture failed or timed out')
@@ -202,6 +208,56 @@ def memory_contract(case):
     return report
 
 
+def kernel_delegation_contract(meter, parent):
+    """A real pre-existing neighbor must prevent ownership of the delegation."""
+    children_before = {path.name for path in parent.iterdir() if path.is_dir()}
+    controls_before = (parent / 'cgroup.subtree_control').read_text()
+    neighbor = subprocess.Popen([sys.executable, '-B', '-c', 'import sys; sys.stdin.buffer.read()'],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    accepted = None
+    try:
+        try:
+            accepted = meter._memory_module.OwnedKernelGroup(parent, meter.cgroup_v2_envelope())
+        except RuntimeError as error:
+            require('refuses a shared or foreign-populated' in str(error),
+                    'calibration.kernel_foreign_monitor', 'unexpected refusal: ' + str(error))
+        else:
+            accepted.close()
+            raise CalibrationFailure('calibration.kernel_foreign_monitor: '
+                                     'accepted a monitor leaf containing a real neighbor')
+    finally:
+        if accepted is not None:
+            accepted.close()
+        try:
+            neighbor.communicate(timeout=5)
+        finally:
+            if neighbor.poll() is None:
+                neighbor.kill()
+                neighbor.communicate(timeout=5)
+    require(neighbor.returncode == 0
+            and {path.name for path in parent.iterdir() if path.is_dir()} == children_before
+            and (parent / 'cgroup.subtree_control').read_text() == controls_before,
+            'calibration.kernel_foreign_release', 'refusal changed delegation or failed to release neighbor')
+    return {'real_preexisting_neighbor_refused': True, 'neighbor_reaped': True,
+            'delegation_unchanged': True}
+
+
+def kernel_contract(case):
+    kernel = case['measured'].get('kernel_resource_accounting')
+    require(kernel is not None and kernel['target_entry_observed'],
+            'calibration.kernel_entry', 'target never entered the fresh owned cgroup')
+    require(kernel.get('group_removed') and not kernel['populated'],
+            'calibration.kernel_release', 'owned cgroup was not emptied and removed')
+    require(kernel['cpu_usage_seconds'] + 0.005 >= case['fixture']['self_cpu_ns'] / 1e9,
+            'calibration.kernel_cpu', 'kernel cgroup omitted real fixture CPU')
+    require(kernel['memory_peak_bytes'] >= 32 * MIB,
+            'calibration.kernel_peak', 'kernel peak lost the touched 32 MiB private mapping')
+    require(kernel['memory_events'].get('oom_kill', 0) == 0,
+            'calibration.kernel_oom', 'bounded fixture was killed by OOM')
+    return kernel
+
+
 def paired_effect(pairs):
     """Exact randomized paired test plus a distribution-free median interval."""
     ratios = [pair['metered']['wall_ms'] / pair['reference']['wall_ms'] for pair in pairs]
@@ -236,6 +292,8 @@ def main():
     parser.add_argument('--pairs', type=int, default=6)
     parser.add_argument('--seed', type=int)
     parser.add_argument('--contracts-only', action='store_true')
+    parser.add_argument('--kernel-cgroup-parent', type=Path,
+                        help='contracts only: explicit delegated parent of this sole monitor leaf')
     parser.add_argument('--fixture', choices=('cost', 'steps', 'burst'), help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not sys.platform.startswith('linux'):
@@ -245,6 +303,9 @@ def main():
         return 0
     if not args.output or not args.output.is_absolute() or not 6 <= args.pairs <= 12:
         parser.error('an absolute new --output and 6..12 independent pairs are required')
+    if args.kernel_cgroup_parent and (not args.contracts_only
+                                      or not args.kernel_cgroup_parent.is_absolute()):
+        parser.error('--kernel-cgroup-parent requires --contracts-only and an absolute delegated directory')
     runs = args.output.with_name(args.output.name + '.runs')
     if args.output.exists() or runs.exists():
         parser.error('output or raw-run directory exists; preserve prior evidence')
@@ -272,13 +333,19 @@ def main():
         meter = load_meter()
         report['host_before'] = meter.host_envelope()
         expected_checksum = work()
-        held = execute_case(meter, runs / 'held-steps', 'steps', True, expected_checksum, deadline)
+        if args.kernel_cgroup_parent:
+            report['delegation_contract'] = kernel_delegation_contract(meter, args.kernel_cgroup_parent)
+        held = execute_case(meter, runs / 'held-steps', 'steps', True, expected_checksum, deadline,
+                            kernel_parent=args.kernel_cgroup_parent)
         report['memory_contract'] = memory_contract(held)
         report['cpu_contract'] = {'reported_fixture_cpu_seconds': held['fixture']['self_cpu_ns'] / 1e9,
                                   'meter_cpu_seconds': held['measured']['user_cpu_seconds']
                                                        + held['measured']['system_cpu_seconds']}
-        if not args.contracts_only:
-            burst = execute_case(meter, runs / 'short-burst', 'burst', True, expected_checksum, deadline)
+        if args.kernel_cgroup_parent:
+            report['held_kernel_contract'] = kernel_contract(held)
+        if not args.contracts_only or args.kernel_cgroup_parent:
+            burst = execute_case(meter, runs / 'short-burst', 'burst', True, expected_checksum, deadline,
+                                 kernel_parent=args.kernel_cgroup_parent)
             baseline = phase_median(burst, 'baseline', 'private_bytes')
             largest = max((sample.get('private_bytes') or 0 for sample in burst['samples']), default=0)
             report['short_burst'] = {'known_touched_private_bytes': 32 * MIB,
@@ -286,6 +353,9 @@ def main():
                                      'observed_delta_bytes': largest - baseline,
                                      'detected_at_declared_tolerance': largest - baseline >= 30 * MIB,
                                      'interpretation': 'detection of this burst does not certify all transient peaks'}
+            if args.kernel_cgroup_parent:
+                report['burst_kernel_contract'] = kernel_contract(burst)
+        if not args.contracts_only:
             pairs = []
             for index, order in enumerate(schedule):
                 pair = {'index': index, 'order': order}
@@ -304,7 +374,8 @@ def main():
         report['status'] = 'declared_contracts_verified'
         print('WEB_METER_CALIBRATION_OK ' + json.dumps({
             'memory_contract': report['memory_contract'], 'cpu_contract': report['cpu_contract'],
-            'observer_effect': report.get('observer_effect'), 'short_burst': report.get('short_burst')}))
+            'observer_effect': report.get('observer_effect'), 'short_burst': report.get('short_burst'),
+            'burst_kernel_contract': report.get('burst_kernel_contract')}))
         return_code = 0
     except Exception as error:
         report['status'] = 'failed'

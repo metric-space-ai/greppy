@@ -10,6 +10,7 @@ be missed: sampled peaks are lower bounds, never OS-enforced memory ceilings.
 import ctypes
 import os
 from pathlib import Path
+import secrets
 import signal
 import sys
 import threading
@@ -203,3 +204,126 @@ class ProcessTreeMemorySampler:
             "peak_sampled_private_bytes": self.peak_private_bytes,
             "scope": "observed process PSS; excludes kernel, GPU and unmapped filesystem cache",
         }
+
+
+class OwnedKernelGroup:
+    """Fresh benchmark-only cgroup below an explicitly delegated monitor.
+
+    The caller must already run alone in the parent's 'monitor' leaf. Never
+    elevates, moves a foreign process, changes ancestor limits or creates a
+    service. The existing scheduler/delegation is the resource authority.
+    See https://docs.kernel.org/admin-guide/cgroup-v2.html.
+    """
+
+    def __init__(self, parent, observation):
+        self.parent = Path(parent).resolve()
+        self.path = None
+        self.identity = None
+        self.enabled_memory = False
+        self.closed = False
+        ancestors = observation.get("visible_ancestors", [])
+        mount = observation.get("mount_point")
+        if (not sys.platform.startswith("linux") or not ancestors or not mount
+                or observation.get("errors")):
+            raise RuntimeError("kernel group requires an observed Linux cgroup-v2 delegation")
+        self.monitor = Path(ancestors[0]["path"]).resolve()
+        mount = Path(mount).resolve()
+        if (self.parent == mount or not self.parent.is_relative_to(mount)
+                or self.parent.stat().st_dev != mount.stat().st_dev
+                or self.monitor.name != "monitor" or self.monitor.parent != self.parent):
+            raise RuntimeError("kernel group requires the explicit parent of this worker's monitor leaf")
+        if (self.parent / "cgroup.type").read_text().strip() != "domain":
+            raise RuntimeError("kernel group requires a normal delegated domain")
+        if ((self.parent / "cgroup.procs").read_text().split()
+                or set(map(int, (self.monitor / "cgroup.procs").read_text().split())) != {os.getpid()}
+                or self._children() != {self.monitor}):
+            raise RuntimeError("kernel group refuses a shared or foreign-populated delegation")
+        try:
+            enabled = (self.parent / "cgroup.subtree_control").read_text().split()
+            if "memory" not in enabled:
+                (self.parent / "cgroup.subtree_control").write_text("+memory")
+                self.enabled_memory = True
+            self.path = self.parent / ("greppy-meter-" + secrets.token_hex(8))
+            self.path.mkdir()
+            metadata = self.path.stat()
+            self.identity = metadata.st_dev, metadata.st_ino
+            # Fresh counters, not a historic worker-wide peak or an FD reset
+            # accidentally read through a different descriptor.
+            if (int((self.path / "memory.peak").read_text()) != 0
+                    or self._values("cpu.stat")["usage_usec"] != 0
+                    or self._values("cgroup.events")["populated"] != 0):
+                raise RuntimeError("new kernel group already contains resource history")
+        except BaseException:
+            self.close()
+            raise
+
+    def _children(self):
+        return {path for path in self.parent.iterdir() if path.is_dir()}
+
+    def _check_identity(self):
+        if self.closed or self.path is None:
+            raise RuntimeError("kernel group is not live")
+        metadata = self.path.stat()
+        if (metadata.st_dev, metadata.st_ino) != self.identity:
+            raise RuntimeError("owned kernel group identity changed")
+
+    def _values(self, name):
+        return {key: int(value) for key, value in
+                (line.split() for line in (self.path / name).read_text().splitlines())}
+
+    def wrap_command(self, command):
+        self._check_identity()
+        if not command:
+            raise ValueError("kernel group requires a command")
+        # Fixed shell source, positional arguments only. The helper enters
+        # before target exec; target descendants inherit membership. No Python
+        # pre_exec callback runs in the multithreaded HTTP-fixture monitor.
+        return ["/bin/sh", "-c",
+                'set -eu; echo "$$" > "$1/cgroup.procs"; shift; exec "$@"',
+                "greppy-owned-kernel-group", str(self.path), *command]
+
+    def snapshot(self):
+        self._check_identity()
+        populated = self._values("cgroup.events")["populated"]
+        if populated != 0:
+            raise RuntimeError("owned kernel group still contains live descendants")
+        cpu = self._values("cpu.stat")
+        return {
+            "schema": "greppy.kernel-resource-group.v1",
+            "path": str(self.path), "device": self.identity[0], "inode": self.identity[1],
+            "fresh_group": True, "populated": False,
+            "target_entry_observed": cpu["usage_usec"] > 0,
+            "memory_current_bytes": int((self.path / "memory.current").read_text()),
+            "memory_peak_bytes": int((self.path / "memory.peak").read_text()),
+            "cpu_usage_seconds": cpu["usage_usec"] / 1_000_000,
+            "cpu_user_seconds": cpu["user_usec"] / 1_000_000,
+            "cpu_system_seconds": cpu["system_usec"] / 1_000_000,
+            "memory_events": self._values("memory.events"),
+            "memory_max": (self.path / "memory.max").read_text().strip(),
+            "scope": "fresh owned cgroup charges through target exit and cleanup; includes charged "
+                     "kernel/cache and descendants, including auto-reaped CPU; shared/preexisting "
+                     "pages may be charged elsewhere; not PSS or all physical RAM; helper work "
+                     "before attachment and LLM/providers outside this group are excluded",
+        }
+
+    def close(self):
+        if self.closed:
+            return
+        if self.path is not None:
+            self._check_identity()
+            if self._values("cgroup.events")["populated"] != 0:
+                raise RuntimeError("refusing to remove a populated owned kernel group")
+            self.path.rmdir()
+            self.path = None
+        if self.enabled_memory:
+            if self._children() != {self.monitor}:
+                raise RuntimeError("refusing to change a delegation with a new foreign subgroup")
+            (self.parent / "cgroup.subtree_control").write_text("-memory")
+            self.enabled_memory = False
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
