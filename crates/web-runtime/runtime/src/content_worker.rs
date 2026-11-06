@@ -6974,7 +6974,13 @@ pub fn run() -> io::Result<()> {
             Err(RecvTimeoutError::Timeout) => {
                 if !engine.pages.is_empty() {
                     let started = Instant::now();
-                    engine.servo.spin_event_loop();
+                    if download_waiters.is_empty() {
+                        engine.servo.spin_event_loop();
+                    } else {
+                        // The awaiting page may belong to an isolated bundle;
+                        // its network completion does not arrive on root Servo.
+                        engine.spin_all_event_loops();
+                    }
                     let elapsed = started.elapsed();
                     if elapsed >= Duration::from_millis(200) {
                         if crate::supervisor::phase_trace_enabled() {
