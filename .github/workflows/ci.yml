@@ -155,6 +155,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anthropic_output_limit_mutation.py
 
+      - name: Agent HTTP error-body mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_agent_http_error_mutation.py
+
       - name: Web argument dispatch mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_argument_mutation.py
