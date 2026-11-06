@@ -84,6 +84,20 @@ and the outer process deadline is finite.
   `max_individual_process_rss_bytes` is the OS maximum for an individual process,
   **not** concurrent aggregate RAM for the whole worker. It cannot establish
   process-tree RAM savings or memory-ceiling acceptance.
+- On Linux, `process_family_memory` additionally samples the observed owned
+  process family using `/proc/PID/smaps_rollup`. PSS counts shared mappings
+  proportionally; private bytes and summed RSS are recorded separately in the
+  raw `OUTPUT.memory.jsonl` artifact, bound by SHA-256. PID/starttime identities
+  prevent following a reused PID. Known live reparented children remain tracked.
+  Raw samples are streamed, not retained in a growing harness history.
+  Samples have a minimum250ms gap; actual read windows, incomplete samples,
+  sampling wall cost and monitor-thread CPU cost remain visible. Both engines
+  use identical instrumentation. End-to-end timing includes its overhead;
+  these are not uninstrumented speed claims. Unsupported/unreadable memory is
+  unknown, not zero. Sampled peaks are lower bounds: unseen short-lived children
+  and between-sample peaks can be missed. Kernel/GPU/unmapped filesystem cache,
+  fixture and harness mappings are excluded. These metrics do not establish a
+  full-agent memory ceiling or leak freedom.
 - Server network counters are actual HTTP body bytes. They exclude headers,
   TCP/TLS overhead and IPC. Those omissions must remain explicit.
 - The receipt binds the shared workload hash, launcher executable hash and
