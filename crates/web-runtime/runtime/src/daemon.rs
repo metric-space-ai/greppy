@@ -511,7 +511,7 @@ struct LateEngineResult {
 
 struct RunControl {
     operation: crate::operation_control::OperationControl,
-    heartbeats: std::sync::Mutex<Vec<String>>,
+    heartbeats: crate::heartbeat_inbox::HeartbeatInbox,
     session_rows: std::sync::Mutex<Vec<serde_json::Value>>,
     late_engine_result: std::sync::Mutex<Option<LateEngineResult>>,
     discarded_engine_results: AtomicU64,
@@ -525,7 +525,7 @@ impl RunControl {
     fn new() -> Self {
         Self {
             operation: crate::operation_control::OperationControl::default(),
-            heartbeats: std::sync::Mutex::new(Vec::new()),
+            heartbeats: crate::heartbeat_inbox::HeartbeatInbox::default(),
             session_rows: std::sync::Mutex::new(Vec::new()),
             late_engine_result: std::sync::Mutex::new(None),
             discarded_engine_results: AtomicU64::new(0),
@@ -537,7 +537,71 @@ impl RunControl {
     }
 
     fn publish_sessions(&self, rows: Vec<serde_json::Value>) {
+        self.heartbeats.publish(rows.iter().filter_map(|row| {
+            matches!(
+                row.get("state").and_then(|value| value.as_str()),
+                Some("creating" | "ready" | "busy" | "failed")
+            )
+            .then(|| row.get("session_id").and_then(|value| value.as_str()))
+            .flatten()
+        }));
         *self.session_rows.lock().unwrap_or_else(|e| e.into_inner()) = rows;
+    }
+}
+
+fn apply_pending_heartbeats(sessions: &mut HashMap<String, Session>, control: &RunControl) {
+    control.heartbeats.drain(|id, received| {
+        if let Some(session) = sessions.get_mut(id) {
+            session.last_heartbeat = session.last_heartbeat.max(received);
+        }
+    });
+}
+
+#[cfg(test)]
+mod heartbeat_application_tests {
+    use super::{apply_pending_heartbeats, snapshot_session_rows, RunControl};
+    use crate::policy::NetworkProfile;
+    use crate::session::{Session, SessionState};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn heartbeat_receipts_refresh_only_their_session_at_the_actual_receipt_time() {
+        let control = RunControl::new();
+        let before = Instant::now() - Duration::from_secs(2);
+        let received = before + Duration::from_secs(1);
+        let mut sessions = HashMap::new();
+        for id in ["a", "b"] {
+            let mut session = Session::new(id, "heartbeat-contract", NetworkProfile::Project);
+            session.transition(SessionState::Ready).unwrap();
+            session.last_heartbeat = before;
+            sessions.insert(id.to_owned(), session);
+        }
+        control.publish_sessions(snapshot_session_rows(&sessions, &control));
+        assert!(control.heartbeats.record("a", received));
+        apply_pending_heartbeats(&mut sessions, &control);
+        assert_eq!(
+            sessions["a"].last_heartbeat,
+            received,
+            "queued heartbeat must retain actual receipt time"
+        );
+        assert_eq!(
+            sessions["b"].last_heartbeat,
+            before,
+            "heartbeat refreshed an unrelated session"
+        );
+        assert!(control.heartbeats.record("a", before));
+        apply_pending_heartbeats(&mut sessions, &control);
+        assert_eq!(
+            sessions["a"].last_heartbeat,
+            received,
+            "delayed heartbeat regressed the session activity clock"
+        );
+        let session = sessions.get_mut("a").unwrap();
+        session.transition(SessionState::Closing).unwrap();
+        session.transition(SessionState::Closed).unwrap();
+        control.publish_sessions(snapshot_session_rows(&sessions, &control));
+        assert!(!control.heartbeats.record("a", received));
     }
 }
 
@@ -968,14 +1032,9 @@ fn accept_loop(
                     .payload
                     .get("session_id")
                     .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-                    .or_else(|| request.session_id.clone())
+                    .or(request.session_id.as_deref())
                 {
-                    control
-                        .heartbeats
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(session_id);
+                    control.heartbeats.record(session_id, Instant::now());
                 }
                 let _ = write_frame(&mut stream, &Response::ok(&request, json!({ "ok": true })));
             }
@@ -5389,6 +5448,7 @@ impl Daemon {
     }
 
     fn reap_idle_sessions(&mut self) {
+        apply_pending_heartbeats(&mut self.sessions, &self.run_control);
         let now = Instant::now();
         let stale: Vec<String> = self
             .sessions
@@ -6355,17 +6415,7 @@ impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
     }
 
     fn poll_control(&mut self) {
-        let mut beats = self
-            .control
-            .heartbeats
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for session_id in beats.drain(..) {
-            if let Some(session) = self.sessions.get_mut(&session_id) {
-                session.last_heartbeat = Instant::now();
-            }
-        }
-        drop(beats);
+        apply_pending_heartbeats(self.sessions, &self.control);
         self.control
             .publish_sessions(snapshot_session_rows(self.sessions, &self.control));
     }

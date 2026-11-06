@@ -11611,6 +11611,85 @@ fn web_read_metrics_include_network_and_rss() {
 }
 
 #[test]
+fn heartbeats_keep_only_their_idle_session_alive_and_stop_after_receipts_end() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-hbidle-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_heartbeat_idle", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let create = || {
+        let response = unix_request(
+            &socket,
+            &Request::new(
+                "run_heartbeat_idle",
+                "web.session.create",
+                json!({ "profile": "project", "limits": { "idle_ttl_ms": 2000 } }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("create heartbeat session");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let kept = create();
+    let untouched = create();
+    let list = || {
+        let response = unix_request(
+            &socket,
+            &Request::new("run_heartbeat_idle", "web.session.list", json!({})),
+            Duration::from_secs(5),
+        )
+        .expect("list heartbeat sessions");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(200));
+        let beat = unix_request(
+            &socket,
+            &Request::new(
+                "run_heartbeat_idle",
+                "web.heartbeat",
+                json!({ "session_id": kept }),
+            ),
+            Duration::from_secs(5),
+        )
+        .expect("heartbeat outside web.run");
+        assert_eq!(beat.status, "ok", "{beat:?}");
+        let rows = list();
+        assert!(
+            rows.iter().any(|row| row["session_id"] == kept),
+            "idle session was reaped despite valid heartbeats: {rows:?}"
+        );
+    }
+    let rows = list();
+    assert!(
+        !rows.iter().any(|row| row["session_id"] == untouched),
+        "heartbeat kept an unrelated idle session alive: {rows:?}"
+    );
+    let expires = Instant::now() + Duration::from_secs(4);
+    loop {
+        let rows = list();
+        if !rows.iter().any(|row| row["session_id"] == kept) {
+            break;
+        }
+        assert!(
+            Instant::now() < expires,
+            "session remained alive after heartbeats stopped: {rows:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_heartbeat_idle");
+}
+
+#[test]
 fn idle_sessions_are_reaped() {
     let socket = std::env::temp_dir().join(format!("greppy-web-reap-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);

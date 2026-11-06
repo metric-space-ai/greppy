@@ -20,6 +20,10 @@ concurrency:
   # Finish active browser suites; only queued superseded revisions may be replaced.
   cancel-in-progress: false
 
+env:
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "1"
+
 jobs:
   session-daemon:
     name: session daemon three-run stability
@@ -83,6 +87,36 @@ jobs:
           --package web-runtime
           --test session-daemon
           --no-run
+
+      - name: Check idle heartbeats preserve only their own live session
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          heartbeats_keep_only_their_idle_session_alive_and_stop_after_receipts_end
+          -- --test-threads=1 --nocapture
+
+      - name: Prove idle expiry requires applying pending heartbeat receipts
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          old = '        apply_pending_heartbeats(&mut self.sessions, &self.run_control);'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '--package', 'web-runtime', '--test', 'session-daemon',
+                     'heartbeats_keep_only_their_idle_session_alive_and_stop_after_receipts_end',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, '        // fault: omitted idle heartbeat drain'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'idle session was reaped despite valid heartbeats' in (result.stdout + result.stderr)
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=300)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
       - name: Check closing one session preserves its live neighbor and recovery worker
         shell: bash
