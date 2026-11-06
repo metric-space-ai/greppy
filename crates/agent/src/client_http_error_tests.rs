@@ -18,6 +18,9 @@ fn request() -> ModelRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    // Darwin accept can inherit the listener's nonblocking flag. A read timeout
+    // does not clear it; normalize before the bounded request read.
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
