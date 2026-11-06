@@ -3,6 +3,7 @@ use crate::protocol::{Request, Response};
 use serde_json::json;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -20,16 +21,22 @@ impl Drop for PrivateDirectory {
 
 fn isolated_case(case: &str) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let directory = PrivateDirectory(std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "gp-dl-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
-    )));
+    ));
     assert!(
-        directory.0.as_os_str().as_bytes().len() + 4 < 104,
+        path.as_os_str().as_bytes().len() + 4 < 104,
         "set TMPDIR to a short private directory for Unix socket contracts"
     );
-    std::fs::create_dir(&directory.0).unwrap();
+    // Install cleanup only after exclusive creation succeeds: never remove a
+    // pre-existing directory on an assertion/create failure or PID reuse.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
+    let directory = PrivateDirectory(path);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
