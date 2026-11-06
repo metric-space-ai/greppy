@@ -37,4 +37,7 @@ pub use protocol::{
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{request as unix_request, serve_connection, UnixClientError};
+pub use unix::{
+    connect_timeout as unix_connect_timeout, request as unix_request, serve_connection,
+    UnixClientError,
+};
