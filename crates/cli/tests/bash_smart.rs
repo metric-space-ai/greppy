@@ -91,6 +91,90 @@ fn node_error_codes_and_process_warnings_reach_the_cli_verdict() {
     }
 }
 
+// Replays use the exact saved diagnostic bytes, not a new target project build.
+fn saved_ansi_oxc_replay(tag: &str, payload: &str, exit: i32, verdict: &str) {
+    let workspace = fresh_workspace(tag);
+    for folded in [false, true] {
+        let bytes = if folded {
+            format!(
+                "{}{payload}{}",
+                "ordinary progress\n".repeat(100),
+                "ordinary tail\n".repeat(100)
+            )
+        } else {
+            payload.to_string()
+        };
+        for stream in ["stdout", "stderr"] {
+            let redirect = if stream == "stderr" { " >&2" } else { "" };
+            let script = format!("printf '%s' \"$1\"{redirect}; exit {exit}");
+            let output = run(
+                &workspace,
+                &[
+                    "bash-smart",
+                    "--",
+                    "sh",
+                    "-c",
+                    &script,
+                    "saved-diagnostic-replay",
+                    &bytes,
+                ],
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(exit),
+                "saved diagnostic child exit changed"
+            );
+            let shown = text(&output.stdout);
+            assert!(
+                shown.starts_with(verdict),
+                "{tag} diagnostic verdict regression: {shown}"
+            );
+            if stream == "stderr" {
+                assert_eq!(
+                    output.stderr,
+                    bytes.as_bytes(),
+                    "saved diagnostic stderr bytes changed"
+                );
+            } else if !folded {
+                assert_eq!(
+                    shown,
+                    format!("{verdict}\n{bytes}"),
+                    "short stdout replay bytes changed"
+                );
+            }
+            if folded {
+                for line in payload.lines() {
+                    assert!(
+                        shown.contains(line),
+                        "saved diagnostic block or recap missing: {shown}"
+                    );
+                }
+                assert!(
+                    shown.lines().count() < 100,
+                    "ordinary output wall was not compacted"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ansi_oxc_saved_ansi_error_reaches_verdict_and_compact_block() {
+    saved_ansi_oxc_replay(
+        "ansi-error",
+        "\x1b[31mError\x1b[39m: Test timed out in 60000ms.\n",
+        1,
+        "FAILED — exit 1: 1 error, 0 warnings",
+    );
+}
+
+#[test]
+fn ansi_oxc_saved_synthetic_oxc_recap_reaches_verdict_and_compact_block() {
+    // The Oxc-shaped warning replay is explicitly synthetic, not a project run.
+    saved_ansi_oxc_replay("oxc-warning", "\x1b[33m⚠ eslint(no-unused-vars)\x1b[0m: fixture warning\nFound 0 errors and 1058 warnings in 3920 files (7.5s, 2 threads)\n", 0,
+        "ok — exit 0, 1058 warnings");
+}
+
 #[test]
 fn rust_error_field_source_keeps_regex_output_and_child_exit_status() {
     let workspace = fresh_workspace("rust-error-field-source");
