@@ -4823,55 +4823,18 @@ console.log(JSON.stringify({ original, saved: await download.path(), second: sec
 
 #[test]
 fn native_download_staging_shares_session_quota_across_contexts() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let origin = format!("http://{}/", listener.local_addr().unwrap());
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopped = Arc::clone(&stop);
-    let server = thread::spawn(move || {
-        while !stopped.load(Ordering::Relaxed) {
-            let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("quota fixture accept: {error}"),
-            };
-            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
-            let mut header = Vec::new();
-            let mut chunk = [0; 1024];
-            while header.len() < 8192 && !header.windows(4).any(|part| part == b"\r\n\r\n") {
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => header.extend_from_slice(&chunk[..n]),
-                }
-            }
-            if !header.windows(4).any(|part| part == b"\r\n\r\n") { continue; }
-            let file = String::from_utf8_lossy(&header).lines().next()
-                .is_some_and(|line| line.starts_with("GET /file "));
-            let (body, kind, disposition) = if file {
-                (b"12345678".as_slice(), "application/octet-stream",
-                 "Content-Disposition: attachment; filename=quota.bin\r\n")
-            } else {
-                (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(),
-                 "text/html", "")
-            };
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-            let _ = stream.write_all(response.as_bytes()).and_then(|_| stream.write_all(body));
-        }
+    use recorded_http_fixture::{http_response, HttpFixture};
+    let _server = HttpFixture::start(|path| {
+        let (body, kind, disposition) = if path == "/file" {
+            (b"12345678".as_slice(), "application/octet-stream",
+             "Content-Disposition: attachment; filename=quota.bin\r\n")
+        } else {
+            (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(),
+             "text/html", "")
+        };
+        http_response(body, kind, disposition)
     });
-    struct ServerGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
-    impl Drop for ServerGuard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-            self.1.take().unwrap().join().unwrap();
-        }
-    }
-    let _server = ServerGuard(stop, Some(server));
+    let origin = _server.origin.clone();
     let dir = TempDirGuard::at(std::env::temp_dir().join(format!("gq-{}", std::process::id())));
     let capture = dir.join("capture");
     std::fs::create_dir_all(&capture).unwrap();
