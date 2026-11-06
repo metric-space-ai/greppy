@@ -134,7 +134,7 @@ pub use embedding::{
     index_code_embeddings_for_scope_with_progress, CodeEmbeddingProvider,
     EmbeddingGemmaCodeProvider, EmbeddingIndexOptions, EmbeddingIndexProgress,
     EmbeddingIndexProgressContext, EmbeddingIndexReport, EmbeddingProviderCacheStats,
-    EmbeddingWorkload,
+    EmbeddingValidationProgress, EmbeddingWorkload,
 };
 
 /// Fraction of the process RAM budget the indexer initialises
