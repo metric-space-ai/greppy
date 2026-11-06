@@ -12759,6 +12759,30 @@ fn hover_reload_check_and_history_accept_timeout_options() {
 }
 
 #[test]
+#[ignore = "requires the real callback omission injected by check_web_history_receipt_mutation.py"]
+fn native_history_rejects_missing_traversal_receipt() {
+    let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-history-receipt-loss-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_history_receipt_loss", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let (path, source) = fixture_source("history-receipt-loss.mjs");
+    let ran = run_playwright_source(
+        &socket,
+        "run_history_receipt_loss",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "history receipt refusal: {ran:?}");
+}
+
+#[test]
 fn native_history_waits_for_matching_traversal() {
     let fixture = serve_fixture(include_str!("../fixtures/spike.html"));
     let socket =
