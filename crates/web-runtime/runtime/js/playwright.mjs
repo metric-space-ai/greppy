@@ -2556,25 +2556,28 @@ class Page {
     if (this._closed) {
       return;
     }
+    let closeError;
     try {
       await engineCall("page.close", { page: this, generation: this._generation || 1 });
-    } finally {
-      this._closed = true;
-      this._generation = (this._generation || 1) + 1;
-      try {
-        this._emit("close", this);
-      } finally {
-        pageContexts.delete(this._id);
-        if (this._context) this._context._pages = this._context._pages.filter(page => page !== this);
-        this._handlers = {};
-        this._seenFrames = {};
-        this._emittedNetwork.clear();
-        this._networkBaseline = null;
-        this._networkBaselineError = null;
-        for (const key of ["_pendingPopups", "_popupWaiters", "_navWaiters",
-          "_consoleWaiters", "_pendingConsole", "_dialogWaiters", "_pendingDialogs"]) this[key] = [];
-      }
+    } catch (error) { closeError = error; }
+    this._closed = true;
+    this._generation = (this._generation || 1) + 1;
+    try { this._emit("close", this); } catch (error) { closeError ||= error; }
+    pageContexts.delete(this._id);
+    if (this._context) this._context._pages = this._context._pages.filter(page => page !== this);
+    this._handlers = {};
+    this._seenFrames = {};
+    this._emittedNetwork.clear();
+    this._networkBaseline = null;
+    this._networkBaselineError = null;
+    for (const key of ["_pendingPopups", "_popupWaiters", "_navWaiters",
+      "_consoleWaiters", "_pendingConsole", "_dialogWaiters", "_pendingDialogs"]) this[key] = [];
+    const ownedContext = this._ownedContext;
+    this._ownedContext = null;
+    if (ownedContext && !ownedContext._closing) {
+      try { await ownedContext.close(); } catch (error) { closeError ||= error; }
     }
+    if (closeError) throw closeError;
   }
 
   async isClosed() {
@@ -3227,6 +3230,7 @@ class BrowserContext {
     if (this._closed) {
       return;
     }
+    this._closing = true;
     let closeError;
     for (const page of this.pages().slice()) {
       try { await page.close(); } catch (error) { closeError ||= error; }
@@ -3243,6 +3247,7 @@ class BrowserContext {
     this._initScripts = [];
     this._handlers = {};
     try { await engineCall("context.close", { context: this }); } catch (error) { closeError ||= error; }
+    this._closing = false;
     if (closeError) throw closeError;
   }
 
@@ -3384,7 +3389,14 @@ class Browser {
 
   async newPage(options) {
     const context = await this.newContext(options);
-    return context.newPage();
+    try {
+      const page = await context.newPage();
+      page._ownedContext = context;
+      return page;
+    } catch (error) {
+      try { await context.close(); } catch (_) { /* Preserve the creation error. */ }
+      throw error;
+    }
   }
 
   async close() {

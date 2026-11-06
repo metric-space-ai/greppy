@@ -41,6 +41,10 @@ if __name__ == "__main__":
               "retained_records_bound_bytes_before_retaining_and_account_updates")
     else:
         prove(ROOT / "crates/web-runtime/runtime/js/playwright.mjs",
+              "page._ownedContext = context;", "// omitted implicit context ownership",
+              ["node", "--test", "crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs"],
+              "browser.newPage owns its implicit context")
+        prove(ROOT / "crates/web-runtime/runtime/js/playwright.mjs",
               "this._context._pages = this._context._pages.filter(page => page !== this)",
               "this._context._pages = this._context._pages",
               ["node", "--test", "crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs"],

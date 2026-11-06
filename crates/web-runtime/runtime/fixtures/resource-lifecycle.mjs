@@ -41,6 +41,13 @@ if (pendingClosed.delegates !== before.delegates) throw new Error("pending popup
 await context.close();
 const closed = await sample();
 if (closed.pages !== baseline.pages || closed.contexts !== baseline.contexts) throw new Error("native context cleanup incomplete");
+for (let i = 0; i < 20; i++) {
+  const convenience = await browser.newPage();
+  await convenience.close();
+  if (browser.contexts().length !== 0) throw new Error("implicit browser.newPage context retained");
+}
+const conveniencesClosed = await sample();
+if (conveniencesClosed.contexts !== baseline.contexts) throw new Error("native implicit contexts retained");
 await browser.close();
 const final = await sample();
 for (const key of ["pages", "contexts", "browsers", "delegates"]) {

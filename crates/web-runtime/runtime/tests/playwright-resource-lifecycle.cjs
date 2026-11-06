@@ -34,8 +34,48 @@ function fixture() {
   let source = fs.readFileSync(path.join(__dirname, "../js/playwright.mjs"), "utf8");
   source = source.replace(/^export \{.*\};$/gm, "").replace(/^export default .*;$/gm, "").replace(/^export const /gm, "const ");
   vm.runInContext(source, world, { filename: "shipped-playwright.mjs" });
-  return { world, calls, records, chromium: vm.runInContext("chromium", world) };
+  return { world, calls, records, ops, chromium: vm.runInContext("chromium", world) };
 }
+test("browser.newPage owns its implicit context while explicit contexts stay open", async () => {
+  const f = fixture();
+  const browser = await f.chromium.launch();
+  for (let i = 0; i < 40; i++) {
+    const page = await browser.newPage();
+    const context = browser.contexts()[0];
+    let closed = 0;
+    context.on("close", () => closed++);
+    await page.close();
+    assert.equal(browser.contexts().length, 0, "implicit context leaked after page.close");
+    assert.equal(closed, 1);
+  }
+  const page = await browser.newPage();
+  const context = browser.contexts()[0];
+  let closed = 0;
+  context.on("close", () => closed++);
+  await context.close();
+  assert.equal(closed, 1, "recursive implicit close emitted the context event twice");
+  assert.equal(f.calls.filter(c => c.method === "context.close" && c.params.context === context._id).length, 1);
+  const failed = await browser.newPage();
+  failed.on("close", () => { throw new Error("owned page callback failed"); });
+  await assert.rejects(() => failed.close(), /owned page callback failed/);
+  assert.equal(browser.contexts().length, 0, "callback failure leaked the implicit context");
+  const explicit = await browser.newContext();
+  const explicitPage = await explicit.newPage();
+  await explicitPage.close();
+  assert.equal(browser.contexts().length, 1, "explicit user context was closed with its page");
+  await browser.close();
+  const broken = fixture();
+  const original = broken.ops.op_engine_call;
+  broken.ops.op_engine_call = async (method, params) => {
+    if (method === "context.newPage") throw new Error("page creation failed");
+    return original(method, params);
+  };
+  const other = await broken.chromium.launch();
+  await assert.rejects(() => other.newPage(), /page creation failed/);
+  assert.equal(other.contexts().length, 0, "failed creation leaked its implicit context");
+  assert(broken.calls.some(call => call.method === "context.close"));
+  await other.close();
+});
 test("closed pages and contexts release wrapper ownership while stale handles reject", async () => {
   const f = fixture();
   const browser = await f.chromium.launch();
