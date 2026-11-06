@@ -141,6 +141,39 @@ for path, value in [('round', row), ('result', {'schema': 'greppy.web-efficiency
 
 
 class ProcessContract(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process-family PSS integration')
+    def test_execute_receipt_accounts_for_a_real_parent_and_child(self):
+        child_source = '''import sys, time
+private = bytearray(18 * 1024 * 1024)
+for i in range(0, len(private), 4096): private[i] = 1
+print('ready', flush=True)
+time.sleep(0.9)
+'''
+        parent_source = '''import json, os, subprocess, sys
+private = bytearray(18 * 1024 * 1024)
+for i in range(0, len(private), 4096): private[i] = 1
+child = subprocess.Popen([sys.executable, '-c', sys.argv[1]], stdout=subprocess.PIPE)
+try:
+    assert child.stdout.readline() == b'ready\\n'
+    print(json.dumps({'parent': os.getpid(), 'child': child.pid}), flush=True)
+    assert child.wait(timeout=5) == 0
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait(timeout=5)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            result = measurement.execute([sys.executable, '-c', parent_source, child_source], pathlib.Path(directory), 8)
+            memory = result['process_family_memory']
+            samples_path = pathlib.Path(memory['samples_path'])
+            samples = [json.loads(row) for row in samples_path.read_text().splitlines()]
+            self.assertEqual(memory['samples_sha256'], measurement.digest(samples_path))
+        self.assertEqual(result['exit_code'], 0, result)
+        pids = set(json.loads(result['stdout_tail']).values())
+        self.assertTrue(any({p['pid'] for p in s['processes']} == pids and (s['private_bytes'] or 0) >= 36 * 1024 * 1024 for s in samples), samples)
+        self.assertGreaterEqual(memory['peak_sampled_private_bytes'], 36 * 1024 * 1024)
+        self.assertGreater(memory['monitor_thread_cpu_seconds'], 0)
+
     def test_failed_process_retains_exit_cost_and_bounded_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             result = measurement.execute([sys.executable, '-c', "print('failure evidence'); raise SystemExit(7)"], pathlib.Path(directory), 3)
