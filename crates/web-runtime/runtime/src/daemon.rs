@@ -1708,25 +1708,7 @@ impl Daemon {
                 let ephemeral = session.persistent_profile.is_none();
                 let profile_lock = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
-                let mut close_failed = self.close_script_objects(&session);
-                if self.content.is_running() {
-                    let mut pages = session.tabs.clone();
-                    if let Some(page) = session.page_id.take() {
-                        if !pages.contains(&page) {
-                            pages.push(page);
-                        }
-                    }
-                    for page in pages {
-                        close_failed |= self
-                            .engine_call("session.closePage", json!({ "page": page }))
-                            .is_err();
-                    }
-                    if let Some(context) = session.engine_context_id.take() {
-                        close_failed |= self
-                            .engine_call("context.close", json!({ "context": context }))
-                            .is_err();
-                    }
-                }
+                let close_failed = self.close_session_objects(&session);
                 if close_failed {
                     self.content.shutdown_or_kill();
                 }
@@ -1762,18 +1744,24 @@ impl Daemon {
         }
     }
 
-    fn close_script_objects(&mut self, session: &Session) -> bool {
+    fn close_session_objects(&mut self, session: &Session) -> bool {
         if !self.content.is_running() { return false; }
         // Unknown creation outcomes cannot be orphaned: the existing failed-
         // close fallback retires Content after attempting every known owner.
         let mut failed = session.pending_pages != 0 || session.pending_contexts != 0;
-        for page in session.objects.pages_to_close() {
+        // CLI pages are also in the live-object ledger. Close their union once:
+        // closing each inventory separately makes the second close fail and
+        // incorrectly retires the worker shared with unrelated sessions.
+        let mut pages: std::collections::BTreeSet<_> = session.objects.pages_to_close().into_iter().collect();
+        pages.extend(session.tabs.iter().cloned());
+        pages.extend(session.page_id.iter().cloned());
+        let mut contexts: std::collections::BTreeSet<_> = session.objects.contexts_to_close().into_iter().collect();
+        contexts.extend(session.engine_context_id.iter().cloned());
+        for page in pages {
             failed |= self.engine_call("session.closePage", json!({"page": page})).is_err();
         }
-        for context in session.objects.contexts_to_close() {
-            if session.engine_context_id.as_deref() != Some(context.as_str()) {
-                failed |= self.engine_call("context.close", json!({"context": context})).is_err();
-            }
+        for context in contexts {
+            failed |= self.engine_call("context.close", json!({"context": context})).is_err();
         }
         for browser in session.objects.browsers_to_close() {
             failed |= self.engine_call("browser.close", json!({"browser": browser})).is_err();
@@ -5274,26 +5262,10 @@ impl Daemon {
             .map(|(id, _)| id.clone())
             .collect();
         for session_id in stale {
-            if let Some(mut session) = self.sessions.remove(&session_id) {
+            if let Some(session) = self.sessions.remove(&session_id) {
                 let ephemeral = session.persistent_profile.is_none();
                 let profile_lock = self.profile_locks.remove(&session_id);
-                let mut close_failed = self.close_script_objects(&session);
-                let mut pages = session.tabs.clone();
-                if let Some(page) = session.page_id.take() {
-                    if !pages.contains(&page) {
-                        pages.push(page);
-                    }
-                }
-                for page in pages {
-                    close_failed |= self
-                        .engine_call("session.closePage", json!({ "page": page }))
-                        .is_err();
-                }
-                if let Some(context) = session.engine_context_id.take() {
-                    close_failed |= self
-                        .engine_call("context.close", json!({ "context": context }))
-                        .is_err();
-                }
+                let close_failed = self.close_session_objects(&session);
                 if close_failed {
                     self.content.shutdown_or_kill();
                 }
