@@ -111,13 +111,17 @@ jobs:
           run_case('normal')
           source = pathlib.Path('bench/process_memory.py')
           cases = [
-              ('shared', 'or set(map(int, (self.monitor / "cgroup.procs").read_text().split())) != {os.getpid()}', '',
+              ('shared', source, 'or set(map(int, (self.monitor / "cgroup.procs").read_text().split())) != {os.getpid()}', '',
                'calibration.kernel_foreign_monitor'),
-              ('outside', 'echo "$$" > "$1/cgroup.procs"; ', '', 'calibration.kernel_entry'),
-              ('current', '"memory_peak_bytes": int((self.path / "memory.peak").read_text())',
+              ('outside', source, 'echo "$$" > "$1/cgroup.procs"; ', '', 'calibration.kernel_entry'),
+              ('current', source, '"memory_peak_bytes": int((self.path / "memory.peak").read_text())',
                '"memory_peak_bytes": int((self.path / "memory.current").read_text())', 'calibration.kernel_peak'),
+              ('rss', pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py'),
+               "'kernel_resource_accounting': resource_group.snapshot() if resource_group else None,",
+               "'kernel_resource_accounting': dict(resource_group.snapshot(), memory_peak_bytes=peak) if resource_group else None,",
+               'calibration.kernel_family_peak'),
           ]
-          for label, old, new, expected in cases:
+          for label, source, old, new, expected in cases:
               original = source.read_text()
               assert original.count(old) == 1
               try:
@@ -130,7 +134,8 @@ jobs:
               finally:
                   source.write_text(original)
           run_case('restored')
-          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', 'bench/process_memory.py',
+                          'crates/web-runtime/scripts/measure-web-efficiency.py'], check=True)
 
       - name: Preserve raw meter calibration and counterproofs
         if: always()

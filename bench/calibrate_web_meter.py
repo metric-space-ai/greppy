@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import random
 import select
+import signal
 import secrets
 import statistics
 import subprocess
@@ -51,8 +52,77 @@ def work():
     return token.hex()
 
 
+def family_burst():
+    """Three real auto-reaped children hold private mappings concurrently."""
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    channels = []
+    rows = []
+    try:
+        for _ in range(3):
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(ready_read)
+                os.close(release_write)
+                for previous in channels:
+                    os.close(previous['ready'])
+                    os.close(previous['release'])
+                status = 2
+                block = None
+                try:
+                    cpu_started = time.process_time_ns()
+                    block = mmap.mmap(-1, 24 * MIB,
+                                      flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+                    for offset in range(0, 24 * MIB, mmap.PAGESIZE):
+                        block[offset] = 1
+                    checksum = work()
+                    row = {'self_cpu_ns': time.process_time_ns() - cpu_started,
+                           'private_bytes': 24 * MIB, 'checksum': checksum}
+                    os.write(ready_write, (json.dumps(row) + '\n').encode())
+                    if os.read(release_read, 1) == b'x':
+                        block.close()
+                        block = None
+                        os.write(ready_write, b'done\n')
+                        status = 0
+                finally:
+                    if block is not None:
+                        block.close()
+                    os.close(ready_write)
+                    os.close(release_read)
+                    os._exit(status)
+            os.close(ready_write)
+            os.close(release_read)
+            channels.append({'pid': pid, 'ready': ready_read,
+                             'release': release_write, 'stream': None})
+        for channel in channels:
+            channel['stream'] = os.fdopen(channel['ready'], 'rb')
+            channel['ready'] = None
+            rows.append(json.loads(channel['stream'].readline()))
+        fully_touched = time.monotonic_ns()
+        time.sleep(0.02)
+        released = time.monotonic_ns()
+        for channel in channels:
+            os.write(channel['release'], b'x')
+            os.close(channel['release'])
+            channel['release'] = None
+        for channel in channels:
+            require(channel['stream'].readline() == b'done\n'
+                    and channel['stream'].read() == b'',
+                    'calibration.family_receipt', 'child failed before closing its mapping')
+        return {'children': rows, 'fully_touched_ns': fully_touched, 'released_ns': released,
+                'parent_ignores_sigchld': True, 'concurrent_private_bytes': 72 * MIB}
+    finally:
+        for channel in channels:
+            if channel['stream'] is not None:
+                channel['stream'].close()
+            for name in ('ready', 'release'):
+                if channel[name] is not None:
+                    os.close(channel[name])
+
+
 def fixture(mode):
-    """One known child, no descendants; physical private pages are touched."""
+    """Controlled root and optional declared children touch private pages."""
     began_cpu = time.process_time_ns()
     phases = []
     allocations = []
@@ -69,13 +139,15 @@ def fixture(mode):
             block[offset] = 1
         allocations.append(block)
 
-    burst = None
+    burst = family = None
     try:
         if mode == 'cost':
             phase('cost_hold', 0.6)
         else:
             phase('baseline', HOLD_SECONDS)
-            if mode == 'steps':
+            if mode == 'family':
+                family = family_burst()
+            elif mode == 'steps':
                 allocate(8 * MIB)
                 phase('held_8_mib', HOLD_SECONDS)
                 allocate(24 * MIB)
@@ -98,7 +170,7 @@ def fixture(mode):
     print(json.dumps({'schema': 'greppy.web-meter-fixture.v1', 'mode': mode,
                       'operations': OPERATIONS, 'checksum': checksum,
                       'self_cpu_ns': time.process_time_ns() - began_cpu,
-                      'phases': phases, 'burst': burst}), flush=True)
+                      'phases': phases, 'burst': burst, 'family': family}), flush=True)
 
 
 def load_meter():
@@ -258,6 +330,34 @@ def kernel_contract(case):
     return kernel
 
 
+def kernel_family_contract(case):
+    family = case['fixture']['family']
+    kernel = case['measured']['kernel_resource_accounting']
+    children = family['children']
+    require(len(children) == 3
+            and all(row['private_bytes'] == 24 * MIB
+                    and row['checksum'] == case['fixture']['checksum'] for row in children),
+            'calibration.kernel_family_receipt', 'real children did not complete identical work')
+    expected_cpu = (case['fixture']['self_cpu_ns'] + sum(row['self_cpu_ns'] for row in children)) / 1e9
+    require(kernel is not None and kernel['target_entry_observed']
+            and kernel.get('group_removed') and not kernel['populated'],
+            'calibration.kernel_family_release', 'family cgroup was not entered, emptied and removed')
+    require(kernel['memory_peak_bytes'] >= 72 * MIB,
+            'calibration.kernel_family_peak', 'aggregate peak lost simultaneous child mappings')
+    require(kernel['cpu_usage_seconds'] + 0.01 >= expected_cpu,
+            'calibration.kernel_family_cpu', 'auto-reaped child CPU was omitted')
+    require(kernel['memory_events'].get('oom_kill', 0) == 0,
+            'calibration.kernel_family_oom', 'family was killed by OOM')
+    return {'independent_process_clock_sum_seconds': expected_cpu,
+            'kernel_cpu_seconds': kernel['cpu_usage_seconds'],
+            'waited_cpu_seconds': case['measured']['user_cpu_seconds'] + case['measured']['system_cpu_seconds'],
+            'known_concurrent_private_bytes': 72 * MIB,
+            'kernel_memory_peak_bytes': kernel['memory_peak_bytes'],
+            'max_individual_process_rss_bytes': case['measured']['max_individual_process_rss_bytes'],
+            'group_removed': kernel['group_removed'], 'populated': kernel['populated'],
+            'scope': 'one real parent and three SIGCHLD-ignored children; kernel cgroup charges, not PSS'}
+
+
 def paired_effect(pairs):
     """Exact randomized paired test plus a distribution-free median interval."""
     ratios = [pair['metered']['wall_ms'] / pair['reference']['wall_ms'] for pair in pairs]
@@ -294,7 +394,7 @@ def main():
     parser.add_argument('--contracts-only', action='store_true')
     parser.add_argument('--kernel-cgroup-parent', type=Path,
                         help='contracts only: explicit delegated parent of this sole monitor leaf')
-    parser.add_argument('--fixture', choices=('cost', 'steps', 'burst'), help=argparse.SUPPRESS)
+    parser.add_argument('--fixture', choices=('cost', 'steps', 'burst', 'family'), help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not sys.platform.startswith('linux'):
         parser.error('Linux /proc calibration required; unsupported is not a successful calibration')
@@ -317,6 +417,7 @@ def main():
                 for _ in range(args.pairs)]
     protocol = {'schema': 'greppy.web-meter-calibration-protocol.v1', 'seed': seed,
                 'schedule': schedule, 'contracts_only': args.contracts_only,
+                'kernel_cgroup_parent': str(args.kernel_cgroup_parent) if args.kernel_cgroup_parent else None,
                 'operations': OPERATIONS, 'hold_seconds': HOLD_SECONDS,
                 'meter_sha256': digest(METER), 'sampler_sha256': digest(ROOT / 'bench/process_memory.py'),
                 'calibrator_sha256': digest(Path(__file__).resolve())}
@@ -325,8 +426,9 @@ def main():
     (runs / 'protocol.json').write_text(json.dumps(protocol, indent=2) + '\n')
     deadline = time.monotonic() + 90
     report = {'schema': 'greppy.web-meter-calibration.v1', 'protocol': protocol,
-              'scope': 'one controlled Linux process; actual production meter; no browser/CLI/LLM',
-              'exclusions': ['unsampled transient peaks', 'kernel/GPU/unmapped cache',
+              'scope': 'controlled Linux roots and declared child families; actual production meter; no browser/CLI/LLM',
+              'exclusions': ['PSS: unsampled transients and kernel/GPU/unmapped cache',
+                             'kernel charges: shared/preexisting pages charged elsewhere and external providers',
                              'arbitrary workload or host generalization'],
               'unsampled_peak_coverage_certified': False}
     try:
@@ -355,6 +457,9 @@ def main():
                                      'interpretation': 'detection of this burst does not certify all transient peaks'}
             if args.kernel_cgroup_parent:
                 report['burst_kernel_contract'] = kernel_contract(burst)
+                family = execute_case(meter, runs / 'family-burst', 'family', True, expected_checksum, deadline,
+                                      kernel_parent=args.kernel_cgroup_parent)
+                report['kernel_family_contract'] = kernel_family_contract(family)
         if not args.contracts_only:
             pairs = []
             for index, order in enumerate(schedule):
@@ -375,7 +480,8 @@ def main():
         print('WEB_METER_CALIBRATION_OK ' + json.dumps({
             'memory_contract': report['memory_contract'], 'cpu_contract': report['cpu_contract'],
             'observer_effect': report.get('observer_effect'), 'short_burst': report.get('short_burst'),
-            'burst_kernel_contract': report.get('burst_kernel_contract')}))
+            'burst_kernel_contract': report.get('burst_kernel_contract'),
+            'kernel_family_contract': report.get('kernel_family_contract')}))
         return_code = 0
     except Exception as error:
         report['status'] = 'failed'
