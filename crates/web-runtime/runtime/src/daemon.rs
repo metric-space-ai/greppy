@@ -12,7 +12,7 @@ use greppy_web_client::{
     new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
