@@ -14,8 +14,8 @@ sha2 = { workspace = true }
 blake3 = { workspace = true }
 greppy-workspace-core = { path = "../workspace-core" }
 filetime = { workspace = true }
-# Plain HTTP only (localhost gateway). No TLS stack.
-ureq = { version = "2", default-features = false }
+# Plain HTTP only (localhost gateway). No TLS stack. All modes share this
+# fallible request-local transport so buffered response errors cannot panic.
 # Async I/O stays on a request-local runtime so ACP can drop blocked reads.
 reqwest = { version = "0.12.28", default-features = false }
 tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
@@ -32,6 +32,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# Original transport retained only for the regression mutation's baseline.
+ureq = { version = "2", default-features = false }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 
