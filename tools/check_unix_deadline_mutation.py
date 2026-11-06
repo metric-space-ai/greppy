@@ -25,7 +25,7 @@ LEGACY = '''pub fn request(
 def run(selector, red=None, diagnostic=None):
     result = subprocess.run(
         ["cargo", "test", "--locked", "--jobs", "2", "-p", "greppy-web-client",
-         "--lib", selector, "--", "--test-threads=1", "--nocapture"],
+         "--lib", selector, "--", "--test-threads=1"] + (["--nocapture"] if red is None else []),
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=180,
     )
