@@ -1196,16 +1196,7 @@ fn run_agent(
             Ok(_) => {
                 let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
                     .set(crate::web_attach::inherit_attach_for_agent);
-                // Start the runtime HERE, while this process is still
-                // unsandboxed. The runtime sandboxes its own workers, and macOS
-                // Seatbelt does not nest: started from a sandboxed tool child it
-                // dies with "worker sandbox: Operation not permitted", and the
-                // agent only ever sees "web-runtime did not create its socket".
-                // Started here, the tool children merely connect.
-                let worktree_root = workspace.worktree_path().to_string_lossy().into_owned();
-                if let Err(error) = crate::web::prestart_unsandboxed(Some(&worktree_root)) {
-                    eprintln!("greppy: browser unavailable to the agent ({error})");
-                }
+                // The web-only attach hook starts the runtime lazily in this parent.
             }
             Err(error) => {
                 eprintln!("greppy: browser unavailable to the agent (no attach token: {error})");
@@ -1216,7 +1207,7 @@ fn run_agent(
         struct ShutdownWebOnDrop;
         impl Drop for ShutdownWebOnDrop {
             fn drop(&mut self) {
-                crate::web::shutdown_if_running();
+                crate::web::shutdown_agent_runtimes();
             }
         }
         let _shutdown_web = ShutdownWebOnDrop;
@@ -2436,7 +2427,7 @@ fn run_interactive_session(
     struct ShutdownWebOnDrop;
     impl Drop for ShutdownWebOnDrop {
         fn drop(&mut self) {
-            crate::web::shutdown_if_running();
+            crate::web::shutdown_agent_runtimes();
         }
     }
     let _shutdown_web = ShutdownWebOnDrop;

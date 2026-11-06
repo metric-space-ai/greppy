@@ -84,6 +84,13 @@ jobs:
           --test session-daemon
           --no-run
 
+      - name: Check confined agent browser scope, reuse and shutdown with mutations
+        shell: bash
+        env:
+          CI: 'true'
+          GREPPY_WEB_RUNTIME: ${{ github.workspace }}/crates/web-runtime/target/debug/web-runtime
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_agent_startup_mutations.py --native
+
       - name: Check closing one session preserves its live neighbor and recovery worker
         shell: bash
         run: |
