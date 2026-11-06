@@ -7,6 +7,7 @@ or claims that a standalone runtime measurement covers an LLM agent or CLI daemo
 import argparse
 from collections import Counter
 import hashlib
+import importlib.util
 import html
 import http.server
 import json
@@ -24,6 +25,11 @@ import time
 import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+_memory_spec = importlib.util.spec_from_file_location(
+    'greppy_process_memory', ROOT.parents[1] / 'bench/process_memory.py')
+_memory_module = importlib.util.module_from_spec(_memory_spec)
+_memory_spec.loader.exec_module(_memory_module)
+ProcessTreeMemorySampler = _memory_module.ProcessTreeMemorySampler
 
 
 def digest(path):
@@ -40,7 +46,7 @@ def source_identity():
         return result.stdout.strip() if result.returncode == 0 else None
     return {'harness_commit': git('rev-parse', 'HEAD'),
             'harness_source_status': git('status', '--porcelain', '--', 'scripts', 'runtime/fixtures/efficiency-workload.mjs',
-                                         'runtime/fixtures/efficiency-native.mjs')}
+                                         'runtime/fixtures/efficiency-native.mjs', ':(top)bench/process_memory.py')}
 
 
 def host_envelope():
@@ -235,17 +241,33 @@ def log_tail(path):
         return stream.read(8192).decode('utf-8', 'replace')
 
 
-def execute(command, directory, timeout, started=None):
+def execute(command, directory, timeout, started=None, memory_log_path=None):
     started = time.monotonic() if started is None else started
     terminated_at = None
-    with (directory / 'stdout.log').open('wb') as stdout, (directory / 'stderr.log').open('wb') as stderr:
+    memory_log_path = memory_log_path or directory / 'process-memory.jsonl'
+    sampling_wall_ns = sampling_cpu_ns = 0
+    # Both engines use this same bounded monitor. Stream raw receipts instead
+    # of retaining a sample history in the harness heap.
+    with (directory / 'stdout.log').open('wb') as stdout, (directory / 'stderr.log').open('wb') as stderr, memory_log_path.open('x') as memory_log:
         child = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
         try:
+            memory = ProcessTreeMemorySampler(child.pid)
+            next_sample = time.monotonic()
             while True:
                 pid, status, usage = os.wait4(child.pid, os.WNOHANG)
                 if pid:
                     child.returncode = os.waitstatus_to_exitcode(status)
                     break
+                now = time.monotonic()
+                if memory.supported and now >= next_sample:
+                    sample_started = time.monotonic_ns()
+                    cpu_started = time.thread_time_ns()
+                    sample = memory.sample()
+                    memory_log.write(json.dumps(sample, separators=(',', ':')) + '\n')
+                    sampling_cpu_ns += time.thread_time_ns() - cpu_started
+                    sampling_wall_ns += time.monotonic_ns() - sample_started
+                    # Never catch up with a burst of scans after a slow sample.
+                    next_sample = time.monotonic() + 0.25
                 elapsed = time.monotonic() - started
                 if elapsed >= timeout and terminated_at is None:
                     os.killpg(child.pid, signal.SIGTERM)
@@ -265,6 +287,18 @@ def execute(command, directory, timeout, started=None):
             'max_individual_process_rss_bytes': peak,
             'cpu_scope': 'wait4 child plus waited descendants; excludes fixture server and harness',
             'rss_scope': 'OS wait4 maximum individual process RSS; not concurrent process-tree aggregate',
+            'process_family_memory': {
+                'supported': memory.supported,
+                'sample_count': memory.samples, 'incomplete_sample_count': memory.incomplete_samples,
+                'peak_sampled_pss_bytes': memory.peak_pss_bytes,
+                'peak_sampled_private_bytes': memory.peak_private_bytes,
+                'minimum_sampling_gap_ms': 250,
+                'sampling_wall_ms': sampling_wall_ns / 1_000_000,
+                'monitor_thread_cpu_seconds': sampling_cpu_ns / 1_000_000_000,
+                'samples_path': str(memory_log_path), 'samples_sha256': digest(memory_log_path),
+                'sampler_sha256': digest(pathlib.Path(_memory_module.__file__)),
+                'scope': 'observed Linux child process-family mappings; sampled peaks are lower bounds; excludes kernel/GPU/unmapped cache, fixture and harness; no inference about LLM/CLI-daemon memory',
+                'timing_scope': 'process time includes concurrent sampling overhead; monitor CPU reported separately'},
             'stdout_tail': log_tail(directory / 'stdout.log'),
             'stderr_tail': log_tail(directory / 'stderr.log')}
 
@@ -337,7 +371,8 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='web-efficiency-', dir=args.output.parent) as temporary:
             fixture.started_at = time.monotonic()
-            measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at)
+            measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
+                               args.output.with_name(args.output.name + '.memory.jsonl'))
         audit = fixture.audit()
         valid = audit['all_tasks_verified'] and measured['exit_code'] == 0 and not measured['timed_out']
         reason = audit['error']
