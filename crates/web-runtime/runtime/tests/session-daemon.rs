@@ -4775,6 +4775,7 @@ if (await download.failure()) throw new Error("HTTP download failed");
 if (events.join() !== "fixture.bin") throw new Error("download event missing or duplicated");
 const original = await download.path();
 if (!original) throw new Error("native download has no path");
+await download.saveAs(original);
 await download.saveAs(original + ".copy");
 console.log(JSON.stringify({ original, saved: await download.path() }));
 "##;

@@ -4347,13 +4347,13 @@ impl ContentEngine {
                     let files = delegate.download_files.borrow();
                     let download = files.get(id).ok_or_else(|| io::Error::other("no matching download"))?;
                     if let Some(failure) = &download.failure { return Err(io::Error::other(failure.clone())); }
-                    let source = download.path.as_ref().ok_or_else(|| io::Error::other("download has no file"))?;
+                    let source = download.path.as_ref().ok_or_else(|| io::Error::other("download has no file"))?.canonicalize()?;
                     let dest = confine_worker_path(Path::new(&path))?;
                     if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
                         std::fs::create_dir_all(parent)?;
                     }
-                    let bytes = if source == &dest { std::fs::metadata(source)?.len() }
-                        else { std::fs::copy(source, &dest)? };
+                    let bytes = if source == dest { std::fs::metadata(&source)?.len() }
+                        else { std::fs::copy(&source, &dest)? };
                     return Ok(json!({ "ok": true, "bytes": bytes }));
                 }
                 let body_b64 = {
