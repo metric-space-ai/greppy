@@ -457,6 +457,15 @@ def main():
                 'observed Linux CLI and runtime descendant mappings; sampled peaks are lower bounds; '
                 'detached descendants are retained only if observed before reparenting; '
                 'excludes kernel/GPU/unmapped cache, fixture, harness and LLM/model providers')
+            observed = measured['process_family_memory']
+            measured['observed_process_family_memory'] = observed
+            measured['process_family_memory'] = {
+                **observed,
+                'peak_sampled_pss_bytes': None,
+                'peak_sampled_private_bytes': None,
+                'complete_for_execution_surface': False,
+                'scope': 'unknown whole CLI/runtime memory: detached owner PID/birth was not registered from a supported owner receipt; observed samples are separate',
+            }
         measured['verified_completed_tasks_per_second_including_all_process_time'] = (
             audit['independently_verified_completed_tasks'] * 1000 / measured['process_cold_total_ms'])
         boundaries = [fixture.started_at] + [event[0] for event in fixture.round_events]

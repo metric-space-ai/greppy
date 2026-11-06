@@ -207,6 +207,12 @@ print(json.dumps({'entry_sha256': hashlib.sha256(entry.read_bytes()).hexdigest()
                     self.assertEqual(receipt['quality_error'], expected)
                     self.assertEqual(receipt['audit']['independently_verified_completed_tasks'], int(changed_runtime))
                     self.assertEqual(receipt['cli_provenance']['sha256'], measurement.digest(probe))
+                    memory = receipt['metrics']['process_family_memory']
+                    self.assertIs(memory.get('complete_for_execution_surface'), False,
+                                  'unregistered CLI runtime owner cannot establish whole-worker memory')
+                    self.assertIsNone(memory['peak_sampled_pss_bytes'])
+                    self.assertIsNone(memory['peak_sampled_private_bytes'])
+                    self.assertIn('observed_process_family_memory', receipt['metrics'])
                     self.assertEqual(json.loads(receipt['metrics']['stdout_tail'])['entry_sha256'],
                                      receipt['native_entry_provenance']['sha256'])
                     checked = subprocess.run(

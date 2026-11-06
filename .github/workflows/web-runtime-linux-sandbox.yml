@@ -261,6 +261,28 @@ jobs:
           subprocess.run(command, check=True, timeout=60)
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
+      - name: Prove an unregistered CLI runtime owner cannot claim complete RAM coverage
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = "'complete_for_execution_surface': False,"
+          assert original.count(old) == 1
+          command = ['python3', 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'CliBoundaryContract']
+          try:
+              source.write_text(original.replace(old, "'complete_for_execution_surface': True,"))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'unregistered CLI runtime owner cannot establish whole-worker memory' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=60)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Check complete-workflow measurement contracts without launching browsers
         env:
           PYTHONDONTWRITEBYTECODE: '1'

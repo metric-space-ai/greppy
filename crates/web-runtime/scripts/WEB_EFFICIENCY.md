@@ -135,6 +135,11 @@ Keep execution surfaces separate when reporting results. CLI mode includes CLI
 startup/composition and the runtime descendants actually observed by the sampler.
 The Linux sampler can miss a child that detaches before its first observation,
 and wait4 CPU includes only waited descendants; these limits remain explicit.
+CLI mode therefore reports whole-surface PSS/private peaks as unknown, not as
+the CLI process's small footprint. Partial samples remain under
+`metrics.observed_process_family_memory`. A future complete measurement must
+register the detached owner's PID and birth identity from its supported owner
+receipt; a process-name scan is not that receipt.
 No mode exercises an LLM/model/prompt, arbitrary public websites, or full
 Web-Worker-Agent resource totals. Those measurements remain necessary before
 claiming general efficiency leadership. CLI parser/adversarial receipt tests
