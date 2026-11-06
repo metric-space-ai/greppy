@@ -196,7 +196,31 @@ fn absolute_deadline_child() {
         }
         "names" => {
             let socket = directory.join(OsString::from_vec(vec![b'n', 0xff]));
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = match UnixListener::bind(&socket) {
+                Ok(listener) => listener,
+                // Some Darwin filesystems reject this byte name before a listener
+                // can exist. Match the standard client's exact OS error there;
+                // a lossy UTF-8 conversion would instead look up another name.
+                Err(error)
+                    if cfg!(target_vendor = "apple")
+                        && error.raw_os_error() == Some(libc::EILSEQ) =>
+                {
+                    let standard = UnixStream::connect(&socket).unwrap_err();
+                    assert_eq!(standard.raw_os_error(), Some(libc::EILSEQ));
+                    let result = request(
+                        &socket,
+                        &Request::new("private", "web.status", json!({})),
+                        BUDGET,
+                    );
+                    assert!(
+                        matches!(&result, Err(UnixClientError::Connect(error))
+                            if error.raw_os_error() == standard.raw_os_error()),
+                        "byte-exact pathname must preserve the standard OS error: {result:?}"
+                    );
+                    return;
+                }
+                Err(error) => panic!("byte-name fixture bind: {error}"),
+            };
             let peer = thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
                 stream

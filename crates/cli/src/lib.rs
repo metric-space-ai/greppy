@@ -1032,6 +1032,43 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // guess away a rejected selector, flag or positional argument and
             // dispatch a different operation against the current session.
             if sub == "web" {
+                if let Some(stray) = first
+                    .strip_prefix("error: unexpected argument '")
+                    .and_then(|rest| rest.split('\'').next())
+                {
+                    if sub == "web" && stray == "::" {
+                        println!(
+                            "`::` chains browser steps only after `web do`. No browser action was run. \
+                             Use `greppy web do fill TARGET VALUE :: click TARGET`; do not repeat \
+                             the executable or `web` after `::`."
+                        );
+                    } else if sub == "web"
+                        && grep_passthrough_args(&argv)
+                            .get(1)
+                            .and_then(|arg| arg.to_str())
+                            == Some("observe")
+                        && !stray.starts_with('-')
+                    {
+                        println!(
+                            "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
+                             No observation was run. Use `greppy web observe QUERY` for matching visible \
+                             regions, or omit QUERY for the unfiltered page."
+                        );
+                    } else if sub == "web"
+                        && grep_passthrough_args(&argv)
+                            .get(1)
+                            .and_then(|arg| arg.to_str())
+                            == Some("wait")
+                        && !stray.starts_with('-')
+                    {
+                        println!(
+                            "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
+                             No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                             `greppy web wait 'text~/WORD/i'` for partial text, or \
+                             `greppy web wait --url '~/PATTERN/'` for a URL."
+                        );
+                    }
+                }
                 println!(
                     "invalid web arguments: {}",
                     first.trim_start_matches("error: ")
@@ -1166,38 +1203,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             {
                 // The usage line below already shows the shape that works;
                 // leading with `error:` only tells the agent it failed.
-                if sub == "web" && stray == "::" {
-                    println!(
-                        "`::` chains browser steps only after `web do`. No browser action was run. \
-                         Use `greppy web do fill TARGET VALUE :: click TARGET`; do not repeat \
-                         the executable or `web` after `::`."
-                    );
-                } else if sub == "web"
-                    && grep_passthrough_args(&argv)
-                        .get(1)
-                        .and_then(|arg| arg.to_str())
-                        == Some("observe")
-                    && !stray.starts_with('-')
-                {
-                    println!(
-                        "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
-                         No observation was run. Use `greppy web observe QUERY` for matching visible \
-                         regions, or omit QUERY for the unfiltered page."
-                    );
-                } else if sub == "web"
-                    && grep_passthrough_args(&argv)
-                        .get(1)
-                        .and_then(|arg| arg.to_str())
-                        == Some("wait")
-                    && !stray.starts_with('-')
-                {
-                    println!(
-                        "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
-                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
-                         `greppy web wait 'text~/WORD/i'` for partial text, or \
-                         `greppy web wait --url '~/PATTERN/'` for a URL."
-                    );
-                } else if sub == "path" && stray == "--code" {
+                if sub == "path" && stray == "--code" {
                     println!(
                         "`path` prints the bounded call-site chain and does not accept `--code`; \
                          run it without `--code`, then use `greppy read SYMBOL` for a returned \
