@@ -2609,7 +2609,11 @@ class Page {
         timeout: this._timeout || 30_000,
       });
       const download = this._downloadFromRecord(result.download);
-      this._emit("download", download);
+      const eventId = result.download.requestId;
+      if (eventId !== this._lastDownloadEventId) {
+        this._lastDownloadEventId = eventId;
+        this._emit("download", download);
+      }
       return download;
     }
     if (event === "request") {

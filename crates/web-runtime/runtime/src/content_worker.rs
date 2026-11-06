@@ -868,6 +868,7 @@ impl WebViewDelegate for Delegate {
                         .unwrap_or("download")
                         .to_owned();
                     self.downloads.borrow_mut().push(json!({
+                        "requestId": request_id,
                         "url": request_url.to_string(),
                         "byteLength": body.len(),
                         "bodyBase64": body_b64,
@@ -6800,6 +6801,7 @@ fn trace_startup(stage: &str) {
 struct PendingRecordedWait {
     request_id: u64,
     method: String,
+    download_after: usize,
     params: serde_json::Value,
     deadline: Instant,
     _reservation: crate::retained_records::RecordReservation,
@@ -6875,7 +6877,7 @@ pub fn run() -> io::Result<()> {
         // without retaining a WebView or delegate.
         let mut write_error = None;
         recorded_waiters.retain(|waiter| {
-            let PendingRecordedWait { request_id, method, params, deadline, .. } = waiter;
+            let PendingRecordedWait { request_id, method, params, deadline, download_after, .. } = waiter;
             let result = (|| -> io::Result<Option<serde_json::Value>> {
                 engine.reject_stale_objects(method, params)?;
                 let page = required_str(params, "page")?;
@@ -6891,7 +6893,7 @@ pub fn run() -> io::Result<()> {
                             .cloned().map(|row| json!({ "response": row })),
                         "timeout: waitForResponse"),
                     "page.waitForDownload" => (
-                        delegate.downloads.borrow().first().cloned().map(|row| json!({ "download": row })),
+                        delegate.downloads.borrow().snapshot()?.get(*download_after).cloned().map(|row| json!({ "download": row })),
                         "timeout: waitForEvent download"),
                     "page.waitForFileChooser" => {
                         let mut choosers = delegate.last_file_choosers.borrow_mut();
@@ -6938,13 +6940,15 @@ pub fn run() -> io::Result<()> {
                         engine.reject_stale_objects(&method, &params)?;
                         let page = required_str(&params, "page")?;
                         let delegate = &engine.page(&page)?.1;
+                        let download_after = delegate.downloads.borrow().len();
                         RecordBudget::hold_value(&delegate.record_budget, &params,
                             std::mem::size_of::<PendingRecordedWait>().saturating_add(method.len()))
+                            .map(|reservation| (reservation, download_after))
                     })();
                     match reservation {
-                        Ok(reservation) => recorded_waiters.push(PendingRecordedWait {
+                        Ok((reservation, download_after)) => recorded_waiters.push(PendingRecordedWait {
                             request_id, deadline: Instant::now() + call_timeout(&params),
-                            params, method, _reservation: reservation,
+                            params, method, download_after, _reservation: reservation,
                         }),
                         Err(error) => write_message(&mut protocol_out,
                             &Message::engine_result(request_id, false, serde_json::Value::Null, Some(error.to_string())))?,

@@ -91,6 +91,28 @@ jobs:
           --package web-runtime --test session-daemon
           real_http_download_wait_allows_click_and_owns_complete_file -- --test-threads=1 --nocapture
 
+      - name: Prove a later download wait cannot reuse the first retained file
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/content_worker.rs')
+          original = source.read_text()
+          old = 'delegate.downloads.borrow().snapshot()?.get(*download_after)'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '--package', 'web-runtime', '--test', 'session-daemon',
+                     'real_http_download_wait_allows_click_and_owns_complete_file',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, 'delegate.downloads.borrow().snapshot()?.first()'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'second download reused first event' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=300)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Prove a synchronous download wait prevents its concurrent click
         shell: python
         run: |

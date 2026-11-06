@@ -4696,6 +4696,8 @@ fn real_http_download_wait_allows_click_and_owns_complete_file() {
     let observed = Arc::clone(&requests);
     let payload: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
     let served_payload = payload.clone();
+    let second_payload: Vec<u8> = payload.iter().map(|byte| byte ^ 0xa5).collect();
+    let served_second = second_payload.clone();
     let server = thread::spawn(move || {
         while !stopped.load(Ordering::Relaxed) {
             let mut stream = match listener.accept() {
@@ -4720,10 +4722,12 @@ fn real_http_download_wait_allows_click_and_owns_complete_file() {
             let header = String::from_utf8_lossy(&header);
             let path = header.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("");
             observed.lock().unwrap().push(path.to_owned());
-            let (body, content_type, disposition) = if path == "/file" || path == "/background.bin" {
+            let (body, content_type, disposition) = if path == "/file-second" {
+                (served_second.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"second.bin\"\r\n")
+            } else if path == "/file" || path == "/background.bin" {
                 (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
             } else {
-                (b"<!doctype html><button id='trigger' onclick=\"fetch('/signal')\">Trigger</button><a id='download' href='/file' download>Download</a>".as_slice(), "text/html", "")
+                (b"<!doctype html><button id='trigger' onclick=\"fetch('/signal')\">Trigger</button><a id='download' href='/file' download>Download</a><a id='second' href='/file-second' download>Second</a>".as_slice(), "text/html", "")
             };
             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
             let _ = stream.write_all(response.as_bytes()).and_then(|_| stream.write_all(body));
@@ -4785,7 +4789,18 @@ const original = await download.path();
 if (!original) throw new Error("native download has no path");
 await download.saveAs(original);
 await download.saveAs(original + ".copy");
-console.log(JSON.stringify({ original, saved: await download.path() }));
+// Reopen in the same live page/session; its native download history remains.
+await page.goto(fixtureUrl);
+const [second, same] = await Promise.all([
+  page.waitForEvent("download"), page.waitForEvent("download"), page.locator("#second").click()
+]);
+if (second.suggestedFilename() !== "second.bin" || same.suggestedFilename() !== "second.bin")
+  throw new Error("second download reused first event");
+const secondPath = await second.path();
+if (!secondPath || secondPath === original || secondPath !== await same.path())
+  throw new Error("simultaneous download listeners disagree on the second file");
+if (events.join() !== "fixture.bin,second.bin") throw new Error("physical download event emitted more than once");
+console.log(JSON.stringify({ original, saved: await download.path(), second: secondPath }));
 "##;
     std::fs::write(&script, source).unwrap();
     let mut request = Request::new("real_http_download", "web.run", json!({
@@ -4797,6 +4812,8 @@ console.log(JSON.stringify({ original, saved: await download.path() }));
     assert_eq!(result.status, "ok", "download Promise.all failed: {result:?}; HTTP paths={:?}", requests.lock().unwrap());
     assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/file").count(), 1,
         "download must use exactly one real HTTP request");
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/file-second").count(), 1,
+        "second download must use exactly one new HTTP request");
     assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal").count(), 1,
         "recorded request and response waits must allow exactly one triggering fetch");
     assert!(!requests.lock().unwrap().iter().any(|path| path == "/never-requested"),
@@ -4805,12 +4822,15 @@ console.log(JSON.stringify({ original, saved: await download.path() }));
     let files: serde_json::Value = serde_json::from_str(stdout).unwrap();
     let original = PathBuf::from(files["original"].as_str().unwrap());
     let saved = PathBuf::from(files["saved"].as_str().unwrap());
+    let second = PathBuf::from(files["second"].as_str().unwrap());
     assert_eq!(std::fs::read(&original).unwrap(), payload, "original HTTP download bytes");
     assert_eq!(std::fs::read(&saved).unwrap(), payload, "saved HTTP download bytes");
+    assert_eq!(std::fs::read(&second).unwrap(), second_payload, "second HTTP download bytes must differ");
     let closed = unix_request(&socket, &Request::new("real_http_download", "web.session.close",
         json!({"session_id":session})), Duration::from_secs(10)).unwrap();
     assert_eq!(closed.status, "ok", "{closed:?}");
     assert!(!original.exists(), "session close leaked its captured download file");
+    assert!(!second.exists(), "session close leaked its second download file");
     let _ = std::fs::remove_file(saved);
 }
 
