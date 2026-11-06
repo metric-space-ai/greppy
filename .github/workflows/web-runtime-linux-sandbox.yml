@@ -64,6 +64,7 @@ jobs:
               ('state', 'or not original.resolve().is_relative_to(state.resolve())):', '):', 'diagnostic_foreign_state'),
               ('birth', 'identity[1] == birth', 'True', 'diagnostic_foreign_birth'),
               ('image', 'and (image.st_dev, image.st_ino) == runtime_identity', 'and True', 'diagnostic_foreign_image'),
+              ('close', 'os.close(self.descriptor)', 'pass # fault: retained descriptor leaked', 'diagnostic_descriptor_release'),
           ]
           positive = run_case('positive')
           print(positive.stdout, positive.stderr)

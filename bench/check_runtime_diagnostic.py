@@ -30,7 +30,7 @@ def check():
             with path.open('xb') as errors:
                 child = subprocess.Popen(
                     [sys.executable, '-B', '-c',
-                     'import os,signal,sys; signal.alarm(10); os.unlink(sys.argv[1]); print("ready",flush=True); sys.stdin.readline()',
+                     'import os,signal,sys; signal.alarm(10); os.unlink(sys.argv[1]); print("ready",flush=True); sys.stdin.readline(); sys.stderr.write("late diagnostic"+chr(10)); sys.stderr.flush()',
                      str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
                 try:
                     # The parent wrote deterministic bytes; the child holds the
@@ -56,13 +56,32 @@ def check():
                     wrong_birth = dict(seen, starttime_ticks=seen['starttime_ticks'] + 1)
                     assert meter.capture_owned_runtime_stderr(wrong_birth, expected_image, state)['status'] == 'unavailable', 'diagnostic_foreign_birth'
                     assert meter.capture_owned_runtime_stderr(seen, (info.st_dev, info.st_ino + 1), state)['status'] == 'unavailable', 'diagnostic_foreign_image'
-                finally:
+                    handle = meter.OwnedRuntimeStderr(seen, expected_image, state)
+                    retained_fd = handle.descriptor
                     try:
                         child.communicate(input=b'stop\n', timeout=5)
-                    except subprocess.TimeoutExpired:
-                        child.kill()
-                        child.communicate(timeout=5)
-                        raise
+                        after_exit = handle.capture()
+                        expected_tail = (body + b'late diagnostic' + bytes([10]))[-65536:]
+                        assert after_exit['tail_sha256'] == hashlib.sha256(expected_tail).hexdigest(), 'diagnostic_exit_tail'
+                        assert 'late diagnostic' in after_exit['stderr_redacted_tail']
+                    finally:
+                        handle.close()
+                    try:
+                        os.fstat(retained_fd)
+                    except OSError:
+                        pass
+                    else:
+                        raise AssertionError('diagnostic_descriptor_release')
+                finally:
+                    if child.poll() is None:
+                        try:
+                            child.communicate(input=b'stop\n', timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.communicate(timeout=5)
+                            raise
+                    else:
+                        child.wait(timeout=5)
                     assert child.returncode == 0, 'diagnostic_owned_child_reap'
     print('OWNED_RUNTIME_DIAGNOSTIC_OK')
 
