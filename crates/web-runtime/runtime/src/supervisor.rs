@@ -1134,6 +1134,17 @@ fn spawn_unix(
     capability: String,
     persistent_profiles: Option<PathBuf>,
 ) -> io::Result<WorkerProcess> {
+    crate::fork_exec_window::exclusive(|| {
+        spawn_unix_in_window(worker, capability, persistent_profiles)
+    })
+}
+
+#[cfg(unix)]
+fn spawn_unix_in_window(
+    worker: WorkerKind,
+    capability: String,
+    persistent_profiles: Option<PathBuf>,
+) -> io::Result<WorkerProcess> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
