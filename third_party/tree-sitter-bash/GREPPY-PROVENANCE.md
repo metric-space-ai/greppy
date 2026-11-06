@@ -33,7 +33,7 @@ The helper verifies the pinned generator archive, records the actual generator,
 Node version, ABI, grammar hash and all generated output hashes, and requires
 byte-identical committed outputs. CI retains the generation receipt and exact
 outputs. The checked-in parser.c, grammar.json, node-types.json and parser.h were
-produced together by CI run42194399650, artifact13490663879. GENERATION.json records
+produced together by CI run42200237259, artifact13493609919. GENERATION.json records
 the actual tools and input/output byte hashes; subsequent CI regenerates and
 checks the committed files rather than accepting hand-edited generated C.
 

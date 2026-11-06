@@ -11,15 +11,15 @@
     "15",
     "grammar.js"
   ],
-  "grammar_js_sha256": "749cbc488002107a22d6c0364a77f8c64d9d7ed1020f83a034924b11f67bdfa5",
+  "grammar_js_sha256": "cd17d973e7d7f5841d9a251da521687e0b1db355e292c9eb28f6f62c3006562a",
   "outputs": {
     "src/parser.c": {
-      "sha256": "aef298dffc2444999e2d9abcd370e95e0afc0a8c6e9b7ec0e50a6578a6dae839",
-      "bytes": 9901999
+      "sha256": "fc14dc88c85b6ec5912987ff268b2a4eb96a4afb21c3d920142fe22399f3aa15",
+      "bytes": 9889856
     },
     "src/grammar.json": {
-      "sha256": "65061ed1f6aa3102a5ac0069f536a67291e249087820d3988e20e8940681553b",
-      "bytes": 179590
+      "sha256": "ebe208d9b98f3f85c15bdc15c5b4feca2c4b9c2d5169230dce6cf648afa59666",
+      "bytes": 178237
     },
     "src/node-types.json": {
       "sha256": "b644629f7f9460cb0af080cb88f3bef898e6c47b6f8a76ed512b67ae16ef5ac5",
@@ -32,8 +32,8 @@
   },
   "upstream_crate_sha256": "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062",
   "source_artifact": {
-    "run": 42194399650,
-    "artifact_id": 13490663879,
-    "head": "40df4c235ffaf4464d214dac1173242b62efbd61"
+    "run": 42200237259,
+    "artifact_id": 13493609919,
+    "head": "2be3f55b619dd1d8d7f965705e27bd16fc5c901e"
   }
 }
