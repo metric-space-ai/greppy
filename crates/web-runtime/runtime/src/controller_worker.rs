@@ -1,6 +1,5 @@
 use crate::protocol::{read_message, timeout_ms_from_json, write_message, Message, WorkerKind};
 use crate::worker::require_worker_auth;
-use std::fs::File;
 use deno_core::error::CoreError;
 use deno_core::url::Url;
 use deno_core::{
@@ -11,6 +10,7 @@ use deno_core::{
 use deno_error::JsErrorBox;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -31,14 +31,8 @@ struct EngineBridge {
     stdout: Arc<Mutex<File>>,
     script_stdout: Arc<Mutex<Vec<String>>>,
     trace_archives: Arc<Mutex<CapturedTraceArchives>>,
-    pending: Arc<
-        Mutex<
-            HashMap<
-                u64,
-                tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
-            >,
-        >,
-    >,
+    pending:
+        Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>>,
 }
 
 #[cfg(test)]
@@ -447,6 +441,9 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     install_process_env_allow_list(&mut runtime)?;
     install_console_capture(&mut runtime)?;
 
+    // Startup is verified above; waiting for a script needs no resident isolate.
+    drop(runtime);
+
     {
         match read_message(&mut protocol_in)? {
             Message::Hello {
@@ -526,7 +523,6 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
         };
         match message {
             Message::Shutdown { .. } => {
-                drop(runtime);
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 return write_message(&mut *stdout, &Message::shutdown_ack(WorkerKind::Controller));
             }
@@ -536,8 +532,7 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                 fixture_url,
                 ..
             } => {
-                drop(runtime);
-                runtime = new_js_runtime(bridge.clone(), granted_script_root(&specifier));
+                let mut runtime = new_js_runtime(bridge.clone(), granted_script_root(&specifier));
                 install_process_env_allow_list(&mut runtime)?;
                 install_console_capture(&mut runtime)?;
                 bridge
@@ -563,11 +558,13 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                         "globalThis.__greppyCaptureActiveTrace?.()",
                     );
                 }
-                let captured = bridge
-                    .script_stdout
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .join("\n");
+                let captured = std::mem::take(
+                    &mut *bridge
+                        .script_stdout
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                )
+                .join("\n");
                 let trace_archives = std::mem::take(
                     &mut *bridge
                         .trace_archives
@@ -583,6 +580,13 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
+                // No script state is reused across RunScript messages. Release
+                // its heap and cancelled request handles before publishing idle.
+                drop(runtime);
+                pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
                 let payload =
                     serde_json::json!({ "stdout": captured, "trace_archives": trace_archives });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());

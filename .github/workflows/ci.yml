@@ -128,6 +128,11 @@ jobs:
       - name: cargo build --workspace (fast test assets)
         run: cargo build --workspace --features greppy/ci-test-assets
 
+      # Reuse the existing build before the bounded transport mutation proof.
+      - name: Unix request absolute-deadline mutation proof
+        if: runner.os == 'Linux'
+        run: python3 tools/check_unix_deadline_mutation.py
+
       - name: Inference watchdog phase and load-budget mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_inference_watchdog_mutation.py
@@ -145,6 +150,10 @@ jobs:
       - name: Anthropic required output-bound mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anthropic_output_limit_mutation.py
+
+      - name: Web argument dispatch mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_argument_mutation.py
 
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         # The unoptimized, generated full CLI parser exceeds the 2 MiB

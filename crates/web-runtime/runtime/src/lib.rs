@@ -17,8 +17,10 @@ pub mod policy_proxy;
 pub mod playwright_trace;
 pub mod protocol;
 pub mod record_usage;
+pub mod retained_records;
 mod rendering_backend;
 pub mod session;
+pub mod object_usage;
 pub mod supervisor;
 #[cfg(feature = "content-runtime")]
 pub mod web_api_shims;

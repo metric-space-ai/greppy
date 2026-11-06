@@ -1689,6 +1689,7 @@ dependencies = [
 name = "greppy-web-client"
 version = "0.3.3"
 dependencies = [
+ "libc",
  "regex",
  "serde",
  "serde_json",

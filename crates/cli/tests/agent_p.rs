@@ -71,6 +71,18 @@ fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHan
 fn spawn_gateway_sequence(
     responses: Vec<&'static str>,
 ) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway_contract(
+        responses,
+        r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#,
+        None,
+    )
+}
+
+fn spawn_gateway_contract(
+    responses: Vec<&'static str>,
+    catalog: &'static str,
+    caller_bound: Option<(&'static str, u64)>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     assert!(!responses.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
@@ -93,7 +105,7 @@ fn spawn_gateway_sequence(
                     let req = String::from_utf8_lossy(&request);
                     let first_line = req.lines().next().unwrap_or("");
                     if first_line.starts_with("GET /v1/models") {
-                        let body = r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#;
+                        let body = catalog;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
@@ -108,10 +120,15 @@ fn spawn_gateway_sequence(
                             + 4;
                         let body: serde_json::Value =
                             serde_json::from_slice(&request[body_start..]).expect("Messages JSON");
-                        assert!(
-                            body["max_tokens"].as_u64().is_some_and(|n| (1..=1024).contains(&n)),
-                            "Messages requires a positive numeric bound within the advertised fixture cap"
-                        );
+                        if let Some((model, limit)) = caller_bound {
+                            assert_eq!(body["model"], model, "wire model must remain unchanged");
+                            assert_eq!(body["max_tokens"].as_u64(), Some(limit));
+                        } else {
+                            assert!(
+                                body["max_tokens"].as_u64().is_some_and(|n| (1..=1024).contains(&n)),
+                                "Messages requires a positive numeric bound within the advertised fixture cap"
+                            );
+                        }
                         let sse = responses[message_index.min(responses.len() - 1)];
                         message_index += 1;
                         let resp = format!(
@@ -472,6 +489,73 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
     let _ = std::fs::remove_dir_all(&store);
     drop(provider);
     let _ = std::fs::remove_dir_all(&provider_root);
+}
+
+#[test]
+fn caller_output_limit_reaches_wire_and_continues() {
+    let repo = unique_temp("caller-limit-repo");
+    init_repo(&repo);
+    let store = unique_temp("caller-limit-store");
+    let provider_root = unique_temp("caller-limit-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let truncated: &'static str = Box::leak(
+        stub_gateway_response()
+            .replace("end_turn", "max_tokens")
+            .replace("hi from stub", "partial from stub")
+            .into_boxed_str(),
+    );
+    // The route exposes no cap. Caller metadata must reach both actual POSTs.
+    let (endpoint, stop, handle) = spawn_gateway_contract(
+        vec![truncated, stub_gateway_response()],
+        r#"{"data":[{"id":"glm-5.3"}]}"#,
+        Some(("glm-5.3", 65536)),
+    );
+    let invoke = |bound: Option<&str>| {
+        let mut command = Command::new(binary_path());
+        command
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_WORKSPACE_DIR", &provider.data)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_MODEL")
+            .env_remove("GREPPY_ENDPOINT")
+            .args([
+                "-p",
+                "say hi",
+                "--model",
+                "glm-5.3",
+                "--endpoint",
+                &endpoint,
+                "--private-store",
+                "--skip-selfcheck",
+            ]);
+        if let Some(bound) = bound {
+            command.args(["--max-output-tokens", bound]);
+        }
+        command.output().expect("spawn caller-bound CLI")
+    };
+    let unknown = invoke(None);
+    assert_eq!(unknown.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&unknown.stderr)
+        .contains("no advertised or registered output limit"));
+    let bounded = invoke(Some("65536"));
+    stop.store(true, Ordering::SeqCst);
+    handle.join().expect("actual request body contract");
+    assert_eq!(
+        bounded.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&bounded.stderr)
+    );
+    let text = String::from_utf8_lossy(&bounded.stdout);
+    assert!(
+        text.contains("partial from stub") && text.contains("hi from stub"),
+        "truncated output must continue: {text}"
+    );
+    drop(provider);
+    for path in [repo, store, provider_root] {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 #[test]
