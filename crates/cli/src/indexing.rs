@@ -32,6 +32,25 @@ fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
     }
 }
 
+/// Liveness and completed work are distinct during candidate validation.
+/// Legacy counting records have no work timestamp: fresh heartbeats cannot
+/// establish whether any candidate has completed.
+fn index_job_progress_ages(job: &serde_json::Value, now: u64) -> (Option<u64>, Option<u64>) {
+    let timestamp = |key| job.get(key).and_then(serde_json::Value::as_u64);
+    let heartbeat = timestamp("updated_at_unix_secs");
+    let work =
+        if job.get("state").and_then(serde_json::Value::as_str) == Some("counting_embeddings") {
+            timestamp("last_work_progress_at_unix_secs")
+                .or_else(|| timestamp("validation_started_at_unix_secs"))
+        } else {
+            heartbeat
+        };
+    (
+        heartbeat.map(|at| now.saturating_sub(at)),
+        work.map(|at| now.saturating_sub(at)),
+    )
+}
+
 pub(crate) fn dispatch_index_status(
     json: bool,
     diagnostics: bool,
@@ -643,10 +662,9 @@ fn background_health_observation(
         "process_alive" => "No writer or startup lease was observed. The recorded PID is alive, but its job identity is unconfirmed; retry the original command rather than waiting for that PID or starting duplicate preparation.",
         _ => "No writer or startup lease and no live recorded process were observed. Inspect the prior job and current store diagnostics before choosing recovery; a stale journal alone does not require rebuilding a healthy graph.",
     };
-    let progress_age_seconds = job
-        .and_then(|job| job.get("updated_at_unix_secs"))
-        .and_then(serde_json::Value::as_u64)
-        .map(|updated| now.saturating_sub(updated));
+    let (heartbeat_age_seconds, progress_age_seconds) = job
+        .map(|job| index_job_progress_ages(job, now))
+        .unwrap_or((None, None));
     let phase = job
         .and_then(|job| job.get("state"))
         .and_then(serde_json::Value::as_str);
@@ -655,6 +673,8 @@ fn background_health_observation(
         "process_identity_confirmed": false,
         "recovery": recovery,
         "progress_age_seconds": progress_age_seconds,
+        "work_progress_age_seconds": progress_age_seconds,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
         "progress_stale": progress_age_seconds.map(|age| age >= progress_stall_threshold_seconds(phase)),
         "note": "PID liveness does not establish admission, writer ownership or current progress; an old progress timestamp alone does not establish process exit",
     }))
@@ -1012,19 +1032,27 @@ fn dispatch_index_health_with_detail(
     // lightweight progress record before touching SQLite or walking Git.
     if writer_active {
         let writer_lock = greppy_freshness::lock_path_for(&store_path);
-        let progress_age_seconds = background_job
+        let (heartbeat_age_seconds, progress_age_seconds) = background_job
             .as_ref()
-            .and_then(|job| job.get("updated_at_unix_secs"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|updated| unix_now_secs_cli().saturating_sub(updated));
+            .map(|job| index_job_progress_ages(job, unix_now_secs_cli()))
+            .unwrap_or((None, None));
         let phase = background_job
             .as_ref()
             .and_then(|job| job.get("state"))
             .and_then(serde_json::Value::as_str);
         let stall_threshold_seconds = progress_stall_threshold_seconds(phase);
-        let progress_stalled =
-            progress_age_seconds.is_some_and(|age| age >= stall_threshold_seconds);
-        let message = if progress_stalled {
+        let progress_stalled = if phase == Some("counting_embeddings") {
+            progress_age_seconds.map(|age| age >= stall_threshold_seconds)
+        } else {
+            Some(progress_age_seconds.is_some_and(|age| age >= stall_threshold_seconds))
+        };
+        let message = if phase == Some("counting_embeddings") && progress_stalled != Some(false) {
+            format!(
+                "candidate validation has no recent completed-work evidence (work_age_seconds={}, heartbeat_age_seconds={}); inspect the owning invocation and its logs; liveness alone does not prove work progress or deadlock; do not signal background_job.pid without separate ownership proof",
+                progress_age_seconds.map(|age| age.to_string()).unwrap_or_else(|| "unknown".into()),
+                heartbeat_age_seconds.map(|age| age.to_string()).unwrap_or_else(|| "unknown".into()),
+            )
+        } else if progress_stalled == Some(true) {
             let phase = phase.unwrap_or("unknown");
             format!(
                 "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the index invocation that owns writer_lock and its logs; background_job.pid is diagnostic only and must not be signaled without separate ownership proof; the OS lock releases when its actual owner exits",
@@ -1053,6 +1081,8 @@ fn dispatch_index_health_with_detail(
             "background_observation": background_observation,
 
             "progress_age_seconds": progress_age_seconds,
+            "work_progress_age_seconds": progress_age_seconds,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
             "progress_stall_threshold_seconds": stall_threshold_seconds,
             "progress_stalled": progress_stalled,
             "fresh": false,
@@ -1074,16 +1104,24 @@ fn dispatch_index_health_with_detail(
             println!("store: {}", store_path.display());
             if let Some(job) = status.get("background_job").filter(|job| !job.is_null()) {
                 println!(
-                    "progress: phase={} completed={}/{} eta_seconds={} workers={}",
+                    "progress: phase={} completed={}/{} unit={} eta_seconds={} workers={}",
                     job.get("state")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("starting"),
-                    job.get("completed_spans")
+                    job.get("validation_completed_candidates")
+                        .filter(|value| !value.is_null())
+                        .or_else(|| job.get("completed_spans"))
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
-                    job.get("total_spans")
+                    job.get("validation_total_candidates")
+                        .filter(|value| !value.is_null())
+                        .or_else(|| job.get("total_spans"))
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    job.get("progress_unit")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("items"),
                     job.get("eta_seconds")
                         .and_then(serde_json::Value::as_u64)
                         .map(|value| value.to_string())
@@ -2773,12 +2811,22 @@ fn index_embeddings_into_temp_store_scoped(
         let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
         let report = if let Some(job) = background_job {
             let heartbeat_path = job.path.clone();
-            job.begin_counting_embeddings(candidate_nodes);
+            // The SQL count covers private project definitions, not a scoped
+            // composed Base/Delta walk. Do not present it as an exact scope total.
+            job.begin_counting_embeddings(if index_prefixes.is_empty() {
+                candidate_nodes
+            } else {
+                None
+            });
             let _heartbeat = heartbeat_path.map(CountingEmbeddingsHeartbeat::start);
             let (backend, device) = provider.backend_plan();
             job.device = device;
+            let job = std::cell::RefCell::new(job);
+            let mut validation_progress =
+                |value| job.borrow_mut().embedding_validation_progress(value);
             let mut started = false;
             let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
+                let mut job = job.borrow_mut();
                 if !started {
                     job.embedding_started(
                         &backend,
@@ -2798,6 +2846,7 @@ fn index_embeddings_into_temp_store_scoped(
                 greppy_indexer::EmbeddingIndexProgressContext {
                     total_documents: 0,
                     callback: &mut progress,
+                    validation_callback: Some(&mut validation_progress),
                 },
                 index_prefixes,
             )?
@@ -2811,6 +2860,7 @@ fn index_embeddings_into_temp_store_scoped(
                 greppy_indexer::EmbeddingIndexProgressContext {
                     total_documents: 0,
                     callback: &mut |_| {},
+                    validation_callback: None,
                 },
                 index_prefixes,
             )?
@@ -2859,6 +2909,36 @@ fn index_embeddings_into_temp_store_scoped(
 #[cfg(test)]
 mod progress_status_tests {
     use super::{index_warm_run_id, progress_stall_threshold_seconds};
+
+    #[test]
+    fn validation_progress_work_age_is_independent_of_liveness() {
+        let mut job = serde_json::json!({
+            "state": "counting_embeddings", "updated_at_unix_secs": 199,
+            "last_work_progress_at_unix_secs": 10, "validation_started_at_unix_secs": 5,
+        });
+        assert_eq!(
+            super::index_job_progress_ages(&job, 200),
+            (Some(1), Some(190)),
+            "fresh heartbeat must not hide old validation work"
+        );
+        let observation =
+            super::background_health_observation(Some(&job), Some("refreshing"), true, 200)
+                .unwrap();
+        assert_eq!(observation["heartbeat_age_seconds"], 1);
+        assert_eq!(observation["work_progress_age_seconds"], 190);
+        assert_eq!(observation["progress_stale"], true);
+        job["last_work_progress_at_unix_secs"] = serde_json::Value::Null;
+        assert_eq!(
+            super::index_job_progress_ages(&job, 200),
+            (Some(1), Some(195))
+        );
+        job["validation_started_at_unix_secs"] = serde_json::Value::Null;
+        assert_eq!(
+            super::index_job_progress_ages(&job, 200),
+            (Some(1), None),
+            "legacy counting heartbeat is not completed-work evidence"
+        );
+    }
 
     #[test]
     fn index_warm_run_ids_are_unique_within_a_process() {
