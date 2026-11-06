@@ -137,6 +137,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_toolchain_cache_roots_mutation.py
 
+      - name: Candidate validation work versus heartbeat mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_validation_progress_mutation.py
+
       - name: Inference watchdog phase and load-budget mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_inference_watchdog_mutation.py
