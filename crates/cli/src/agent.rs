@@ -3055,7 +3055,6 @@ fn writable_roots_for(
     roots
 }
 
-
 /// Ensure the worktree's greppy index is usable before the first agent turn.
 ///
 /// Skips quietly when `doctor --json` already reports `embedding_complete:
