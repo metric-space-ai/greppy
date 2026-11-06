@@ -884,7 +884,7 @@ struct Daemon {
     runtime_image_id: String,
     fixture_url: String,
     search_endpoint: Option<String>,
-    ever_had_session: bool,
+
     store: ArtifactStore,
     controller: WorkerProcess,
     content: WorkerProcess,
@@ -1047,7 +1047,7 @@ impl Daemon {
             fixture_url: config.fixture_url.unwrap_or_default(),
             search_endpoint: config.search_endpoint,
             store: ArtifactStore::new(data_root)?,
-            ever_had_session: false,
+
             controller,
             content,
             sessions: HashMap::new(),
@@ -1539,7 +1539,7 @@ impl Daemon {
         if let Some(lock) = profile_lock {
             self.profile_locks.insert(id.clone(), lock);
         }
-        self.ever_had_session = true;
+
         self.run_control
             .publish_sessions(snapshot_session_rows(&self.sessions, &self.run_control));
         self.journal(
@@ -5225,9 +5225,10 @@ impl Daemon {
     }
 
     fn should_idle_exit(&self) -> bool {
-        self.ever_had_session
-            && self.sessions.is_empty()
-            && self.last_request.elapsed() >= self.idle_ttl
+        // Readiness sets last_request after worker initialization. An unused
+        // warm runtime needs the same finite lease as one whose last session
+        // closed; creating a session must not be a prerequisite for cleanup.
+        self.sessions.is_empty() && self.last_request.elapsed() >= self.idle_ttl
     }
 
     fn idle_exit(&mut self) {

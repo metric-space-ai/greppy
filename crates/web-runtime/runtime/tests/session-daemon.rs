@@ -11631,6 +11631,29 @@ fn idle_sessions_are_reaped() {
 }
 
 #[test]
+fn supervisor_exits_after_idle_ttl_without_creating_a_session() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-unused-idle-exit-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let run = "run_unused_idleex";
+    let mut guard = Supervisor::spawn(&socket, run, |command| {
+        command.arg("--idle-ttl-ms").arg("80");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let status = unix_request(
+        &socket, &Request::new(run, "web.status", json!({})), Duration::from_secs(5),
+    ).expect("unused runtime status");
+    assert_eq!(status.status, "ok", "{status:?}");
+    assert_eq!(status.result.as_ref().unwrap()["sessions"], 0);
+    assert_eq!(status.result.as_ref().unwrap()["process_health"]["healthy"], true);
+    let children = child_pids(guard.child.id());
+    let exited = guard.wait_exited(Duration::from_secs(2));
+    assert!(exited.success(), "unused runtime idle-exit failed: {exited}");
+    wait_pids_gone(&children, Duration::from_secs(2));
+    assert!(!socket.exists(), "idle runtime left its socket behind");
+}
+
+#[test]
 fn supervisor_exits_after_typed_idle_ttl() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-idle-exit-{}.sock", std::process::id()));
