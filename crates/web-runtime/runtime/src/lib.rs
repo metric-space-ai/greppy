@@ -13,6 +13,8 @@ mod observed_refs;
 mod operation_control;
 #[cfg(unix)]
 mod heartbeat_inbox;
+#[cfg(unix)]
+mod fork_exec_window;
 mod locator_diagnostics;
 mod wait_contract;
 pub mod policy;
