@@ -156,28 +156,41 @@ fn absolute_deadline_child() {
             for _ in 0..16 {
                 match connect_timeout(&socket, Duration::from_millis(20)) {
                     Ok(stream) => queued.push(stream),
-                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    Err(error)
+                        if error.kind() == io::ErrorKind::TimedOut
+                            || (cfg!(target_vendor = "apple")
+                                && error.kind() == io::ErrorKind::ConnectionRefused) =>
+                    {
                         full = true;
                         break;
                     }
                     Err(error) => panic!("private queue setup: {error}"),
                 }
             }
-            assert!(full, "private listen queue did not saturate");
+            assert!(
+                full && !queued.is_empty(),
+                "private listen queue did not saturate after a real connection"
+            );
             let started = Instant::now();
             let result = request(
                 &socket,
                 &Request::new("private", "web.status", json!({})),
                 BUDGET,
             );
+            // Darwin refuses a saturated AF_UNIX queue immediately; Linux
+            // leaves the old blocking connect pending. Preserve that OS fact,
+            // without weakening the Linux watchdog-mutation requirement.
+            let bounded = matches!(&result, Err(UnixClientError::Connect(error))
+                if error.kind() == io::ErrorKind::TimedOut
+                    || (cfg!(target_vendor = "apple") && error.kind() == io::ErrorKind::ConnectionRefused));
             assert!(
-                result.as_ref().is_err_and(|error| error.is_timeout()),
-                "saturated connect must exhaust one deadline, got {result:?}"
+                bounded,
+                "saturated connect must return its bounded OS result: {result:?}"
             );
             let elapsed = started.elapsed();
             assert!(elapsed < Duration::from_millis(900));
             println!(
-                "deadline-proof: saturated-listener request elapsed={elapsed:?} budget={BUDGET:?}"
+                "deadline-proof: saturated-listener request elapsed={elapsed:?} budget={BUDGET:?} result={result:?}"
             );
             drop(queued);
         }
