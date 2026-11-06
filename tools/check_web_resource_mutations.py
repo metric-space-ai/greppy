@@ -23,8 +23,16 @@ def prove(path, old, new, command, marker):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", action="store_true")
+    parser.add_argument("--slots", action="store_true")
     args = parser.parse_args()
-    if args.records:
+    if args.slots:
+        prove(ROOT / "crates/web-runtime/runtime/src/object_usage.rs",
+              "session.objects.forget_page(&page);", "// omitted live-page release",
+              ["cargo", "test", "--locked", "--manifest-path", "crates/web-runtime/Cargo.toml",
+               "-p", "web-runtime", "--lib", "--no-default-features",
+               "live_object_slots_follow_acknowledged_identity_not_historical_creations", "--", "--test-threads=1"],
+              "live_object_slots_follow_acknowledged_identity_not_historical_creations")
+    elif args.records:
         prove(ROOT / "crates/web-runtime/runtime/src/retained_records.rs",
               "if self.budget.reserve(size)", "if true",
               ["cargo", "test", "--locked", "--manifest-path", "crates/web-runtime/Cargo.toml",
