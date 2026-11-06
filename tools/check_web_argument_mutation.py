@@ -16,12 +16,12 @@ def run():
     print(result.stdout, flush=True)
     return result
 
-fixed = 'if sub == "web" {'
+fixed = '// dispatch a different operation against the current session.\n            if sub == "web" {'
 original = SOURCE.read_text()
 assert original.count(fixed) == 1, "Web parse guard must be unique"
 assert run().returncode == 0, "fixed command contract must pass first"
 try:
-    SOURCE.write_text(original.replace(fixed, 'if sub == "web" && false {', 1))
+    SOURCE.write_text(original.replace(fixed, fixed.replace('if sub == "web"', 'if sub == "web" && false'), 1))
     red = run()
     assert (red.returncode == 101 and "test result: FAILED" in red.stdout
             and NAME + " ... FAILED" in red.stdout
