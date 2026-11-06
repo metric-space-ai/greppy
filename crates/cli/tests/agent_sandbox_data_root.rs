@@ -102,28 +102,13 @@ fn init_git_fixture(root: &Path) {
 }
 
 /// Narrow root list matching `crates/cli/src/agent.rs::writable_roots_for`
-/// after WP21 (worktree, per-run scratch, isolated agent data, cargo
-/// registry/git). Kept local so the regression stays focused on the Enforce
-/// path rather than exporting the CLI helper.
+/// (worktree, per-run scratch, isolated agent data). Package caches written by
+/// confined tools are under scratch, not the operator's Cargo home.
 fn agent_writable_roots(worktree: &Path, scratch: &Path, agent_data: &Path) -> Vec<PathBuf> {
-    let cargo = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/"));
-            home.join(".cargo")
-        });
-    let registry = cargo.join("registry");
-    let git_cache = cargo.join("git");
-    let _ = std::fs::create_dir_all(&registry);
-    let _ = std::fs::create_dir_all(&git_cache);
     vec![
         worktree.to_path_buf(),
         scratch.to_path_buf(),
         agent_data.to_path_buf(),
-        registry,
-        git_cache,
     ]
 }
 

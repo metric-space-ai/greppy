@@ -3003,7 +3003,7 @@ fn writable_roots_for(
     scratch_dir: &Path,
     agent_data: &Path,
 ) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::with_capacity(7);
+    let mut roots = Vec::with_capacity(5);
 
     // Worktree: agent proposal edits and worktree-local builds land here.
     roots.push(worktree_path.to_path_buf());
@@ -3028,14 +3028,10 @@ fn writable_roots_for(
     // lease file without a file-level grant API.
     roots.push(agent_data.to_path_buf());
 
-    // Cargo download caches only — never ~/.cargo/bin, config.toml, credentials*.
-    let cargo = cargo_home_dir();
-    let cargo_registry = cargo.join("registry");
-    let cargo_git = cargo.join("git");
-    let _ = std::fs::create_dir_all(&cargo_registry);
-    let _ = std::fs::create_dir_all(&cargo_git);
-    roots.push(cargo_registry);
-    roots.push(cargo_git);
+    // Confined tool children use CARGO_HOME=<run scratch>/cargo and
+    // CARGO_TARGET_DIR=<run scratch>/target (prepare_tool_cache_env). Those
+    // paths are already below scratch_dir. Do not create or grant the unused
+    // operator caches: existing storage symlinks are not writable run roots.
 
     // This run's own browser-runtime socket directory. Narrow on purpose: NOT
     // the shared /tmp/greppy-daemon-<uid>, so the agent cannot reach the
@@ -3057,13 +3053,6 @@ fn writable_roots_for(
     // Stable-worktree PARENT and the sibling lock file must stay outside every
     // tool-writable root (worktree path itself is root 1; its parent is not).
     roots
-}
-
-fn cargo_home_dir() -> std::path::PathBuf {
-    if let Some(home) = std::env::var_os("CARGO_HOME") {
-        return std::path::PathBuf::from(home);
-    }
-    home_dir().join(".cargo")
 }
 
 fn home_dir() -> std::path::PathBuf {
@@ -3743,6 +3732,77 @@ mod tests {
         assert!(line.contains("the result may be incomplete"));
     }
 
+    /// The operator cache is a read-only input, not a run-owned writable root.
+    /// Deliberately exercise a valid storage link, a retargeted link and a
+    /// dangling cache link without changing HOME or touching real user caches.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_cache_roots_preserve_operator_links_and_refuse_run_escape() {
+        use std::os::unix::fs::symlink;
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(fixture.path()).unwrap();
+        let cargo = base.join("operator-cargo");
+        let cache = base.join("storage-cache");
+        let outside = base.join("ungranted");
+        for directory in [&cargo, &cache, &outside] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::write(cache.join("retained"), b"original-cache").unwrap();
+        symlink(&cache, cargo.join("registry")).unwrap();
+        let missing = base.join("missing-cache-volume");
+        symlink(&missing, cargo.join("git")).unwrap();
+        struct CargoEnv(Option<OsString>);
+        impl Drop for CargoEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CARGO_HOME", value),
+                    None => std::env::remove_var("CARGO_HOME"),
+                }
+            }
+        }
+        let previous = CargoEnv(std::env::var_os("CARGO_HOME"));
+        std::env::set_var("CARGO_HOME", &cargo);
+        let operator_home = std::env::var_os("HOME");
+        let wt = base.join("worktree");
+        let git = base.join("git-state");
+        let scratch = base.join("scratch");
+        let data = base.join("agent-data");
+        let run = base.file_name().unwrap().to_string_lossy();
+        let _runtime_cleanup = AgentRuntimeDirCleanup::new(&run);
+        let raw = writable_roots_for(&wt, &git, &run, &scratch, &data);
+        let roots = agent_sandbox::prepare_writable_roots(&raw)
+            .expect("operator cache links must not block private scratch setup");
+        assert_eq!(raw.len(), 5, "only run-owned roots may be granted");
+        assert!(!roots
+            .iter()
+            .any(|root| cargo.starts_with(root) || cache.starts_with(root)));
+        assert_eq!(fs::read_link(cargo.join("registry")).unwrap(), cache);
+        assert_eq!(fs::read_link(cargo.join("git")).unwrap(), missing);
+        assert!(
+            !missing.exists(),
+            "must not create through a dangling operator link"
+        );
+        assert_eq!(fs::read(cache.join("retained")).unwrap(), b"original-cache");
+        // Retargeting the ungranted alias cannot authorize its new destination.
+        fs::remove_file(cargo.join("registry")).unwrap();
+        symlink(&outside, cargo.join("registry")).unwrap();
+        let next = writable_roots_for(&wt, &git, &run, &scratch, &data);
+        assert_eq!(agent_sandbox::prepare_writable_roots(&next).unwrap(), roots);
+        assert!(!roots.iter().any(|root| outside.starts_with(root)));
+        // A symlink supplied as an actual run root is still rejected before any
+        // missing child is created outside. No general canonicalize bypass.
+        symlink(&outside, scratch.join("escape")).unwrap();
+        let forbidden = scratch.join("escape/new-child");
+        let error = agent_sandbox::prepare_writable_roots(&[forbidden]).unwrap_err();
+        assert!(error.to_string().contains("symlink component"), "{error}");
+        assert!(!outside.join("new-child").exists());
+        assert_eq!(std::env::var_os("HOME"), operator_home);
+        drop(previous);
+    }
+
     #[test]
     fn writable_roots_are_narrow_no_global_shared_state() {
         let _env_guard = crate::TEST_ENV_LOCK
@@ -3788,19 +3848,9 @@ mod tests {
             !roots.iter().any(|r| r == &global_temp),
             "global temp must not be a root: {roots:?}"
         );
-        let cargo = cargo_home_dir();
-        assert!(
-            !roots.iter().any(|r| r == &cargo),
-            "whole cargo home must not be granted: {roots:?}"
-        );
-        assert!(
-            roots.iter().any(|r| r == &cargo.join("registry")),
-            "cargo registry missing: {roots:?}"
-        );
-        assert!(
-            roots.iter().any(|r| r == &cargo.join("git")),
-            "cargo git missing: {roots:?}"
-        );
+        // Every root has a run-specific owner; operator package caches are
+        // absent because confined child cache writes already live in scratch.
+        assert_eq!(roots.len(), 5, "unexpected writable root: {roots:?}");
         assert!(
             !roots.iter().any(|r| {
                 let s = r.to_string_lossy();
