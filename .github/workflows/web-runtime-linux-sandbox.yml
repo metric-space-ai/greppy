@@ -58,7 +58,7 @@ jobs:
           python3 -B bench/profile_released_web.py
           --release "$GREPPY_PROFILE_RELEASE"
           --cpu-percent "$GREPPY_PROFILE_CPU" --memory-mib "$GREPPY_PROFILE_MEMORY"
-          --output "$RUNNER_TEMP/web-release-profile"
+          --output "$RUNNER_TEMP/web-release-profile" --provision-dependencies
 
       - name: Preserve the released worker measurement including failures
         if: always() && github.event_name == 'workflow_dispatch' && inputs.profile_release != ''

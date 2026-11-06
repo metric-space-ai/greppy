@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Collect one real released Greppy CLI/browser baseline in the existing Linux CI.
 
-No package install, model download or fallback engine. Only the CLI and web SDK
-are extracted from the official checksum-verified release. A failed target stays
+No Greppy package install, model download or fallback engine. Only CLI/WebSDK
+are extracted from the checksum-verified release. Explicit ephemeral CI may
+provision the package's declared system dependencies before measured work. A failed target stays
 a failed measurement; collection success is not a performance/quality verdict.
 """
 import argparse
@@ -91,12 +92,37 @@ def inspect_environment(package, cli):
             'egl_loadable_on_host': any(p['exit_code'] == 0 for p in probes.values())}
 
 
+def provision_dependencies(package, evidence):
+    """Honor the verified package's simple Debian dependency list in opt-in CI."""
+    depends = subprocess.run(['dpkg-deb', '-f', str(package), 'Depends'],
+                             capture_output=True, text=True, timeout=15, check=True)
+    packages = [name.strip() for name in depends.stdout.split(',')]
+    if not packages or any(not re.fullmatch(r'[a-z][a-z0-9+.-]*', name) for name in packages):
+        raise ValueError('dependency provisioning requires plain Debian package names')
+    started = time.monotonic()
+    # Only the explicitly requested hosted-CI preparation installs system packages.
+    # GNU timeout bounds the whole apt process group, outside measured task costs.
+    with (evidence / 'dependency-provisioning.log').open('wb') as log:
+        for limit, arguments in ((90, ['update']),
+                                 (180, ['install', '--no-install-recommends', '-y', '--', *packages])):
+            subprocess.run(['sudo', '-n', 'timeout', '--kill-after=5s', str(limit) + 's',
+                            'env', 'DEBIAN_FRONTEND=noninteractive', 'apt-get', *arguments],
+                           stdout=log, stderr=subprocess.STDOUT, timeout=limit + 15, check=True)
+    installed = subprocess.run(['dpkg-query', '-W', '-f=${Package}=${Version}\\n', *packages],
+                               capture_output=True, text=True, timeout=15, check=True)
+    return {'declared_packages': packages, 'installed_versions': installed.stdout.splitlines(),
+            'wall_seconds': time.monotonic() - started,
+            'scope': 'ephemeral CI preparation outside measured worker; no Greppy package/model installation'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--release', required=True)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--cpu-percent', type=int, default=200)
     parser.add_argument('--memory-mib', type=int, default=2048)
+    parser.add_argument('--provision-dependencies', action='store_true',
+                        help='Install declared system dependencies in explicit ephemeral CI preparation')
     args = parser.parse_args()
     if (not sys.platform.startswith('linux') or not args.output.is_absolute()
             or args.output.exists() or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', args.release)
@@ -143,6 +169,9 @@ def main():
             path = runtime_root / name
             if path.is_file() and path.stat().st_size <= 128 * 1024:
                 report['sdk_metadata'][name] = json.loads(path.read_text())
+        report['environment_before_provisioning'] = inspect_environment(package, cli)
+        if args.provision_dependencies:
+            report['dependency_provisioning'] = provision_dependencies(package, evidence)
         report['environment'] = inspect_environment(package, cli)
         if not report['environment']['egl_loadable_on_host']:
             report['status'] = 'environment_preflight_failed'
@@ -155,6 +184,9 @@ def main():
         # Keep state separate from public evidence; never archive owner tokens.
         state_parent = Path(tempfile.mkdtemp(prefix='gwp-', dir='/tmp'))
         report['private_state_parent'] = str(state_parent)
+        xdg = state_parent / 'xdg'
+        xdg.mkdir(mode=0o700)
+        report['private_xdg_runtime_dir'] = str(xdg)
         unit = 'greppy-release-profile-' + str(os.getpid()) + '-' + str(time.time_ns())
         parent = '/sys/fs/cgroup/system.slice/' + unit + '.service'
         report['unit'] = {'name': unit + '.service', 'runtime_max_seconds': 150,
@@ -167,6 +199,7 @@ def main():
                    '--property=MemoryMax=' + str(args.memory_mib) + 'M',
                    '--property=CPUQuota=' + str(args.cpu_percent) + '%',
                    '--property=TasksMax=64', '--property=RuntimeMaxSec=150', '--expand-environment=no',
+                   '--setenv=XDG_RUNTIME_DIR=' + str(xdg),
                    '--working-directory=' + str(ROOT), sys.executable, '-B',
                    str(ROOT / 'crates/web-runtime/scripts/measure-web-efficiency.py'),
                    '--engine', 'cli', '--cli', str(cli), '--runtime', str(runtime),
