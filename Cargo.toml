@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["third_party/tree-sitter-bash"]
 members = [
     "crates/core",
     "crates/store",
@@ -65,7 +66,7 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-php = "0.24"
-tree-sitter-bash = "0.25"
+tree-sitter-bash = { path = "third_party/tree-sitter-bash", version = "=0.25.1" }
 tree-sitter-lua = "0.5"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-scala = "0.26"

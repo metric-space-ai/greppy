@@ -14,6 +14,116 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(unix)]
+#[test]
+fn bash_single_equals_logical_write_is_exact_and_refusal_is_atomic() {
+    let (repo, store, _scratch) = make_repo("bash-equality", "marker");
+    let source = r#"#!/usr/bin/env bash
+choose_candidate() {
+  for candidate in /synthetic-node; do
+    [[ "$candidate" = /* && -x "$candidate" ]] || continue
+  done
+}
+"#;
+    // The real shell is an independent syntax oracle; -n never runs this script.
+    let oracle = repo.join("oracle.bash");
+    std::fs::write(&oracle, source).unwrap();
+    assert!(Command::new("/bin/bash")
+        .arg("-n")
+        .arg(&oracle)
+        .status()
+        .unwrap()
+        .success());
+    let target = repo.join("candidate.sh");
+    let (exit, stdout, stderr) = run(
+        &["write", "candidate.sh", source, "--dry-run"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        exit, 0,
+        "valid complete Bash dry-run must pass: {stdout}\n{stderr}"
+    );
+    assert!(!target.exists(), "dry-run must not publish the file");
+    let (exit, stdout, stderr) = run(&["write", "candidate.sh", source], &repo, &store);
+    assert_eq!(
+        exit, 0,
+        "valid complete Bash write must pass: {stdout}\n{stderr}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), source.as_bytes());
+    // Extraction uses the same grammar, not a validation-only source rewrite.
+    let tree = greppy_parser::parse(greppy_parser::Language::Bash, source.as_bytes()).unwrap();
+    assert!(
+        !tree.root_node().has_error(),
+        "raw Bash grammar must agree with the CLI"
+    );
+    assert!(tree.root_node().to_sexp().contains("function_definition"));
+    let extracted = greppy_parser::extract(
+        greppy_parser::Language::Bash,
+        source.as_bytes(),
+        "candidate.sh",
+    )
+    .unwrap();
+    assert!(
+        extracted
+            .nodes
+            .iter()
+            .any(|node| node.name == "choose_candidate"),
+        "Bash function extraction must survive the equality grammar fix"
+    );
+    for valid in [
+        r#"[[ "$candidate" = /tmp && -x "$candidate" ]]"#,
+        r#"[[ "$candidate" = /* || -x "$candidate" ]]"#,
+        r#"[[ "$candidate" == /* && -x "$candidate" ]]"#,
+        r#"[[ "$candidate" != /* && -x "$candidate" ]]"#,
+        r#"[[ "$candidate" = /* ]]"#,
+        r#"candidate=/tmp
+(( counter = 1 ))
+printf '%s' '[[ x = /* && -x x ]]'
+cat <<'EOF'
+[[ x = /* && -x x ]]
+EOF
+"#,
+    ] {
+        let (exit, stdout, stderr) = run(&["write", "control.bash", valid], &repo, &store);
+        assert_eq!(exit, 0, "{valid}\n{stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read(repo.join("control.bash")).unwrap(),
+            valid.as_bytes()
+        );
+    }
+    for invalid in [
+        r#"[[ "$candidate" = /* && -x "$candidate""#,
+        r#"[[ "$candidate" == /* && -x "$candidate""#,
+        r#"[[ "$candidate" = /* && ]]"#,
+    ] {
+        std::fs::write(&oracle, invalid).unwrap();
+        assert!(!Command::new("/bin/bash")
+            .arg("-n")
+            .arg(&oracle)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let (exit, stdout, stderr) = run(&["write", "candidate.sh", invalid], &repo, &store);
+        assert_eq!(exit, 13, "invalid Bash must fail: {stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            source.as_bytes(),
+            "refusal must retain exact original bytes"
+        );
+        let (exit, stdout, stderr) = run(
+            &["write", "invalid-new.sh", invalid, "--dry-run"],
+            &repo,
+            &store,
+        );
+        assert_eq!(exit, 13, "invalid dry-run must fail: {stdout}\n{stderr}");
+        assert!(!repo.join("invalid-new.sh").exists());
+    }
+    let (exit, _, _) = run(&["write", "other.json", r#"{"x":2e+}"#], &repo, &store);
+    assert_eq!(exit, 13, "unrelated JSON validation must remain enabled");
+    assert!(!repo.join("other.json").exists());
+}
 #[test]
 fn json_write_accepts_positive_exponent_and_refuses_invalid_replacement_atomically() {
     let (repo, store, _scratch) = make_repo("json-exponent", "marker");

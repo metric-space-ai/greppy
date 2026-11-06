@@ -6786,6 +6786,7 @@ pub fn run() -> io::Result<()> {
             ));
         }
     }
+    trace_startup("hello-received");
     write_message(&mut protocol_out, &Message::ready(WorkerKind::Content))?;
     trace_startup("ready-sent");
 

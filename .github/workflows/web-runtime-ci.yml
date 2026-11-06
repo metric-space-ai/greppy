@@ -84,6 +84,37 @@ jobs:
           --test session-daemon
           --no-run
 
+
+      - name: Check an unused runtime releases its workers after the configured idle lease
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          supervisor_exits_after_idle_ttl_without_creating_a_session -- --test-threads=1 --nocapture
+
+      - name: Prove unused-runtime cleanup detects an immortal warm runtime
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          old = 'self.sessions.is_empty() && self.last_request.elapsed() >= self.idle_ttl'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '--package', 'web-runtime', '--test', 'session-daemon',
+                     'supervisor_exits_after_idle_ttl_without_creating_a_session',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, 'false && (' + old + ')'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'supervisor did not idle-exit within' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=300)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+
       - name: Check closing one session preserves its live neighbor and recovery worker
         shell: bash
         run: |

@@ -60,6 +60,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
+      - name: Reproduce pinned Bash grammar source
+        if: runner.os == 'Linux'
+        run: python3 tools/regenerate_bash_grammar.py --output-dir "$RUNNER_TEMP/bash-grammar-generated"
+
+      - name: Retain pinned Bash grammar generation
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bash-grammar-generated
+          path: ${{ runner.temp }}/bash-grammar-generated
+          retention-days: 2
+          if-no-files-found: error
+
       - name: Verify Apple Silicon runner
         if: runner.os == 'macOS'
         run: test "$(uname -m)" = arm64
@@ -133,6 +146,10 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 tools/check_unix_deadline_mutation.py
 
+      - name: Bash equality CLI mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_bash_equality_mutation.py
+
       - name: Toolchain scratch-cache roots mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_toolchain_cache_roots_mutation.py
@@ -162,6 +179,10 @@ jobs:
       - name: Web argument dispatch mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_argument_mutation.py
+
+      - name: EOF-only patch byte and refusal mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_patch_eof_mutation.py
 
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         # The unoptimized, generated full CLI parser exceeds the 2 MiB

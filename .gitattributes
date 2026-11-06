@@ -31,3 +31,4 @@ AGENTS.md text eol=lf
 assets/prompts/agent-adapter.md text eol=lf
 assets/prompts/capabilities/*.md text eol=lf
 assets/prompts/contract.rs text eol=lf
+third_party/tree-sitter-bash/** text eol=lf linguist-vendored
