@@ -909,6 +909,14 @@ pub async fn main_fetch(
                 None,
             )
         };
+    let download = if failure.is_none() {
+        let actual = response.actual_response();
+        let body = actual.body.lock();
+        match &*body {
+            ResponseBody::Done(bytes) => embedder_traits::CapturedWebResourceDownload::capture(&headers, bytes),
+            _ => None,
+        }
+    } else { None };
     context
         .request_interceptor
         .lock()
@@ -926,6 +934,7 @@ pub async fn main_fetch(
                 status_code,
                 status_message,
                 body_bytes,
+                download,
                 from_cache,
                 failure,
             },

@@ -2391,6 +2391,9 @@ async fn http_network_fetch(
                 };
                 let devtools_response_body = completed_body.clone();
                 let body_bytes = completed_body.len() as u64;
+                let download = embedder_traits::CapturedWebResourceDownload::capture(
+                    &completed_headers, &completed_body,
+                );
                 *body = ResponseBody::Done(completed_body);
                 send_response_values_to_devtools(
                     Some(headers),
@@ -2412,6 +2415,7 @@ async fn http_network_fetch(
                         status_code: Some(completed_status.as_u16()),
                         status_message: completed_status_message,
                         body_bytes,
+                        download,
                         from_cache: false,
                         failure: None,
                     },
@@ -2449,6 +2453,7 @@ async fn http_network_fetch(
                         status_code: Some(failed_status.as_u16()),
                         status_message: failed_status_message,
                         body_bytes,
+                        download: None,
                         from_cache: false,
                         failure: Some(failure),
                     },

@@ -2102,13 +2102,17 @@ class Page {
       url: () => rec.url,
       suggestedFilename: () => rec.suggestedFilename || "download",
       page: () => page,
-      failure: async () => null,
-      path: async () => rec.path || null,
+      failure: async () => rec.failure || null,
+      path: async () => {
+        if (rec.failure) throw new Error(rec.failure);
+        return rec.path || null;
+      },
       cancel: async () => unsupported("Download.cancel")(),
       saveAs: async (path) => {
         const result = await engineCall("page.saveDownload", {
           page: page,
           url: rec.url,
+          downloadId: rec.requestId,
           path: String(path),
         });
         if (Number(result.bytes) !== Number(rec.byteLength || 0)) {
@@ -2116,9 +2120,11 @@ class Page {
             "saveAs wrote " + result.bytes + " bytes, expected " + rec.byteLength,
           );
         }
-        const expectedHex = hexEncode(decodeBase64(rec.bodyBase64 || ""));
-        if (String(result.hex) !== expectedHex) {
-          throw new Error("saveAs hex " + result.hex + " expected " + expectedHex);
+        if (rec.bodyBase64 != null) {
+          const expectedHex = hexEncode(decodeBase64(rec.bodyBase64));
+          if (String(result.hex) !== expectedHex) {
+            throw new Error("saveAs hex " + result.hex + " expected " + expectedHex);
+          }
         }
         rec.path = String(path);
       },

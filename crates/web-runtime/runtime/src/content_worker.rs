@@ -362,6 +362,7 @@ struct Delegate {
     requests: RefCell<RetainedRecords>,
     dropped_requests: Cell<u64>,
     downloads: RefCell<RetainedRecords>,
+    download_files: RefCell<HashMap<String, Arc<servo::CapturedWebResourceDownload>>>,
     // The opener's ID cannot retain its WebView -> Delegate -> popup cycle.
     // Retain the child's actual delegate so adoption preserves event state.
     popups: RefCell<Vec<(WebView, WebViewId, Rc<Delegate>)>>,
@@ -432,6 +433,7 @@ impl Delegate {
                 usize::MAX,
                 Rc::clone(&record_budget),
             )),
+            download_files: RefCell::new(HashMap::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
             dialog_action: RefCell::new(DialogAction::Accept),
@@ -920,6 +922,30 @@ impl WebViewDelegate for Delegate {
             "fromCache": response.from_cache,
             "headers": headers,
         });
+        if let Some(download) = response.download.as_ref() {
+            if !self.download_files.borrow().contains_key(&request_id) {
+                let disposition = response.headers.get(http::header::CONTENT_DISPOSITION)
+                    .and_then(|value| value.to_str().ok()).unwrap_or("");
+                let filename = disposition.split(';').skip(1).find_map(|part| {
+                    let (key, value) = part.trim().split_once('=')?;
+                    key.trim().eq_ignore_ascii_case("filename").then(|| value.trim().trim_matches('"'))
+                }).filter(|name| !name.is_empty()).or_else(|| response.url.path_segments()
+                    .and_then(|mut parts| parts.next_back()).filter(|name| !name.is_empty()))
+                    .unwrap_or("download");
+                let before = self.downloads.borrow().len();
+                self.downloads.borrow_mut().push(json!({
+                    "requestId": request_id,
+                    "url": response.url.to_string(),
+                    "byteLength": response.body_bytes,
+                    "suggestedFilename": filename,
+                    "path": download.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+                    "failure": download.failure,
+                }));
+                if self.downloads.borrow().len() > before {
+                    self.download_files.borrow_mut().insert(request_id.clone(), Arc::clone(download));
+                }
+            }
+        }
         if let Some(status) = response.status_code {
             row["status"] = json!(status);
             row["ok"] = json!((200..400).contains(&status));
@@ -4316,6 +4342,20 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
                 let path = required_str(&params, "path")?;
+                if let Some(id) = params.get("downloadId").and_then(|value| value.as_str()) {
+                    let delegate = &self.page(&page_id)?.1;
+                    let files = delegate.download_files.borrow();
+                    let download = files.get(id).ok_or_else(|| io::Error::other("no matching download"))?;
+                    if let Some(failure) = &download.failure { return Err(io::Error::other(failure.clone())); }
+                    let source = download.path.as_ref().ok_or_else(|| io::Error::other("download has no file"))?;
+                    let dest = confine_worker_path(Path::new(&path))?;
+                    if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let bytes = if source == &dest { std::fs::metadata(source)?.len() }
+                        else { std::fs::copy(source, &dest)? };
+                    return Ok(json!({ "ok": true, "bytes": bytes }));
+                }
                 let body_b64 = {
                     let downloads = self.page(&page_id)?.1.downloads.borrow();
                     downloads
@@ -6817,10 +6857,36 @@ pub fn run() -> io::Result<()> {
             )
         })?;
 
+    let mut download_waiters: Vec<(u64, serde_json::Value, Instant)> = Vec::new();
     loop {
         if engine.parent_dead() {
             return Ok(());
         }
+        // A wait must not occupy the same protocol loop as the click that
+        // produces its event. Keep only request metadata, not a WebView/Rc.
+        let mut write_error = None;
+        download_waiters.retain(|(request_id, params, deadline)| {
+            let result = (|| -> io::Result<Option<serde_json::Value>> {
+                engine.reject_stale_objects("page.waitForDownload", params)?;
+                let page = required_str(params, "page")?;
+                let delegate = &engine.page(&page)?.1;
+                if let Some(row) = delegate.downloads.borrow().first().cloned() {
+                    return Ok(Some(json!({ "download": row })));
+                }
+                if Instant::now() >= *deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForEvent download"));
+                }
+                Ok(None)
+            })();
+            let reply = match result {
+                Ok(None) => return true,
+                Ok(Some(value)) => Message::engine_result(*request_id, true, value, None),
+                Err(error) => Message::engine_result(*request_id, false, serde_json::Value::Null, Some(error.to_string())),
+            };
+            if let Err(error) = write_message(&mut protocol_out, &reply) { write_error = Some(error); }
+            false
+        });
+        if let Some(error) = write_error { return Err(error); }
         // Protocol first. Spinning Servo before recv starved engine calls when
         // browser.close left a wake bit with no pages and spin_event_loop
         // blocked; the supervisor then sat in session.setProfile until the
@@ -6839,6 +6905,11 @@ pub fn run() -> io::Result<()> {
                 params,
                 ..
             })) => {
+                if method == "page.waitForDownload" {
+                    let deadline = Instant::now() + call_timeout(&params);
+                    download_waiters.push((request_id, params, deadline));
+                    continue;
+                }
                 let call_started = NavTrace::enabled().then(|| {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

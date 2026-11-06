@@ -4684,6 +4684,115 @@ fn download_is_recorded_from_fulfilled_binary() {
 }
 
 #[test]
+fn real_http_download_wait_allows_click_and_owns_complete_file() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&requests);
+    let payload: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
+    let served_payload = payload.clone();
+    let server = thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("download fixture accept: {error}"),
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut header = Vec::new();
+            let mut chunk = [0; 1024];
+            while header.len() < 8192 && !header.windows(4).any(|part| part == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => header.extend_from_slice(&chunk[..n]),
+                }
+            }
+            if !header.windows(4).any(|part| part == b"\r\n\r\n") { continue; }
+            let header = String::from_utf8_lossy(&header);
+            let path = header.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("");
+            observed.lock().unwrap().push(path.to_owned());
+            let (body, content_type, disposition) = if path == "/file" {
+                (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
+            } else {
+                (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(), "text/html", "")
+            };
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = stream.write_all(response.as_bytes()).and_then(|_| stream.write_all(body));
+        }
+    });
+    struct ServerGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let _server = ServerGuard(stop, Some(server));
+    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-http-download-{}", std::process::id())));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("runtime.sock");
+    let _guard = Supervisor::spawn(&socket, "real_http_download", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(&socket, &Request::new("real_http_download", "web.session.create",
+        json!({"profile": "project"})), Duration::from_secs(10)).unwrap();
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let script = dir.join("download.mjs");
+    let source = r##"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+page.setDefaultTimeout(2000);
+const events = [];
+context.on("download", d => events.push(d.suggestedFilename()));
+const [download] = await Promise.all([
+  page.waitForEvent("download"), page.locator("#download").click()
+]);
+if (download.suggestedFilename() !== "fixture.bin") throw new Error("wrong HTTP download filename");
+if (await download.failure()) throw new Error("HTTP download failed");
+if (events.join() !== "fixture.bin") throw new Error("download event missing or duplicated");
+const original = await download.path();
+if (!original) throw new Error("native download has no path");
+await download.saveAs(original + ".copy");
+console.log(JSON.stringify({ original, saved: await download.path() }));
+"##;
+    std::fs::write(&script, source).unwrap();
+    let mut request = Request::new("real_http_download", "web.run", json!({
+        "session_id": session, "script_source": "file",
+        "script_file": script, "script_text": source,
+    }));
+    request.deadline_ms = 30_000;
+    let result = unix_request(&socket, &request, Duration::from_secs(35)).unwrap();
+    assert_eq!(result.status, "ok", "download Promise.all failed: {result:?}; HTTP paths={:?}", requests.lock().unwrap());
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/file").count(), 1,
+        "download must use exactly one real HTTP request");
+    let stdout = result.result.as_ref().unwrap()["stdout"].as_str().unwrap().trim();
+    let files: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let original = PathBuf::from(files["original"].as_str().unwrap());
+    let saved = PathBuf::from(files["saved"].as_str().unwrap());
+    assert_eq!(std::fs::read(&original).unwrap(), payload, "original HTTP download bytes");
+    assert_eq!(std::fs::read(&saved).unwrap(), payload, "saved HTTP download bytes");
+    let closed = unix_request(&socket, &Request::new("real_http_download", "web.session.close",
+        json!({"session_id":session})), Duration::from_secs(10)).unwrap();
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    assert!(!original.exists(), "session close leaked its captured download file");
+    let _ = std::fs::remove_file(saved);
+}
+
+#[test]
 fn file_chooser_accepts_set_input_files() {
     // Component evidence only: worker-visible path storage. Compatibility
     // requires file_chooser_populates_dom_filelist_and_change_events.

@@ -698,6 +698,63 @@ pub struct WebResourceRequest {
     pub is_redirect: bool,
 }
 
+/// The in-process completion channel shares custody of a private download
+/// file. The last owner removes it, even if the WebView died before delivery.
+/// No body enters controller RPCs.
+#[derive(Debug)]
+pub struct CapturedWebResourceDownload {
+    pub path: Option<std::path::PathBuf>,
+    pub failure: Option<String>,
+}
+
+impl CapturedWebResourceDownload {
+    pub fn capture(headers: &HeaderMap, body: &[u8]) -> Option<std::sync::Arc<Self>> {
+        let attachment = headers.get(http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("attachment"));
+        let binary = headers.get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/octet-stream"));
+        if !attachment && !binary { return None; }
+        let result = (|| -> std::io::Result<std::path::PathBuf> {
+            use std::io::Write;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            for _ in 0..16 {
+                let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!("greppy-download-{}-{id}.bin", std::process::id()));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)] {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = match options.open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                };
+                if let Err(error) = file.write_all(body) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                return Ok(path);
+            }
+            Err(std::io::Error::other("download temporary-file collision limit"))
+        })();
+        Some(std::sync::Arc::new(match result {
+            Ok(path) => Self { path: Some(path), failure: None },
+            Err(error) => Self { path: None, failure: Some(error.to_string()) },
+        }))
+    }
+}
+
+impl Drop for CapturedWebResourceDownload {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path { let _ = std::fs::remove_file(path); }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct WebResourceResponseCompleted {
     pub id: WebResourceLoadId,
@@ -711,6 +768,10 @@ pub struct WebResourceResponseCompleted {
     pub status_code: Option<u16>,
     pub status_message: Vec<u8>,
     pub body_bytes: u64,
+    /// Native shared custody only; never serialized into a page or protocol.
+    #[serde(skip)]
+    #[ignore_malloc_size_of = "Shared private download file, no retained body"]
+    pub download: Option<std::sync::Arc<CapturedWebResourceDownload>>,
     pub from_cache: bool,
     pub failure: Option<String>,
 }
