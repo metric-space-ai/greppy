@@ -611,13 +611,13 @@ module.exports = grammar({
     binary_expression: $ => {
       const table = [
         [choice('+=', '-=', '*=', '/=', '%=', '**=', '<<=', '>>=', '&=', '^=', '|='), PREC.UPDATE],
-        [choice('=', '=~'), PREC.ASSIGN],
+        ['=~', PREC.ASSIGN],
         ['||', PREC.LOGICAL_OR],
         ['&&', PREC.LOGICAL_AND],
         ['|', PREC.BITWISE_OR],
         ['^', PREC.BITWISE_XOR],
         ['&', PREC.BITWISE_AND],
-        [choice('==', '!='), PREC.EQUALITY],
+        [choice('=', '==', '!='), PREC.EQUALITY],
         [choice('<', '>', '<=', '>='), PREC.COMPARE],
         [$.test_operator, PREC.TEST],
         [choice('<<', '>>'), PREC.SHIFT],

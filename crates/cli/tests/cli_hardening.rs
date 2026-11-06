@@ -58,6 +58,19 @@ choose_candidate() {
         "raw Bash grammar must agree with the CLI"
     );
     assert!(tree.root_node().to_sexp().contains("function_definition"));
+    let extracted = greppy_parser::extract(
+        greppy_parser::Language::Bash,
+        source.as_bytes(),
+        "candidate.sh",
+    )
+    .unwrap();
+    assert!(
+        extracted
+            .nodes
+            .iter()
+            .any(|node| node.name == "choose_candidate"),
+        "Bash function extraction must survive the equality grammar fix"
+    );
     for valid in [
         r#"[[ "$candidate" = /tmp && -x "$candidate" ]]"#,
         r#"[[ "$candidate" = /* || -x "$candidate" ]]"#,

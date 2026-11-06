@@ -12,8 +12,10 @@ The original license is retained in LICENSE.
   normal Greppy builds compile the checked-in C source and require no Node or
   Tree-sitter executable at build time or runtime.
 
-The grammar change adds `=` to the recursive equality/pattern branch alongside
-`==` and `!=`. Bash accepts all three in conditional expressions. The upstream
+The grammar change gives `=` the same comparison precedence as `==`/`!=` in
+ordinary conditional expressions and includes it in their recursive pattern
+branch. The separate arithmetic assignment tables are unchanged. Bash accepts
+all three comparison operators in conditional expressions. The upstream
 special-case `=` rule appears only directly under test_command, so it cannot
 serve as the left side of a logical conjunction/disjunction. Greppy's CLI edit
 validation and extraction both load this same generated language; neither
