@@ -439,22 +439,7 @@ module.exports = grammar({
     test_command: $ => seq(
       choice(
         seq('[', optional(choice($._expression, $.redirected_statement)), ']'),
-        seq(
-          '[[',
-          choice(
-            $._expression,
-            alias($._test_command_binary_expression, $.binary_expression),
-          ),
-          ']]',
-        ),
-      ),
-    ),
-
-    _test_command_binary_expression: $ => prec(PREC.ASSIGN,
-      seq(
-        field('left', $._expression),
-        field('operator', '='),
-        field('right', alias($._regex_no_space, $.regex)),
+        seq('[[', $._expression, ']]'),
       ),
     ),
 
