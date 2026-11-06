@@ -4774,6 +4774,28 @@ const [request, response] = await Promise.all([
 ]);
 if (request.url() !== fixtureUrl + "signal" || response.url() !== request.url() || !response.ok())
   throw new Error("recorded request/response wait blocked its triggering click");
+page.setDefaultTimeout(50);
+for (const method of ["waitForRequest", "waitForResponse"]) {
+  let expired = false;
+  try { await page[method]("/signal"); }
+  catch (error) {
+    if (error.name !== "TimeoutError") throw error;
+    expired = true;
+  }
+  if (!expired) throw new Error(method + " replayed retained history");
+}
+page.setDefaultTimeout(2000);
+await page.evaluate(() => {
+  document.querySelector("#trigger").onclick = () => fetch("/signal?next=1");
+});
+const [nextRequest, sameRequest, nextResponse] = await Promise.all([
+  page.waitForRequest("/signal"), page.waitForRequest("/signal"),
+  page.waitForResponse("/signal"), page.locator("#trigger").click()
+]);
+if (nextRequest.url() !== fixtureUrl + "signal?next=1" || sameRequest.url() !== nextRequest.url())
+  throw new Error("second request wait reused retained history");
+if (nextResponse.url() !== nextRequest.url() || !nextResponse.ok())
+  throw new Error("second response wait reused retained history");
 // An ordinary fetch of the same MIME/attachment headers is not a download.
 await page.evaluate(async url => { await (await fetch(url)).arrayBuffer(); }, fixtureUrl + "background.bin");
 const events = [];
@@ -4816,6 +4838,8 @@ console.log(JSON.stringify({ original, saved: await download.path(), second: sec
         "second download must use exactly one new HTTP request");
     assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal").count(), 1,
         "recorded request and response waits must allow exactly one triggering fetch");
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal?next=1").count(), 1,
+        "second request/response waits must allow exactly one new triggering fetch");
     assert!(!requests.lock().unwrap().iter().any(|path| path == "/never-requested"),
         "a response wait must never issue its own request");
     let stdout = result.result.as_ref().unwrap()["stdout"].as_str().unwrap().trim();

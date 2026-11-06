@@ -46,6 +46,7 @@ page.on("domcontentloaded", () => {
 });
 const loadWait = page.waitForEvent("load");
 const nav = page.waitForNavigation();
+const pendingRequest = page.waitForRequest("http");
 await page.goto(fixtureUrl);
 await nav;
 await loadWait;
@@ -83,7 +84,7 @@ const url = await page.waitForURL("http");
 if (!String(url).includes("http")) throw new Error("waitForURL " + url);
 const frameUrl = await page.mainFrame().waitForURL("http");
 if (!String(frameUrl).includes("http")) throw new Error("frame waitForURL " + frameUrl);
-const request = await page.waitForRequest("http");
+const request = await pendingRequest;
 if (!String(request.url()).includes("http")) throw new Error("waitForRequest");
 const dumped = await page.requests();
 if (!dumped.some((item) => String(item.url()).includes("http"))) {

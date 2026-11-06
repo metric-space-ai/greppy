@@ -1,5 +1,6 @@
 //! Retained records share the existing context memory ceiling, never a second
-//! per-buffer allowance. This accounts encoded records, not total process RSS.
+//! per-buffer allowance. This accounts encoded records and cursor bookkeeping,
+//! not total process RSS.
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::{cell::Cell, io, ops::Deref, rc::Rc};
@@ -58,6 +59,8 @@ impl Drop for RecordReservation {
 pub struct RetainedRecords {
     rows: Vec<Value>,
     sizes: Vec<usize>,
+    sequences: Vec<u64>,
+    sequence: u64,
     bytes: usize,
     budget: Rc<RecordBudget>,
     max_rows: usize,
@@ -87,6 +90,8 @@ impl RetainedRecords {
         Self {
             rows: Vec::new(),
             sizes: Vec::new(),
+            sequences: Vec::new(),
+            sequence: 0,
             bytes: 0,
             budget,
             max_rows,
@@ -104,6 +109,11 @@ impl RetainedRecords {
         }
     }
     pub fn push(&mut self, row: Value) {
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.overflowed = true;
+            return;
+        };
+        self.sequence = sequence;
         if self.max_rows == 0 {
             self.overflowed = true;
             self.dropped = self.dropped.saturating_add(1);
@@ -114,14 +124,16 @@ impl RetainedRecords {
         if self.rows.len() == self.max_rows {
             let old_size = self.sizes.remove(0);
             self.rows.remove(0);
+            self.sequences.remove(0);
             self.bytes = self.bytes.saturating_sub(old_size);
             self.budget.release(old_size);
             self.dropped = self.dropped.saturating_add(1);
         }
-        let size = row_bytes(&row);
+        let size = row_bytes(&row).saturating_add(std::mem::size_of::<u64>());
         if self.admit(size) {
             self.bytes += size;
             self.sizes.push(size);
+            self.sequences.push(sequence);
             self.rows.push(row);
         }
     }
@@ -135,13 +147,15 @@ impl RetainedRecords {
         };
         let mut row = self.rows.remove(index);
         let previous = self.sizes.remove(index);
+        let sequence = self.sequences.remove(index);
         self.bytes = self.bytes.saturating_sub(previous);
         self.budget.release(previous);
         update(&mut row);
-        let size = row_bytes(&row);
+        let size = row_bytes(&row).saturating_add(std::mem::size_of::<u64>());
         if self.admit(size) {
             self.bytes += size;
             self.sizes.insert(index, size);
+            self.sequences.insert(index, sequence);
             self.rows.insert(index, row);
         }
         true
@@ -150,18 +164,21 @@ impl RetainedRecords {
         self.budget.release(self.bytes);
         self.rows.clear();
         self.sizes.clear();
+        self.sequences.clear();
         self.bytes = 0;
         self.dropped = 0;
         self.overflowed = false;
     }
     pub fn retain(&mut self, mut predicate: impl FnMut(&Value) -> bool) {
-        let mut sizes = self.sizes.iter().copied();
+        let mut bookkeeping = self.sizes.iter().copied().zip(self.sequences.iter().copied());
         let mut kept_sizes = Vec::new();
+        let mut kept_sequences = Vec::new();
         let mut released = 0;
         self.rows.retain(|row| {
-            let size = sizes.next().expect("one size per retained row");
+            let (size, sequence) = bookkeeping.next().expect("one cursor and size per retained row");
             if predicate(row) {
                 kept_sizes.push(size);
+                kept_sequences.push(sequence);
                 true
             } else {
                 released += size;
@@ -169,11 +186,24 @@ impl RetainedRecords {
             }
         });
         self.sizes = kept_sizes;
+        self.sequences = kept_sequences;
         self.bytes = self.bytes.saturating_sub(released);
         self.budget.release(released);
     }
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+    /// A registration boundary survives rotation, pruning and clear().
+    pub fn event_cursor(&self) -> u64 {
+        self.sequence
+    }
+    pub fn first_after(&self, cursor: u64, mut predicate: impl FnMut(&Value) -> bool) -> io::Result<Option<&Value>> {
+        self.snapshot()?;
+        if self.sequences.first().is_some_and(|first| *first > cursor.saturating_add(1)) {
+            return Err(io::Error::other("resource_limit: event history no longer retains the wait registration boundary"));
+        }
+        let start = self.sequences.partition_point(|sequence| *sequence <= cursor);
+        Ok(self.rows[start..].iter().find(|row| predicate(row)))
     }
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -209,6 +239,35 @@ impl Serialize for RetainedRecords {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn event_cursor_survives_rotation_updates_pruning_and_clear() {
+        let mut rows = RetainedRecords::new(2, 1024);
+        rows.push(json!({"requestId": "first", "url": "/signal"}));
+        let first = rows.event_cursor();
+        assert!(rows.first_after(first, |_| true).unwrap().is_none());
+        rows.update_last("first", |row| row["status"] = json!(200));
+        assert!(rows.first_after(first, |_| true).unwrap().is_none(),
+            "updating a retained record replayed its old event");
+        rows.push(json!({"requestId": "second", "url": "/signal"}));
+        assert_eq!(rows.first_after(first, |_| true).unwrap().unwrap()["requestId"], "second");
+        let listener = rows.first_after(first, |_| true).unwrap().unwrap();
+        assert_eq!(listener["requestId"], "second", "listeners must see the same next event");
+        rows.push(json!({"requestId": "third", "url": "/signal"}));
+        let rotated = rows.event_cursor();
+        assert!(rows.first_after(rotated, |_| true).unwrap().is_none(),
+            "rotation replayed a retained event as new");
+        rows.retain(|row| row["requestId"] == "third");
+        rows.clear();
+        assert_eq!(rows.event_cursor(), rotated, "clear rewound the event cursor");
+        rows.push(json!({"requestId": "fourth", "url": "/signal"}));
+        assert_eq!(rows.first_after(rotated, |_| true).unwrap().unwrap()["requestId"], "fourth");
+        assert!(rows.first_after(first, |_| true).unwrap_err().to_string().contains("registration boundary"),
+            "a lost event window was silently accepted");
+        rows.sequence = u64::MAX;
+        rows.push(json!({"requestId": "overflow"}));
+        assert!(rows.snapshot().is_err(), "event sequence exhaustion must fail closed");
+    }
 
     #[test]
     fn pending_event_wait_returns_its_shared_record_budget() {
