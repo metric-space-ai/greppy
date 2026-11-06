@@ -60,6 +60,10 @@ def main():
                  "let owned = std::mem::take(\n        &mut *agent_runtimes()\n            .lock()\n            .unwrap_or_else(|error| error.into_inner()),\n    );",
                  "let owned: AgentRuntimeScopes = Default::default();",
                  "agent exit retained its authenticated runtime socket", True)
+        mutation("crates/cli/tests/agent_p.rs",
+                 "remaining = &candidate[documents.byte_offset()..];",
+                 "break; // fault: ignore later runtime-status documents",
+                 "web tool calls did not reuse one authenticated runtime", True)
     else:
         anchor = "// The web-only attach hook starts the runtime lazily in this parent."
         mutation("crates/cli/src/agent.rs", anchor,

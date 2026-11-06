@@ -412,7 +412,12 @@ fn collect_runtime_scopes(
     match value {
         serde_json::Value::Object(object) => {
             if let Some(result) = object.get("result") {
-                if result["running"] == true && result["owned"] == true {
+                if object.get("schema").and_then(serde_json::Value::as_str)
+                    == Some("greppy.web-runtime.v1")
+                    && object.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+                    && result["running"] == true
+                    && result["owned"] == true
+                {
                     if let (Some(socket), Some(run_id)) =
                         (result["socket"].as_str(), result["run_id"].as_str())
                     {
@@ -430,15 +435,20 @@ fn collect_runtime_scopes(
             }
         }
         serde_json::Value::String(text) => {
-            // Tool text is fenced; the web-do JSON starts at the first parseable
-            // object. Decode that document rather than depending on its preview.
-            for (offset, _) in text.match_indices('{') {
-                if let Some(Ok(document)) = serde_json::Deserializer::from_str(&text[offset..])
-                    .into_iter::<serde_json::Value>()
-                    .next()
-                {
-                    collect_runtime_scopes(&document, scopes);
-                    break;
+            // Fenced web-do text contains one JSON document per operation.
+            // Consume each complete document so a preceding session result
+            // cannot hide the later authenticated runtime-status receipt.
+            let mut remaining = text.as_str();
+            while let Some(offset) = remaining.find('{') {
+                let candidate = &remaining[offset..];
+                let mut documents =
+                    serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+                match documents.next() {
+                    Some(Ok(document)) => {
+                        collect_runtime_scopes(&document, scopes);
+                        remaining = &candidate[documents.byte_offset()..];
+                    }
+                    _ => remaining = &candidate[1..],
                 }
             }
         }
