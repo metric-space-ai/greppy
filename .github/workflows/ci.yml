@@ -155,6 +155,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_argument_mutation.py
 
+      - name: EOF-only patch byte and refusal mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_patch_eof_mutation.py
+
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         # The unoptimized, generated full CLI parser exceeds the 2 MiB
         # libtest thread stack. Same-source verification: debug2MiB aborts,

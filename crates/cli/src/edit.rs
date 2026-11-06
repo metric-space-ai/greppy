@@ -2876,6 +2876,8 @@ struct TrainedPatchHunk {
     declared_old_line: usize,
     old_lines: Vec<String>,
     new_lines: Vec<String>,
+    old_no_final_newline: bool,
+    new_no_final_newline: bool,
 }
 
 #[derive(Debug)]
@@ -3110,6 +3112,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             index += 1;
             let mut old_lines = Vec::new();
             let mut new_lines = Vec::new();
+            let mut old_no_final_newline = false;
+            let mut new_no_final_newline = false;
             while index < lines.len()
                 && !lines[index].starts_with("@@")
                 && !lines[index].starts_with("diff --git ")
@@ -3143,14 +3147,38 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                         }
                     }
                 }
-                match line.as_bytes().first() {
+                let prefix = line.as_bytes().first().copied();
+                if (old_no_final_newline && matches!(prefix, Some(b' ' | b'-')))
+                    || (new_no_final_newline && matches!(prefix, Some(b' ' | b'+')))
+                {
+                    return Err(EditRefusal::new(
+                        "invalid_patch",
+                        format!("{path}: hunk content follows a no-final-newline marker for that side — nothing written"),
+                        20,
+                    ));
+                }
+                match prefix {
                     Some(b' ') => {
                         old_lines.push(line[1..].to_string());
                         new_lines.push(line[1..].to_string());
                     }
                     Some(b'-') => old_lines.push(line[1..].to_string()),
                     Some(b'+') => new_lines.push(line[1..].to_string()),
-                    Some(b'\\') => {}
+                    Some(b'\\') if line == "\\ No newline at end of file" => {
+                        match lines.get(index.wrapping_sub(1)).and_then(|line| line.as_bytes().first()) {
+                            Some(b' ') => {
+                                old_no_final_newline = true;
+                                new_no_final_newline = true;
+                            }
+                            Some(b'-') => old_no_final_newline = true,
+                            Some(b'+') => new_no_final_newline = true,
+                            _ => return Err(EditRefusal::new(
+                                "invalid_patch",
+                                format!("{path}: no-final-newline marker must immediately follow a hunk content line — nothing written"),
+                                20,
+                            )),
+                        }
+                    }
                     _ => {
                         return Err(EditRefusal::new(
                             "invalid_patch",
@@ -3187,6 +3215,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 declared_old_line,
                 old_lines,
                 new_lines,
+                old_no_final_newline,
+                new_no_final_newline,
             });
         }
         if hunks.is_empty() {
@@ -3297,10 +3327,27 @@ fn apply_trained_patch_file(
         };
         let start = line_ranges[first].0;
         let end = line_ranges[first + hunk.old_lines.len() - 1].1;
+        if (hunk.old_no_final_newline || hunk.new_no_final_newline) && end != content.len() {
+            return Err(EditRefusal::new(
+                "patch_context",
+                format!("{path}: no-final-newline marker does not match the end of this file — nothing written"),
+                13,
+            ));
+        }
         let had_final_ending = content[start..end].ends_with(b"\n");
         let mut replacement = hunk.new_lines.join(ending).into_bytes();
-        if had_final_ending {
+        if !hunk.new_lines.is_empty()
+            && !hunk.new_no_final_newline
+            && (had_final_ending || hunk.old_no_final_newline)
+        {
             replacement.extend_from_slice(ending.as_bytes());
+        }
+        if hunk.old_no_final_newline && had_final_ending && content[start..end] != replacement {
+            return Err(EditRefusal::new(
+                "patch_context",
+                format!("{path}: removed source was marked without a final newline, but this file has one — nothing written"),
+                13,
+            ));
         }
         edits.push((start, end, replacement));
     }
@@ -5263,6 +5310,104 @@ mod nearest_old_tests {
 #[cfg(test)]
 mod patch_rollback_tests {
     use super::*;
+
+    #[test]
+    fn unified_patch_eof_newline_is_a_real_atomic_byte_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.txt");
+        let diff = b"--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-foo\n\\ No newline at end of file\n+foo\n";
+        for dry_run in [true, false] {
+            std::fs::write(&path, b"foo").unwrap();
+            let record =
+                run_trained_patch(dir.path(), dir.path(), diff.to_vec(), dry_run, false, false)
+                    .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+            assert!(
+                !record.already_as_sent,
+                "EOF-only addition is a real byte edit"
+            );
+            assert_eq!(record.published, !dry_run);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                if dry_run { &b"foo"[..] } else { &b"foo\n"[..] }
+            );
+        }
+        let record = run_trained_patch(dir.path(), dir.path(), diff.to_vec(), false, false, false)
+            .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        assert!(
+            record.already_as_sent,
+            "only the actual final bytes justify a replay no-op"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"foo\n");
+    }
+
+    #[test]
+    fn unified_patch_eof_markers_preserve_each_side_and_surrounding_bytes() {
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (
+                b"foo\n",
+                b"-foo\n+foo\n\\ No newline at end of file\n",
+                b"foo",
+            ),
+            (
+                b"head\r\nfoo",
+                b"-foo\n\\ No newline at end of file\n+foo\n",
+                b"head\r\nfoo\r\n",
+            ),
+            (
+                b"head\nfoo",
+                b"-foo\n\\ No newline at end of file\n+bar\n\\ No newline at end of file\n",
+                b"head\nbar",
+            ),
+            (b"head\nfoo\n", b"-foo\n", b"head\n"),
+            (b"foo", b"-foo\n\\ No newline at end of file\n", b""),
+            (b"head\nfoo\nlast", b"-foo\n+bar\n", b"head\nbar\nlast"),
+            (b"foo", b" foo\n\\ No newline at end of file\n", b"foo"),
+        ];
+        for &(before, body, expected) in cases {
+            let mut patch = b"--- a/example.txt\n+++ b/example.txt\n@@ -99 +99 @@\n".to_vec();
+            patch.extend_from_slice(body);
+            let parsed =
+                parse_trained_patch(&patch).unwrap_or_else(|refusal| panic!("{}", refusal.message));
+            let (actual, _) = apply_trained_patch_file("example.txt", before, &parsed[0].hunks)
+                .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+            assert_eq!(actual, expected, "EOF patch body {:?}", body);
+        }
+    }
+
+    #[test]
+    fn unified_patch_eof_invalid_marker_never_publishes_any_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let last = dir.path().join("last.txt");
+        std::fs::write(&first, b"foo").unwrap();
+        std::fs::write(&last, b"bad\ntail\n").unwrap();
+        let diff = b"--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-foo\n\\ No newline at end of file\n+foo\n--- a/last.txt\n+++ b/last.txt\n@@ -1 +1 @@\n-bad\n\\ No newline at end of file\n+fixed\n";
+        let refusal = run_trained_patch_with_publish_hook(
+            dir.path(),
+            dir.path(),
+            diff.to_vec(),
+            false,
+            false,
+            false,
+            |_| panic!("invalid EOF marker must refuse before any publish"),
+        )
+        .err()
+        .expect("non-final marked line must be rejected");
+        assert_eq!(refusal.code, "patch_context");
+        assert_eq!(std::fs::read(&first).unwrap(), b"foo");
+        assert_eq!(std::fs::read(&last).unwrap(), b"bad\ntail\n");
+        for body in [
+            "\\ No newline at end of file\n-foo\n+bar\n",
+            "-foo\n\\ No newline at end of file\n more\n+bar\n",
+            "-foo\n+bar\n\\ unknown marker\n",
+        ] {
+            let patch = format!("--- a/example.txt\n+++ b/example.txt\n@@\n{body}");
+            assert!(
+                parse_trained_patch(patch.as_bytes()).is_err(),
+                "accepted malformed marker {body:?}"
+            );
+        }
+    }
 
     #[test]
     fn rename_edge_requires_selected_method_identity_evidence() {
