@@ -718,10 +718,8 @@ impl CapturedWebResourceDownload {
         if !attachment && !binary { return None; }
         let result = (|| -> std::io::Result<std::path::PathBuf> {
             use std::io::Write;
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             for _ in 0..16 {
-                let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let path = std::env::temp_dir().join(format!("greppy-download-{}-{id}.bin", std::process::id()));
+                let path = std::env::temp_dir().join(format!("greppy-download-{}.bin", Uuid::new_v4()));
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
                 #[cfg(unix)] {
