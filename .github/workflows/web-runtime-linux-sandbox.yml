@@ -159,6 +159,26 @@ jobs:
       - name: Check wrapper resource lifecycle
         run: node --test crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs
 
+      - name: Prove synthetic download saving cannot use native file custody
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/js/playwright.mjs')
+          original = source.read_text()
+          old = 'downloadId: rec.bodyBase64 == null ? rec.requestId : undefined,'
+          assert original.count(old) == 1
+          command = ['node', '--test', '--test-name-pattern=download saveAs keeps synthetic',
+                     'crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs']
+          try:
+              source.write_text(original.replace(old, 'downloadId: rec.requestId,'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'synthetic download was sent to native file custody' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=30)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Prove closed-page retention is detected
         run: python3 tools/check_web_resource_mutations.py
 

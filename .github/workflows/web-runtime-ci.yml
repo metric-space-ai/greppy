@@ -84,6 +84,12 @@ jobs:
           --test session-daemon
           --no-run
 
+      - name: Check synthetic download still saves its original fulfilled body
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --test session-daemon
+          download_is_recorded_from_fulfilled_binary -- --test-threads=1 --nocapture
+
       - name: Check real HTTP download event, filename, bytes and temporary-file lifetime
         shell: bash
         run: >-
