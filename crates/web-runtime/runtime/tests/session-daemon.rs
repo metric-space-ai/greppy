@@ -4723,7 +4723,7 @@ fn real_http_download_wait_allows_click_and_owns_complete_file() {
             let (body, content_type, disposition) = if path == "/file" || path == "/background.bin" {
                 (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
             } else {
-                (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(), "text/html", "")
+                (b"<!doctype html><button id='trigger' onclick=\"fetch('/signal')\">Trigger</button><a id='download' href='/file' download>Download</a>".as_slice(), "text/html", "")
             };
             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
             let _ = stream.write_all(response.as_bytes()).and_then(|_| stream.write_all(body));
@@ -4756,6 +4756,12 @@ const context = await browser.newContext();
 const page = await context.newPage();
 await page.goto(fixtureUrl);
 page.setDefaultTimeout(2000);
+const [request, response] = await Promise.all([
+  page.waitForRequest("/signal"), page.waitForResponse("/signal"),
+  page.locator("#trigger").click()
+]);
+if (request.url() !== fixtureUrl + "signal" || response.url() !== request.url() || !response.ok())
+  throw new Error("recorded request/response wait blocked its triggering click");
 // An ordinary fetch of the same MIME/attachment headers is not a download.
 await page.evaluate(async url => { await (await fetch(url)).arrayBuffer(); }, fixtureUrl + "background.bin");
 const events = [];
@@ -4782,6 +4788,8 @@ console.log(JSON.stringify({ original, saved: await download.path() }));
     assert_eq!(result.status, "ok", "download Promise.all failed: {result:?}; HTTP paths={:?}", requests.lock().unwrap());
     assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/file").count(), 1,
         "download must use exactly one real HTTP request");
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal").count(), 1,
+        "recorded request and response waits must allow exactly one triggering fetch");
     let stdout = result.result.as_ref().unwrap()["stdout"].as_str().unwrap().trim();
     let files: serde_json::Value = serde_json::from_str(stdout).unwrap();
     let original = PathBuf::from(files["original"].as_str().unwrap());

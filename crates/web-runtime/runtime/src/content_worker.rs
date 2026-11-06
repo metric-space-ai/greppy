@@ -6797,8 +6797,9 @@ fn trace_startup(stage: &str) {
     }
 }
 
-struct PendingDownloadWait {
+struct PendingRecordedWait {
     request_id: u64,
+    method: String,
     params: serde_json::Value,
     deadline: Instant,
     _reservation: crate::retained_records::RecordReservation,
@@ -6864,25 +6865,44 @@ pub fn run() -> io::Result<()> {
             )
         })?;
 
-    let mut download_waiters: Vec<PendingDownloadWait> = Vec::new();
+    let mut recorded_waiters: Vec<PendingRecordedWait> = Vec::new();
     loop {
         if engine.parent_dead() {
             return Ok(());
         }
         // A wait must not occupy the same protocol loop as the click that
-        // produces its event. Keep only request metadata, not a WebView/Rc.
+        // produces its event. Keep request metadata and a budget reservation,
+        // without retaining a WebView or delegate.
         let mut write_error = None;
-        download_waiters.retain(|waiter| {
-            let PendingDownloadWait { request_id, params, deadline, .. } = waiter;
+        recorded_waiters.retain(|waiter| {
+            let PendingRecordedWait { request_id, method, params, deadline, .. } = waiter;
             let result = (|| -> io::Result<Option<serde_json::Value>> {
-                engine.reject_stale_objects("page.waitForDownload", params)?;
+                engine.reject_stale_objects(method, params)?;
                 let page = required_str(params, "page")?;
                 let delegate = &engine.page(&page)?.1;
-                if let Some(row) = delegate.downloads.borrow().first().cloned() {
-                    return Ok(Some(json!({ "download": row })));
-                }
+                let needle = params.get("needle").and_then(|value| value.as_str()).unwrap_or("");
+                let (result, timeout_label) = match method.as_str() {
+                    "page.waitForRequest" => (
+                        delegate.requests.borrow().iter().find(|row| recorded_url_contains(row, needle))
+                            .cloned().map(|row| json!({ "request": crate::daemon::redact_json(row) })),
+                        "timeout: waitForRequest"),
+                    "page.waitForResponse" => (
+                        delegate.last_responses.borrow().iter().find(|row| recorded_url_contains(row, needle))
+                            .cloned().map(|row| json!({ "response": row })),
+                        "timeout: waitForResponse"),
+                    "page.waitForDownload" => (
+                        delegate.downloads.borrow().first().cloned().map(|row| json!({ "download": row })),
+                        "timeout: waitForEvent download"),
+                    "page.waitForFileChooser" => {
+                        let mut choosers = delegate.last_file_choosers.borrow_mut();
+                        (if choosers.is_empty() { None } else { Some(json!({ "chooser": choosers.remove(0) })) },
+                            "timeout: waitForEvent filechooser")
+                    }
+                    _ => unreachable!("only recorded event waits are registered"),
+                };
+                if result.is_some() { return Ok(result); }
                 if Instant::now() >= *deadline {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForEvent download"));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_label));
                 }
                 Ok(None)
             })();
@@ -6913,18 +6933,18 @@ pub fn run() -> io::Result<()> {
                 params,
                 ..
             })) => {
-                if method == "page.waitForDownload" {
+                if matches!(method.as_str(), "page.waitForRequest" | "page.waitForResponse" | "page.waitForDownload" | "page.waitForFileChooser") {
                     let reservation = (|| {
                         engine.reject_stale_objects(&method, &params)?;
                         let page = required_str(&params, "page")?;
                         let delegate = &engine.page(&page)?.1;
                         RecordBudget::hold_value(&delegate.record_budget, &params,
-                            std::mem::size_of::<PendingDownloadWait>())
+                            std::mem::size_of::<PendingRecordedWait>().saturating_add(method.len()))
                     })();
                     match reservation {
-                        Ok(reservation) => download_waiters.push(PendingDownloadWait {
+                        Ok(reservation) => recorded_waiters.push(PendingRecordedWait {
                             request_id, deadline: Instant::now() + call_timeout(&params),
-                            params, _reservation: reservation,
+                            params, method, _reservation: reservation,
                         }),
                         Err(error) => write_message(&mut protocol_out,
                             &Message::engine_result(request_id, false, serde_json::Value::Null, Some(error.to_string())))?,
@@ -6995,7 +7015,7 @@ pub fn run() -> io::Result<()> {
             Err(RecvTimeoutError::Timeout) => {
                 if !engine.pages.is_empty() {
                     let started = Instant::now();
-                    if download_waiters.is_empty() {
+                    if recorded_waiters.is_empty() {
                         engine.servo.spin_event_loop();
                     } else {
                         // The awaiting page may belong to an isolated bundle;
