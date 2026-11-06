@@ -57,7 +57,7 @@ def main():
                  "let _ = identity_root;\n    let (run_id, identity) = runtime_run_id(root);",
                  "confined web tool did not read the genuine native page", True)
         mutation(source,
-                 "let owned = std::mem::take(&mut *agent_runtimes().lock().unwrap_or_else(|error| error.into_inner()));",
+                 "let owned = std::mem::take(\n        &mut *agent_runtimes()\n            .lock()\n            .unwrap_or_else(|error| error.into_inner()),\n    );",
                  "let owned: AgentRuntimeScopes = Default::default();",
                  "agent exit retained its authenticated runtime socket", True)
     else:

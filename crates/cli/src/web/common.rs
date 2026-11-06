@@ -1349,49 +1349,75 @@ pub(super) fn rpc_on_response(
 type AgentRuntimeScopes = std::collections::HashMap<PathBuf, (SupervisorCtx, PathBuf)>;
 
 fn agent_runtimes() -> &'static std::sync::Mutex<AgentRuntimeScopes> {
-    static OWNED: std::sync::OnceLock<std::sync::Mutex<AgentRuntimeScopes>> = std::sync::OnceLock::new();
+    static OWNED: std::sync::OnceLock<std::sync::Mutex<AgentRuntimeScopes>> =
+        std::sync::OnceLock::new();
     OWNED.get_or_init(Default::default)
 }
 
 /// Prepare a web tool in its trusted parent, before tool write confinement.
 /// Identity follows the actual CLI arguments; route writes stay in the worktree.
 pub fn prepare_agent_runtime(args: &[String], worktree: &Path) -> io::Result<()> {
-    use clap::Parser;
     use super::{SessionsCommand, WebCommand};
+    use clap::Parser;
     // Help, version, explain and invalid argv keep the CLI's own fast path.
-    let Ok(cli) = crate::Cli::try_parse_from(std::iter::once("greppy").chain(args.iter().map(String::as_str))) else {
+    let Ok(cli) = crate::Cli::try_parse_from(
+        std::iter::once("greppy").chain(args.iter().map(String::as_str)),
+    ) else {
         return Ok(());
     };
-    let Some(crate::Command::Web { command }) = cli.command else { return Ok(()); };
-    if matches!(command,
-        WebCommand::Sessions(SessionsCommand::Status { .. } | SessionsCommand::Doctor { .. } |
-            SessionsCommand::Runtime { .. }) |
-        WebCommand::Chain(super::ChainCommand::Do { explain: true, .. }) |
-        WebCommand::Chain(super::ChainCommand::Script { command:
-            super::chain::ScriptCommand::Save { .. } | super::chain::ScriptCommand::List { .. } |
-            super::chain::ScriptCommand::Show { .. } | super::chain::ScriptCommand::Rm { .. } }) |
-        WebCommand::Results(super::ResultsCommand::Result { .. })
-    ) { return Ok(()); }
-    let root = worktree.to_str().ok_or_else(|| io::Error::new(
-        io::ErrorKind::InvalidInput, "agent web worktree is not UTF-8"
-    ))?;
-    let spawn = SupervisorSpawn { fixture_url: None, search_endpoint: None };
+    let Some(crate::Command::Web { command }) = cli.command else {
+        return Ok(());
+    };
+    if matches!(
+        command,
+        WebCommand::Sessions(
+            SessionsCommand::Status { .. }
+                | SessionsCommand::Doctor { .. }
+                | SessionsCommand::Runtime { .. }
+        ) | WebCommand::Chain(super::ChainCommand::Do { explain: true, .. })
+            | WebCommand::Chain(super::ChainCommand::Script {
+                command: super::chain::ScriptCommand::Save { .. }
+                    | super::chain::ScriptCommand::List { .. }
+                    | super::chain::ScriptCommand::Show { .. }
+                    | super::chain::ScriptCommand::Rm { .. }
+            })
+            | WebCommand::Results(super::ResultsCommand::Result { .. })
+    ) {
+        return Ok(());
+    }
+    let root = worktree.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent web worktree is not UTF-8",
+        )
+    })?;
+    let spawn = SupervisorSpawn {
+        fixture_url: None,
+        search_endpoint: None,
+    };
     let ctx = ensure_supervisor_with_identity(Some(root), cli.root.as_deref(), &spawn)
         .map_err(|error| io::Error::other(error.message))?;
-    agent_runtimes().lock().unwrap_or_else(|error| error.into_inner())
+    agent_runtimes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
         .insert(ctx.socket.clone(), (ctx, worktree.to_owned()));
     Ok(())
 }
 
 /// Drop only the authenticated runtime scopes actually prepared by this parent.
 pub fn shutdown_agent_runtimes() {
-    let owned = std::mem::take(&mut *agent_runtimes().lock().unwrap_or_else(|error| error.into_inner()));
+    let owned = std::mem::take(
+        &mut *agent_runtimes()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    );
     #[cfg(unix)]
     for (_, (ctx, worktree)) in owned {
         let mut request = Request::new(&ctx.run_id, "web.shutdown", json!({}));
         request.capability = ctx.capability;
         if greppy_web_client::unix_request(&ctx.socket, &request, Duration::from_secs(3))
-            .ok().is_some_and(|response| response.status == "ok" && response.error.is_none())
+            .ok()
+            .is_some_and(|response| response.status == "ok" && response.error.is_none())
         {
             remove_runtime_routes(worktree.to_str(), &ctx.runtime_image_id, ctx.legacy);
         }
