@@ -909,7 +909,7 @@ pub async fn main_fetch(
                 None,
             )
         };
-    let download = if failure.is_none() {
+    let download = if failure.is_none() && matches!(&request.destination, content_security_policy::Destination::Document) {
         let actual = response.actual_response();
         let body = actual.body.lock();
         match &*body {

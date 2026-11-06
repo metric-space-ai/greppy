@@ -2391,9 +2391,9 @@ async fn http_network_fetch(
                 };
                 let devtools_response_body = completed_body.clone();
                 let body_bytes = completed_body.len() as u64;
-                let download = embedder_traits::CapturedWebResourceDownload::capture(
-                    &completed_headers, &completed_body,
-                );
+                let download = if matches!(&completed_request.destination, content_security_policy::Destination::Document) {
+                    embedder_traits::CapturedWebResourceDownload::capture(&completed_headers, &completed_body)
+                } else { None };
                 *body = ResponseBody::Done(completed_body);
                 send_response_values_to_devtools(
                     Some(headers),

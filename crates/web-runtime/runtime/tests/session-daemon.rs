@@ -4720,7 +4720,7 @@ fn real_http_download_wait_allows_click_and_owns_complete_file() {
             let header = String::from_utf8_lossy(&header);
             let path = header.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("");
             observed.lock().unwrap().push(path.to_owned());
-            let (body, content_type, disposition) = if path == "/file" {
+            let (body, content_type, disposition) = if path == "/file" || path == "/background.bin" {
                 (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
             } else {
                 (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(), "text/html", "")
@@ -4756,12 +4756,15 @@ const context = await browser.newContext();
 const page = await context.newPage();
 await page.goto(fixtureUrl);
 page.setDefaultTimeout(2000);
+// An ordinary fetch of the same MIME/attachment headers is not a download.
+await page.evaluate(async url => { await (await fetch(url)).arrayBuffer(); }, fixtureUrl + "background.bin");
 const events = [];
 context.on("download", d => events.push(d.suggestedFilename()));
 const [download] = await Promise.all([
   page.waitForEvent("download"), page.locator("#download").click()
 ]);
 if (download.suggestedFilename() !== "fixture.bin") throw new Error("wrong HTTP download filename");
+if (download.url() !== fixtureUrl + "file") throw new Error("ordinary fetch fabricated a download");
 if (await download.failure()) throw new Error("HTTP download failed");
 if (events.join() !== "fixture.bin") throw new Error("download event missing or duplicated");
 const original = await download.path();
