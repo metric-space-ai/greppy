@@ -43,6 +43,17 @@ pub(crate) fn phase_trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("GREPPY_WEB_TRACE_PHASE").is_some())
 }
 
+// Startup receipts intentionally contain only owned PID, role and fixed phase.
+// No protocol payload/capability or per-operation log is emitted here.
+fn trace_worker_startup(worker: WorkerKind, pid: u32, stage: &str) {
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+        eprintln!(
+            "web-runtime: startup parent={} worker={worker:?} pid={pid} stage={stage}",
+            std::process::id()
+        );
+    }
+}
+
 macro_rules! phase {
     ($($arg:tt)*) => {
         if crate::supervisor::phase_trace_enabled() {
@@ -1221,7 +1232,9 @@ fn spawn_unix(
             libc::close(cap_read_fd);
             libc::close(proto_child_fd);
         }
+        trace_worker_startup(worker, child.id(), "reexec-started");
         image.prove_child_or_kill(&mut child)?;
+        trace_worker_startup(worker, child.id(), "pinned-image-proven");
         if let Err(error) = prove_same_executable(child.id()) {
             unsafe {
                 libc::close(proto_parent_fd);
@@ -1231,6 +1244,7 @@ fn spawn_unix(
             return Err(error);
         }
 
+        trace_worker_startup(worker, child.id(), "same-image-proven");
         let proto_read_fd = unsafe { libc::dup(proto_parent_fd) };
         if proto_read_fd < 0 {
             let error = io::Error::last_os_error();
@@ -1295,6 +1309,7 @@ fn spawn_unix(
             }
         };
 
+        trace_worker_startup(worker, child.id(), "channels-ready");
         register_owned_worker(child.id());
         Ok(WorkerProcess {
             worker,
@@ -1790,8 +1805,12 @@ fn child_executable_path(pid: u32) -> io::Result<PathBuf> {
 
 impl WorkerProcess {
     pub(crate) fn handshake(&mut self) -> io::Result<()> {
+        trace_worker_startup(self.worker, self.pid(), "send-hello");
         self.send(&Message::hello(self.worker, self.capability.clone()))?;
-        self.expect(Message::ready(self.worker))
+        trace_worker_startup(self.worker, self.pid(), "await-ready");
+        self.expect(Message::ready(self.worker))?;
+        trace_worker_startup(self.worker, self.pid(), "ready-accepted");
+        Ok(())
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
