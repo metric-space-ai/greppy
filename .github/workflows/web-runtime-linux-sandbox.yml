@@ -293,6 +293,33 @@ jobs:
           node --check crates/web-runtime/scripts/efficiency-reference.mjs
           node --check crates/web-runtime/scripts/check-efficiency-native-entry.mjs
 
+      - name: Prove detached CLI lifetime cannot disappear before the first sample
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys, tempfile
+          source = pathlib.Path('bench/process_memory.py')
+          original = source.read_text()
+          old = 'self._prctl(36, ctypes.c_ulong(1))'
+          assert original.count(old) == 1
+          def run_case(capture=False):
+              with tempfile.TemporaryDirectory(prefix='greppy-custody-pycache-') as cache:
+                  return subprocess.run(
+                      [sys.executable, '-X', 'pycache_prefix=' + cache,
+                       'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                       'ProcessContract.test_detached_family_cost_and_exit_are_not_lost_after_cli_exit'],
+                      capture_output=capture, text=True, timeout=30, check=not capture)
+          try:
+              source.write_text(original.replace(old, 'self._prctl(36, ctypes.c_ulong(0))'))
+              result = run_case(capture=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'detached child lifetime was omitted after original CLI exit' in result.stderr
+          finally:
+              source.write_text(original)
+          run_case()
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Prove a leaf cgroup cannot hide tighter ancestor ceilings
         shell: python
         env:

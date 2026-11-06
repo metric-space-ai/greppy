@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -194,7 +195,7 @@ for path, value in [('round', row), ('result', {'schema': 'greppy.web-efficiency
             self.assertEqual(result.returncode, 1, result.stderr)
             receipt = json.loads(output.read_text())
             self.assertFalse(receipt['quality_verified'])
-            self.assertEqual(receipt['metrics']['exit_code'], 0)
+            self.assertEqual(receipt['metrics']['exit_code'], 0, json.dumps(receipt['metrics'], ensure_ascii=False))
             self.assertEqual(receipt['audit']['independently_verified_completed_tasks'], 0)
             self.assertEqual(receipt['server_evidence']['observed_effects'], 0)
             self.assertEqual(receipt['server_evidence']['expected_effects'], 1)
@@ -293,6 +294,126 @@ print(json.dumps({'entry_sha256': hashlib.sha256(entry.read_bytes()).hexdigest()
 
 
 class ProcessContract(unittest.TestCase):
+    def wait_for_bounded_detached_helper(self, receipt):
+        deadline = time.monotonic() + 12
+        while not receipt.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not receipt.exists():
+            return
+        record = json.loads(receipt.read_text())
+        path = pathlib.Path('/proc') / str(record['pid']) / 'stat'
+        while time.monotonic() < deadline:
+            try:
+                fields = path.read_text().rsplit(')', 1)[1].split()
+            except FileNotFoundError:
+                return
+            if int(fields[19]) != record['starttime_ticks'] or fields[0] == 'Z':
+                return
+            time.sleep(0.02)
+        self.fail('bounded owned helper did not reach its self-exit deadline')
+
+    def detached_source(self, ignore_term=False):
+        return r"""
+import json, os, pathlib, signal, sys, time
+if os.fork():
+    os._exit(0)
+os.setsid()
+if IGNORE_TERM:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+private = bytearray(24 * 1024 * 1024)
+for index in range(0, len(private), 4096):
+    private[index] = 1
+fields = pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()
+record = {'pid': os.getpid(), 'starttime_ticks': int(fields[19])}
+receipt = pathlib.Path(sys.argv[1])
+stage = receipt.with_suffix('.stage')
+stage.write_text(json.dumps(record))
+os.replace(stage, receipt)
+wall = time.monotonic()
+cpu = time.process_time()
+if IGNORE_TERM:
+    while time.monotonic() - wall < 9:
+        time.sleep(0.05)
+else:
+    while time.process_time() - cpu < 0.2 and time.monotonic() - wall < 2:
+        sum(range(1000))
+    time.sleep(0.65)
+record['cpu_seconds'] = time.process_time() - cpu
+stage = receipt.with_suffix('.stage')
+stage.write_text(json.dumps(record))
+os.replace(stage, receipt)
+os._exit(0)
+""".replace('IGNORE_TERM', repr(ignore_term))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'actual Linux subreaper custody')
+    def test_detached_family_cost_and_exit_are_not_lost_after_cli_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            receipt = directory / 'owned-detached.json'
+            try:
+                runtime = pathlib.Path(sys.executable).stat()
+                measured = measurement.execute(
+                    [sys.executable, '-c', self.detached_source(), str(receipt)],
+                    directory, 5, runtime_identity=(runtime.st_dev, runtime.st_ino))
+                self.assertGreaterEqual(
+                    measured['process_cold_total_ms'], 550,
+                    'detached child lifetime was omitted after original CLI exit')
+                family = measured['process_custody']
+                self.assertTrue(family['supported'], family)
+                self.assertTrue(family['all_reaped'], family)
+                self.assertTrue(family['runtime_image_observed'], family)
+                self.assertFalse(measured['timed_out'])
+                observed = measured['process_family_memory']
+                self.assertGreaterEqual(
+                    observed['peak_sampled_private_bytes'] or 0, 16 * 1024 * 1024,
+                    'detached child private mappings were omitted')
+                record = json.loads(receipt.read_text())
+                self.assertGreaterEqual(
+                    measured['user_cpu_seconds'] + measured['system_cpu_seconds'],
+                    record['cpu_seconds'] * 0.8,
+                    'adopted child wait4 CPU was omitted')
+                identity = measurement._memory_module._stat(record['pid'])
+                self.assertTrue(identity is None or identity[1] != record['starttime_ticks'],
+                                'owned detached identity survived a completed measurement')
+            finally:
+                self.wait_for_bounded_detached_helper(receipt)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'actual Linux orphan cleanup')
+    def test_timeout_reaps_detached_term_ignoring_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            receipt = directory / 'owned-timeout.json'
+            try:
+                measured = measurement.execute(
+                    [sys.executable, '-c', self.detached_source(ignore_term=True), str(receipt)],
+                    directory, 0.3)
+                self.assertTrue(measured['timed_out'], 'detached timeout was called successful')
+                self.assertTrue(measured['process_custody']['all_reaped'])
+                self.assertLess(measured['process_cold_total_ms'], 8000,
+                                'TERM-ignoring detached child escaped forced-cleanup deadline')
+                record = json.loads(receipt.read_text())
+                identity = measurement._memory_module._stat(record['pid'])
+                self.assertTrue(identity is None or identity[1] != record['starttime_ticks'],
+                                'timed-out detached identity survived cleanup')
+            finally:
+                self.wait_for_bounded_detached_helper(receipt)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'actual Linux existing-child isolation')
+    def test_custody_refuses_to_adopt_a_preexisting_child(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'])
+        try:
+            custody = measurement._memory_module.ProcessFamilyCustody()
+            try:
+                self.assertFalse(custody.supported,
+                                 'custody claimed a child that predated the measured workload')
+                self.assertIn('pre-existing children', custody.reason)
+            finally:
+                custody.close()
+            self.assertIsNone(child.poll(), 'custody stopped an unrelated pre-existing child')
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process-family PSS integration')
     def test_execute_receipt_accounts_for_a_real_parent_and_child(self):
         child_source = '''import sys, time

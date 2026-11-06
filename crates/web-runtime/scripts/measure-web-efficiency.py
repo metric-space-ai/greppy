@@ -333,67 +333,173 @@ def log_tail(path):
         return stream.read(8192).decode('utf-8', 'replace')
 
 
-def execute(command, directory, timeout, started=None, memory_log_path=None, *, env=None, cwd=None):
+def execute(command, directory, timeout, started=None, memory_log_path=None, *,
+            env=None, cwd=None, cleanup_command=None, runtime_identity=None):
     started = time.monotonic() if started is None else started
+    monitor_cpu_started = time.thread_time_ns()
     terminated_at = None
     memory_log_path = memory_log_path or directory / 'process-memory.jsonl'
-    sampling_wall_ns = sampling_cpu_ns = 0
-    # Both engines use this same bounded monitor. Stream raw receipts instead
-    # of retaining a sample history in the harness heap.
-    with (directory / 'stdout.log').open('wb') as stdout, (directory / 'stderr.log').open('wb') as stderr, memory_log_path.open('x') as memory_log:
-        child = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True,
-                                 env=env, cwd=cwd)
-        try:
+    sampling_wall_ns = 0
+    custody = _memory_module.ProcessFamilyCustody()
+    child = cleanup = memory = None
+    known_direct = {}
+    controls = {}
+    totals = [0.0, 0.0, 0]
+    runtime_seen = None
+
+    def refresh_roots():
+        if custody.supported:
+            for pid, birth in custody.children().items():
+                known_direct[pid] = birth
+                if memory is not None and memory.identities.get(pid) != birth:
+                    memory.register_root(pid, expected_starttime=birth)
+
+    def reap():
+        changed = False
+        for pid in list(known_direct):
+            try:
+                exited, status, usage = os.wait4(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                known_direct.pop(pid)
+                if pid in controls:
+                    controls[pid].returncode = -1
+                raise RuntimeError('measurement child was reaped outside its custody scope')
+            if not exited:
+                continue
+            known_direct.pop(pid)
+            if pid in controls:
+                controls[pid].returncode = os.waitstatus_to_exitcode(status)
+            totals[0] += usage.ru_utime
+            totals[1] += usage.ru_stime
+            totals[2] = max(totals[2], usage.ru_maxrss)
+            changed = True
+        return changed
+
+    def signal_owned(sig):
+        if custody.supported:
+            # A fresh direct child remains ours, with an unreusable PID until wait4.
+            for pid in custody.children():
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        else:
+            for pid, process in controls.items():
+                if process.returncode is None:
+                    try:
+                        os.killpg(pid, sig)
+                    except ProcessLookupError:
+                        pass
+
+    def observe_runtime():
+        nonlocal runtime_seen
+        if runtime_seen is not None or runtime_identity is None or memory is None:
+            return
+        for pid, birth in memory.identities.items():
+            if pid in controls:
+                continue
+            identity = _memory_module._stat(pid)
+            if identity is None or identity[1] != birth:
+                continue
+            try:
+                image = pathlib.Path(f'/proc/{pid}/exe').stat()
+            except OSError:
+                continue
+            if (image.st_dev, image.st_ino) == runtime_identity:
+                runtime_seen = {'pid': pid, 'starttime_ticks': birth}
+                break
+
+    try:
+        with ((directory / 'stdout.log').open('wb') as stdout,
+              (directory / 'stderr.log').open('wb') as stderr,
+              (directory / 'cleanup-stdout.log').open('wb') as cleanup_stdout,
+              (directory / 'cleanup-stderr.log').open('wb') as cleanup_stderr,
+              memory_log_path.open('x') as memory_log):
+            child = subprocess.Popen(command, stdout=stdout, stderr=stderr,
+                                     start_new_session=True, env=env, cwd=cwd)
+            controls[child.pid] = child
+            known_direct[child.pid] = None
             memory = ProcessTreeMemorySampler(child.pid)
             next_sample = time.monotonic()
             while True:
-                pid, status, usage = os.wait4(child.pid, os.WNOHANG)
-                if pid:
-                    child.returncode = os.waitstatus_to_exitcode(status)
-                    break
+                changed = reap()
                 now = time.monotonic()
+                if child.returncode is not None and cleanup_command is not None and cleanup is None and terminated_at is None:
+                    cleanup = subprocess.Popen(
+                        cleanup_command, stdout=cleanup_stdout, stderr=cleanup_stderr,
+                        start_new_session=True, env=env, cwd=cwd)
+                    controls[cleanup.pid] = cleanup
+                    known_direct[cleanup.pid] = None
+                    memory.register_root(cleanup.pid)
+                    changed = True
+                controls_done = (child.returncode is not None
+                                 and (cleanup is None or cleanup.returncode is not None))
+                if changed or now >= next_sample or controls_done or terminated_at is not None:
+                    refresh_roots()
                 if memory.supported and now >= next_sample:
                     sample_started = time.monotonic_ns()
-                    cpu_started = time.thread_time_ns()
                     sample = memory.sample()
                     memory_log.write(json.dumps(sample, separators=(',', ':')) + '\n')
-                    sampling_cpu_ns += time.thread_time_ns() - cpu_started
                     sampling_wall_ns += time.monotonic_ns() - sample_started
-                    # Never catch up with a burst of scans after a slow sample.
+                    observe_runtime()
+                    # Do not burst scans to catch up after a slow sample.
                     next_sample = time.monotonic() + 0.25
-                elapsed = time.monotonic() - started
-                if elapsed >= timeout and terminated_at is None:
-                    os.killpg(child.pid, signal.SIGTERM)
-                    terminated_at = time.monotonic()
-                elif terminated_at is not None and time.monotonic() - terminated_at >= 5:
-                    os.killpg(child.pid, signal.SIGKILL)
+                if controls_done and not known_direct:
+                    break
+                if now - started >= timeout and terminated_at is None:
+                    terminated_at = now
+                if terminated_at is not None:
+                    signal_owned(signal.SIGKILL if now - terminated_at >= 5 else signal.SIGTERM)
+                    if now - terminated_at >= 10:
+                        raise RuntimeError('owned process family exceeded its forced-cleanup deadline')
                 time.sleep(0.02)
-        except BaseException:
-            os.killpg(child.pid, signal.SIGKILL)
-            _, status, usage = os.wait4(child.pid, 0)
-            child.returncode = os.waitstatus_to_exitcode(status)
-            raise
-    peak = usage.ru_maxrss * (1 if platform.system() == 'Darwin' else 1024)
-    return {'exit_code': child.returncode, 'timed_out': terminated_at is not None,
-            'process_cold_total_ms': (time.monotonic() - started) * 1000,
-            'user_cpu_seconds': usage.ru_utime, 'system_cpu_seconds': usage.ru_stime,
-            'max_individual_process_rss_bytes': peak,
-            'cpu_scope': 'wait4 child plus waited descendants; excludes fixture server and harness',
-            'rss_scope': 'OS wait4 maximum individual process RSS; not concurrent process-tree aggregate',
-            'process_family_memory': {
-                'supported': memory.supported,
-                'sample_count': memory.samples, 'incomplete_sample_count': memory.incomplete_samples,
-                'peak_sampled_pss_bytes': memory.peak_pss_bytes,
-                'peak_sampled_private_bytes': memory.peak_private_bytes,
-                'minimum_sampling_gap_ms': 250,
-                'sampling_wall_ms': sampling_wall_ns / 1_000_000,
-                'monitor_thread_cpu_seconds': sampling_cpu_ns / 1_000_000_000,
-                'samples_path': str(memory_log_path), 'samples_sha256': digest(memory_log_path),
-                'sampler_sha256': digest(pathlib.Path(_memory_module.__file__)),
-                'scope': 'observed Linux child process-family mappings; sampled peaks are lower bounds; excludes kernel/GPU/unmapped cache, fixture and harness; no inference about LLM/CLI-daemon memory',
-                'timing_scope': 'process time includes concurrent sampling overhead; monitor CPU reported separately'},
-            'stdout_tail': log_tail(directory / 'stdout.log'),
-            'stderr_tail': log_tail(directory / 'stderr.log')}
+    except BaseException:
+        # No new control process is launched during exception cleanup.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            refresh_roots()
+            signal_owned(signal.SIGKILL)
+            reap()
+            refresh_roots()
+            if not known_direct:
+                break
+            time.sleep(0.02)
+        raise
+    finally:
+        custody.close()
+    peak = totals[2] * (1 if platform.system() == 'Darwin' else 1024)
+    return {
+        'exit_code': child.returncode, 'timed_out': terminated_at is not None,
+        'cleanup_exit_code': cleanup.returncode if cleanup is not None else None,
+        'process_cold_total_ms': (time.monotonic() - started) * 1000,
+        'user_cpu_seconds': totals[0], 'system_cpu_seconds': totals[1],
+        'max_individual_process_rss_bytes': peak,
+        'cpu_scope': 'wait4 original child, cleanup CLI and adopted roots plus their waited descendants; excludes fixture and monitor; auto-reaped unobserved CPU remains outside this accounting',
+        'rss_scope': 'OS wait4 maximum individual process RSS; not concurrent process-tree aggregate',
+        'process_custody': {
+            'supported': custody.supported, 'unavailable_reason': custody.reason,
+            'all_reaped': not known_direct if custody.supported else None,
+            'runtime_image_observed': runtime_seen is not None,
+            'runtime_image_process': runtime_seen,
+            'scope': 'private monitor Linux child-subreaper ownership, not a caller-declared PID receipt'},
+        'process_family_memory': {
+            'supported': memory.supported,
+            'sample_count': memory.samples, 'incomplete_sample_count': memory.incomplete_samples,
+            'peak_sampled_pss_bytes': memory.peak_pss_bytes,
+            'peak_sampled_private_bytes': memory.peak_private_bytes,
+            'minimum_sampling_gap_ms': 250,
+            'sampling_wall_ms': sampling_wall_ns / 1_000_000,
+            'monitor_thread_cpu_seconds': (time.thread_time_ns() - monitor_cpu_started) / 1_000_000_000,
+            'samples_path': str(memory_log_path), 'samples_sha256': digest(memory_log_path),
+            'sampler_sha256': digest(pathlib.Path(_memory_module.__file__)),
+            'scope': 'observed Linux owned process-family mappings; sampled peaks are lower bounds; excludes kernel/GPU/unmapped cache, fixture, monitor and LLM/model providers',
+            'timing_scope': 'process time includes custody, cleanup and sampling overhead; complete monitor main-thread CPU is separate'},
+        'stdout_tail': log_tail(directory / 'stdout.log'),
+        'stderr_tail': log_tail(directory / 'stderr.log'),
+        'cleanup_stdout_tail': log_tail(directory / 'cleanup-stdout.log'),
+        'cleanup_stderr_tail': log_tail(directory / 'cleanup-stderr.log')}
 
 
 def prepare_native_entry(path, fixture_url=None):
@@ -522,12 +628,20 @@ def main():
                 command, environment, cwd = cli_execution(executable, runtime, native_entry['path'], state, args.timeout)
             fixture.started_at = time.monotonic()
             measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
-                               args.output.with_name(args.output.name + '.memory.jsonl'), env=environment, cwd=cwd)
+                               args.output.with_name(args.output.name + '.memory.jsonl'), env=environment, cwd=cwd,
+                               cleanup_command=([str(executable), 'web', 'runtime', 'stop', '--json']
+                                                if state is not None else None),
+                               runtime_identity=((runtime_before.st_dev, runtime_before.st_ino)
+                                                 if runtime_before is not None else None))
         audit = fixture.audit()
         valid = audit['all_tasks_verified'] and measured['exit_code'] == 0 and not measured['timed_out']
         reason = audit['error']
         if reason is None and not valid:
             reason = 'process timed out' if measured['timed_out'] else 'engine process failed'
+        if state is not None and measured['cleanup_exit_code'] != 0:
+            valid = False
+            if reason is None:
+                reason = 'owned runtime cleanup command failed'
         executable_after = executable.stat()
         if (executable_before.st_dev, executable_before.st_ino, executable_before.st_size, executable_before.st_mtime_ns) != (
                 executable_after.st_dev, executable_after.st_ino, executable_after.st_size, executable_after.st_mtime_ns):
@@ -547,7 +661,7 @@ def main():
                 valid, reason = False, 'CLI runtime executable changed during measurement'
             measured['process_family_memory']['scope'] = (
                 'observed Linux CLI and runtime descendant mappings; sampled peaks are lower bounds; '
-                'detached descendants are retained only if observed before reparenting; '
+                'detached roots are adopted when Linux kernel custody is supported; '
                 'excludes kernel/GPU/unmapped cache, fixture, harness and LLM/model providers')
             observed = measured['process_family_memory']
             measured['observed_process_family_memory'] = observed
@@ -556,8 +670,17 @@ def main():
                 'peak_sampled_pss_bytes': None,
                 'peak_sampled_private_bytes': None,
                 'complete_for_execution_surface': False,
-                'scope': 'unknown whole CLI/runtime memory: detached owner PID/birth was not registered from a supported owner receipt; observed samples are separate',
+                'scope': 'unknown whole CLI/runtime memory: complete kernel custody and the configured runtime image were not verified; observed samples are separate',
             }
+            family = measured['process_custody']
+            if (family['supported'] and family['all_reaped'] and family['runtime_image_observed']
+                    and observed['incomplete_sample_count'] == 0
+                    and observed['peak_sampled_pss_bytes'] is not None):
+                measured['process_family_memory'] = {
+                    **observed,
+                    'complete_for_execution_surface': True,
+                    'scope': 'sampled Linux CLI/runtime family under kernel custody through explicit cleanup; transient peaks, kernel/GPU/cache and LLM/model providers remain excluded',
+                }
         measured['verified_completed_tasks_per_second_including_all_process_time'] = (
             audit['independently_verified_completed_tasks'] * 1000 / measured['process_cold_total_ms'])
         boundaries = [fixture.started_at] + [event[0] for event in fixture.round_events]
@@ -592,7 +715,7 @@ def main():
                 'runtime_executable': str(runtime), 'runtime_sha256': runtime_sha256,
                 'private_state_directory': str(state),
                 'state_cleanup': 'preserved for ownership/lifecycle inspection; not automatically deleted',
-                'lifecycle_scope': 'normal standalone CLI shutdown; no proof that every descendant exited',
+                'lifecycle_scope': 'explicit runtime stop is measured; descendant exit is proved only where process_custody.all_reaped is true',
                 'session_profile': 'project; explicit loopback fixture, normal session limits',
                 'entry_url_binding': 'module-local generated loopback URL; no production fixture env',
             }
