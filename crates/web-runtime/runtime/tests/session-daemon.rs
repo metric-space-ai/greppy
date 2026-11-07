@@ -17,6 +17,8 @@ use web_runtime::worker::give_child_attach_token;
 
 #[path = "cases/workflow_cases.rs"]
 mod workflow_cases;
+#[path = "support/navigation_fixture_stream.rs"]
+mod navigation_fixture_stream;
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const SOCKET_WAIT: Duration = Duration::from_secs(30);
@@ -1129,7 +1131,7 @@ impl Drop for NavigationLifecycleFixture {
 }
 
 fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind lifecycle fixture");
@@ -1156,17 +1158,18 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                 }
                 Err(_) => break,
             };
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            if let Err(error) = navigation_fixture_stream::normalize_accepted_stream(&stream) {
+                server_diagnostics.lock().unwrap().push(format!("socket setup error: {error}"));
+                continue;
+            }
             let events_tx = events_tx.clone();
             let diagnostics = Arc::clone(&server_diagnostics);
             let releases = Arc::clone(&server_releases);
             let handler_stop = Arc::clone(&server_stop);
             let handler = thread::spawn(move || {
-                let mut buffer = [0_u8; 2048];
-                let n = match stream.read(&mut buffer) {
-                    Ok(0) => return,
-                    Ok(n) => n,
+                let request = match navigation_fixture_stream::read_headers(&mut stream) {
+                    Ok(None) => return,
+                    Ok(Some(request)) => request,
                     Err(error) => {
                         diagnostics
                             .lock()
@@ -1175,7 +1178,7 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                         return;
                     }
                 };
-                let request = String::from_utf8_lossy(&buffer[..n]);
+                let request = String::from_utf8_lossy(&request);
                 let path = request
                     .lines()
                     .next()
@@ -5579,7 +5582,11 @@ await browser.close();
         None,
         Duration::from_secs(30),
     );
-    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert_eq!(
+        ran.status, "ok",
+        "{ran:?}; fixture diagnostics={:?}",
+        fixture.diagnostics.lock().unwrap()
+    );
     assert!(
         ran.result.as_ref().unwrap()["stdout"]
             .as_str()

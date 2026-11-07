@@ -150,6 +150,9 @@ jobs:
       - name: Prove failed worker preparation releases kernel descriptors
         run: python3 tools/check_worker_fd_mutation.py
 
+      - name: Prove accepted navigation sockets and fragmented headers are real
+        run: python3 tools/check_navigation_fixture_stream_mutations.py
+
       - name: Run Linux sandbox and fexecve gates
         run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh
 

@@ -1,3 +1,6 @@
+#[cfg(all(test, unix))]
+#[path = "../tests/support/navigation_fixture_stream.rs"]
+mod navigation_fixture_stream_contract;
 pub mod artifacts;
 #[cfg(feature = "controller-runtime")]
 pub mod controller_worker;
