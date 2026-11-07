@@ -841,63 +841,6 @@ pub(crate) fn search_symbols_json(
     Ok(())
 }
 
-pub(crate) fn search_code_definition_entry(
-    root_path: &std::path::Path,
-    row: &greppy_search::graph::SearchGraphRow,
-) -> Result<Option<SearchCodeDefinitionEntry>> {
-    if row.start_line < 1 || is_synthetic_file_anchor(&row.label, &row.name, &row.qualified_name) {
-        return Ok(None);
-    }
-    let absolute = root_path.join(&row.file_path);
-    let content = match std::fs::read(&absolute) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(Error::Io {
-                context: format!("read {}", absolute.display()),
-                source,
-            });
-        }
-    };
-    let start_line = std::str::from_utf8(&content)
-        .ok()
-        .map(|text| search_definition_start_line(text, row.start_line))
-        .unwrap_or(row.start_line);
-    let Some(span) = read_span_with_meta(
-        root_path,
-        &row.file_path,
-        start_line,
-        row.end_line,
-        usize::MAX,
-        false,
-    ) else {
-        return Ok(None);
-    };
-    let (byte_start, byte_end) =
-        line_range_to_bytes(&content, start_line as usize, span.end_line as usize);
-    let mut handle = greppy_edit::EditHandle::for_range(
-        root_path,
-        std::path::Path::new(&row.file_path),
-        &content,
-        byte_start,
-        byte_end,
-    )?;
-    let language = greppy_edit::language_for_path(std::path::Path::new(&row.file_path));
-    handle.signature_fingerprint =
-        greppy_edit::verbs::signature_fingerprint(language, &content, (byte_start, byte_end));
-    handle.grammar_id = Some(format!("{language:?}"));
-    handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
-    Ok(Some(SearchCodeDefinitionEntry {
-        qualified_name: row.qualified_name.clone(),
-        file: row.file_path.clone(),
-        start_line,
-        end_line: span.end_line,
-        source: span.text,
-        handle: handle.encode(),
-        matches: Vec::new(),
-    }))
-}
-
 pub(crate) fn search_code_definition_json(
     definition: &SearchCodeDefinitionEntry,
 ) -> serde_json::Value {
