@@ -505,8 +505,7 @@ fn collect_runtime_scopes(
 #[ignore = "requires a task-owned confinement canary"]
 fn sandbox_canary_child_probe() {
     use std::io::Write;
-    let path = std::env::var_os("GREPPY_TEST_SANDBOX_CANARY")
-        .expect("task-owned canary path");
+    let path = std::env::var_os("GREPPY_TEST_SANDBOX_CANARY").expect("task-owned canary path");
     let result = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
@@ -558,8 +557,11 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
     assert!(!canary.starts_with(std::fs::canonicalize(&root).unwrap()));
     let probe_binary = std::env::current_exe().unwrap();
     let probe_args = [
-        "--exact", "sandbox_canary_child_probe",
-        "--ignored", "--nocapture", "--test-threads=1",
+        "--exact",
+        "sandbox_canary_child_probe",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
     ];
     // The same executable and file must really be writable before confinement;
     // a read-only file, nonexistent path or broken probe cannot pass as denial.
@@ -664,13 +666,16 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .collect();
-    let session = events.iter().find(|event| event["type"] == "session")
+    let session = events
+        .iter()
+        .find(|event| event["type"] == "session")
         .expect("actual agent session event");
     assert_eq!(
         session["sandbox"], "confined",
         "native agent test did not select confined mode: {stdout}\n{stderr}"
     );
-    let finishes: Vec<_> = events.iter()
+    let finishes: Vec<_> = events
+        .iter()
         .filter(|event| event["type"] == "tool_finish")
         .collect();
     let wire = messages.lock().unwrap();
@@ -715,7 +720,11 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
     drop(wire);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match std::os::unix::net::UnixStream::connect(&socket) {
+        // Close the presence probe before recovery. A match scrutinee would
+        // otherwise keep its empty connection open while public stop waits
+        // behind it in the serial runtime frame reader.
+        let presence = std::os::unix::net::UnixStream::connect(&socket).map(drop);
+        match presence {
             Err(error)
                 if matches!(
                     error.kind(),
@@ -725,10 +734,10 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                 break
             }
             Err(error) => panic!("cannot verify agent runtime socket closure: {error}"),
-            Ok(_) if std::time::Instant::now() < deadline => {
+            Ok(()) if std::time::Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10))
             }
-            Ok(_) => {
+            Ok(()) => {
                 // A cleanup mutant must still release its own authenticated test
                 // runtime through the public stop operation before failing.
                 let mut stop_command = Command::new(binary_path());
@@ -753,20 +762,28 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                 let direct_status = if stopped.status.success() {
                     None
                 } else {
-                    Some(match greppy_web_client::probe_runtime_status(
-                        std::path::Path::new(&socket), &run_id, &cleanup_token,
-                    ) {
-                        Ok(greppy_web_client::RuntimeStatusProbe::Ready(_)) =>
-                            serde_json::json!({"state": "ready"}),
-                        Ok(greppy_web_client::RuntimeStatusProbe::Starting) =>
-                            serde_json::json!({"state": "starting"}),
-                        Err(error) => serde_json::json!({
-                            "state": "error", "code": error.into_error().code,
-                        }),
-                    })
+                    Some(
+                        match greppy_web_client::probe_runtime_status(
+                            std::path::Path::new(&socket),
+                            &run_id,
+                            &cleanup_token,
+                        ) {
+                            Ok(greppy_web_client::RuntimeStatusProbe::Ready(_)) => {
+                                serde_json::json!({"state": "ready"})
+                            }
+                            Ok(greppy_web_client::RuntimeStatusProbe::Starting) => {
+                                serde_json::json!({"state": "starting"})
+                            }
+                            Err(error) => serde_json::json!({
+                                "state": "error", "code": error.into_error().code,
+                            }),
+                        },
+                    )
                 };
                 let short_text = |value: &serde_json::Value| {
-                    value.as_str().map(|text| text.chars().take(256).collect::<String>())
+                    value
+                        .as_str()
+                        .map(|text| text.chars().take(256).collect::<String>())
                 };
                 let stop_diagnostic = serde_json::json!({
                     "exit_code": stopped.status.code(),
