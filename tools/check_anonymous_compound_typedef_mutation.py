@@ -33,6 +33,26 @@ def checked(args):
     return result.stdout
 
 
+def read_sources(paths):
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def write_sources(sources):
+    for path, data in sources.items():
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+
+def legacy_sources(paths):
+    tracked = set(checked(["git", "ls-tree", "-r", "--name-only", LEGACY_BASE, "--", "crates"]).splitlines())
+    return {path: subprocess.check_output(
+        ["git", "show", f"{LEGACY_BASE}:{path.relative_to(ROOT)}"], cwd=ROOT)
+        if path.relative_to(ROOT).as_posix() in tracked else None for path in paths}
+
+
 def run(kind, red=None):
     cases = {
         "parser": (["-p", "greppy-parser", "--lib", PARSER], [PARSER]),
@@ -60,18 +80,17 @@ def digest(path):
     return h.hexdigest()
 
 
-# Replace EVERY changed production Rust source by its exact immutable Main
-# bytes, not a parser imitation or forged store. Tests/helpers are not compiled
-# into `cargo build --bin greppy`. Restore all sources before the current build.
+# Reproduce each changed production source's exact immutable bytes OR absence.
+# Later additions must not survive in the legacy build; removed legacy files
+# must be restored too. Tests/helpers are not part of `cargo build --bin greppy`.
 if subprocess.run(["git", "cat-file", "-e", LEGACY_BASE + "^{commit}"], cwd=ROOT,
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
     checked(["git", "fetch", "--no-tags", "--depth=1", "origin", LEGACY_BASE])
-changed = checked(["git", "diff", "--name-only", LEGACY_BASE, "--", "crates"]).splitlines()
+changed = checked(["git", "diff", "--no-renames", "--name-only", LEGACY_BASE, "--", "crates"]).splitlines()
 production = [ROOT / name for name in changed if "/src/" in name and name.endswith(".rs")]
 assert EXTRACT in production and POLICY in production
-original = {path: path.read_bytes() for path in production}
-legacy_bytes = {path: subprocess.check_output(
-    ["git", "show", f"{LEGACY_BASE}:{path.relative_to(ROOT)}"], cwd=ROOT) for path in production}
+original = read_sources(production)
+legacy_bytes = legacy_sources(production)
 assert b"fn c_cpp_anonymous_compound_typedef" not in legacy_bytes[EXTRACT]
 metadata = json.loads(checked(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]))
 target = Path(metadata["target_directory"])
@@ -79,15 +98,13 @@ legacy = target / "tmp" / "greppy-pre-typedef"
 legacy.parent.mkdir(parents=True, exist_ok=True)
 try:
     try:
-        for path, data in legacy_bytes.items():
-            path.write_bytes(data)
-        checked(["git", "diff", "--exit-code", LEGACY_BASE, "--", *[str(p.relative_to(ROOT)) for p in production]])
+        write_sources(legacy_bytes)
+        assert read_sources(production) == legacy_bytes, "legacy production source snapshot mismatch"
         checked(["cargo", "build", "--locked", "--jobs", "2", "-p", "greppy", "--features", "ci-test-assets", "--bin", "greppy"])
         shutil.copy2(target / "debug" / "greppy", legacy)
         print(f"mutation: actual legacy CLI built from exact {LEGACY_BASE} production sources; binary SHA256={digest(legacy)}; extractor SHA256={hashlib.sha256(legacy_bytes[EXTRACT]).hexdigest()}", flush=True)
     finally:
-        for path, data in original.items():
-            path.write_bytes(data)
+        write_sources(original)
 
     run("parser")
     run("cli")
@@ -139,9 +156,8 @@ try:
     run("cli")
     run("reuse")
     run("warm")
-    assert all(path.read_bytes() == data for path, data in original.items())
+    assert read_sources(production) == original
     print("mutation: every production source restored byte-for-byte; parser/CLI, true warm upgrade, exact Base-key/title/format guards and cache-reuse contracts green", flush=True)
 finally:
-    for path, data in original.items():
-        path.write_bytes(data)
+    write_sources(original)
     legacy.unlink(missing_ok=True)

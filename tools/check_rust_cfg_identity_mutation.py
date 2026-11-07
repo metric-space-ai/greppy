@@ -29,6 +29,26 @@ def checked(args):
     return result.stdout
 
 
+def read_sources(paths):
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def write_sources(sources):
+    for path, data in sources.items():
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+
+def legacy_sources(paths):
+    tracked = set(checked(["git", "ls-tree", "-r", "--name-only", LEGACY_BASE, "--", "crates"]).splitlines())
+    return {path: subprocess.check_output(
+        ["git", "show", f"{LEGACY_BASE}:{path.relative_to(ROOT)}"], cwd=ROOT)
+        if path.relative_to(ROOT).as_posix() in tracked else None for path in paths}
+
+
 def run(warm=False, red=None):
     names = WARM if warm else [COLD]
     result = command(["cargo", "test", "--locked", "--jobs", "2", "-p", "greppy", "--features", "ci-test-assets", "--test", "rust_cfg_identity", "rust_cfg_warm_" if warm else COLD, "--", "--test-threads=1", *(["--ignored"] if warm else [])])
@@ -39,26 +59,24 @@ def run(warm=False, red=None):
 if subprocess.run(["git", "cat-file", "-e", LEGACY_BASE + "^{commit}"], cwd=ROOT,
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
     checked(["git", "fetch", "--no-tags", "--depth=1", "origin", LEGACY_BASE])
-changed = checked(["git", "diff", "--name-only", LEGACY_BASE, "--", "crates"]).splitlines()
+changed = checked(["git", "diff", "--no-renames", "--name-only", LEGACY_BASE, "--", "crates"]).splitlines()
 production = [ROOT / name for name in changed if "/src/" in name and name.endswith(".rs")]
 assert EXTRACT in production and POLICY in production
-original = {path: path.read_bytes() for path in production}
-old = {path: subprocess.check_output(["git", "show", f"{LEGACY_BASE}:{path.relative_to(ROOT)}"], cwd=ROOT) for path in production}
+original = read_sources(production)
+old = legacy_sources(production)
 metadata = json.loads(checked(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]))
 target = Path(metadata["target_directory"])
 legacy = target / "tmp" / "greppy-pre-rust-cfg"
 legacy.parent.mkdir(parents=True, exist_ok=True)
 try:
     try:
-        for path, data in old.items():
-            path.write_bytes(data)
-        checked(["git", "diff", "--exit-code", LEGACY_BASE, "--", *[str(p.relative_to(ROOT)) for p in production]])
+        write_sources(old)
+        assert read_sources(production) == old, "legacy production source snapshot mismatch"
         checked(["cargo", "build", "--locked", "--jobs", "2", "-p", "greppy", "--features", "ci-test-assets", "--bin", "greppy"])
         shutil.copy2(target / "debug" / "greppy", legacy)
         print(f"mutation: actual legacy CLI built from exact {LEGACY_BASE} production sources; binary SHA256={hashlib.sha256(legacy.read_bytes()).hexdigest()}; extractor SHA256={hashlib.sha256(old[EXTRACT]).hexdigest()}", flush=True)
     finally:
-        for path, data in original.items():
-            path.write_bytes(data)
+        write_sources(original)
 
     run()
     run(warm=True)
@@ -96,9 +114,8 @@ try:
 
     run()
     run(warm=True)
-    assert all(path.read_bytes() == data for path, data in original.items())
+    assert read_sources(production) == original
     print("mutation: all production sources restored byte-for-byte; cold parser/graph/read, both warm paths and stable vector reuse green again", flush=True)
 finally:
-    for path, data in original.items():
-        path.write_bytes(data)
+    write_sources(original)
     legacy.unlink(missing_ok=True)
