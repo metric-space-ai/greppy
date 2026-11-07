@@ -68,7 +68,17 @@ impl SharedRenderWorkers {
             .unwrap_or_else(|error| error.into_inner()))
     }
 
-    fn retire_if_idle(current: &mut Option<Generation>) -> io::Result<()> {
+    fn join_retired_workers(&self, workers: Vec<JoinHandle<()>>) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(events) = self.events.as_ref() {
+            events
+                .retire_joins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        join_workers(workers)
+    }
+
+    fn retire_if_idle(&self, current: &mut Option<Generation>) -> io::Result<()> {
         if current
             .as_ref()
             .is_some_and(|entry| entry.pool.strong_count() != 0)
@@ -76,14 +86,14 @@ impl SharedRenderWorkers {
             return Ok(());
         }
         if let Some(previous) = current.take() {
-            join_workers(previous.workers)?;
+            self.join_retired_workers(previous.workers)?;
         }
         Ok(())
     }
 
     fn independent(&self, count: usize) -> io::Result<Arc<rayon::ThreadPool>> {
         let mut current = self.enter()?;
-        Self::retire_if_idle(&mut current)?;
+        self.retire_if_idle(&mut current)?;
         rayon::ThreadPoolBuilder::new()
             .num_threads(count)
             .thread_name(|index| format!("WRWorker#{index}"))
@@ -97,7 +107,7 @@ impl SharedRenderWorkers {
         if let Some(pool) = current.as_ref().and_then(|entry| entry.pool.upgrade()) {
             return Ok(pool);
         }
-        Self::retire_if_idle(&mut current)?;
+        self.retire_if_idle(&mut current)?;
 
         let mut workers = Vec::new();
         let built = rayon::ThreadPoolBuilder::new()
@@ -186,6 +196,7 @@ struct Events {
     exits: std::sync::atomic::AtomicUsize,
     live: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
+    retire_joins: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -329,12 +340,14 @@ mod tests {
         let pool = registry.acquire(2).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
         let completed = Arc::new(AtomicUsize::new(0));
         let completed_job = completed.clone();
         pool.spawn(move || {
             started_tx.send(()).unwrap();
             finish_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             completed_job.store(4096, SeqCst);
+            done_tx.send(()).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(pool);
@@ -346,10 +359,22 @@ mod tests {
             result_tx.send(next_registry.acquire(2).unwrap()).unwrap();
         });
         enter_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = result_rx.recv_timeout(Duration::from_millis(250)).ok();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The real join has begun, or the no-join fault has actually started a
+        // successor worker. Keep the old job blocked until one is observed.
+        while events.retire_joins.load(SeqCst) == 0 && events.peak.load(SeqCst) <= 2 {
+            assert!(
+                Instant::now() < deadline,
+                "renderer restart did not enter retirement"
+            );
+            thread::yield_now();
+        }
         finish_tx.send(()).unwrap();
-        let next = early.unwrap_or_else(|| result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        let next = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         restart.join().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pending renderer work did not finish after release");
         assert_eq!(
             completed.load(SeqCst),
             4096,

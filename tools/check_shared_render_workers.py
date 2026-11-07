@@ -22,7 +22,7 @@ FAULTS = (
     ("reuse", "return Ok(pool);",
      "return rayon::ThreadPoolBuilder::new().num_threads(count.max(1)).build().map(std::sync::Arc::new).map_err(|error| std::io::Error::other(error.to_string()));",
      CONTRACTS[0], "overlapping renderers started duplicate worker threads"),
-    ("drain", "join_workers(previous.workers)?;", "drop(previous.workers);",
+    ("drain", "self.join_retired_workers(previous.workers)?;", "drop(previous.workers);",
      CONTRACTS[1], "new render workers overlapped retiring generation"),
     ("retention", "*current = Some(Generation {",
      "std::mem::forget(pool.clone());\n                *current = Some(Generation {",
