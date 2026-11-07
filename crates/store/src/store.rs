@@ -62,6 +62,7 @@ pub struct Store {
 #[derive(Debug, Clone)]
 struct OverlayInfo {
     base_path: PathBuf,
+    reuse_identity: Option<crate::BaseStoreIdentity>,
 }
 
 impl std::fmt::Debug for Store {
@@ -325,6 +326,12 @@ impl Store {
         self.conn.execute_batch(OVERLAY_VIEWS_SQL)?;
         self.overlay = Some(OverlayInfo {
             base_path: base_path.to_path_buf(),
+            // Bare/legacy attached databases remain usable as before, but are
+            // not eligible for hidden-Base content reuse without publication
+            // verification through the existing immutable Base authority.
+            reuse_identity: crate::BaseStoreLayout::read_verified_graph_manifest(base_path)
+                .ok()
+                .map(|manifest| manifest.identity),
         });
         Ok(self)
     }
@@ -335,6 +342,10 @@ impl Store {
 
     pub fn overlay_base_path(&self) -> Option<&Path> {
         self.overlay.as_ref().map(|info| info.base_path.as_path())
+    }
+
+    pub(crate) fn overlay_reuse_identity(&self) -> Option<&crate::BaseStoreIdentity> {
+        self.overlay.as_ref()?.reuse_identity.as_ref()
     }
 
     /// Begin a write transaction. Rolls back on drop if neither

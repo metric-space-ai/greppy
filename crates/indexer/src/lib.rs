@@ -1510,13 +1510,13 @@ fn apply_file_nodes(
     // files and needs the per-file delete-then-insert for correctness.
     insert_content: bool,
 ) -> Result<()> {
-    // Delete any prior nodes for this file BEFORE inserting
-    // the new ones. The FK cascade on `edges.source_id` /
-    // `edges.target_id` removes orphaned edges in the same
-    // transaction. This per-file deletion is preserved exactly under
-    // the two-phase split — each file is still individually cleaned
-    // before its fresh nodes land.
-    let _removed = store.delete_nodes_for_file(project, rel_path)?;
+    // A revision-only refresh has proven identical source bytes. Preserve
+    // unchanged definition identities and their content-addressed vectors;
+    // ordinary source edits retain the existing delete/reinsert behavior.
+    let revision_only = store.get_file_state(project, rel_path)?.is_some_and(|old| {
+        old.sha256 == file_state::sha256_hex(bytes)
+            && !greppy_parser::extraction_revision_matches(abs_path, &old.extractor_version)
+    });
 
     // Also delete prior file-content rows before the new
     // content is inserted, so a renamed/removed symbol's content
@@ -1558,6 +1558,40 @@ fn apply_file_nodes(
     for n in nodes {
         new_nodes.push(new_node_for(project, rel_path, n.clone()));
     }
+    if revision_only {
+        let expected = new_nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect::<std::collections::HashMap<_, _>>();
+        // Match the old cascade's edge boundary while retaining exact nodes.
+        // Raw rows below are replaced and the existing resolver regenerates
+        // these relations against the new definition set.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.edges WHERE project=?1 AND (
+                source_id IN (SELECT id FROM main.nodes WHERE project=?1 AND file_path=?2)
+                OR target_id IN (SELECT id FROM main.nodes WHERE project=?1 AND file_path=?2))",
+                rusqlite::params![project, rel_path],
+            )
+            .map_err(sqlite_err)?;
+        for old in store.list_nodes_for_file(project, rel_path)? {
+            let unchanged = expected
+                .get(old.qualified_name.as_str())
+                .is_some_and(|new| {
+                    old.label == new.label
+                        && old.name == new.name
+                        && old.start_line == new.start_line
+                        && old.end_line == new.end_line
+                        && old.properties == new.properties
+                });
+            if !unchanged && old.id > 0 {
+                store.delete_node(old.id)?;
+            }
+        }
+    } else {
+        let _removed = store.delete_nodes_for_file(project, rel_path)?;
+    }
     store.insert_nodes(&new_nodes)?;
 
     // Feed indexed file-content rows for `search-code`. We
@@ -1585,7 +1619,10 @@ fn apply_file_nodes(
         mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-        extractor_version: "greppy-extractor-v1".into(),
+        extractor_version: greppy_parser::extraction_revision(greppy_parser::language_for_path(
+            abs_path,
+        ))
+        .into(),
         last_indexed_generation: generation,
     };
     store.upsert_file_state(&fs)?;
@@ -8068,7 +8105,10 @@ fn record_unsupported_file_state(
             mtime_ns: metadata.mtime_ns.unwrap_or(0),
             size: md.len() as i64,
             parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-            extractor_version: "greppy-extractor-v1".into(),
+            extractor_version: greppy_parser::extraction_revision(
+                greppy_parser::language_for_path(&entry.abs_path),
+            )
+            .into(),
             last_indexed_generation: generation,
         };
         let _ = store.upsert_file_state(&fs);
@@ -8095,7 +8135,10 @@ fn record_unsupported_file_state(
         mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-        extractor_version: "greppy-extractor-v1".into(),
+        extractor_version: greppy_parser::extraction_revision(greppy_parser::language_for_path(
+            &entry.abs_path,
+        ))
+        .into(),
         last_indexed_generation: generation,
     };
     let _ = store.upsert_file_state(&fs);

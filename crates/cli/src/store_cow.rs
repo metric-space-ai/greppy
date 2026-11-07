@@ -98,6 +98,7 @@ fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Opti
     } else {
         visibility_against(root, &base_commit)?
     };
+    let visibility = visibility_with_extraction_revisions(root, &base_path, visibility)?;
     Ok(Some(OverlaySpec {
         base_path,
         base_commit,
@@ -242,7 +243,11 @@ pub(crate) fn overlay_freshness_proof(
         return Ok(None);
     };
     let cached = cached?;
-    let live = visibility_against(root, &base_commit)?;
+    let live = visibility_with_extraction_revisions(
+        root,
+        &base_path,
+        visibility_against(root, &base_commit)?,
+    )?;
     if cached != live {
         return Ok(Some(OverlayFreshnessProof::Stale {
             changed_paths: visibility_changed_paths(&cached, &live),
@@ -359,7 +364,8 @@ pub(crate) fn overlay_freshness_proof(
         )? {
             return Ok(Some(OverlayFreshnessProof::Stale {
                 changed_paths: vec![(*rel_path).to_owned()],
-                reason: "a Store-CoW Delta path changed after it was indexed".into(),
+                reason: "a Store-CoW Delta path or its extraction revision changed after indexing"
+                    .into(),
             }));
         }
     }
@@ -561,6 +567,10 @@ fn persisted_delta_path_matches(
                 Error::Store(format!("read sparse Store-CoW file state: {error}"))
             })? {
                 return Ok(state.size >= 0
+                    && greppy_parser::extraction_revision_matches(
+                        Path::new(rel_path),
+                        &state.extractor_version,
+                    )
                     && blob.size == state.size as u64
                     && blob.sha256 == state.sha256);
             }
@@ -581,7 +591,12 @@ fn persisted_delta_path_matches(
         .get_file_state(project, rel_path)
         .map_err(|error| Error::Store(format!("read Store-CoW file state: {error}")))?
     {
-        if !metadata.is_file() {
+        if !metadata.is_file()
+            || !greppy_parser::extraction_revision_matches(
+                Path::new(rel_path),
+                &state.extractor_version,
+            )
+        {
             return Ok(false);
         }
         let identity = identities.get(rel_path);
@@ -826,8 +841,40 @@ pub(crate) fn visibility_for_open_connection(
     base_commit: &str,
     connection: &rusqlite::Connection,
 ) -> Result<VisibilityIndex> {
-    cached_visibility_from_connection(connection, base_commit)
-        .unwrap_or_else(|| visibility_against(root, base_commit))
+    let visibility = cached_visibility_from_connection(connection, base_commit)
+        .unwrap_or_else(|| visibility_against(root, base_commit))?;
+    match overlay_environment(root)? {
+        Some((base, _)) => visibility_with_extraction_revisions(root, &base, visibility),
+        None => Ok(visibility),
+    }
+}
+
+/// An immutable Base keeps its original extraction results. Paths whose
+/// revision is obsolete become ordinary private Delta ownership, even when Git
+/// bytes are unchanged. Readers and writers derive exactly the same boundary.
+fn visibility_with_extraction_revisions(
+    root: &Path,
+    base_path: &Path,
+    visibility: VisibilityIndex,
+) -> Result<VisibilityIndex> {
+    let base = greppy_store::Store::open_with(base_path, greppy_store::OpenOptions::read_only())?;
+    let project = greppy_core::project_identity(root);
+    let mut dirty = visibility
+        .dirty_paths()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    for state in base.list_file_states(&project)? {
+        if !visibility.is_deleted_path(&state.rel_path)
+            && !greppy_parser::extraction_revision_matches(
+                Path::new(&state.rel_path),
+                &state.extractor_version,
+            )
+        {
+            dirty.insert(state.rel_path);
+        }
+    }
+    VisibilityIndex::new(dirty, visibility.deleted_paths().map(str::to_owned))
+        .map_err(|error| Error::io("bind extraction-compatible Delta visibility", error))
 }
 
 fn rust_repair_requires_source_refresh(
@@ -1412,31 +1459,7 @@ fn diagnostics_inner(
 }
 
 fn verified_manifest_for_graph(path: &Path) -> std::io::Result<greppy_store::BaseStoreManifest> {
-    let identity_dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("Base graph has no identity directory"))?;
-    let repo_dir = identity_dir
-        .parent()
-        .ok_or_else(|| std::io::Error::other("Base graph has no repository directory"))?;
-    let version_dir = repo_dir
-        .parent()
-        .ok_or_else(|| std::io::Error::other("Base graph has no format directory"))?;
-    let stores_dir = version_dir
-        .parent()
-        .ok_or_else(|| std::io::Error::other("Base graph has no stores directory"))?;
-    let data_root = stores_dir
-        .parent()
-        .ok_or_else(|| std::io::Error::other("Base graph has no data root"))?;
-    let bytes = std::fs::read(identity_dir.join(greppy_store::BASE_STORE_MANIFEST_FILE))?;
-    let manifest: greppy_store::BaseStoreManifest = serde_json::from_slice(&bytes)
-        .map_err(|issue| std::io::Error::other(format!("decode Base manifest: {issue}")))?;
-    let layout = BaseStoreLayout::new(data_root, &manifest.identity)?;
-    if layout.graph != path {
-        return Err(std::io::Error::other(
-            "Base graph path does not match identity",
-        ));
-    }
-    layout.read_verified_manifest()
+    BaseStoreLayout::read_verified_graph_manifest(path)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
