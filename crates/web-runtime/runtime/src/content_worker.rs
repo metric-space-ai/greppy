@@ -1551,10 +1551,6 @@ impl ContentEngine {
         }
     }
 
-    fn spin_until(&self, timeout: Duration, predicate: impl FnMut() -> bool) -> io::Result<bool> {
-        self.spin_until_on(&self.wake, timeout, predicate)
-    }
-
     fn spin_until_on(
         &self,
         wake: &WakeFlag,
@@ -1984,7 +1980,8 @@ impl ContentEngine {
             *callback_slot.borrow_mut() = Some(result);
         });
         let ready = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some())? {
+        let wake = self.wake_for_webview(&webview);
+        if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || ready.borrow().is_some())? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out evaluating structured DOM query",
@@ -2218,9 +2215,10 @@ impl ContentEngine {
             *callback_slot.borrow_mut() = Some((Instant::now(), result));
         });
         let ready = Rc::clone(&saved);
+        let wake = self.wake_for_webview(&webview);
         // The generic pump can notice a reply before checking its own clock.
         // Keep the original caller's absolute deadline and check actual receipt.
-        self.spin_until(deadline.saturating_duration_since(Instant::now()), move || {
+        self.spin_until_on(&wake, deadline.saturating_duration_since(Instant::now()), move || {
             ready.borrow().is_some()
         })?;
         let result = crate::locator_diagnostics::take_timely_dom_reply(
