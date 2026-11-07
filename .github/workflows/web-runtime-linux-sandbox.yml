@@ -398,6 +398,9 @@ jobs:
       - name: Prove actionability timeout diagnostics never invent DOM evidence
         run: python3 tools/check_unobserved_dom_deadline_mutations.py
 
+      - name: Prove shared render capacity releases workers before restart
+        run: python3 tools/check_shared_render_workers.py
+
       - name: Prove HTML fixtures release listener, thread, connections and owned body
         run: python3 tools/check_owned_html_fixture_mutations.py
 
