@@ -826,10 +826,31 @@ impl AgentWorkspace {
             )?,
         };
         if !changed_paths.is_empty() {
-            let mut arguments = vec!["add", "-A", "--"];
-            arguments.extend(changed_paths.iter().map(String::as_str));
-            arguments.extend(excluded_paths.iter().map(String::as_str));
-            git_with_index(&self.worktree, &self.private_index, &arguments)?;
+            let mut query = vec!["ls-files", "-z", "--"];
+            query.extend(changed_paths.iter().map(String::as_str));
+            let tracked = git_with_index(&self.worktree, &self.private_index, &query)?;
+            let tracked: std::collections::HashSet<_> = tracked
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .collect();
+            let (tracked_paths, new_paths): (Vec<_>, Vec<_>) = changed_paths
+                .iter()
+                .map(String::as_str)
+                .partition(|path| tracked.contains(path));
+            if !tracked_paths.is_empty() {
+                // Even an already tracked file under an ignored directory can
+                // make add -A return an ignored-path error after staging it.
+                // Update known entries without asking Git to add ignored paths.
+                let mut arguments = vec!["add", "-u", "--"];
+                arguments.extend(tracked_paths);
+                git_with_index(&self.worktree, &self.private_index, &arguments)?;
+            }
+            if !new_paths.is_empty() {
+                let mut arguments = vec!["add", "-A", "--"];
+                arguments.extend(new_paths);
+                arguments.extend(excluded_paths.iter().map(String::as_str));
+                git_with_index(&self.worktree, &self.private_index, &arguments)?;
+            }
         }
         stage_hardlink_groups(
             &self.core,
@@ -7233,6 +7254,7 @@ mod tests {
         )
         .unwrap();
         fs::write(workspace.worktree_path().join("source.txt"), b"after\n").unwrap();
+        fs::write(workspace.worktree_path().join("added.txt"), b"new source\n").unwrap();
         let outcome = workspace
             .finish("preserve source despite ignored web runtime")
             .expect("ignored runtime exclusion must not block a source proposal");
@@ -7246,6 +7268,10 @@ mod tests {
         assert_eq!(
             git(&repo, &["show", &format!("{commit}:source.txt")]),
             "after"
+        );
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:added.txt")]),
+            "new source"
         );
         assert_eq!(
             git(&repo, &["show", &format!("{commit}:{baseline_route}")]),
