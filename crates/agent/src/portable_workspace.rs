@@ -804,8 +804,15 @@ impl AgentWorkspace {
         let excluded_paths: Vec<_> = backend_changed_paths
             .iter()
             .filter(|path| !changed_paths.contains(path) && is_web_ephemeral_path(path))
-            .map(|path| format!(":(literal,exclude){path}"))
+            .cloned()
             .collect();
+        // Git already excludes ignored metadata. An explicit negative pathspec
+        // below an ignored directory makes `git add` reject that directory.
+        let excluded_paths: Vec<_> =
+            filter_ignored_paths(&self.worktree, &self.private_index, excluded_paths)?
+                .into_iter()
+                .map(|path| format!(":(literal,exclude){path}"))
+                .collect();
         let changed_paths =
             filter_ignored_paths(&self.worktree, &self.private_index, changed_paths)?;
         let hardlink_groups = match &self.backend {
@@ -7190,6 +7197,68 @@ mod tests {
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&replacement, &path).unwrap();
         assert!(verify_ordinary_identity(&root, "run", "git-run", "nonce").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_finish_ignored_runtime_metadata_does_not_block_proposal() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir_all(repo.join(".greppy/web/runtime-routes")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        let baseline_route = format!(".greppy/web/runtime-routes/{}.json", "b".repeat(64));
+        fs::write(repo.join(&baseline_route), b"user baseline").unwrap();
+        git(&repo, &["add", ".greppy"]);
+        git(&repo, &["commit", "-qm", "tracked user route"]);
+        fs::write(repo.join(".gitignore"), b".greppy/\n").unwrap();
+        fs::write(repo.join("source.txt"), b"before\n").unwrap();
+        git(&repo, &["add", ".gitignore", "source.txt"]);
+        git(
+            &repo,
+            &["commit", "-qm", "ignore newly generated runtime files"],
+        );
+        let index_before = fs::read(repo.join(".git/index")).unwrap();
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "ignored-web-runtime").unwrap();
+        let route = format!(".greppy/web/runtime-routes/{}.json", "a".repeat(64));
+        fs::write(workspace.worktree_path().join(&route), b"runtime only").unwrap();
+        fs::write(
+            workspace.worktree_path().join(&baseline_route),
+            b"user change",
+        )
+        .unwrap();
+        fs::write(workspace.worktree_path().join("source.txt"), b"after\n").unwrap();
+        let outcome = workspace
+            .finish("preserve source despite ignored web runtime")
+            .expect("ignored runtime exclusion must not block a source proposal");
+        let (commit, ref_name) = match outcome {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("source change must produce a proposal"),
+        };
+        assert_eq!(git(&repo, &["rev-parse", &ref_name]), commit);
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:source.txt")]),
+            "after"
+        );
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:{baseline_route}")]),
+            "user change"
+        );
+        assert!(git(&repo, &["ls-tree", "-r", &commit, "--", &route]).is_empty());
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index_before);
+        assert!(workspace.worktree_path().join(&route).exists());
+        workspace.cleanup().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
     }
 
     #[cfg(unix)]
