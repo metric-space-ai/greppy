@@ -1233,26 +1233,34 @@ fn print_search_pattern_definition_source(
         );
         return Ok(true);
     }
-    let graph_row = greppy_search::graph::SearchGraphRow {
-        id: node.id,
-        project: node.project.clone(),
-        label: node.label.clone(),
-        name: node.name.clone(),
-        qualified_name: node.qualified_name.clone(),
-        file_path: node.file_path.clone(),
-        start_line: node.start_line,
-        end_line: node.end_line,
-    };
-    let Some(definition) = search_code_definition_entry(root_path, &graph_row)? else {
+    // Text needs the source span, not JSON's edit handle and signature parser.
+    // Match the existing definition boundary without generating unused metadata.
+    let path = root_path.join(&node.file_path);
+    let content = std::fs::read(&path).map_err(|source| Error::Io {
+        context: format!("read definition source {}", path.display()),
+        source,
+    })?;
+    let start_line = std::str::from_utf8(&content)
+        .ok()
+        .map(|content| search_definition_start_line(content, node.start_line))
+        .unwrap_or(node.start_line);
+    let Some(span) = read_span_with_meta(
+        root_path,
+        &node.file_path,
+        start_line,
+        node.end_line,
+        usize::MAX,
+        false,
+    ) else {
         println!("[incomplete source: definition unavailable; matching line only]");
         return Ok(false);
     };
     shown_definitions.insert(identity);
-    for (offset, line) in definition.source.lines().enumerate() {
+    for (offset, line) in span.text.lines().enumerate() {
         print_search_pattern_line(
             root_path,
-            &definition.file,
-            definition.start_line + offset as i64,
+            &node.file_path,
+            start_line + offset as i64,
             line,
             search_pattern_display_anchor(line, query, mode, pattern),
         );
