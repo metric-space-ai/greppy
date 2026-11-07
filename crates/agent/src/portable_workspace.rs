@@ -784,18 +784,11 @@ impl AgentWorkspace {
         self.finish_with_ref(message, format!("{}-turn-{sequence}", self.ref_name()))
     }
 
-    fn finish_with_ref(
+    /// Stage raw backend paths through one shared ignore/index/hardlink policy.
+    fn stage_proposal_paths(
         &self,
-        message: &str,
-        ref_name: String,
-    ) -> Result<RunOutcome, WorkspaceError> {
-        self.verify_identity()?;
-        let backend_changed_paths = match &self.backend {
-            WorkspaceBackend::Provider { .. } => self.core.changed_paths(&self.handle)?,
-            WorkspaceBackend::Ordinary { .. } => {
-                ordinary_changed_paths(&self.worktree, &self.private_index, &self.baseline_tree)?
-            }
-        };
+        backend_changed_paths: Vec<String>,
+    ) -> Result<Vec<Vec<String>>, WorkspaceError> {
         let changed_paths = filter_agent_owned_ephemeral_paths(
             &self.worktree,
             &self.baseline_tree,
@@ -860,6 +853,22 @@ impl AgentWorkspace {
             &hardlink_groups,
             matches!(&self.backend, WorkspaceBackend::Provider { .. }),
         )?;
+        Ok(hardlink_groups)
+    }
+
+    fn finish_with_ref(
+        &self,
+        message: &str,
+        ref_name: String,
+    ) -> Result<RunOutcome, WorkspaceError> {
+        self.verify_identity()?;
+        let backend_changed_paths = match &self.backend {
+            WorkspaceBackend::Provider { .. } => self.core.changed_paths(&self.handle)?,
+            WorkspaceBackend::Ordinary { .. } => {
+                ordinary_changed_paths(&self.worktree, &self.private_index, &self.baseline_tree)?
+            }
+        };
+        let hardlink_groups = self.stage_proposal_paths(backend_changed_paths)?;
         let final_tree = git_with_index(&self.worktree, &self.private_index, &["write-tree"])?;
         if final_tree == self.baseline_tree {
             return Ok(RunOutcome::Clean);
@@ -7255,6 +7264,20 @@ mod tests {
         .unwrap();
         fs::write(workspace.worktree_path().join("source.txt"), b"after\n").unwrap();
         fs::write(workspace.worktree_path().join("added.txt"), b"new source\n").unwrap();
+        // A provider journal reports ignored writes, unlike ordinary Git
+        // discovery. Exercise the actual shared staging boundary with that raw
+        // path, then publish through the normal ordinary finish as well.
+        let mut raw_paths = ordinary_changed_paths(
+            workspace.worktree_path(),
+            &workspace.private_index,
+            &workspace.baseline_tree,
+        )
+        .unwrap();
+        assert!(!raw_paths.contains(&route));
+        raw_paths.push(route.clone());
+        let _ = workspace
+            .stage_proposal_paths(raw_paths)
+            .expect("ignored runtime exclusion must not block a source proposal");
         let outcome = workspace
             .finish("preserve source despite ignored web runtime")
             .expect("ignored runtime exclusion must not block a source proposal");
