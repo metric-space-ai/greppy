@@ -748,6 +748,23 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                 let stopped = stop_command.output().unwrap();
                 drop(attach);
                 let stop_result = serde_json::from_slice::<serde_json::Value>(&stopped.stdout);
+                // Observe only after the public stop has already failed. This
+                // cannot turn its immutable exit status into a successful case.
+                let direct_status = if stopped.status.success() {
+                    None
+                } else {
+                    Some(match greppy_web_client::probe_runtime_status(
+                        std::path::Path::new(&socket), &run_id, &cleanup_token,
+                    ) {
+                        Ok(greppy_web_client::RuntimeStatusProbe::Ready(_)) =>
+                            serde_json::json!({"state": "ready"}),
+                        Ok(greppy_web_client::RuntimeStatusProbe::Starting) =>
+                            serde_json::json!({"state": "starting"}),
+                        Err(error) => serde_json::json!({
+                            "state": "error", "code": error.into_error().code,
+                        }),
+                    })
+                };
                 let short_text = |value: &serde_json::Value| {
                     value.as_str().map(|text| text.chars().take(256).collect::<String>())
                 };
@@ -763,7 +780,12 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                         "socket": short_text(&reply["result"]["socket"]),
                         "run_id": short_text(&reply["result"]["run_id"]),
                         "error_code": short_text(&reply["error"]["code"]),
+                        "socket_matches_expected": reply["result"]["socket"].as_str()
+                            .map(|actual| actual == socket.as_str()),
+                        "run_id_matches_expected": reply["result"]["run_id"].as_str()
+                            .map(|actual| actual == run_id.as_str()),
                     })),
+                    "direct_status_after_failed_stop": direct_status,
                     "stdout_bytes": stopped.stdout.len(),
                     "stderr_bytes": stopped.stderr.len(),
                     "stderr_parent_attach_required": String::from_utf8_lossy(&stopped.stderr)
