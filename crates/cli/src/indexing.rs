@@ -1483,7 +1483,8 @@ fn dispatch_index_health_with_detail(
     let js_ts_usage_repair_skips = js_ts_usage_repair_skip_diagnostic(&store);
 
     if json {
-        let value = serde_json::json!({
+        let git_tracked_total = git_tracked.map(|counts| counts.total);
+        let mut value = serde_json::json!({
             "command": command,
             "status": status_label,
             "healthy": healthy,
@@ -1517,9 +1518,7 @@ fn dispatch_index_health_with_detail(
             "provider_failure_count": provider_failure_count,
             "providers": provider_states,
             "skip_counts_by_reason": skip_counts,
-            "git_tracked_files": git_tracked.map(|counts| counts.total),
-            "git_skip_worktree_files": git_tracked.map(|counts| counts.skip_worktree),
-            "git_tracked_non_skip_worktree_files": git_tracked.map(GitTrackedFiles::non_skip_worktree),
+            "git_tracked_files": git_tracked_total,
             "coverage_warning": coverage_warning,
             "vectors_missing_with_model": vectors_missing_with_model,
             "inference_healthy": inference_healthy,
@@ -1528,6 +1527,11 @@ fn dispatch_index_health_with_detail(
             "inference": inference_diagnostics,
             "js_ts_usage_repair_skips": js_ts_usage_repair_skips,
         });
+        // Keep supplementary scope evidence outside the large json! expansion.
+        value["git_skip_worktree_files"] =
+            serde_json::json!(git_tracked.map(|counts| counts.skip_worktree));
+        value["git_tracked_non_skip_worktree_files"] =
+            serde_json::json!(git_tracked.map(GitTrackedFiles::non_skip_worktree));
         println!(
             "{}",
             serde_json::to_string_pretty(&index_health_output(value, detailed))
