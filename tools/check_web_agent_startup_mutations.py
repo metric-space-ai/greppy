@@ -58,7 +58,20 @@ def main():
                  "confined web tool did not read the genuine native page", True)
         mutation(source,
                  "let owned = std::mem::take(\n        &mut *agent_runtimes()\n            .lock()\n            .unwrap_or_else(|error| error.into_inner()),\n    );",
-                 "let owned: AgentRuntimeScopes = Default::default();",
+                 # The deliberately detached runtime outlives the agent. Its
+                 # normal in-memory capability dies with that process; publish
+                 # only this mutant's already-owned token via the production
+                 # reconnect-cookie provider so the test can use public stop.
+                 # Do not weaken ownership checks or change the positive path.
+                 """{
+        let retained = agent_runtimes()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (ctx, _) in retained.values() {
+            save_attach_cookie(&ctx.socket, &ctx.capability);
+        }
+    }
+    let owned: AgentRuntimeScopes = Default::default();""",
                  "agent exit retained its authenticated runtime socket", True)
         mutation("crates/cli/tests/agent_p.rs",
                  "remaining = &candidate[documents.byte_offset()..];",
