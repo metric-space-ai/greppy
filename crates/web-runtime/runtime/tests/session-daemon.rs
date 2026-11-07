@@ -27,6 +27,10 @@ mod recorded_http_fixture;
 #[path = "support/owned_html_fixture.rs"]
 mod owned_html_fixture;
 
+#[path = "support/owned_http_scenarios.rs"]
+mod owned_http_scenarios;
+use owned_http_scenarios::{serve_site, serve_status_fixture};
+
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const SOCKET_WAIT: Duration = Duration::from_secs(30);
@@ -994,61 +998,6 @@ fn spawn_reset_server() -> ResetServer {
     }
 }
 
-fn serve_status_fixture() -> String {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status fixture");
-    let address = listener.local_addr().expect("status fixture addr");
-    thread::spawn(move || {
-        let repeated = std::sync::atomic::AtomicUsize::new(0);
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buffer = [0_u8; 2048];
-            let count = stream.read(&mut buffer).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..count]);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
-            if path == "/jump" {
-                let location = format!("http://{address}/landed");
-                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
-                continue;
-            }
-            if path == "/jump-empty" {
-                let location = format!("http://{address}/empty");
-                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
-                continue;
-            }
-            if path == "/chunked" {
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
-                continue;
-            }
-            let (status, body) = match path {
-                "/missing" => ("404 Not Found", b"missing".as_slice()),
-                "/repeat" => {
-                    if repeated.fetch_add(1, Ordering::SeqCst) == 0 {
-                        ("200 OK", b"repeated ok".as_slice())
-                    } else {
-                        ("404 Not Found", b"repeated missing".as_slice())
-                    }
-                }
-                "/empty" => ("204 No Content", b"".as_slice()),
-                "/landed" => ("200 OK", b"landed".as_slice()),
-                _ => ("200 OK", b"ok".as_slice()),
-            };
-            let header = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(body);
-        }
-    });
-    format!("http://{address}/")
-}
-
 struct NavigationLifecycleFixture {
     origin: String,
     events: std::sync::mpsc::Receiver<String>,
@@ -1297,37 +1246,6 @@ fn navigation_fixture_closes_silent_connections_without_response() {
         assert_eq!(count, 0, "fixture fabricated an HTTP response without a request (eof={eof})");
     }
     fixture.assert_not_requested("/", Duration::from_millis(50));
-}
-
-fn serve_site() -> String {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind site");
-    let address = listener.local_addr().expect("addr");
-    let article = include_str!("../fixtures/article.html");
-    thread::spawn(move || {
-        let origin = format!("http://{address}");
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buffer = [0_u8; 2048];
-            let n = stream.read(&mut buffer).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buffer[..n]);
-            let body = if req.contains("GET /search") {
-                format!(
-                    "<!DOCTYPE html><html><body><h1>Results</h1><ul><li><a href=\"{origin}/article\">Greppy Article</a></li></ul></body></html>"
-                )
-            } else {
-                article.to_owned()
-            };
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(body.as_bytes());
-        }
-    });
-    format!("http://{address}")
 }
 
 fn run_playwright_source(
@@ -1740,7 +1658,7 @@ fn one_thousand_session_create_close_cycles() {
 
 #[test]
 fn observe_read_search_research_screenshot_and_policy() {
-    let origin = serve_site();
+    let (_origin_server_owner, origin) = serve_site();
     let socket =
         std::env::temp_dir().join(format!("greppy-web-research-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
@@ -3627,7 +3545,7 @@ fn network_query_filters_enriched_response_records() {
 
 #[test]
 fn network_query_filters_real_http_and_https_responses() {
-    let origin = serve_status_fixture();
+    let (_origin_server_owner, origin) = serve_status_fixture();
     let https = spawn_tls_origin("network-status-origin.py");
     let https_origin = format!("https://{}/", https.addr);
     let failed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
@@ -3902,7 +3820,7 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
 
 #[test]
 fn top_level_204_terminates_without_replacing_the_document() {
-    let status_origin = serve_status_fixture();
+    let (_status_origin_server_owner, status_origin) = serve_status_fixture();
     let (_prior_owner, prior) = serve_fixture("<!doctype html><title>Prior</title><p id='prior'>preserved document</p>");
     let (_subresource_owner, subresource) = serve_fixture(format!(
         "<!doctype html><p id='ready'>subresource page</p><img src='{status_origin}empty'>"
@@ -4336,7 +4254,7 @@ console.log(JSON.stringify(state));
 
 #[test]
 fn click_navigation_wait_handles_redirect_reload_and_bounds_delayed_javascript() {
-    let destination = serve_status_fixture();
+    let (_destination_server_owner, destination) = serve_status_fixture();
     let (_redirect_page_owner, redirect_page) = serve_fixture(format!(
         "<!doctype html><a id='go' href='{destination}jump'>Redirect</a>"
     ));
@@ -5601,7 +5519,7 @@ fn controller_locator_click_consumes_only_its_navigation_failure() {
     let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
     let refused = format!("http://{}/refused", closed_listener.local_addr().unwrap());
     drop(closed_listener);
-    let destination = serve_status_fixture();
+    let (_destination_server_owner, destination) = serve_status_fixture();
     let (_fixture_owner, fixture) = serve_fixture(format!(
         "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='refused' href='{refused}'>Refused</a><a id='redirect' href='{destination}jump'>Redirect</a><button id='clean' onclick='window.__controllerCleanClicks=(window.__controllerCleanClicks||0)+1'>Clean</button>"
     ));

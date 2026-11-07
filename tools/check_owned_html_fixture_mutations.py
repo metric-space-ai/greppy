@@ -1,12 +1,56 @@
 #!/usr/bin/env python3
 """Qualify scope-owned HTML fixtures with real TCP sockets and source faults."""
 from pathlib import Path
+import json
 import os
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "crates/web-runtime/runtime/tests/support/owned_html_fixture.rs"
+
+
+def qualify_http_scenarios(scratch):
+    support = ROOT / "crates/web-runtime/runtime/tests/support"
+    source = support / "recorded_http_fixture.rs"
+    original = source.read_text()
+    wrapper = Path(scratch) / "http_scenarios.rs"
+    wrapper.write_text(
+        "#[path = " + json.dumps(str(source), ensure_ascii=False) + "]\n"
+        "mod recorded_http_fixture;\n"
+        "#[path = " + json.dumps(str(support / "owned_http_scenarios.rs"), ensure_ascii=False) + "]\n"
+        "mod owned_http_scenarios;\n"
+    )
+    binary = str(Path(scratch) / "owned-http-scenarios")
+
+    def run():
+        subprocess.run(["rustc", "--edition=2021", "--test", "-D", "warnings",
+                        str(wrapper), "-o", binary], cwd=ROOT, check=True, timeout=60)
+        result = subprocess.run([binary, "owned_http_scenarios", "--test-threads=1", "--nocapture"],
+                                cwd=ROOT, capture_output=True, text=True, timeout=30)
+        print(result.stdout, result.stderr, flush=True)
+        return result
+
+    def positive():
+        result = run()
+        assert result.returncode == 0 and "test result: ok." in result.stdout
+
+    positive()
+    old = """        self.stop.store(true, Ordering::Relaxed);
+        self.worker.take().unwrap().join().unwrap();"""
+    fault = """        let _ = &self.stop;
+        let _ = self.worker.take();"""
+    marker = "scenario fixture listener survived guard drop"
+    assert original.count(old) == 1, "HTTP scenario lifetime source target is not unique"
+    try:
+        source.write_text(original.replace(old, fault))
+        result = run()
+        assert result.returncode == 101 and marker in result.stdout + result.stderr
+        print("mutation: rejected " + marker, flush=True)
+    finally:
+        source.write_text(original)
+    positive()
+    assert source.read_text() == original
 
 
 def main():
@@ -55,6 +99,7 @@ def main():
                 SOURCE.write_text(original)
             positive()
         assert SOURCE.read_text() == original
+        qualify_http_scenarios(scratch)
 
 
 if __name__ == "__main__":
