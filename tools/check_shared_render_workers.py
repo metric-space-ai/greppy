@@ -14,8 +14,11 @@ CONTRACTS = (
     "restart_drains_running_render_work_before_starting_new_workers",
     "retiring_worker_refuses_registry_reentry_before_the_embedder_lock",
     "registry_drop_does_not_join_an_externally_owned_pool",
+    "renderer_pool_keeps_independent_capacity_when_one_cap_cannot_fill_the_host",
 )
 FAULTS = (
+    ("capacity", "if available_parallelism.is_some_and(|parallelism| parallelism > 0 && count >= parallelism) {",
+     "if true {", CONTRACTS[4], "per-renderer cap reduced independent worker capacity or invented unknown capacity"),
     ("reuse", "return Ok(pool);",
      "return rayon::ThreadPoolBuilder::new().num_threads(count.max(1)).build().map(std::sync::Arc::new).map_err(|error| std::io::Error::other(error.to_string()));",
      CONTRACTS[0], "overlapping renderers started duplicate worker threads"),
@@ -54,7 +57,7 @@ def positive():
     if code != 0 or any(PREFIX + name not in output for name in CONTRACTS):
         raise AssertionError("production render pool contract failed:\n" + output)
     for line in output.splitlines():
-        if "render pool:" in line:
+        if "render pool:" in line or "render capacity:" in line:
             print(line, flush=True)
 
 

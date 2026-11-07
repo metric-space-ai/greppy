@@ -206,12 +206,12 @@ impl Painter {
         } else {
             UploadMethod::PixelBuffer(ONE_TIME_USAGE_HINT)
         };
-        let worker_threads = std::thread::available_parallelism()
-            .map(|i| i.get())
+        let available_parallelism = std::thread::available_parallelism().ok().map(|i| i.get());
+        let worker_threads = available_parallelism
             .unwrap_or(pref!(thread_pool_fallback_workers) as usize)
             .min(pref!(thread_pool_webrender_workers_max).max(1) as usize);
         let workers = Some(
-            crate::shared_render_workers::shared_render_workers(worker_threads)
+            crate::shared_render_workers::shared_render_workers(worker_threads, available_parallelism)
                 .expect("Unable to initialize WebRender worker pool."),
         );
 

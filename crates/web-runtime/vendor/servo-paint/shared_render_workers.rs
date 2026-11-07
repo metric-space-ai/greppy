@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Share render capacity without sharing renderer, document or network state.
 //!
-//! The bootstrap Painter owns the process resources until ContentEngine exits.
-//! Context Painters borrow the same pool. The cache owns only a Weak plus one
-//! generation's join handles, never a strong reference to the pool. A changed
-//! CPU/thread preference takes effect after the last live pool owner releases.
+//! Share when one pool already covers the entire known CPU capacity; keep
+//! independent pools when a per-Painter cap is smaller or capacity is unknown.
+//! The bootstrap Painter owns the shared process resources until ContentEngine
+//! exits. The cache owns only a Weak plus one generation's join handles, never
+//! a strong pool reference. A new shared degree applies after its last owner.
 //! Rayon requests termination on ThreadPool::drop; it does not join its workers.
 //! Rebuild therefore joins the retired generation before creating any new one.
 use std::cell::Cell;
@@ -18,8 +19,18 @@ thread_local! {
 
 static WORKERS: SharedRenderWorkers = SharedRenderWorkers::new();
 
-pub(crate) fn shared_render_workers(count: usize) -> io::Result<Arc<rayon::ThreadPool>> {
-    WORKERS.acquire(count)
+pub(crate) fn shared_render_workers(
+    count: usize,
+    available_parallelism: Option<usize>,
+) -> io::Result<Arc<rayon::ThreadPool>> {
+    // Share only when one existing pool can use the entire known CPU budget.
+    // Otherwise a per-Painter cap must not become a new process-wide cap.
+    // An unknown capacity preserves the original independent-pool fallback.
+    if available_parallelism.is_some_and(|parallelism| parallelism > 0 && count >= parallelism) {
+        WORKERS.acquire(count)
+    } else {
+        WORKERS.independent(count)
+    }
 }
 
 struct Generation {
@@ -42,7 +53,7 @@ impl SharedRenderWorkers {
         }
     }
 
-    fn acquire(&self, count: usize) -> io::Result<Arc<rayon::ThreadPool>> {
+    fn enter(&self) -> io::Result<std::sync::MutexGuard<'_, Option<Generation>>> {
         // Before the lock: the embedder may hold it while joining this worker.
         // Painter construction belongs to the embedder, never its Rayon jobs.
         if IN_RENDER_WORKER.with(Cell::get) {
@@ -51,16 +62,42 @@ impl SharedRenderWorkers {
                 "a render worker cannot acquire its renderer pool",
             ));
         }
-        let mut current = self
+        Ok(self
             .current
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(pool) = current.as_ref().and_then(|entry| entry.pool.upgrade()) {
-            return Ok(pool);
+            .unwrap_or_else(|error| error.into_inner()))
+    }
+
+    fn retire_if_idle(current: &mut Option<Generation>) -> io::Result<()> {
+        if current
+            .as_ref()
+            .is_some_and(|entry| entry.pool.strong_count() != 0)
+        {
+            return Ok(());
         }
         if let Some(previous) = current.take() {
             join_workers(previous.workers)?;
         }
+        Ok(())
+    }
+
+    fn independent(&self, count: usize) -> io::Result<Arc<rayon::ThreadPool>> {
+        let mut current = self.enter()?;
+        Self::retire_if_idle(&mut current)?;
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(count)
+            .thread_name(|index| format!("WRWorker#{index}"))
+            .build()
+            .map(Arc::new)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn acquire(&self, count: usize) -> io::Result<Arc<rayon::ThreadPool>> {
+        let mut current = self.enter()?;
+        if let Some(pool) = current.as_ref().and_then(|entry| entry.pool.upgrade()) {
+            return Ok(pool);
+        }
+        Self::retire_if_idle(&mut current)?;
 
         let mut workers = Vec::new();
         let built = rayon::ThreadPoolBuilder::new()
@@ -183,6 +220,36 @@ mod tests {
             events: Some(events.clone()),
         });
         (registry, events)
+    }
+
+    #[test]
+    fn renderer_pool_keeps_independent_capacity_when_one_cap_cannot_fill_the_host() {
+        for (available, expected_threads) in [(Some(2), 2), (Some(4), 4), (None, 4)] {
+            let left = shared_render_workers(2, available).unwrap();
+            let right = shared_render_workers(2, available).unwrap();
+            assert_eq!(
+                left.install(|| (0..1024_u64).into_par_iter().sum::<u64>()),
+                523776
+            );
+            assert_eq!(
+                right.install(|| (1024..2048_u64).into_par_iter().sum::<u64>()),
+                1572352
+            );
+            let ids: HashSet<_> = left
+                .broadcast(|_| thread::current().id())
+                .into_iter()
+                .chain(right.broadcast(|_| thread::current().id()))
+                .collect();
+            assert_eq!(
+                ids.len(),
+                expected_threads,
+                "per-renderer cap reduced independent worker capacity or invented unknown capacity"
+            );
+            println!(
+                "render capacity: declared available={available:?}, per-renderer degree2, actual distinct workers={}",
+                ids.len()
+            );
+        }
     }
 
     #[test]
