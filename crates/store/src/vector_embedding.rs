@@ -325,6 +325,7 @@ impl Store {
              WHERE v.project=?1 AND v.model_id=?2 AND v.prompt_version=?3 AND v.task=?4
                  AND v.qualified_name=?5 AND v.chunk_idx=?6 AND v.content_sha256=?7
                  AND v.dim=?8 AND v.dim>0 AND length(v.vector)=v.dim*4
+                 AND b.file_path<>'' AND b.start_line>0 AND b.end_line>=b.start_line
                  AND b.file_path=d.file_path AND b.start_line=d.start_line AND b.end_line=d.end_line
                  AND v.file_path=b.file_path AND v.start_line>=b.start_line
                  AND v.end_line>=v.start_line AND v.end_line<=b.end_line
@@ -1017,6 +1018,7 @@ mod tests {
             "norm",
             "nan",
             "payload-type",
+            "title-span",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let staged = tmp.path().join("staged.db");
@@ -1031,7 +1033,10 @@ mod tests {
                 root_path: "/fixture".into(),
             })
             .unwrap();
-            let n = node("p", qname, file);
+            let mut n = node("p", qname, file);
+            if scenario == "title-span" {
+                n.start_line = 0;
+            }
             let id = base.insert_node(&n).unwrap();
             let value = embedding("p", Some(id), qname, file, 1, &hash, vec![1.0, 0.0]);
             base.upsert_vector_embedding(&value).unwrap();
@@ -1112,7 +1117,15 @@ mod tests {
                     root_path: "/fixture".into(),
                 })
                 .unwrap();
+            let allocation = delta
+                .insert_node(&node("p", "sample.c::allocation", file))
+                .unwrap();
+            delta.delete_node(allocation).unwrap();
             let current_id = delta.insert_node(&n).unwrap();
+            assert_ne!(
+                current_id, id,
+                "fixture must distinguish old Base and current Delta node ids"
+            );
             let key = ReusableVectorEmbeddingKey {
                 project: "p",
                 model_id: &value.model_id,
@@ -1171,6 +1184,13 @@ mod tests {
                 .unwrap()
                 .expect("attached Base content reuse missing");
             assert_eq!(hit.vector, value.vector);
+            assert!(
+                delta
+                    .vector_search_exact(&[1.0, 0.0], &search)
+                    .unwrap()
+                    .is_empty(),
+                "content lookup materialized a hidden Base search row"
+            );
             assert_eq!(
                 hit.node_id,
                 Some(current_id),
