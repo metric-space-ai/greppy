@@ -1756,6 +1756,12 @@ impl ContentEngine {
     }
 
     fn settle_pump_tokens(&self, webview: &WebView) {
+        // Each confirmed per-token cleanup advances the floor and removes its
+        // ledger entry. Avoid another JS roundtrip and two whole-window walks
+        // when nothing remains; unconfirmed cleanup still requires the sweep.
+        if self.pump_pending.borrow().is_empty() {
+            return;
+        }
         if self.sweep_pump_namespace(webview) {
             reclaim_all_tracked_tokens(&self.pump_pending);
         }
