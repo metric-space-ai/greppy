@@ -129,6 +129,10 @@ jobs:
         run: cargo build --workspace --features greppy/ci-test-assets
 
       # Reuse the existing build before the bounded transport mutation proof.
+      - name: Rust cfg sibling identity mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_rust_cfg_identity_mutation.py
+
       - name: Anonymous compound typedef parser and CLI read mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anonymous_compound_typedef_mutation.py
