@@ -423,6 +423,14 @@ fn valid_session_route_image(route: &SessionRoute) -> bool {
 }
 
 pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
+    runtime_control_status(json, root, None)
+}
+
+fn runtime_control_status(
+    json: bool,
+    root: Option<&str>,
+    stop_acknowledged: Option<bool>,
+) -> Result<i32> {
     let (run_id, identity) = runtime_run_id(root);
     let runtime = match resolve_runtime() {
         Ok(runtime) => runtime,
@@ -441,12 +449,16 @@ pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
     let Some(socket) = web_runtime_socket(&identity) else {
         return emit_error(json, unavailable("cannot allocate web-runtime socket"));
     };
+    if stop_acknowledged == Some(true) {
+        // Reuse the existing owned-drain confirmation budget, not a new request.
+        let _ = wait_runtime_socket_closed(&socket);
+    }
     let running = socket_connected(&socket);
     let live = match crate::web_attach::current_token().or_else(|| load_attach_cookie(&socket)) {
         Some(capability) if running => live_runtime_status(&socket, &run_id, &capability),
         _ => None,
     };
-    let payload = json!({
+    let mut payload = json!({
         "schema": SCHEMA,
         "status": "ok",
         "result": {
@@ -458,13 +470,35 @@ pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
             "socket": socket,
         }
     });
+    let mut code = 0;
+    if let Some(acknowledged) = stop_acknowledged {
+        payload["result"]["stop_requested"] = json!(acknowledged);
+        payload["result"]["stopped"] = json!(!running);
+        if running {
+            let next = if live.is_some() || acknowledged {
+                "inspect greppy web runtime status --json; shutdown has not been confirmed"
+            } else {
+                "run greppy web runtime stop from the runtime's authenticated owner context"
+            };
+            let error = ErrorObject::new(
+                "runtime_stop_unconfirmed",
+                "web runtime is still reachable; shutdown was not confirmed",
+                new_request_id(),
+                EXIT_WEB_UNAVAILABLE,
+                next,
+            );
+            code = error.exit_code;
+            payload["status"] = json!("error");
+            payload["error"] = json!(error);
+        }
+    }
     emit_web(json, &payload)?;
-    Ok(0)
+    Ok(code)
 }
 
 pub(super) fn runtime_stop(json: bool, root: Option<&str>) -> Result<i32> {
-    shutdown_runtime(root);
-    runtime_status(json, root)
+    let acknowledged = shutdown_runtime(root);
+    runtime_control_status(json, root, Some(acknowledged))
 }
 
 pub(super) fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
@@ -1809,16 +1843,20 @@ fn drain_stale_owned_runtime(
     if let Some(session) = read_current_scope(root).session {
         forget_current_session(root, &session);
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while socket_connected(socket) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if socket_connected(socket) {
+    if !wait_runtime_socket_closed(socket) {
         return Err(unavailable(
             "owned stale web-runtime acknowledged shutdown but did not release its socket",
         ));
     }
     Ok(())
+}
+
+fn wait_runtime_socket_closed(socket: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket_connected(socket) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !socket_connected(socket)
 }
 
 pub(super) fn socket_connected(socket: &std::path::Path) -> bool {
@@ -1882,22 +1920,22 @@ pub fn shutdown_if_running() {
     shutdown_runtime(None);
 }
 
-pub(super) fn shutdown_runtime(root: Option<&str>) {
+pub(super) fn shutdown_runtime(root: Option<&str>) -> bool {
     #[cfg(unix)]
     {
         let (run_id, identity) = runtime_run_id(root);
         let Ok(runtime) = resolve_runtime() else {
-            return;
+            return false;
         };
         let Ok(image) = greppy_web_client::runtime_image_id(&runtime.executable) else {
-            return;
+            return false;
         };
         let identity = runtime_identity_for_image(&identity, &image);
         let Some(capability) = crate::web_attach::current_token().or_else(|| {
             crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
                 .and_then(|endpoint| load_attach_cookie(&PathBuf::from(endpoint.address())))
         }) else {
-            return;
+            return false;
         };
         if let Some(endpoint) =
             crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
@@ -1910,12 +1948,15 @@ pub(super) fn shutdown_runtime(root: Option<&str>) {
                 .is_some_and(|response| response.status == "ok" && response.error.is_none())
             {
                 remove_runtime_routes(root, &image, false);
+                return true;
             }
         }
+        false
     }
     #[cfg(not(unix))]
     {
         let _ = root;
+        false
     }
 }
 
