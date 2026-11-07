@@ -144,6 +144,19 @@ class ComparisonContract(unittest.TestCase):
         with self.assertRaises(InvalidComparison, msg="changed visible capacity was accepted"):
             self.audit()
 
+    def test_overflow_host_capacity_cannot_be_accepted(self):
+        for number in ("1e999", "-1e999"):
+            with self.subTest(number=number):
+                for row in self.result["runs"]:
+                    path = self.root / Path(row["receipt"]).name
+                    receipt = json.loads(path.read_text())
+                    receipt["host_envelope"]["sustained_cpu_capacity_upper_bound"] = "overflow-capacity"
+                    path.write_text(json.dumps(receipt).replace('"overflow-capacity"', number))
+                    row["receipt_sha256"] = digest(path)
+                write_json(self.result_path, self.result)
+                with self.assertRaises(InvalidComparison, msg="overflow host capacity was accepted"):
+                    self.audit()
+
     def test_cli_cannot_overwrite_input_evidence(self):
         before = digest(self.result_path)
         result = subprocess.run([sys.executable, "-B",

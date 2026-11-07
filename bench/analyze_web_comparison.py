@@ -40,12 +40,18 @@ def _bad_constant(_value):
     raise InvalidComparison("non-finite JSON constant")
 
 
+def _finite_float(value):
+    value = float(value)
+    require(math.isfinite(value), "non-finite JSON number")
+    return value
+
+
 def load_json(path):
     with Path(path).open("rb") as stream:
         raw = stream.read(MAX_JSON_BYTES + 1)
     require(len(raw) <= MAX_JSON_BYTES, "JSON document exceeds bounded input size")
     return json.loads(raw, object_pairs_hook=_unique_object,
-                      parse_constant=_bad_constant), hashlib.sha256(raw).hexdigest()
+                      parse_constant=_bad_constant, parse_float=_finite_float), hashlib.sha256(raw).hexdigest()
 
 
 def positive(value):
