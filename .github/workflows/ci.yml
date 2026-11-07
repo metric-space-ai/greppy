@@ -87,6 +87,10 @@ jobs:
           toolchain: '1.95.0'
           components: rustfmt, clippy
 
+      - name: Debug model-size metadata contract
+        if: runner.os == 'Linux'
+        run: python3 tools/check_debug_asset_metadata.py
+
       - name: Cache cargo registry, git, and target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:

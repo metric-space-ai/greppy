@@ -118,6 +118,7 @@ fn main() {
     verify(&qwen_gguf, QWEN_GGUF_NAME, &qwen_gguf_sha);
     verify(&qwen_tokenizer, QWEN_TOK_NAME, &qwen_tok_sha);
     export_path("GREPPY_EMBEDDED_QWEN35_GGUF_PATH", &qwen_gguf);
+    export_qwen35_gguf_size(&qwen_gguf);
     export_path("GREPPY_EMBEDDED_QWEN35_TOK_PATH", &qwen_tokenizer);
 }
 
@@ -148,6 +149,7 @@ fn configure_ci_test_assets(manifest: &Path) {
     export_path("GREPPY_EMBEDDED_GGUF_PATH", &embedding_gguf);
     export_path("GREPPY_EMBEDDED_TOK_PATH", &embedding_tokenizer);
     export_path("GREPPY_EMBEDDED_QWEN35_GGUF_PATH", &qwen_gguf);
+    export_qwen35_gguf_size(&qwen_gguf);
     export_path("GREPPY_EMBEDDED_QWEN35_TOK_PATH", &qwen_tokenizer);
 }
 
@@ -180,6 +182,17 @@ fn export_path(name: &str, path: &Path) {
         .canonicalize()
         .unwrap_or_else(|error| panic!("canonicalize embedded asset {}: {error}", path.display()));
     println!("cargo:rustc-env={name}={}", canonical.display());
+}
+
+// Both callers have already verified the payload digest. Export only its size:
+// include_bytes!(...).len() also serializes the payload into debug Rust metadata.
+fn export_qwen35_gguf_size(path: &Path) {
+    let bytes = std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("read verified Qwen asset size {}: {error}", path.display()))
+        .len();
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(out.join("qwen35_gguf_size.rs"), format!("{bytes}u64\n"))
+        .expect("write verified Qwen asset size");
 }
 
 fn sha256_file(path: &Path) -> String {
