@@ -747,12 +747,37 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                     .expect("official cleanup control FD");
                 let stopped = stop_command.output().unwrap();
                 drop(attach);
+                let stop_result = serde_json::from_slice::<serde_json::Value>(&stopped.stdout);
+                let short_text = |value: &serde_json::Value| {
+                    value.as_str().map(|text| text.chars().take(256).collect::<String>())
+                };
+                let stop_diagnostic = serde_json::json!({
+                    "exit_code": stopped.status.code(),
+                    "json_valid": stop_result.is_ok(),
+                    "reply": stop_result.as_ref().ok().map(|reply| serde_json::json!({
+                        "status": short_text(&reply["status"]),
+                        "owned": reply["result"]["owned"].as_bool(),
+                        "running": reply["result"]["running"].as_bool(),
+                        "stop_requested": reply["result"]["stop_requested"].as_bool(),
+                        "stopped": reply["result"]["stopped"].as_bool(),
+                        "socket": short_text(&reply["result"]["socket"]),
+                        "run_id": short_text(&reply["result"]["run_id"]),
+                        "error_code": short_text(&reply["error"]["code"]),
+                    })),
+                    "stdout_bytes": stopped.stdout.len(),
+                    "stderr_bytes": stopped.stderr.len(),
+                    "stderr_parent_attach_required": String::from_utf8_lossy(&stopped.stderr)
+                        .contains("requires a parent-owned attach token"),
+                    "stderr_permission_denied": String::from_utf8_lossy(&stopped.stderr)
+                        .contains("Permission denied")
+                        || String::from_utf8_lossy(&stopped.stderr)
+                            .contains("Operation not permitted"),
+                });
                 assert!(
                     stopped.status.success(),
-                    "test could not stop its retained runtime"
+                    "error: test could not stop its retained runtime: {stop_diagnostic}"
                 );
-                let stop_result: serde_json::Value =
-                    serde_json::from_slice(&stopped.stdout).expect("public stop returned JSON");
+                let stop_result = stop_result.expect("public stop returned JSON");
                 assert_eq!(
                     stop_result["result"]["socket"].as_str(),
                     Some(socket.as_str()),
