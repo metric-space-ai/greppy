@@ -346,6 +346,54 @@ fn code_reads_rust_python_definitions_without_repeating_bodies() {
         "Python definition body must be present: {text}"
     );
 
+    for (file, first_line) in [
+        (
+            "lifetime.rs",
+            "pub fn borrow<'a>(value: &'a str) -> &'a str { value }",
+        ),
+        ("comment.rs", "pub fn brace_comment() { /* { */ }"),
+    ] {
+        std::fs::write(
+            fixture.repo.join(file),
+            format!("{first_line}\npub fn unrelated() -> u8 {{ 91 }}\n"),
+        )
+        .unwrap();
+        let output = fixture.run(&[
+            "search-pattern",
+            "^pub fn (borrow|brace_comment)",
+            "--code",
+            "--path",
+            file,
+        ]);
+        assert_eq!(output.status.code(), Some(0));
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(first_line),
+            "one-line source must remain exact: {text}"
+        );
+        assert!(
+            !text.contains("pub fn unrelated"),
+            "live definition must exclude its unrelated neighbor: {text}"
+        );
+        let json = fixture.run(&[
+            "search-pattern",
+            "^pub fn (borrow|brace_comment)",
+            "--code",
+            "--json",
+            "--path",
+            file,
+        ]);
+        assert_eq!(json.status.code(), Some(0));
+        let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(
+            json["hits"][0]["source"].as_str(),
+            Some(first_line),
+            "live JSON definition must exclude its unrelated neighbor"
+        );
+        assert_eq!(json["hits"][0]["span"]["start_line"], 1);
+        assert_eq!(json["hits"][0]["span"]["end_line"], 1);
+    }
+
     let repeated = fixture.run(&[
         "search-pattern",
         "repeated_source_marker",

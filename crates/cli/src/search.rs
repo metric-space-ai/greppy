@@ -925,6 +925,89 @@ struct SearchPatternRow {
     test: bool,
 }
 
+struct SearchPatternSource {
+    content: Vec<u8>,
+    start_line: i64,
+    end_line: i64,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+impl SearchPatternSource {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.content[self.byte_start..self.byte_end])
+    }
+}
+
+fn live_search_pattern_source(
+    root_path: &std::path::Path,
+    node: &greppy_store::Node,
+) -> Result<Option<SearchPatternSource>> {
+    if node.start_line < 1
+        || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+    {
+        return Ok(None);
+    }
+    let path = root_path.join(&node.file_path);
+    let content = std::fs::read(&path).map_err(|source| Error::Io {
+        context: format!("read definition source {}", path.display()),
+        source,
+    })?;
+    let start_line = std::str::from_utf8(&content)
+        .ok()
+        .map(|content| search_definition_start_line(content, node.start_line))
+        .unwrap_or(node.start_line);
+    // Live extraction supplies an exact inclusive end, including one-line definitions.
+    let end_line = node.end_line;
+    let source = String::from_utf8_lossy(&content);
+    if start_line < 1 || end_line < start_line || end_line as usize > source.lines().count() {
+        return Ok(None);
+    }
+    drop(source);
+    let (byte_start, byte_end) =
+        line_range_to_bytes(&content, start_line as usize, end_line as usize);
+    Ok(Some(SearchPatternSource {
+        content,
+        start_line,
+        end_line,
+        byte_start,
+        byte_end,
+    }))
+}
+
+fn search_pattern_definition_entry(
+    root_path: &std::path::Path,
+    node: &greppy_store::Node,
+) -> Result<Option<SearchCodeDefinitionEntry>> {
+    let Some(span) = live_search_pattern_source(root_path, node)? else {
+        return Ok(None);
+    };
+    let mut handle = greppy_edit::EditHandle::for_range(
+        root_path,
+        std::path::Path::new(&node.file_path),
+        &span.content,
+        span.byte_start,
+        span.byte_end,
+    )?;
+    let language = greppy_edit::language_for_path(std::path::Path::new(&node.file_path));
+    handle.signature_fingerprint = greppy_edit::verbs::signature_fingerprint(
+        language,
+        &span.content,
+        (span.byte_start, span.byte_end),
+    );
+    handle.grammar_id = Some(format!("{language:?}"));
+    handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    Ok(Some(SearchCodeDefinitionEntry {
+        qualified_name: node.qualified_name.clone(),
+        file: node.file_path.clone(),
+        start_line: span.start_line,
+        end_line: span.end_line,
+        source: span.text().lines().collect::<Vec<_>>().join("\n"),
+        handle: handle.encode(),
+        matches: Vec::new(),
+    }))
+}
+
 fn search_pattern_case_insensitive_hits(
     query: &str,
     root_path: &std::path::Path,
@@ -1129,17 +1212,7 @@ fn search_pattern_row_json(
     _code: bool,
 ) -> Result<serde_json::Value> {
     if let Some(node) = row.node.as_ref() {
-        let graph_row = greppy_search::graph::SearchGraphRow {
-            id: node.id,
-            project: node.project.clone(),
-            label: node.label.clone(),
-            name: node.name.clone(),
-            qualified_name: node.qualified_name.clone(),
-            file_path: node.file_path.clone(),
-            start_line: node.start_line,
-            end_line: node.end_line,
-        };
-        if let Some(mut entry) = search_code_definition_entry(root_path, &graph_row)? {
+        if let Some(mut entry) = search_pattern_definition_entry(root_path, node)? {
             entry.matches.push(row.hit.clone());
             let mut value = search_code_definition_json(&entry);
             if let Some(object) = value.as_object_mut() {
@@ -1225,6 +1298,9 @@ fn print_search_pattern_definition_source(
     let Some(node) = row.node.as_ref() else {
         return Ok(false);
     };
+    if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+        return Ok(false);
+    }
     let identity = (node.file_path.clone(), node.start_line, node.end_line);
     if shown_definitions.contains(&identity) {
         println!(
@@ -1233,34 +1309,17 @@ fn print_search_pattern_definition_source(
         );
         return Ok(true);
     }
-    // Text needs the source span, not JSON's edit handle and signature parser.
-    // Match the existing definition boundary without generating unused metadata.
-    let path = root_path.join(&node.file_path);
-    let content = std::fs::read(&path).map_err(|source| Error::Io {
-        context: format!("read definition source {}", path.display()),
-        source,
-    })?;
-    let start_line = std::str::from_utf8(&content)
-        .ok()
-        .map(|content| search_definition_start_line(content, node.start_line))
-        .unwrap_or(node.start_line);
-    let Some(span) = read_span_with_meta(
-        root_path,
-        &node.file_path,
-        start_line,
-        node.end_line,
-        usize::MAX,
-        false,
-    ) else {
+    // Text uses the same exact live span without JSON's unused edit metadata.
+    let Some(span) = live_search_pattern_source(root_path, node)? else {
         println!("[incomplete source: definition unavailable; matching line only]");
         return Ok(false);
     };
     shown_definitions.insert(identity);
-    for (offset, line) in span.text.lines().enumerate() {
+    for (offset, line) in span.text().lines().enumerate() {
         print_search_pattern_line(
             root_path,
             &node.file_path,
-            start_line + offset as i64,
+            span.start_line + offset as i64,
             line,
             search_pattern_display_anchor(line, query, mode, pattern),
         );

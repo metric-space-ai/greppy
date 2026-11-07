@@ -37,6 +37,9 @@ faults = [
     ("definition body must not be repeated",
      "    if shown_definitions.contains(&identity) {",
      "    if false && shown_definitions.contains(&identity) {"),
+    ("live definition must exclude its unrelated neighbor",
+     "    let end_line = node.end_line;",
+     "    let end_line = read_span_with_meta(root_path, &node.file_path, start_line, node.end_line, usize::MAX, false).map(|span| span.end_line).unwrap_or(node.end_line);"),
 ]
 for diagnostic, anchor, mutant in faults:
     assert original.decode().count(anchor) == 1, "source target must be unique"
