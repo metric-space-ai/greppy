@@ -407,6 +407,28 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key='store_cow.visibility.v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let proof: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            proof["extraction_compatibility"]["policy"],
+            greppy_parser::extraction_revision_policy_key()
+        );
+        assert_eq!(
+            proof["extraction_compatibility"]["base_manifest_sha256"],
+            greppy_store::file_state::sha256_hex(&std::fs::read(&layout.manifest).unwrap())
+        );
+        let revision_paths: Vec<String> =
+            serde_json::from_value(proof["extraction_compatibility"]["paths"].clone()).unwrap();
+        assert_eq!(
+            revision_paths,
+            vec!["keep.c".to_owned(), format!("types.{extension}")]
+        );
         assert_eq!(
             private,
             vec!["keep.c".to_owned(), format!("types.{extension}")],
@@ -467,5 +489,22 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
             before,
             "content reuse mutated immutable Base"
         );
+        drop(composed);
+        // A cached revision boundary must survive deletion and exact restore:
+        // the underlying immutable Base still has the legacy extraction.
+        let header = task.join(format!("types.{extension}"));
+        let original_header = std::fs::read(&header).unwrap();
+        std::fs::remove_file(&header).unwrap();
+        let (code, out, err) = run(
+            Path::new(env!("CARGO_BIN_EXE_greppy")),
+            &task,
+            &delta,
+            &["read", "SyntheticWorkspace", "--head", "150"],
+            overlay,
+        );
+        assert_eq!(code, 1, "deleted typedef remained visible: {out}\n{err}");
+        std::fs::write(&header, original_header).unwrap();
+        read_current(&task, &delta, overlay);
+        assert_eq!(std::fs::read(&layout.graph).unwrap(), before);
     }
 }
