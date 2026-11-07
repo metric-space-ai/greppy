@@ -6399,6 +6399,20 @@ impl GraphIndex {
             .iter()
             .filter(|node| node.file_path == referrer_file)
             .collect::<Vec<_>>();
+        // Distinct same-name Rust free functions can be conditional siblings.
+        // Their source identities do not prove which cfg is active. Preserve
+        // ambiguity before the historical local label/id preference can pick
+        // one variant merely because it was inserted first.
+        if referrer_file.ends_with(".rs")
+            && local
+                .iter()
+                .filter(|node| node.label == "Function")
+                .take(2)
+                .count()
+                > 1
+        {
+            return UniqueResolution::Ambiguous;
+        }
         if let Some(target) = local
             .iter()
             .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
