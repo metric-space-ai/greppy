@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LEGACY_BASE = "62420447f0fa82de4f30bd9e7a4eb7cd1c528136"
 EXTRACT = ROOT / "crates/parser/src/extract.rs"
 POLICY = ROOT / "crates/parser/src/lib.rs"
+INDEXER = ROOT / "crates/indexer/src/lib.rs"
 COLD = "rust_cfg_siblings_survive_parser_store_and_public_read"
 WARM = ["rust_cfg_warm_private_repair_same_source_through_normal_read", "rust_cfg_warm_base_repair_same_source_through_normal_read"]
 ENV = os.environ.copy()
@@ -72,6 +73,16 @@ try:
         print("mutation: disabling only collision identity map restores real parser2/Store1/public-read later-body loss; renamed source control stays required", flush=True)
     finally:
         EXTRACT.write_bytes(original[EXTRACT])
+
+    text = original[INDEXER].decode()
+    anchor = 'if referrer_file.ends_with(".rs")\n            && local'
+    assert text.count(anchor) == 1
+    try:
+        INDEXER.write_text(text.replace(anchor, 'if false && referrer_file.ends_with(".rs")\n            && local', 1))
+        run(red="incoming ambiguous call guessed a platform")
+        print("mutation: disabling only the same-file free-function ambiguity guard creates the false unique incoming edge; real graph/read contract red", flush=True)
+    finally:
+        INDEXER.write_bytes(original[INDEXER])
 
     text = original[POLICY].decode()
     anchor = "    expected == LEGACY_EXTRACTION_REVISION || revision == expected"
