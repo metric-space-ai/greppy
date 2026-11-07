@@ -1,3 +1,4 @@
+use crate::history_receipt::HistoryReceipt;
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
 use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
@@ -13,7 +14,7 @@ use servo::{
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
     RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
-    TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, TraversalId, UserContentManager, UserScript,
     WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
     WebViewDelegate, WebViewId, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
@@ -357,11 +358,13 @@ enum DialogAction {
 struct Delegate {
     new_frame_ready: RefCell<bool>,
     record_budget: Rc<RecordBudget>,
+    download_budget: Rc<RefCell<Arc<servo::DownloadBudget>>>,
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<RetainedRecords>,
     dropped_requests: Cell<u64>,
     downloads: RefCell<RetainedRecords>,
+    download_files: RefCell<HashMap<String, Arc<servo::CapturedWebResourceDownload>>>,
     // The opener's ID cannot retain its WebView -> Delegate -> popup cycle.
     // Retain the child's actual delegate so adoption preserves event state.
     popups: RefCell<Vec<(WebView, WebViewId, Rc<Delegate>)>>,
@@ -389,6 +392,7 @@ struct Delegate {
     /// Main-document lifecycle, owned by Servo rather than page script. A
     /// navigation discards the old Window and all of its installed waiters.
     document_generation: Cell<u64>,
+    history_receipt: RefCell<HistoryReceipt<TraversalId>>,
     /// Receipts for synthetic input: Servo acknowledges every input event,
     /// and a painter-side drop (no display list yet -> empty hit test)
     /// arrives as InputEventResult::DispatchFailed. Confirmed delivery
@@ -415,12 +419,14 @@ impl Delegate {
         wake: WakeFlag,
         user_content: Rc<UserContentManager>,
         record_budget: Rc<RecordBudget>,
+        download_budget: Rc<RefCell<Arc<servo::DownloadBudget>>>,
     ) -> Self {
         #[cfg(debug_assertions)]
         LIVE_DELEGATES.fetch_add(1, Ordering::Relaxed);
         Self {
             new_frame_ready: RefCell::new(false),
             record_budget: Rc::clone(&record_budget),
+            download_budget,
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(RetainedRecords::with_budget(
@@ -432,6 +438,7 @@ impl Delegate {
                 usize::MAX,
                 Rc::clone(&record_budget),
             )),
+            download_files: RefCell::new(HashMap::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
             dialog_action: RefCell::new(DialogAction::Accept),
@@ -461,6 +468,7 @@ impl Delegate {
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
             document_generation: Cell::new(0),
+            history_receipt: RefCell::new(HistoryReceipt::new()),
             input_receipts: RefCell::new(HashMap::new()),
             wake,
             user_content,
@@ -585,6 +593,12 @@ impl WebViewDelegate for Delegate {
         self.wake.wake();
     }
 
+    fn notify_traversal_complete(&self, _webview: WebView, traversal_id: TraversalId) {
+        if self.history_receipt.borrow_mut().complete(&traversal_id) {
+            self.wake.wake();
+        }
+    }
+
     fn notify_input_event_handled(
         &self,
         _webview: WebView,
@@ -636,6 +650,7 @@ impl WebViewDelegate for Delegate {
             self.wake.clone(),
             Rc::clone(&self.user_content),
             Rc::clone(&self.record_budget),
+            Rc::clone(&self.download_budget),
         ));
         let child = request
             .builder(Rc::clone(&self.rendering_context))
@@ -801,9 +816,7 @@ impl WebViewDelegate for Delegate {
             });
         let Some((action, body, status, content_type, continue_headers)) = matched else {
             let extras = extra_request_headers(&self.extra_headers.borrow());
-            if !extras.is_empty() {
-                load.continue_with_headers(extras);
-            }
+            load.continue_with_download_budget(extras, Arc::clone(&self.download_budget.borrow()));
             return;
         };
         let request_url = load.request.url.clone();
@@ -866,6 +879,7 @@ impl WebViewDelegate for Delegate {
                         .unwrap_or("download")
                         .to_owned();
                     self.downloads.borrow_mut().push(json!({
+                        "requestId": request_id,
                         "url": request_url.to_string(),
                         "byteLength": body.len(),
                         "bodyBase64": body_b64,
@@ -879,10 +893,7 @@ impl WebViewDelegate for Delegate {
                 let mut merged = self.extra_headers.borrow().clone();
                 merged.extend(continue_headers);
                 let extras = extra_request_headers(&merged);
-                if extras.is_empty() {
-                    return;
-                }
-                load.continue_with_headers(extras);
+                load.continue_with_download_budget(extras, Arc::clone(&self.download_budget.borrow()));
             }
             _ => {}
         }
@@ -920,6 +931,30 @@ impl WebViewDelegate for Delegate {
             "fromCache": response.from_cache,
             "headers": headers,
         });
+        if let Some(download) = response.download.as_ref() {
+            if !self.download_files.borrow().contains_key(&request_id) {
+                let disposition = response.headers.get(http::header::CONTENT_DISPOSITION)
+                    .and_then(|value| value.to_str().ok()).unwrap_or("");
+                let filename = disposition.split(';').skip(1).find_map(|part| {
+                    let (key, value) = part.trim().split_once('=')?;
+                    key.trim().eq_ignore_ascii_case("filename").then(|| value.trim().trim_matches('"'))
+                }).filter(|name| !name.is_empty()).or_else(|| response.url.path_segments()
+                    .and_then(|mut parts| parts.next_back()).filter(|name| !name.is_empty()))
+                    .unwrap_or("download");
+                let before = self.downloads.borrow().len();
+                self.downloads.borrow_mut().push(json!({
+                    "requestId": request_id,
+                    "url": response.url.to_string(),
+                    "byteLength": response.body_bytes,
+                    "suggestedFilename": filename,
+                    "path": download.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+                    "failure": download.failure,
+                }));
+                if self.downloads.borrow().len() > before {
+                    self.download_files.borrow_mut().insert(request_id.clone(), Arc::clone(download));
+                }
+            }
+        }
         if let Some(status) = response.status_code {
             row["status"] = json!(status);
             row["ok"] = json!((200..400).contains(&status));
@@ -1124,6 +1159,7 @@ struct EngineBundle {
     wake: WakeFlag,
     user_content: Rc<UserContentManager>,
     record_budget: Rc<RecordBudget>,
+    download_budget: Rc<RefCell<Arc<servo::DownloadBudget>>>,
     _proxy: PolicyProxy,
 }
 
@@ -1216,6 +1252,8 @@ struct ContentEngine {
     session_contexts: HashMap<String, String>,
     next_id: u64,
     record_memory_limit: usize,
+    download_budget: Arc<servo::DownloadBudget>,
+    download_budgets: servo::DownloadBudgets,
     pump_nonce: Cell<u64>,
     pump_pending: RefCell<Vec<String>>,
     renderer_error: RefCell<Option<String>>,
@@ -1332,6 +1370,9 @@ impl ContentEngine {
                 .content_rss_bytes
                 .try_into()
                 .unwrap_or(usize::MAX),
+            download_budget: Arc::new(servo::DownloadBudget::new(
+                crate::limits::SessionLimits::default().max_download_bytes)),
+            download_budgets: servo::DownloadBudgets::default(),
             pump_nonce: Cell::new(1),
             pump_pending: RefCell::new(Vec::new()),
             renderer_error: RefCell::new(None),
@@ -1417,6 +1458,7 @@ impl ContentEngine {
             wake,
             user_content,
             record_budget: Rc::new(RecordBudget::new(self.record_memory_limit)),
+            download_budget: Rc::new(RefCell::new(Arc::clone(&self.download_budget))),
             _proxy: proxy,
         }))
     }
@@ -1507,10 +1549,6 @@ impl ContentEngine {
                 .retired_network_bytes
                 .saturating_add(bundle._proxy.bytes_transferred());
         }
-    }
-
-    fn spin_until(&self, timeout: Duration, predicate: impl FnMut() -> bool) -> io::Result<bool> {
-        self.spin_until_on(&self.wake, timeout, predicate)
     }
 
     fn spin_until_on(
@@ -1942,7 +1980,8 @@ impl ContentEngine {
             *callback_slot.borrow_mut() = Some(result);
         });
         let ready = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some())? {
+        let wake = self.wake_for_webview(&webview);
+        if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || ready.borrow().is_some())? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out evaluating structured DOM query",
@@ -2154,21 +2193,37 @@ impl ContentEngine {
         script: &str,
         timeout: Duration,
     ) -> io::Result<JSValue> {
+        self.evaluate_before_deadline(webview, script, Instant::now() + timeout)
+    }
+
+    fn evaluate_before_deadline(
+        &self,
+        webview: WebView,
+        script: &str,
+        deadline: Instant,
+    ) -> io::Result<JSValue> {
+        let unobserved = || io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out evaluating page JavaScript (failed_check=unobserved)",
+        );
+        if Instant::now() >= deadline {
+            return Err(unobserved());
+        }
         let saved = Rc::new(RefCell::new(None));
         let callback_slot = Rc::clone(&saved);
         webview.evaluate_javascript(script, move |result| {
-            *callback_slot.borrow_mut() = Some(result);
+            *callback_slot.borrow_mut() = Some((Instant::now(), result));
         });
         let ready = Rc::clone(&saved);
-        if !self.spin_until(timeout.max(Duration::from_millis(1)), move || {
+        let wake = self.wake_for_webview(&webview);
+        // The generic pump can notice a reply before checking its own clock.
+        // Keep the original caller's absolute deadline and check actual receipt.
+        self.spin_until_on(&wake, deadline.saturating_duration_since(Instant::now()), move || {
             ready.borrow().is_some()
-        })? {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out evaluating page JavaScript",
-            ));
-        }
-        let result = saved.borrow_mut().take().expect("evaluation completed");
+        })?;
+        let result = crate::locator_diagnostics::take_timely_dom_reply(
+            deadline, saved.borrow_mut().take(),
+        ).ok_or_else(unobserved)?;
         result.map_err(|error| {
             let concise = match &error {
                 servo::JavaScriptEvaluationError::CompilationFailure => Some(
@@ -2780,12 +2835,15 @@ impl ContentEngine {
                     ),
                 };
                 let record_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.record_budget)).unwrap_or_else(|| Rc::new(RecordBudget::new(self.record_memory_limit)));
+                let download_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.download_budget))
+                    .unwrap_or_else(|| Rc::new(RefCell::new(Arc::clone(&self.download_budget))));
                 let delegate = Rc::new(Delegate::new(
                     Rc::clone(&rendering_context),
                     profile,
                     wake.clone(),
                     Rc::clone(&user_content),
                     record_budget,
+                    download_budget,
                 ));
                 let webview = WebViewBuilder::new(servo, rendering_context)
                     .delegate(delegate.clone())
@@ -2826,10 +2884,25 @@ impl ContentEngine {
                     )
                 })?;
                 let record_limit = params.get("record_memory_bytes").and_then(|value| value.as_u64()).map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+                let download_budget = match (
+                    params.get("__download_session").and_then(|value| value.as_str()),
+                    params.get("max_download_bytes").and_then(|value| value.as_u64()),
+                ) {
+                    (Some(session), Some(limit)) if !session.is_empty() =>
+                        Some(self.download_budgets.for_session(session, limit)),
+                    (None, None) => None,
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid download session authority")),
+                };
                 if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+                    if let Some(PageSlot::Live { pair, .. }) = self.pages.get(page) {
+                        if let Some(budget) = &download_budget {
+                            pair.1.download_budget.replace(Arc::clone(budget));
+                        }
+                    }
                     if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
                         bundle.profile.set(parsed);
                         if let Some(limit) = record_limit { bundle.record_budget.set_limit(limit); }
+
                         return Ok(json!({ "profile": bundle.profile.get().as_str() }));
                     }
                 }
@@ -2837,6 +2910,7 @@ impl ContentEngine {
                 // explicit contexts. A bundled daemon page never mutates it.
                 self.profile.set(parsed);
                 if let Some(limit) = record_limit { self.record_memory_limit = limit; }
+                if let Some(budget) = download_budget { self.download_budget = budget; }
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
             "session.attachPage" => {
@@ -3226,21 +3300,13 @@ impl ContentEngine {
                 Ok(json!({}))
             }
             "locator.fill" => {
-                let resolved = self.resolve_actionable(&params)?;
+                self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let value = required_str(&params, "value")?;
-                let (webview, delegate) = self.page(&page_id)?.clone();
+                let (webview, _) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
-                click_at(
-                    &webview,
-                    &delegate,
-                    resolved.x,
-                    resolved.y,
-                    resolved.width,
-                    resolved.height,
-                    || self.spin_all_event_loops(),
-                )?;
-                self.spin_all_event_loops();
+                // fill_script focuses the field. Pointer input here is both
+                // redundant work and an observable, unintended click.
                 let selector = params
                     .get("selector")
                     .cloned()
@@ -4316,6 +4382,20 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
                 let path = required_str(&params, "path")?;
+                if let Some(id) = params.get("downloadId").and_then(|value| value.as_str()) {
+                    let delegate = &self.page(&page_id)?.1;
+                    let files = delegate.download_files.borrow();
+                    let download = files.get(id).ok_or_else(|| io::Error::other("no matching download"))?;
+                    if let Some(failure) = &download.failure { return Err(io::Error::other(failure.clone())); }
+                    let source = download.path.as_ref().ok_or_else(|| io::Error::other("download has no file"))?.canonicalize()?;
+                    let dest = confine_worker_path(Path::new(&path))?;
+                    if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let bytes = if source == dest { std::fs::metadata(&source)?.len() }
+                        else { std::fs::copy(&source, &dest)? };
+                    return Ok(json!({ "ok": true, "bytes": bytes }));
+                }
                 let body_b64 = {
                     let downloads = self.page(&page_id)?.1.downloads.borrow();
                     downloads
@@ -4501,12 +4581,18 @@ impl ContentEngine {
             }
             "page.goBack" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let ok = webview.can_go_back();
                 if ok {
-                    webview.go_back(1);
+                    delegate.history_receipt.borrow_mut().begin(webview.go_back(1));
                     let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
+                    let loaded = self.spin_until_loaded(&loading, call_timeout(&params), || {
+                        delegate.history_receipt.borrow().is_complete()
+                    });
+                    delegate.history_receipt.borrow_mut().clear();
+                    if !loaded? {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "history traversal timed out"));
+                    }
                     webview.paint();
                     self.spin_all_event_loops();
                 }
@@ -4517,12 +4603,18 @@ impl ContentEngine {
             }
             "page.goForward" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let ok = webview.can_go_forward();
                 if ok {
-                    webview.go_forward(1);
+                    delegate.history_receipt.borrow_mut().begin(webview.go_forward(1));
                     let loading = webview.clone();
-                    let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
+                    let loaded = self.spin_until_loaded(&loading, call_timeout(&params), || {
+                        delegate.history_receipt.borrow().is_complete()
+                    });
+                    delegate.history_receipt.borrow_mut().clear();
+                    if !loaded? {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "history traversal timed out"));
+                    }
                     webview.paint();
                     self.spin_all_event_loops();
                 }
@@ -4883,6 +4975,7 @@ impl ContentEngine {
     }
 
     fn resolve_actionable(&self, params: &serde_json::Value) -> io::Result<ResolvedNode> {
+        let deadline = Instant::now() + call_timeout(params);
         let page_id = required_str(params, "page")?;
         let selector = params
             .get("selector")
@@ -4891,19 +4984,13 @@ impl ContentEngine {
         let (webview, _) = self.page(&page_id)?.clone();
         self.present_exclusively(&webview);
         let script = resolve_script(&selector);
-        let deadline = Instant::now() + call_timeout(params);
-        let mut last = String::from("failed_check=stable");
+        let mut last = String::from("failed_check=unobserved");
         let mut stable: Option<ResolvedNode> = None;
         let mut stable_since: Option<Instant> = None;
         let timeout_err = |last: &str| {
-            let detail = if last.contains("failed_check=") {
-                last.to_owned()
-            } else {
-                format!("failed_check=stable; {last}")
-            };
             io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("timed out waiting for actionable locator target ({detail})"),
+                crate::locator_diagnostics::actionability_timeout_message(last),
             )
         };
         loop {
@@ -4913,8 +5000,7 @@ impl ContentEngine {
             if Instant::now() >= deadline {
                 return Err(timeout_err(&last));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let sampled = match self.evaluate_until(webview.clone(), &script, remaining) {
+            let sampled = match self.evaluate_before_deadline(webview.clone(), &script, deadline) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     return Err(timeout_err(&last));
@@ -4966,6 +5052,9 @@ impl ContentEngine {
                                     since.elapsed() >= Duration::from_millis(32)
                                 }) {
                                     self.settle_pump_tokens(&webview);
+                                    if Instant::now() >= deadline {
+                                        return Err(timeout_err(&last));
+                                    }
                                     return Ok(node);
                                 }
                             } else {
@@ -4995,10 +5084,10 @@ impl ContentEngine {
                         };
                     }
                 }
-                other => {
+                _ => {
                     stable = None;
                     stable_since = None;
-                    last = format!("failed_check=attached; {other:?}");
+                    last = String::from("failed_check=unobserved; invalid DOM resolver response");
                 }
             }
             if Instant::now() >= deadline {
@@ -6757,6 +6846,15 @@ fn trace_startup(stage: &str) {
     }
 }
 
+struct PendingRecordedWait {
+    request_id: u64,
+    method: String,
+    after: u64,
+    params: serde_json::Value,
+    deadline: Instant,
+    _reservation: crate::retained_records::RecordReservation,
+}
+
 pub fn run() -> io::Result<()> {
     trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
@@ -6817,10 +6915,56 @@ pub fn run() -> io::Result<()> {
             )
         })?;
 
+    let mut recorded_waiters: Vec<PendingRecordedWait> = Vec::new();
     loop {
         if engine.parent_dead() {
             return Ok(());
         }
+        // A wait must not occupy the same protocol loop as the click that
+        // produces its event. Keep request metadata and a budget reservation,
+        // without retaining a WebView or delegate.
+        let mut write_error = None;
+        recorded_waiters.retain(|waiter| {
+            let PendingRecordedWait { request_id, method, params, deadline, after, .. } = waiter;
+            let result = (|| -> io::Result<Option<serde_json::Value>> {
+                engine.reject_stale_objects(method, params)?;
+                let page = required_str(params, "page")?;
+                let delegate = &engine.page(&page)?.1;
+                let needle = params.get("needle").and_then(|value| value.as_str()).unwrap_or("");
+                let (result, timeout_label) = match method.as_str() {
+                    "page.waitForRequest" => (
+                        delegate.requests.borrow().first_after(*after, |row| recorded_url_contains(row, needle))?
+                            .cloned().map(|row| json!({ "request": crate::daemon::redact_json(row) })),
+                        "timeout: waitForRequest"),
+                    "page.waitForResponse" => (
+                        delegate.last_responses.borrow().first_after(*after, |row| recorded_url_contains(row, needle))?
+                            .cloned().map(|row| json!({ "response": row })),
+                        "timeout: waitForResponse"),
+                    "page.waitForDownload" => (
+                        delegate.downloads.borrow().first_after(*after, |_| true)?.cloned().map(|row| json!({ "download": row })),
+                        "timeout: waitForEvent download"),
+                    "page.waitForFileChooser" => {
+                        let mut choosers = delegate.last_file_choosers.borrow_mut();
+                        (if choosers.is_empty() { None } else { Some(json!({ "chooser": choosers.remove(0) })) },
+                            "timeout: waitForEvent filechooser")
+                    }
+                    _ => unreachable!("only recorded event waits are registered"),
+                };
+                if result.is_some() { return Ok(result); }
+                if Instant::now() >= *deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_label));
+                }
+                Ok(None)
+            })();
+            let reply = match result {
+                Ok(None) => return true,
+                Ok(Some(value)) => Message::engine_result(*request_id, true, value, None),
+                Err(error) => Message::engine_result(*request_id, false, serde_json::Value::Null, Some(error.to_string())),
+            };
+            if let Err(error) = write_message(&mut protocol_out, &reply) { write_error = Some(error); }
+            false
+        });
+        if let Some(error) = write_error { return Err(error); }
         // Protocol first. Spinning Servo before recv starved engine calls when
         // browser.close left a wake bit with no pages and spin_event_loop
         // blocked; the supervisor then sat in session.setProfile until the
@@ -6839,6 +6983,31 @@ pub fn run() -> io::Result<()> {
                 params,
                 ..
             })) => {
+                if matches!(method.as_str(), "page.waitForRequest" | "page.waitForResponse" | "page.waitForDownload" | "page.waitForFileChooser") {
+                    let reservation = (|| {
+                        engine.reject_stale_objects(&method, &params)?;
+                        let page = required_str(&params, "page")?;
+                        let delegate = &engine.page(&page)?.1;
+                        let after = match method.as_str() {
+                            "page.waitForRequest" => delegate.requests.borrow().event_cursor(),
+                            "page.waitForResponse" => delegate.last_responses.borrow().event_cursor(),
+                            "page.waitForDownload" => delegate.downloads.borrow().event_cursor(),
+                            _ => 0,
+                        };
+                        RecordBudget::hold_value(&delegate.record_budget, &params,
+                            std::mem::size_of::<PendingRecordedWait>().saturating_add(method.len()))
+                            .map(|reservation| (reservation, after))
+                    })();
+                    match reservation {
+                        Ok((reservation, after)) => recorded_waiters.push(PendingRecordedWait {
+                            request_id, deadline: Instant::now() + call_timeout(&params),
+                            params, method, after, _reservation: reservation,
+                        }),
+                        Err(error) => write_message(&mut protocol_out,
+                            &Message::engine_result(request_id, false, serde_json::Value::Null, Some(error.to_string())))?,
+                    }
+                    continue;
+                }
                 let call_started = NavTrace::enabled().then(|| {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -6903,7 +7072,13 @@ pub fn run() -> io::Result<()> {
             Err(RecvTimeoutError::Timeout) => {
                 if !engine.pages.is_empty() {
                     let started = Instant::now();
-                    engine.servo.spin_event_loop();
+                    if recorded_waiters.is_empty() {
+                        engine.servo.spin_event_loop();
+                    } else {
+                        // The awaiting page may belong to an isolated bundle;
+                        // its network completion does not arrive on root Servo.
+                        engine.spin_all_event_loops();
+                    }
                     let elapsed = started.elapsed();
                     if elapsed >= Duration::from_millis(200) {
                         if crate::supervisor::phase_trace_enabled() {

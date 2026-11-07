@@ -122,6 +122,7 @@ pub use crate::webview_delegate::{
     SimpleDialog, WebResourceLoad, WebViewDelegate,
 };
 pub use embedder_traits::WebResourceResponseCompleted;
+pub use embedder_traits::CapturedWebResourceDownload;
 
 #[cfg(feature = "webxr")]
 pub mod webxr {

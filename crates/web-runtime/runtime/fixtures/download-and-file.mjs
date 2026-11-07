@@ -22,8 +22,12 @@ await page.route("**/data.bin", (route) =>
   }),
 );
 await page.goto(fixtureUrl);
+const ctxDownloads = [];
+page.context().on("download", (item) => { ctxDownloads.push(item); });
+const pendingDownload = page.waitForEvent("download");
+const pendingResponse = page.waitForResponse("data.bin");
 await page.evaluate((url) => fetch(url), fixtureUrl + "data.bin");
-const response = await page.waitForResponse("data.bin");
+const response = await pendingResponse;
 const raw = await response.body();
 if (toHex(raw) !== expectedHex) {
   throw new Error("Response.body hex " + toHex(raw) + " expected " + expectedHex);
@@ -33,11 +37,7 @@ const afterText = await response.body();
 if (toHex(afterText) !== expectedHex) {
   throw new Error("Response.body changed after text(): " + toHex(afterText) + " text=" + JSON.stringify(asText));
 }
-const ctxDownloads = [];
-page.context().on("download", (item) => {
-  ctxDownloads.push(item);
-});
-const download = await page.waitForEvent("download");
+const download = await pendingDownload;
 if (!download || !String(download.url()).includes("data.bin")) {
   throw new Error("download url " + (download && download.url()));
 }

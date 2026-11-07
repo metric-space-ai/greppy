@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 #[test]
 fn runtime_stop_reports_observed_state_without_weakening_ownership() {
-    use greppy::{generate_attach_token, give_child_attach_token, web_runtime_socket};
+    use greppy::{generate_attach_token, give_child_attach_token};
     use greppy_web_client::{Request, RuntimeStatusProbe, StatusProbeError};
     use std::os::unix::process::CommandExt;
 
@@ -28,9 +28,45 @@ fn runtime_stop_reports_observed_state_without_weakening_ownership() {
             .unwrap()
             .as_nanos()
     );
-    let image = greppy_web_client::runtime_image_id(&runtime).expect("actual native image");
-    let socket =
-        web_runtime_socket(&format!("{run_id}:image:{image}")).expect("owned test endpoint");
+    fn control(
+        runtime: &std::path::Path,
+        run_id: &str,
+        action: &str,
+        capability: Option<&str>,
+    ) -> (i32, serde_json::Value) {
+        let mut command = Command::new(bin());
+        command
+            .args(["web", "runtime", action, "--json"])
+            .env("GREPPY_RUN_ID", run_id)
+            .env("GREPPY_WEB_RUNTIME", runtime)
+            .env_remove("GREPPY_WEB_ATTACH")
+            .env_remove("GREPPY_WEB_RUNTIME_DIST")
+            .env_remove("GREPPY_WEB_FIXTURE_URL")
+            .stdin(Stdio::null());
+        let hold = capability.map(|token| give_child_attach_token(&mut command, token).unwrap());
+        let output = command.output().expect("public runtime control");
+        drop(hold);
+        let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+            panic!(
+                "invalid {action} JSON: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        (output.status.code().unwrap_or(1), value)
+    }
+    // Ask the public CLI for its endpoint: its identity also includes the
+    // resolved repository root, not just the run ID and runtime image.
+    let (code, initial) = control(&runtime, &run_id, "status", None);
+    assert_eq!(code, 0, "endpoint discovery failed: {initial}");
+    assert_eq!(initial["status"], "ok");
+    assert_eq!(initial["result"]["running"], false);
+    assert_eq!(initial["result"]["run_id"], run_id);
+    let socket = std::path::PathBuf::from(
+        initial["result"]["socket"]
+            .as_str()
+            .expect("public status must name its socket"),
+    );
     assert!(
         !socket.exists(),
         "new private runtime endpoint already exists"
@@ -117,28 +153,16 @@ fn runtime_stop_reports_observed_state_without_weakening_ownership() {
             other => panic!("owned native status failed: {other:?}"),
         }
     }
-    let stop = |capability: Option<&str>| {
-        let mut command = Command::new(bin());
-        command
-            .args(["web", "runtime", "stop", "--json"])
-            .env("GREPPY_RUN_ID", &owned.run_id)
-            .env("GREPPY_WEB_RUNTIME", &runtime)
-            .env_remove("GREPPY_WEB_ATTACH")
-            .env_remove("GREPPY_WEB_RUNTIME_DIST")
-            .env_remove("GREPPY_WEB_FIXTURE_URL")
-            .stdin(Stdio::null());
-        let hold = capability.map(|token| give_child_attach_token(&mut command, token).unwrap());
-        let output = command.output().expect("public runtime stop");
-        drop(hold);
-        let value: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
-                panic!(
-                    "invalid stop JSON: {}",
-                    String::from_utf8_lossy(&output.stdout)
-                )
-            });
-        (output.status.code().unwrap_or(1), value)
-    };
+    let (code, live) = control(&runtime, &owned.run_id, "status", None);
+    assert_eq!(code, 0, "public live status failed: {live}");
+    assert_eq!(
+        live["result"]["running"], true,
+        "public CLI missed fixture: {live}"
+    );
+    assert_eq!(live["result"]["owned"], false);
+    assert_eq!(live["result"]["run_id"], owned.run_id);
+    assert_eq!(live["result"]["socket"], owned.socket.to_str().unwrap());
+    let stop = |capability: Option<&str>| control(&runtime, &owned.run_id, "stop", capability);
     let (code, refused) = stop(None);
     assert_ne!(
         code, 0,

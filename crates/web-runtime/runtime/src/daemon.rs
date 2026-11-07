@@ -12,7 +12,7 @@ use greppy_web_client::{
     new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -423,7 +423,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     if crate::supervisor::phase_trace_enabled() {
         eprintln!("web-runtime: phase listening");
     }
-    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
+    let (tx, rx) = request_inbox();
     let accept_attach = attach.clone();
     let accept_control = Arc::clone(&early_control);
     let accept_startup = Arc::clone(&startup);
@@ -480,29 +480,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let operation = request.operation.clone();
-        let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            daemon.handle(request.clone())
-        })) {
-            Ok(response) => response,
-            Err(_) => {
-                if crate::supervisor::phase_trace_enabled() {
-                    if crate::supervisor::phase_trace_enabled() {
-                        eprintln!("web-runtime: phase handle-panic operation={operation}");
-                    }
-                }
-                Response::error(
-                    &request,
-                    ErrorObject::new(
-                        "engine_error",
-                        format!("supervisor panicked while handling {operation}"),
-                        request.request_id.clone(),
-                        38,
-                        "retry greppy web run",
-                    ),
-                )
-            }
-        };
+        let response = dispatch_request(request, |request| daemon.handle(request));
         let _ = write_frame(&mut stream, &response);
         if daemon.exiting {
             break;
@@ -532,10 +510,8 @@ struct LateEngineResult {
 }
 
 struct RunControl {
-    busy: std::sync::Mutex<Option<(String, String)>>,
-    cancel_target: std::sync::Mutex<Option<(String, String)>>,
-    completed: std::sync::Mutex<HashSet<(String, String)>>,
-    heartbeats: std::sync::Mutex<Vec<String>>,
+    operation: crate::operation_control::OperationControl,
+    heartbeats: crate::heartbeat_inbox::HeartbeatInbox,
     session_rows: std::sync::Mutex<Vec<serde_json::Value>>,
     late_engine_result: std::sync::Mutex<Option<LateEngineResult>>,
     discarded_engine_results: AtomicU64,
@@ -548,10 +524,8 @@ struct RunControl {
 impl RunControl {
     fn new() -> Self {
         Self {
-            busy: std::sync::Mutex::new(None),
-            cancel_target: std::sync::Mutex::new(None),
-            completed: std::sync::Mutex::new(HashSet::new()),
-            heartbeats: std::sync::Mutex::new(Vec::new()),
+            operation: crate::operation_control::OperationControl::default(),
+            heartbeats: crate::heartbeat_inbox::HeartbeatInbox::default(),
             session_rows: std::sync::Mutex::new(Vec::new()),
             late_engine_result: std::sync::Mutex::new(None),
             discarded_engine_results: AtomicU64::new(0),
@@ -563,7 +537,71 @@ impl RunControl {
     }
 
     fn publish_sessions(&self, rows: Vec<serde_json::Value>) {
+        self.heartbeats.publish(rows.iter().filter_map(|row| {
+            matches!(
+                row.get("state").and_then(|value| value.as_str()),
+                Some("creating" | "ready" | "busy" | "failed")
+            )
+            .then(|| row.get("session_id").and_then(|value| value.as_str()))
+            .flatten()
+        }));
         *self.session_rows.lock().unwrap_or_else(|e| e.into_inner()) = rows;
+    }
+}
+
+fn apply_pending_heartbeats(sessions: &mut HashMap<String, Session>, control: &RunControl) {
+    control.heartbeats.drain(|id, received| {
+        if let Some(session) = sessions.get_mut(id) {
+            session.last_heartbeat = session.last_heartbeat.max(received);
+        }
+    });
+}
+
+#[cfg(test)]
+mod heartbeat_application_tests {
+    use super::{apply_pending_heartbeats, snapshot_session_rows, RunControl};
+    use crate::policy::NetworkProfile;
+    use crate::session::{Session, SessionState};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn heartbeat_receipts_refresh_only_their_session_at_the_actual_receipt_time() {
+        let control = RunControl::new();
+        let before = Instant::now() - Duration::from_secs(2);
+        let received = before + Duration::from_secs(1);
+        let mut sessions = HashMap::new();
+        for id in ["a", "b"] {
+            let mut session = Session::new(id, "heartbeat-contract", NetworkProfile::Project);
+            session.transition(SessionState::Ready).unwrap();
+            session.last_heartbeat = before;
+            sessions.insert(id.to_owned(), session);
+        }
+        control.publish_sessions(snapshot_session_rows(&sessions, &control));
+        assert!(control.heartbeats.record("a", received));
+        apply_pending_heartbeats(&mut sessions, &control);
+        assert_eq!(
+            sessions["a"].last_heartbeat,
+            received,
+            "queued heartbeat must retain actual receipt time"
+        );
+        assert_eq!(
+            sessions["b"].last_heartbeat,
+            before,
+            "heartbeat refreshed an unrelated session"
+        );
+        assert!(control.heartbeats.record("a", before));
+        apply_pending_heartbeats(&mut sessions, &control);
+        assert_eq!(
+            sessions["a"].last_heartbeat,
+            received,
+            "delayed heartbeat regressed the session activity clock"
+        );
+        let session = sessions.get_mut("a").unwrap();
+        session.transition(SessionState::Closing).unwrap();
+        session.transition(SessionState::Closed).unwrap();
+        control.publish_sessions(snapshot_session_rows(&sessions, &control));
+        assert!(!control.heartbeats.record("a", received));
     }
 }
 
@@ -719,9 +757,202 @@ fn bind_socket_healing_stale(path: &Path) -> io::Result<UnixListener> {
     }
 }
 
+type PendingRequest = (UnixStream, Request);
+
+fn request_inbox() -> (
+    mpsc::SyncSender<PendingRequest>,
+    mpsc::Receiver<PendingRequest>,
+) {
+    // One serialized executor needs only one prefetched request. More buffered
+    // payloads cannot execute in parallel and must not accumulate during a run.
+    mpsc::sync_channel(1)
+}
+
+fn dispatch_request(request: Request, handle: impl FnOnce(Request) -> Response) -> Response {
+    // Preserve only response correlation before moving the payload to its handler.
+    let failure = Response::error(
+        &request,
+        ErrorObject::new(
+            "engine_error",
+            format!("supervisor panicked while handling {}", request.operation),
+            request.request_id.clone(),
+            38,
+            "retry greppy web run",
+        ),
+    );
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(request))) {
+        Ok(response) => response,
+        Err(_) => {
+            if crate::supervisor::phase_trace_enabled() {
+                eprintln!(
+                    "web-runtime: phase handle-panic operation={}",
+                    failure.operation
+                );
+            }
+            failure
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_inbox_tests {
+    use super::{accept_loop, dispatch_request, request_inbox, RunControl, StartupGate};
+    use greppy_web_client::{read_frame, write_frame, Request, Response};
+    use serde_json::{json, Value};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::{mpsc, Arc};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    const ATTACH: &str = "private-inbox-contract-capability";
+
+    struct Acceptor {
+        socket: PathBuf,
+        receiver: Option<mpsc::Receiver<super::PendingRequest>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Acceptor {
+        fn start() -> Self {
+            let socket = std::env::temp_dir().join(format!("gi-{}.sock", std::process::id()));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (tx, rx) = request_inbox();
+            let startup = Arc::new(StartupGate::new());
+            startup.mark_ready();
+            let control = Arc::new(RunControl::new());
+            let thread = thread::spawn(move || {
+                accept_loop(listener, tx, control, ATTACH.to_owned(), startup);
+            });
+            Self {
+                socket,
+                receiver: Some(rx),
+                thread: Some(thread),
+            }
+        }
+
+        fn send(&self, operation: &str, payload: Value) -> (Request, UnixStream) {
+            let mut request = Request::new("inbox-contract", operation, payload);
+            request.capability = ATTACH.to_owned();
+            let mut stream = UnixStream::connect(&self.socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write_frame(&mut stream, &request).unwrap();
+            (request, stream)
+        }
+    }
+
+    impl Drop for Acceptor {
+        fn drop(&mut self) {
+            // A disconnected receiver plus one authenticated wakeup terminates
+            // the real accept loop. This fixture leaves no listener thread.
+            drop(self.receiver.take());
+            if self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+            {
+                let _ = self.send("web.read", json!({}));
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    #[test]
+    fn saturated_inbox_rejects_excess_work_without_blocking_control() {
+        let acceptor = Acceptor::start();
+        let (first, _first_stream) = acceptor.send(
+            "web.read",
+            json!({ "url": "about:blank", "probe": "x".repeat(64 * 1024) }),
+        );
+        let (excess, mut excess_stream) =
+            acceptor.send("web.read", json!({ "url": "about:blank" }));
+        let rejected: Response = read_frame(&mut excess_stream)
+            .expect("saturated supervisor inbox did not reject the excess request");
+        assert_eq!(rejected.request_id, excess.request_id);
+        assert_eq!(rejected.status, "error", "{rejected:?}");
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code.as_str()),
+            Some("resource_limit"),
+            "excess request must be refused before execution"
+        );
+        assert!(
+            rejected
+                .error
+                .as_ref()
+                .unwrap()
+                .next_action
+                .contains("not started"),
+            "{rejected:?}"
+        );
+
+        let (_, mut cancel_stream) = acceptor.send(
+            "web.cancel",
+            json!({ "session_id": "absent", "target_request_id": "absent" }),
+        );
+        let cancel: Response = read_frame(&mut cancel_stream)
+            .expect("full inbox blocked the cancellation control path");
+        assert_eq!(cancel.status, "ok", "{cancel:?}");
+        assert_eq!(cancel.result.as_ref().unwrap()["cancelled"], json!(false));
+
+        let (_, queued) = acceptor
+            .receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(queued.request_id, first.request_id);
+        let (next, _next_stream) = acceptor.send("web.read", json!({ "url": "about:blank" }));
+        let (_, queued_next) = acceptor
+            .receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("inbox did not admit work after its slot was released");
+        assert_eq!(queued_next.request_id, next.request_id);
+    }
+
+    #[test]
+    fn dispatch_moves_payload_and_preserves_panic_correlation() {
+        let request = Request::new(
+            "dispatch-contract",
+            "web.run",
+            json!({ "script_text": "x".repeat(1024 * 1024) }),
+        );
+        let allocation = request.payload["script_text"].as_str().unwrap().as_ptr() as usize;
+        let response = dispatch_request(request, |owned| {
+            let same_allocation =
+                owned.payload["script_text"].as_str().unwrap().as_ptr() as usize == allocation;
+            Response::ok(&owned, json!({ "same_allocation": same_allocation }))
+        });
+        assert_eq!(
+            response.result.as_ref().unwrap()["same_allocation"],
+            json!(true),
+            "dispatch copied the full request payload"
+        );
+
+        let failed = Request::new("dispatch-contract", "web.read", json!({}));
+        let request_id = failed.request_id.clone();
+        let operation = failed.operation.clone();
+        let response = dispatch_request(failed, |_| panic!("intentional dispatch contract fault"));
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.operation, operation);
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error.as_ref().unwrap().code, "engine_error");
+        assert_eq!(response.error.as_ref().unwrap().exit_code, 38);
+    }
+}
+
 fn accept_loop(
     listener: UnixListener,
-    tx: mpsc::Sender<(UnixStream, Request)>,
+    tx: mpsc::SyncSender<PendingRequest>,
     control: Arc<RunControl>,
     attach: String,
     startup: Arc<StartupGate>,
@@ -783,55 +1014,27 @@ fn accept_loop(
                     let _ = write_frame(&mut stream, &Response::error(&request, error));
                     continue;
                 }
-                let pair = (session_id, target);
-                let completed = control.completed.lock().unwrap_or_else(|e| e.into_inner());
-                if completed.contains(&pair) {
-                    drop(completed);
-                    let _ = write_frame(
-                        &mut stream,
-                        &Response::ok(
-                            &request,
-                            json!({ "cancelled": false, "reason": "already_completed" }),
-                        ),
-                    );
-                    continue;
-                }
-                drop(completed);
-                let busy = control.busy.lock().unwrap_or_else(|e| e.into_inner());
-                if busy.as_ref() != Some(&pair) {
-                    drop(busy);
-                    let _ = write_frame(
-                        &mut stream,
-                        &Response::ok(
-                            &request,
-                            json!({ "cancelled": false, "reason": "no_match" }),
-                        ),
-                    );
-                    continue;
-                }
-                drop(busy);
-                *control
-                    .cancel_target
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(pair);
-                let _ = write_frame(
-                    &mut stream,
-                    &Response::ok(&request, json!({ "cancelled": true })),
-                );
+                let result = match control.operation.cancel(&session_id, &target) {
+                    crate::operation_control::CancelResult::Requested => {
+                        json!({ "cancelled": true })
+                    }
+                    crate::operation_control::CancelResult::AlreadyCompleted => {
+                        json!({ "cancelled": false, "reason": "already_completed" })
+                    }
+                    crate::operation_control::CancelResult::NoMatch => {
+                        json!({ "cancelled": false, "reason": "no_match" })
+                    }
+                };
+                let _ = write_frame(&mut stream, &Response::ok(&request, result));
             }
             "heartbeat" | "web.heartbeat" => {
                 if let Some(session_id) = request
                     .payload
                     .get("session_id")
                     .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-                    .or_else(|| request.session_id.clone())
+                    .or(request.session_id.as_deref())
                 {
-                    control
-                        .heartbeats
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(session_id);
+                    control.heartbeats.record(session_id, Instant::now());
                 }
                 let _ = write_frame(&mut stream, &Response::ok(&request, json!({ "ok": true })));
             }
@@ -869,11 +1072,23 @@ fn accept_loop(
                     &Response::ok(&request, json!({ "sessions": sessions })),
                 );
             }
-            _ => {
-                if tx.send((stream, request)).is_err() {
-                    return;
+            _ => match tx.try_send((stream, request)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full((mut stream, request))) => {
+                    let error = ErrorObject::new(
+                        "resource_limit",
+                        "runtime request inbox is full",
+                        request.request_id.clone(),
+                        37,
+                        concat!(
+                            "wait for an outstanding runtime operation to finish; ",
+                            "this request was not started"
+                        ),
+                    );
+                    let _ = write_frame(&mut stream, &Response::error(&request, error));
                 }
-            }
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+            },
         }
     }
 }
@@ -1825,7 +2040,7 @@ impl Daemon {
         }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
-            json!({ "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
+            json!({ "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id), "__download_session": session_id.clone(), "max_download_bytes": self.download_byte_limit(&session_id) }),
             run_deadline.saturating_duration_since(Instant::now()),
         ) {
             self.finish_session(&session_id);
@@ -1900,7 +2115,7 @@ impl Daemon {
         if let Some(page) = bound_page.as_deref() {
             if let Err(error) = self.engine_call_timed(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id), "__download_session": session_id.clone(), "max_download_bytes": self.download_byte_limit(&session_id) }),
                 run_deadline.saturating_duration_since(Instant::now()),
             ) {
                 self.finish_session(&session_id);
@@ -1950,12 +2165,14 @@ impl Daemon {
                 );
             }
         }
-        *self
-            .run_control
-            .busy
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) =
-            Some((session_id.clone(), request.request_id.clone()));
+        let control = Arc::clone(&self.run_control);
+        let _operation_lease = match control.operation.begin(&session_id, &request.request_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_session(&session_id);
+                return engine_error(request, error, 38);
+            }
+        };
         self.run_control
             .controller_pid
             .store(self.controller.pid(), Ordering::Relaxed);
@@ -2076,7 +2293,6 @@ impl Daemon {
         let controller_pid = self.controller.pid();
         let content_cpu_baseline_ns = sample_cpu_ns(content_pid);
         let controller_cpu_baseline_ns = sample_cpu_ns(controller_pid);
-        let control = Arc::clone(&self.run_control);
         let operation_id = request.request_id.clone();
         let remaining = run_deadline
             .saturating_duration_since(Instant::now())
@@ -2211,27 +2427,8 @@ impl Daemon {
                 let failure_trace_warning = failure_trace_storage.warning;
                 let message = error.to_string();
                 if message.contains("cancelled") {
-                    let pair = (session_id.clone(), operation_id.clone());
-                    control
-                        .completed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(pair.clone());
-                    {
-                        let mut cancel_target = control
-                            .cancel_target
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if cancel_target.as_ref() == Some(&pair) {
-                            *cancel_target = None;
-                        }
-                    }
-                    {
-                        let mut busy = control.busy.lock().unwrap_or_else(|e| e.into_inner());
-                        if busy.as_ref() == Some(&pair) {
-                            *busy = None;
-                        }
-                    }
+                    // The script is settled before draining/replacing its workers.
+                    drop(_operation_lease);
                     self.drain_late_engine_results(&session_id, &operation_id);
                     if had_inflight_engine.is_some() {
                         match self.respawn_content_after_cancel("cancelled content isolate") {
@@ -4509,7 +4706,7 @@ impl Daemon {
             } else {
                 self.engine_call_timed_with_recovery(
                     "session.setProfile",
-                    json!({"page":page,"profile":profile.as_str(),"record_memory_bytes":self.record_memory_limit(&session_id)}),
+                    json!({"page":page,"profile":profile.as_str(),"record_memory_bytes":self.record_memory_limit(&session_id),"__download_session":session_id.clone(),"max_download_bytes":self.download_byte_limit(&session_id)}),
                     remaining,
                     false,
                 )
@@ -4517,7 +4714,7 @@ impl Daemon {
         } else {
             self.engine_call(
                 "session.setProfile",
-                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id) }),
+                json!({ "page": page, "profile": profile.as_str(), "record_memory_bytes": self.record_memory_limit(&session_id), "__download_session": session_id.clone(), "max_download_bytes": self.download_byte_limit(&session_id) }),
             )
         };
         if let Err(error) = profile_result {
@@ -4995,6 +5192,10 @@ impl Daemon {
         }
     }
 
+    fn download_byte_limit(&self, session_id: &str) -> u64 {
+        self.sessions.get(session_id).map(|session| session.limits.max_download_bytes).unwrap_or(0)
+    }
+
     fn record_memory_limit(&self, session_id: &str) -> u64 {
         self.sessions.get(session_id).map(|session| session.limits.content_rss_bytes)
             .unwrap_or_else(|| crate::limits::SessionLimits::default().content_rss_bytes)
@@ -5251,6 +5452,7 @@ impl Daemon {
     }
 
     fn reap_idle_sessions(&mut self) {
+        apply_pending_heartbeats(&mut self.sessions, &self.run_control);
         let now = Instant::now();
         let stale: Vec<String> = self
             .sessions
@@ -6212,25 +6414,12 @@ struct SessionEngineGate<'a> {
 impl crate::supervisor::EngineGate for SessionEngineGate<'_> {
     fn is_cancelled(&self) -> bool {
         self.control
-            .cancel_target
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|pair| pair.0 == self.session_id && pair.1 == self.operation_id)
+            .operation
+            .is_cancelled(&self.session_id, &self.operation_id)
     }
 
     fn poll_control(&mut self) {
-        let mut beats = self
-            .control
-            .heartbeats
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for session_id in beats.drain(..) {
-            if let Some(session) = self.sessions.get_mut(&session_id) {
-                session.last_heartbeat = Instant::now();
-            }
-        }
-        drop(beats);
+        apply_pending_heartbeats(self.sessions, &self.control);
         self.control
             .publish_sessions(snapshot_session_rows(self.sessions, &self.control));
     }

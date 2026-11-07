@@ -157,6 +157,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_go_qualified_type_mutation.py
 
+      - name: Sparse-checkout coverage mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_sparse_coverage_mutation.py
+
       # Several crates' unit tests mutate process-global env via set_var
       # (GREPPY_* config knobs). set_var is process-wide across the test
       # harness's parallel threads, so one test's override leaks into another
@@ -174,6 +178,13 @@ jobs:
       - name: Web argument dispatch mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_argument_mutation.py
+
+      - name: Saved ANSI and Oxc diagnostic replay mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_bash_smart_diagnostics_mutation.py
+
+      - name: Live inference child lease mutation proof
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_inference_lease_probe_mutation.py
 
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         # The unoptimized, generated full CLI parser exceeds the 2 MiB

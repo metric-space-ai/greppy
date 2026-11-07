@@ -18,5 +18,7 @@ servo-embedder-traits = { path = "vendor/servo-embedder-traits" }
 servo-layout = { path = "vendor/servo-layout" }
 servo-net = { path = "vendor/servo-net" }
 servo-net-traits = { path = "vendor/servo-net-traits" }
+# One render worker pool per live process generation, shared by isolated Painters.
+servo-paint = { path = "vendor/servo-paint" }
 servo-script = { path = "vendor/servo-script" }
 servo-script-traits = { path = "vendor/servo-script-traits" }
