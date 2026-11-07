@@ -82,6 +82,9 @@ jobs:
           restored = run_case('restored')
           print(restored.stdout, restored.stderr)
           assert restored.returncode == 0
+          subprocess.run(['python3', '-B', 'bench/check_meter_cleanup.py',
+                          '--output', str(root / 'owner-cleanup'), '--mutations'],
+                         check=True, timeout=60)
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
       - name: Collect an optional real released web worker baseline

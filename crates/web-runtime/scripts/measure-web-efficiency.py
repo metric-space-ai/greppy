@@ -402,12 +402,31 @@ def capture_owned_runtime_stderr(runtime_seen, runtime_identity, state):
             handle.close()
 
 
+def failure_cleanup(command, directory, env, cwd, resource_group):
+    """Attempt the explicit owner stop after an interrupted observation, bounded."""
+    arguments = resource_group.wrap_command(command) if resource_group else command
+    with ((directory / 'cleanup-stdout.log').open('ab') as stdout,
+          (directory / 'cleanup-stderr.log').open('ab') as stderr):
+        process = subprocess.Popen(arguments, stdout=stdout, stderr=stderr,
+                                   start_new_session=True, env=env, cwd=cwd)
+        try:
+            return process.wait(timeout=3)
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=2)
+
+
 def execute(command, directory, timeout, started=None, memory_log_path=None, *,
             env=None, cwd=None, cleanup_command=None, runtime_identity=None, resource_group=None,
             diagnostic_state=None):
     started = time.monotonic() if started is None else started
     monitor_cpu_started = time.thread_time_ns()
     terminated_at = None
+    cleanup_started_at = None
     memory_log_path = memory_log_path or directory / 'process-memory.jsonl'
     sampling_wall_ns = 0
     custody = _memory_module.ProcessFamilyCustody()
@@ -460,12 +479,18 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
                 except ProcessLookupError:
                     pass
         else:
-            for pid, process in controls.items():
+            for pid, process in list(controls.items()):
                 if process.returncode is None:
                     try:
                         os.killpg(pid, sig)
                     except ProcessLookupError:
                         pass
+                    except PermissionError:
+                        # A root can exit between the last wait4 and signalling.
+                        # Ignore this only after wait4 proves that exact child exited.
+                        reap()
+                        if process.returncode is None:
+                            raise
 
     def observe_runtime():
         nonlocal runtime_seen, diagnostic_handle
@@ -506,7 +531,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
             while True:
                 changed = reap()
                 now = time.monotonic()
-                if child.returncode is not None and cleanup_command is not None and cleanup is None and terminated_at is None:
+                if child.returncode is not None and cleanup_command is not None and cleanup is None:
                     if child.returncode != 0 and diagnostic_state is not None:
                         refresh_roots()
                         observe_runtime()
@@ -529,6 +554,7 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
                         start_new_session=True, env=env, cwd=cwd)
                     controls[cleanup.pid] = cleanup
                     known_direct[cleanup.pid] = None
+                    cleanup_started_at = now
                     memory.register_root(cleanup.pid)
                     changed = True
                 controls_done = (child.returncode is not None
@@ -548,21 +574,35 @@ def execute(command, directory, timeout, started=None, memory_log_path=None, *,
                 if now - started >= timeout and terminated_at is None:
                     terminated_at = now
                 if terminated_at is not None:
-                    signal_owned(signal.SIGKILL if now - terminated_at >= 5 else signal.SIGTERM)
+                    # The task remains timed out; give its explicit owner stop a
+                    # bounded chance instead of killing that cleanup immediately.
+                    if (cleanup is None or cleanup.returncode is not None
+                            or now - cleanup_started_at >= 3):
+                        signal_owned(signal.SIGKILL if now - terminated_at >= 5 else signal.SIGTERM)
                     if now - terminated_at >= 10:
                         raise RuntimeError('owned process family exceeded its forced-cleanup deadline')
                 time.sleep(0.02)
     except BaseException:
-        # No new control process is launched during exception cleanup.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            refresh_roots()
-            signal_owned(signal.SIGKILL)
-            reap()
-            refresh_roots()
-            if not known_direct:
-                break
-            time.sleep(0.02)
+        # Reap observed controls before retrying an interrupted owner stop. The
+        # finally also attempts that stop if forced process cleanup itself fails.
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                refresh_roots()
+                reap()
+                refresh_roots()
+                if not known_direct:
+                    break
+                signal_owned(signal.SIGKILL)
+                time.sleep(0.02)
+        finally:
+            if (child is not None and cleanup_command is not None
+                    and (cleanup is None or cleanup.returncode != 0)):
+                try:
+                    failure_cleanup(cleanup_command, directory, env, cwd, resource_group)
+                except Exception as error:
+                    with (directory / 'cleanup-stderr.log').open('a') as errors:
+                        errors.write('explicit failure cleanup failed: ' + type(error).__name__ + '\n')
         raise
     finally:
         if diagnostic_handle is not None:
