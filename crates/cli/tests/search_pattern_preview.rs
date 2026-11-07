@@ -295,3 +295,199 @@ fn text_pattern_all_preserves_explicit_limit_and_offset() {
     ]);
     assert_eq!(page_headers(&output), ["page1.rs:1", "page1.rs:2"]);
 }
+
+#[test]
+fn code_reads_rust_python_definitions_without_repeating_bodies() {
+    let fixture = Fixture::new();
+    let rust_first = "pub fn decode_token(value: usize) -> usize {\n    // repeated_source_marker\n    value + 7 // repeated_source_marker\n}";
+    let rust_second = "pub fn next_token() -> usize {\n    91\n}";
+    std::fs::write(
+        fixture.repo.join("source.rs"),
+        format!("{rust_first}\n{rust_second}\n"),
+    )
+    .unwrap();
+    let rust = fixture.run(&[
+        "search-pattern",
+        "^pub fn (decode_token|next_token)",
+        "--code",
+        "--path",
+        "source.rs",
+    ]);
+    assert_eq!(
+        rust.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&rust.stderr)
+    );
+    let text = String::from_utf8(rust.stdout).unwrap();
+    assert!(
+        text.contains(rust_first) && text.contains(rust_second),
+        "definition body must be present, not only the matching signature: {text}"
+    );
+
+    let python_source = "def decode_items(value):\n    python_body_marker = list(value)\n    return python_body_marker\n";
+    std::fs::write(fixture.repo.join("source.py"), python_source).unwrap();
+    let python = fixture.run(&[
+        "search-pattern",
+        "^def decode_items",
+        "--code",
+        "--path",
+        "source.py",
+    ]);
+    assert_eq!(
+        python.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+    let text = String::from_utf8(python.stdout).unwrap();
+    assert!(
+        text.contains(python_source),
+        "Python definition body must be present: {text}"
+    );
+
+    for (file, first_line) in [
+        (
+            "lifetime.rs",
+            "pub fn borrow<'a>(value: &'a str) -> &'a str { value }",
+        ),
+        ("comment.rs", "pub fn brace_comment() { /* { */ }"),
+    ] {
+        std::fs::write(
+            fixture.repo.join(file),
+            format!("{first_line}\npub fn unrelated() -> u8 {{ 91 }}\n"),
+        )
+        .unwrap();
+        let output = fixture.run(&[
+            "search-pattern",
+            "^pub fn (borrow|brace_comment)",
+            "--code",
+            "--path",
+            file,
+        ]);
+        assert_eq!(output.status.code(), Some(0));
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(first_line),
+            "one-line source must remain exact: {text}"
+        );
+        assert!(
+            !text.contains("pub fn unrelated"),
+            "live definition must exclude its unrelated neighbor: {text}"
+        );
+        let json = fixture.run(&[
+            "search-pattern",
+            "^pub fn (borrow|brace_comment)",
+            "--code",
+            "--json",
+            "--path",
+            file,
+        ]);
+        assert_eq!(json.status.code(), Some(0));
+        let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        let expected_source = format!("{first_line}\n");
+        assert_eq!(
+            json["hits"][0]["source"].as_str(),
+            Some(expected_source.as_str()),
+            "JSON source must equal its addressed bytes"
+        );
+        assert_eq!(json["hits"][0]["span"]["start_line"], 1);
+        assert_eq!(json["hits"][0]["span"]["end_line"], 1);
+    }
+
+    for (file, newline) in [("adjacent-lf.py", "\n"), ("adjacent-crlf.py", "\r\n")] {
+        let first = format!("def first():{newline}    return 1{newline}");
+        let original = format!("{first}def next_one():{newline}    return 2{newline}");
+        std::fs::write(fixture.repo.join(file), &original).unwrap();
+        let output = fixture.run(&[
+            "search-pattern",
+            "^def first",
+            "--code",
+            "--json",
+            "--path",
+            file,
+        ]);
+        assert_eq!(output.status.code(), Some(0));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hit = &result["hits"][0];
+        assert_eq!(
+            hit["source"].as_str(),
+            Some(first.as_str()),
+            "JSON source must equal its addressed bytes"
+        );
+        let replaced = fixture.run(&[
+            "replace-span",
+            hit["handle"].as_str().unwrap(),
+            hit["source"].as_str().unwrap(),
+        ]);
+        assert_eq!(
+            replaced.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&replaced.stderr)
+        );
+        assert_eq!(
+            std::fs::read(fixture.repo.join(file)).unwrap(),
+            original.as_bytes(),
+            "unchanged source/handle roundtrip must preserve neighbors and line endings"
+        );
+    }
+
+    let repeated = fixture.run(&[
+        "search-pattern",
+        "repeated_source_marker",
+        "--code",
+        "--path",
+        "source.rs",
+    ]);
+    assert_eq!(repeated.status.code(), Some(0));
+    let text = String::from_utf8(repeated.stdout).unwrap();
+    assert_eq!(
+        text.matches("    value + 7 // repeated_source_marker")
+            .count(),
+        1,
+        "definition body must not be repeated for multiple literal hits: {text}"
+    );
+    assert!(
+        text.contains("definition source already shown"),
+        "later matches must explain source reuse: {text}"
+    );
+    let compact = fixture.run(&[
+        "search-pattern",
+        "^pub fn decode_token",
+        "--path",
+        "source.rs",
+    ]);
+    assert_eq!(compact.status.code(), Some(0));
+    assert!(!String::from_utf8(compact.stdout)
+        .unwrap()
+        .contains("value + 7"));
+
+    let wide_source = format!(
+        "pub fn wide() -> &'static str {{\n    \"{}middle_marker{}\"\n}}\n",
+        "x".repeat(100_000),
+        "y".repeat(100_000)
+    );
+    std::fs::write(fixture.repo.join("wide.rs"), &wide_source).unwrap();
+    let wide = fixture.run(&[
+        "search-pattern",
+        "middle_marker",
+        "--code",
+        "--path",
+        "wide.rs",
+    ]);
+    assert_eq!(wide.status.code(), Some(0));
+    let text = String::from_utf8(wide.stdout).unwrap();
+    assert!(
+        text.len() < 6000 && text.contains("middle_marker") && text.contains("source preview:"),
+        "wide definition must remain bounded and explicitly partial"
+    );
+    assert!(
+        text.contains("--lines 2:2"),
+        "wide body recovery must point to the clipped body line: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join("wide.rs")).unwrap(),
+        wide_source
+    );
+}
