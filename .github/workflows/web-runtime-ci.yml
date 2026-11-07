@@ -117,6 +117,9 @@ jobs:
           --test session-daemon
           --no-run
 
+      - name: Prove public runtime stop never reports success for a live unowned endpoint
+        run: python3 tools/check_runtime_stop_result_mutation.py
+
       - name: Check closing one session preserves its live neighbor and recovery worker
         shell: bash
         run: |
