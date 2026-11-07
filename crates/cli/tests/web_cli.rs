@@ -4,6 +4,174 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+#[test]
+fn runtime_stop_reports_observed_state_without_weakening_ownership() {
+    use greppy::{generate_attach_token, give_child_attach_token, web_runtime_socket};
+    use greppy_web_client::{Request, RuntimeStatusProbe, StatusProbeError};
+    use std::os::unix::process::CommandExt;
+
+    // The Native driver supplies its exact just-built image. A random cached
+    // optional binary must not silently select this physical contract.
+    let Some(runtime) = std::env::var_os("GREPPY_WEB_RUNTIME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        eprintln!("skipping physical stop proof: explicit native runtime is not provided");
+        return;
+    };
+    let run_id = format!(
+        "run_stop_receipt_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let image = greppy_web_client::runtime_image_id(&runtime).expect("actual native image");
+    let socket =
+        web_runtime_socket(&format!("{run_id}:image:{image}")).expect("owned test endpoint");
+    assert!(
+        !socket.exists(),
+        "new private runtime endpoint already exists"
+    );
+    let token = generate_attach_token().expect("private test capability");
+    let mut command = Command::new(&runtime);
+    command
+        .args(["--socket", socket.to_str().unwrap(), "--run-id", &run_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    let hold = give_child_attach_token(&mut command, &token).expect("official attach provider");
+    let child = command.spawn().expect("owned actual native supervisor");
+    drop(hold);
+
+    struct OwnedRuntime {
+        child: std::process::Child,
+        socket: std::path::PathBuf,
+        run_id: String,
+        token: String,
+    }
+    impl Drop for OwnedRuntime {
+        fn drop(&mut self) {
+            // Only this test's captured process group and in-memory capability.
+            let mut request = Request::new(&self.run_id, "web.shutdown", serde_json::json!({}));
+            request.capability = self.token.clone();
+            let _ = greppy_web_client::unix_request(&self.socket, &request, Duration::from_secs(3));
+            let until = Instant::now() + Duration::from_secs(5);
+            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let pid = self.child.id() as i32;
+                // A still-unreaped direct child cannot have its PID reused.
+                if unsafe { libc::getpgid(pid) } == pid {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGTERM);
+                    }
+                } else {
+                    let _ = self.child.kill();
+                }
+                let until = Instant::now() + Duration::from_secs(1);
+                while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if matches!(self.child.try_wait(), Ok(None)) {
+                    if unsafe { libc::getpgid(pid) } == pid {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                    } else {
+                        let _ = self.child.kill();
+                    }
+                    let _ = self.child.wait();
+                }
+            }
+        }
+    }
+    let mut owned = OwnedRuntime {
+        child,
+        socket,
+        run_id,
+        token,
+    };
+    wait_unix_socket(&owned.socket, &mut owned.child, Duration::from_secs(60));
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        match greppy_web_client::probe_runtime_status(&owned.socket, &owned.run_id, &owned.token) {
+            Ok(RuntimeStatusProbe::Ready(_)) => break,
+            Ok(RuntimeStatusProbe::Starting)
+            | Err(StatusProbeError::Starting)
+            | Err(StatusProbeError::NotRunning) => {
+                assert!(
+                    Instant::now() < until,
+                    "owned native runtime never became ready"
+                );
+                assert!(
+                    matches!(owned.child.try_wait(), Ok(None)),
+                    "owned native supervisor exited"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => panic!("owned native status failed: {other:?}"),
+        }
+    }
+    let stop = |capability: Option<&str>| {
+        let mut command = Command::new(bin());
+        command
+            .args(["web", "runtime", "stop", "--json"])
+            .env("GREPPY_RUN_ID", &owned.run_id)
+            .env("GREPPY_WEB_RUNTIME", &runtime)
+            .env_remove("GREPPY_WEB_ATTACH")
+            .env_remove("GREPPY_WEB_RUNTIME_DIST")
+            .env_remove("GREPPY_WEB_FIXTURE_URL")
+            .stdin(Stdio::null());
+        let hold = capability.map(|token| give_child_attach_token(&mut command, token).unwrap());
+        let output = command.output().expect("public runtime stop");
+        drop(hold);
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                panic!(
+                    "invalid stop JSON: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        (output.status.code().unwrap_or(1), value)
+    };
+    let (code, refused) = stop(None);
+    assert_ne!(
+        code, 0,
+        "unowned live runtime stop must not report success: {refused}"
+    );
+    assert_eq!(refused["status"], "error");
+    assert_eq!(refused["error"]["code"], "runtime_stop_unconfirmed");
+    assert_eq!(refused["result"]["running"], true);
+    assert_eq!(refused["result"]["owned"], false);
+    assert_eq!(refused["result"]["stopped"], false);
+    assert_eq!(refused["result"]["stop_requested"], false);
+    assert_eq!(refused["result"]["socket"], owned.socket.to_str().unwrap());
+    assert!(
+        std::os::unix::net::UnixStream::connect(&owned.socket).is_ok(),
+        "unauthenticated stop changed the owner runtime"
+    );
+    let (code, stopped) = stop(Some(&owned.token));
+    assert_eq!(code, 0, "authenticated stop failed: {stopped}");
+    assert_eq!(stopped["status"], "ok");
+    assert_eq!(stopped["result"]["running"], false);
+    assert_eq!(stopped["result"]["stopped"], true);
+    assert_eq!(stopped["result"]["stop_requested"], true);
+    assert!(
+        std::os::unix::net::UnixStream::connect(&owned.socket).is_err(),
+        "stop receipt preceded actual socket closure"
+    );
+    let (code, repeated) = stop(None);
+    assert_eq!(code, 0, "already-stopped must be idempotent: {repeated}");
+    assert_eq!(repeated["result"]["stopped"], true);
+    assert_eq!(repeated["result"]["stop_requested"], false);
+    println!("RUNTIME_STOP_REAL_CONTROL_PASSED");
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
 }

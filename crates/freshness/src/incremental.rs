@@ -728,7 +728,10 @@ mod tests {
                 mtime_ns: 1,
                 size: 7,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -741,7 +744,10 @@ mod tests {
                 mtime_ns: 1,
                 size: 2,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -754,7 +760,10 @@ mod tests {
                 mtime_ns: 1,
                 size: 16,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -967,7 +976,10 @@ mod tests {
                 mtime_ns: metadata.mtime_ns.unwrap(),
                 size: metadata.size as i64,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1140,7 +1152,10 @@ mod tests {
                 mtime_ns: 10_000_000_000,
                 size: 8,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1211,7 +1226,10 @@ mod tests {
                 mtime_ns: 20_000_000_000,
                 size: 9,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1319,7 +1337,10 @@ mod tests {
                 mtime_ns: 1,
                 size: 7,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1332,7 +1353,10 @@ mod tests {
                 mtime_ns: 1,
                 size: 2,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1401,7 +1425,10 @@ mod tests {
                 mtime_ns: current_mtime_ns(&entry.abs_path),
                 size: md.len() as i64,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1471,7 +1498,10 @@ mod tests {
                 mtime_ns: original_identity.mtime_ns.unwrap(),
                 size: 8,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1527,7 +1557,10 @@ mod tests {
                 mtime_ns: 1, // stale mtime: stat tier must NOT match
                 size: md.len() as i64,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1566,7 +1599,10 @@ mod tests {
                 mtime_ns: 0, // sentinel
                 size: md.len() as i64,
                 parser_version: "x".into(),
-                extractor_version: "x".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();

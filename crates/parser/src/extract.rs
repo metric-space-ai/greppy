@@ -305,7 +305,42 @@ fn enclosing_impl_type<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> 
 /// Walk `node`'s ancestors and return the first enclosing
 /// `function_item`'s qname (constructed with the same collision-
 /// avoiding rules as the definition pass).
-fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+/// Disambiguate colliding free functions without evaluating cfg on the host.
+/// Build once per tree; definition and reference passes share exact AST owners.
+fn rust_free_function_qnames(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+) -> std::collections::HashMap<usize, String> {
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "function_item" && enclosing_impl_type(source, node).is_none() {
+            if let Some(name) = node.child_by_field_name("name") {
+                let qname = format!("{file_path}::Function::{}", node_text(source, name));
+                groups.entry(qname).or_default().push(node.start_byte());
+            }
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let mut identities = std::collections::HashMap::new();
+    for (qname, starts) in groups {
+        if starts.len() > 1 {
+            for start in starts {
+                identities.insert(start, format!("{qname}@{start}"));
+            }
+        }
+    }
+    identities
+}
+
+fn enclosing_function_qname(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
+) -> Option<String> {
     let mut p = node.parent();
     while let Some(cur) = p {
         if cur.kind() == "function_item" {
@@ -317,7 +352,10 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
                         let impl_ctx = enclosing_impl_type(source, cur);
                         return Some(match impl_ctx {
                             Some(t) => format!("{file_path}::{t}::{name}"),
-                            None => format!("{file_path}::Function::{name}"),
+                            None => free_function_qnames
+                                .get(&cur.start_byte())
+                                .cloned()
+                                .unwrap_or_else(|| format!("{file_path}::Function::{name}")),
                         });
                     }
                 }
@@ -1838,7 +1876,12 @@ fn rust_local_binding_owner<'a>(
 ///
 /// Construction mirrors PASS 1's qname scheme so the endpoints resolve
 /// against the nodes emitted there.
-fn enclosing_def_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+fn enclosing_def_qname(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
+) -> Option<String> {
     let mut p = node.parent();
     while let Some(cur) = p {
         match cur.kind() {
@@ -1847,7 +1890,10 @@ fn enclosing_def_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option
                 let name = node_text(source, name_node);
                 return Some(match enclosing_impl_type(source, cur) {
                     Some(t) => format!("{file_path}::{t}::{name}"),
-                    None => format!("{file_path}::Function::{name}"),
+                    None => free_function_qnames
+                        .get(&cur.start_byte())
+                        .cloned()
+                        .unwrap_or_else(|| format!("{file_path}::Function::{name}")),
                 });
             }
             "struct_item" | "union_item" => {
@@ -4765,6 +4811,7 @@ fn rust_expression_macro_calls(
     source: &[u8],
     root: Node<'_>,
     file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
 ) -> greppy_core::Result<Vec<ExtractedEdge>> {
     const PREFIX: &str = "async fn __greppy_macro_arguments__() { let _ = (";
     const MACROS: &[&str] = &[
@@ -4804,7 +4851,7 @@ fn rust_expression_macro_calls(
                 node.child_by_field_name("macro"),
                 node.named_children(&mut node.walk())
                     .find(|n| n.kind() == "token_tree"),
-                enclosing_function_qname(source, node, file_path),
+                enclosing_function_qname(source, node, file_path, free_function_qnames),
             ) {
                 let name = node_text(source, name);
                 if admitted(name, &shadowed) && tokens.end_byte() > tokens.start_byte() + 1 {
@@ -4862,8 +4909,12 @@ fn rust_expression_macro_calls(
                         != Some("callee")
                         || node.start_byte() < PREFIX.len()
                         || node.end_byte() > PREFIX.len() + body.len()
-                        || enclosing_function_qname(&wrapped, node, file_path)
-                            != Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+                        || enclosing_function_qname(
+                            &wrapped,
+                            node,
+                            file_path,
+                            &std::collections::HashMap::new(),
+                        ) != Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
                     {
                         continue;
                     }
@@ -4926,8 +4977,12 @@ fn rust_expression_macro_calls(
         let mut nested = vec![tree.root_node()];
         while let Some(node) = nested.pop() {
             if node.kind() == "macro_invocation"
-                && enclosing_function_qname(&wrapped, node, file_path)
-                    == Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+                && enclosing_function_qname(
+                    &wrapped,
+                    node,
+                    file_path,
+                    &std::collections::HashMap::new(),
+                ) == Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
             {
                 if let (Some(name), Some(tokens)) = (
                     node.child_by_field_name("macro"),
@@ -4983,6 +5038,7 @@ fn rust_expression_macro_calls(
 
 fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
     let tree = crate::parse(Language::Rust, source)?;
+    let free_function_qnames = rust_free_function_qnames(source, tree.root_node(), file_path);
     let queries = crate::query::cached_query_set(&Language::Rust)
         .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
 
@@ -5033,7 +5089,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     // (`enclosing_def_qname` walks to the nearest struct/enum/
                     // trait/function and rebuilds its qname with the same
                     // label scheme).
-                    let Some(owner_qn) = enclosing_def_qname(source, node, file_path) else {
+                    let Some(owner_qn) =
+                        enclosing_def_qname(source, node, file_path, &free_function_qnames)
+                    else {
                         continue;
                     };
                     let decl = node.parent().unwrap_or(node);
@@ -5133,7 +5191,10 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         let impl_ctx = enclosing_impl_type(source, node);
                         match impl_ctx {
                             Some(t) => format!("{file_path}::{t}::{text}"),
-                            None => format!("{file_path}::Function::{text}"),
+                            None => free_function_qnames
+                                .get(&node.parent().unwrap_or(node).start_byte())
+                                .cloned()
+                                .unwrap_or_else(|| format!("{file_path}::Function::{text}")),
                         }
                     }
                     _ => format!("{file_path}::{label}::{text}"),
@@ -5442,7 +5503,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 // CALLS edge below targets the real `file::Function::<text>`
                 // qname (resolved by name when cross-file); the Call node was
                 // never a resolution endpoint, only dead weight + search noise.
-                if let Some(caller_qname) = enclosing_function_qname(source, node, file_path) {
+                if let Some(caller_qname) =
+                    enclosing_function_qname(source, node, file_path, &free_function_qnames)
+                {
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
                         source_qualified_name: caller_qname,
@@ -5546,6 +5609,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
         source,
         tree.root_node(),
         file_path,
+        &free_function_qnames,
     )?);
 
     // PASS 4+5 — usages (the unified reference model). There are NO separate
@@ -5571,8 +5635,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
             // The nearest enclosing function's qname, with the same file-node
             // fallback the resolver applies when the reference is not inside
             // any function.
-            let source_qname = enclosing_function_qname(source, node, file_path)
-                .unwrap_or_else(|| file_qname.clone());
+            let source_qname =
+                enclosing_function_qname(source, node, file_path, &free_function_qnames)
+                    .unwrap_or_else(|| file_qname.clone());
             result.edges.push(ExtractedEdge {
                 edge_type: "USAGE".into(),
                 source_qualified_name: source_qname,
@@ -5660,7 +5725,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 let Some(type_node) = node.child_by_field_name("type") else {
                     continue;
                 };
-                let Some(source_qname) = enclosing_def_qname(source, node, file_path) else {
+                let Some(source_qname) =
+                    enclosing_def_qname(source, node, file_path, &free_function_qnames)
+                else {
                     // Top-level const/static with no enclosing def — skip;
                     // type-assigns are attached to an enclosing function.
                     continue;

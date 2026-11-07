@@ -42,6 +42,7 @@ pub const LEGACY_EXTRACTION_REVISION: &str = "greppy-extractor-v1";
 pub fn extraction_revision(language: Language) -> &'static str {
     match language {
         Language::C | Language::Cpp => "greppy-extractor-c-cpp-v2",
+        Language::Rust => "greppy-extractor-rust-v2",
         _ => LEGACY_EXTRACTION_REVISION,
     }
 }
@@ -56,10 +57,11 @@ pub fn extraction_revision_matches(path: &std::path::Path, revision: &str) -> bo
 /// A freshness TTL proof must not survive a change in extraction compatibility.
 pub fn extraction_revision_policy_key() -> String {
     format!(
-        "default={};c={};cpp={}",
+        "default={};c={};cpp={};rust={}",
         LEGACY_EXTRACTION_REVISION,
         extraction_revision(Language::C),
-        extraction_revision(Language::Cpp)
+        extraction_revision(Language::Cpp),
+        extraction_revision(Language::Rust)
     )
 }
 
