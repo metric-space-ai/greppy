@@ -11,8 +11,13 @@ fn runtime_stop_reports_observed_state_without_weakening_ownership() {
     use greppy_web_client::{Request, RuntimeStatusProbe, StatusProbeError};
     use std::os::unix::process::CommandExt;
 
-    let Some(runtime) = locate_web_runtime() else {
-        eprintln!("skipping physical stop proof: optional native runtime is not built");
+    // The Native driver supplies its exact just-built image. A random cached
+    // optional binary must not silently select this physical contract.
+    let Some(runtime) = std::env::var_os("GREPPY_WEB_RUNTIME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        eprintln!("skipping physical stop proof: explicit native runtime is not provided");
         return;
     };
     let run_id = format!(
