@@ -66,6 +66,49 @@ pub(crate) fn serve_site() -> (HttpFixture, String) {
     (fixture, url)
 }
 
+pub(crate) fn serve_form_post_fixture(
+    redirect_post: bool,
+) -> (HttpFixture, String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let fixture = HttpFixture::start_with_request(
+        move |request| {
+            let posted = request.method == "POST" && matches!(request.path, "/login" | "/complete");
+            let body = if posted {
+                sender.send(request.body.to_vec()).unwrap();
+                "<!doctype html><title>submitted</title><body>submitted</body>"
+            } else {
+                "<!doctype html><title>login</title><form method='post' action='/login'><input id='username' name='username'><input id='password' name='password'><button id='submit' type='submit'>Login</button></form>"
+            };
+            if redirect_post && request.method == "POST" && request.path == "/login" {
+                b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /complete\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            } else {
+                http_response(body.as_bytes(), "text/html; charset=utf-8", "")
+            }
+        },
+        false,
+    );
+    let url = fixture.origin.clone();
+    (fixture, url, receiver)
+}
+
+pub(crate) fn serve_cookie_isolation_fixture() -> (HttpFixture, String) {
+    let fixture = HttpFixture::start_with_request(
+        |request| {
+            let cookie = request.header("cookie").unwrap_or("");
+            let body = format!("<!doctype html><title>cookie</title><body>{cookie}</body>");
+            let set_cookie = if request.path == "/set" {
+                "Set-Cookie: isolation=A; Path=/; Max-Age=3600; HttpOnly\r\n"
+            } else {
+                ""
+            };
+            http_response(body.as_bytes(), "text/html; charset=utf-8", set_cookie)
+        },
+        false,
+    );
+    let url = fixture.origin.trim_end_matches('/').to_owned();
+    (fixture, url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,11 +129,117 @@ mod tests {
     }
 
     fn request(url: &str, path: &str) -> String {
+        request_headers(url, path, "")
+    }
+
+    fn request_headers(url: &str, path: &str, headers: &str) -> String {
         let mut stream = connect(url);
-        write!(stream, "GET {path} HTTP/1.1\r\nHost: fixture\r\n\r\n").unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: fixture\r\n{headers}\r\n"
+        )
+        .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
+    }
+
+    fn assert_no_response_yet(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        let error = stream
+            .read(&mut byte)
+            .expect_err("incomplete POST fabricated a response");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{error}"
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+    }
+
+    #[test]
+    fn owned_http_scenarios_preserve_fragmented_post_bodies_and_307_replay() {
+        let (fixture, url, posted) = serve_form_post_fixture(true);
+        let idle = connect(&url);
+        let body = b"username=alice&password=fixture";
+        let mut login = connect(&url);
+        write!(
+            login,
+            "POST /login HTTP/1.1\r\nHost: fixture\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        login.write_all(&body[..5]).unwrap();
+        assert_no_response_yet(&mut login);
+        assert!(matches!(
+            posted.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        login.write_all(&body[5..]).unwrap();
+        let mut response = String::new();
+        login.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "HTTP/1.1 307 Temporary Redirect\r\nLocation: /complete\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert_eq!(
+            posted
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .as_slice(),
+            body.as_slice(),
+            "POST fixture discarded or changed the real body"
+        );
+
+        let mut complete = connect(&url);
+        complete.write_all(b"POST /complete HTTP/1.1\r\nHost: fixture\r\nTransfer-Encoding: chunked\r\n\r\n5;proof=fragment\r\n").unwrap();
+        complete.write_all(&body[..5]).unwrap();
+        write!(complete, "\r\n{:x}\r\n", body.len() - 5).unwrap();
+        complete.write_all(&body[5..]).unwrap();
+        complete.write_all(b"\r\n0\r\n").unwrap();
+        assert_no_response_yet(&mut complete);
+        assert!(matches!(
+            posted.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        complete.write_all(b"\r\n").unwrap();
+        let mut response = String::new();
+        complete.read_to_string(&mut response).unwrap();
+        assert!(response
+            .ends_with("\r\n\r\n<!doctype html><title>submitted</title><body>submitted</body>"));
+        assert_eq!(
+            posted
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .as_slice(),
+            body.as_slice(),
+            "chunked POST fixture discarded or changed the real body"
+        );
+        assert!(matches!(
+            posted.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_released(fixture, &url, idle);
+    }
+
+    #[test]
+    fn owned_http_scenarios_preserve_cookie_headers_echo_and_release_state() {
+        let (fixture, url) = serve_cookie_isolation_fixture();
+        let idle = connect(&url);
+        let set = request(&url, "/set");
+        assert!(set.contains("\r\nSet-Cookie: isolation=A; Path=/; Max-Age=3600; HttpOnly\r\n"));
+        let echo = request_headers(&url, "/echo", "cookie: isolation=A\r\n");
+        assert!(
+            echo.ends_with("<!doctype html><title>cookie</title><body>isolation=A</body>"),
+            "cookie fixture discarded or changed the real header"
+        );
+        let clean = request(&url, "/echo");
+        assert!(clean.ends_with("<!doctype html><title>cookie</title><body></body>"));
+        assert_released(fixture, &url, idle);
     }
 
     fn assert_released(fixture: HttpFixture, url: &str, mut idle: TcpStream) {

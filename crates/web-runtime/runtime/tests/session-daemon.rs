@@ -29,7 +29,9 @@ mod owned_html_fixture;
 
 #[path = "support/owned_http_scenarios.rs"]
 mod owned_http_scenarios;
-use owned_http_scenarios::{serve_site, serve_status_fixture};
+use owned_http_scenarios::{
+    serve_cookie_isolation_fixture, serve_form_post_fixture, serve_site, serve_status_fixture,
+};
 
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
@@ -791,146 +793,6 @@ fn serve_fixture(
     html: impl Into<std::borrow::Cow<'static, str>>,
 ) -> (owned_html_fixture::HtmlFixture, String) {
     owned_html_fixture::HtmlFixture::start(html)
-}
-
-fn decode_chunked_body(mut encoded: &[u8]) -> Option<Vec<u8>> {
-    let mut decoded = Vec::new();
-    loop {
-        let line_end = encoded.windows(2).position(|part| part == b"\r\n")?;
-        let size_text = std::str::from_utf8(&encoded[..line_end]).ok()?;
-        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
-        encoded = &encoded[line_end + 2..];
-        if size == 0 {
-            return Some(decoded);
-        }
-        if encoded.len() < size + 2 || &encoded[size..size + 2] != b"\r\n" {
-            return None;
-        }
-        decoded.extend_from_slice(&encoded[..size]);
-        encoded = &encoded[size + 2..];
-    }
-}
-
-fn serve_form_post_fixture(redirect_post: bool) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind form post fixture");
-    let address = listener.local_addr().expect("form post addr");
-    let (body_sender, body_receiver) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            let (header_end, content_length, chunked) = loop {
-                let size = stream.read(&mut chunk).unwrap_or(0);
-                if size == 0 {
-                    break (request.len(), 0, false);
-                }
-                request.extend_from_slice(&chunk[..size]);
-                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    let header_end = header_end + 4;
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    let chunked = headers.lines().any(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("transfer-encoding:")
-                            .is_some_and(|value| value.trim() == "chunked")
-                    });
-                    break (header_end, content_length, chunked);
-                }
-            };
-            while if chunked {
-                decode_chunked_body(&request[header_end..]).is_none()
-            } else {
-                request.len() < header_end + content_length
-            } {
-                let size = stream.read(&mut chunk).unwrap_or(0);
-                if size == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..size]);
-            }
-            let request_line = String::from_utf8_lossy(&request[..header_end])
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_owned();
-            let posted = request_line.starts_with("POST /login ")
-                || request_line.starts_with("POST /complete ");
-            let response_body = if posted {
-                let body = if chunked {
-                    decode_chunked_body(&request[header_end..]).unwrap()
-                } else {
-                    request[header_end..header_end + content_length].to_vec()
-                };
-                body_sender.send(body).unwrap();
-                "<!doctype html><title>submitted</title><body>submitted</body>"
-            } else {
-                "<!doctype html><title>login</title><form method='post' action='/login'><input id='username' name='username'><input id='password' name='password'><button id='submit' type='submit'>Login</button></form>"
-            };
-            let response = if redirect_post && request_line.starts_with("POST /login ") {
-                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /complete\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
-            } else {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len()
-                )
-            };
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    (format!("http://{address}/"), body_receiver)
-}
-
-fn serve_cookie_isolation_fixture() -> String {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind cookie isolation fixture");
-    let address = listener.local_addr().expect("cookie isolation addr");
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..size]);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
-            let cookie = request
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("Cookie: ")
-                        .or_else(|| line.strip_prefix("cookie: "))
-                })
-                .unwrap_or("");
-            let body = format!("<!doctype html><title>cookie</title><body>{cookie}</body>");
-            let set_cookie = if path == "/set" {
-                "Set-Cookie: isolation=A; Path=/; Max-Age=3600; HttpOnly\r\n"
-            } else {
-                ""
-            };
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{set_cookie}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(body.as_bytes());
-        }
-    });
-    format!("http://{address}")
 }
 
 struct ResetServer {
@@ -3949,7 +3811,7 @@ console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: rec
 
 #[test]
 fn fresh_sessions_submit_complete_form_post_bodies() {
-    let (fixture, posted_bodies) = serve_form_post_fixture(false);
+    let (_post_fixture_owner, fixture, posted_bodies) = serve_form_post_fixture(false);
     let socket =
         std::env::temp_dir().join(format!("greppy-web-form-post-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
@@ -4003,7 +3865,7 @@ fn fresh_sessions_submit_complete_form_post_bodies() {
 
 #[test]
 fn materialized_form_post_body_replays_across_temporary_redirect() {
-    let (fixture, posted_bodies) = serve_form_post_fixture(true);
+    let (_post_fixture_owner, fixture, posted_bodies) = serve_form_post_fixture(true);
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-form-post-redirect-{}.sock",
         std::process::id()
@@ -10492,7 +10354,7 @@ fn locator_strict_mode_rejects_ambiguous_click() {
 
 #[test]
 fn ordinary_sessions_isolate_cookie_state() {
-    let fixture = serve_cookie_isolation_fixture();
+    let (_cookie_fixture_owner, fixture) = serve_cookie_isolation_fixture();
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-cookie-isolation-{}.sock",
         std::process::id()
@@ -10842,7 +10704,7 @@ fn persistent_profile_lock_is_exclusive_until_owner_closes() {
 
 #[test]
 fn persistent_profile_survives_content_runtime_restart() {
-    let fixture = serve_cookie_isolation_fixture();
+    let (_cookie_fixture_owner, fixture) = serve_cookie_isolation_fixture();
     let nonce = format!(
         "{}-{}",
         std::process::id(),
@@ -10922,7 +10784,7 @@ fn persistent_profile_survives_content_runtime_restart() {
 
 #[test]
 fn persistent_profile_survives_content_worker_recovery() {
-    let fixture = serve_cookie_isolation_fixture();
+    let (_cookie_fixture_owner, fixture) = serve_cookie_isolation_fixture();
     let nonce = format!("{}-recovery", std::process::id());
     let store = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}"));
     let socket = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}.sock"));
@@ -11001,7 +10863,7 @@ fn persistent_profile_survives_content_worker_recovery() {
 
 #[test]
 fn persistent_profile_lock_contends_across_supervisors_until_close_flushes() {
-    let fixture = serve_cookie_isolation_fixture();
+    let (_cookie_fixture_owner, fixture) = serve_cookie_isolation_fixture();
     let nonce = format!("{}-lock", std::process::id());
     let store = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}"));
     let socket_a = std::env::temp_dir().join(format!("greppy-web-profile-a-{nonce}.sock"));

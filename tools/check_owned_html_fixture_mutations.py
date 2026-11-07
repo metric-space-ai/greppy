@@ -40,17 +40,28 @@ def qualify_http_scenarios(scratch):
         self.worker.take().unwrap().join().unwrap();"""
     fault = """        let _ = &self.stop;
         let _ = self.worker.take();"""
-    marker = "scenario fixture listener survived guard drop"
-    assert original.count(old) == 1, "HTTP scenario lifetime source target is not unique"
-    try:
-        source.write_text(original.replace(old, fault))
-        result = run()
-        assert result.returncode == 101 and marker in result.stdout + result.stderr
-        print("mutation: rejected " + marker, flush=True)
-    finally:
-        source.write_text(original)
-    positive()
-    assert source.read_text() == original
+    scenarios = support / "owned_http_scenarios.rs"
+    saved = {source: original, scenarios: scenarios.read_text()}
+    cases = [
+        (source, old, fault, "scenario fixture listener survived guard drop"),
+        (source, "std::borrow::Cow::Borrowed(&body[..content_length])",
+         "std::borrow::Cow::Borrowed(&[])",
+         "POST fixture discarded or changed the real body"),
+        (scenarios, 'request.header("cookie")', 'None::<&str>',
+         "cookie fixture discarded or changed the real header"),
+    ]
+    for target, old, fault, marker in cases:
+        original_target = saved[target]
+        assert original_target.count(old) == 1, "HTTP scenario source target is not unique"
+        try:
+            target.write_text(original_target.replace(old, fault))
+            result = run()
+            assert result.returncode == 101 and marker in result.stdout + result.stderr
+            print("mutation: rejected " + marker, flush=True)
+        finally:
+            target.write_text(original_target)
+        positive()
+    assert all(target.read_text() == original_target for target, original_target in saved.items())
 
 
 def main():
