@@ -594,7 +594,7 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                     .env("GREPPY_RUN_ID", &run_id)
                     .env(
                         "GREPPY_WEB_RUNTIME_DIR",
-                        std::path::Path::new(&socket).parent().unwrap(),
+                        greppy_agent::greppy_env::agent_runtime_dir(&run_id),
                     )
                     .env_remove("GREPPY_WEB_RUNTIME_DIST")
                     .args(["web", "runtime", "stop", "--json"])
@@ -604,11 +604,23 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                     stopped.status.success(),
                     "test could not stop its retained runtime"
                 );
+                let stop_result: serde_json::Value =
+                    serde_json::from_slice(&stopped.stdout).expect("public stop returned JSON");
+                assert_eq!(
+                    stop_result["result"]["socket"].as_str(),
+                    Some(socket.as_str()),
+                    "test recovery selected a different runtime namespace: {stop_result}"
+                );
+                assert_eq!(
+                    stop_result["result"]["run_id"].as_str(),
+                    Some(run_id.as_str()),
+                    "test recovery selected a different run: {stop_result}"
+                );
                 let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
                 while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                     assert!(
                         std::time::Instant::now() < cleanup_deadline,
-                        "test runtime stop did not close its socket"
+                        "test runtime stop did not close its socket: {stop_result}"
                     );
                     thread::sleep(Duration::from_millis(10));
                 }

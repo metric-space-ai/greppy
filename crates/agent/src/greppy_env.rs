@@ -47,6 +47,18 @@ type AttachHold = Box<dyn Send>;
 type PrepareAttachFd = fn(&mut Command, &[String]) -> io::Result<AttachHold>;
 pub static PREPARE_ATTACH_FD: OnceLock<PrepareAttachFd> = OnceLock::new();
 
+/// Raw namespace input for this agent's browser owner. Retain this path for
+/// later CLI lifecycle operations: its text is part of the endpoint identity.
+pub fn agent_runtime_dir(run_id: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // "/tmp/greppy-agent-" + 8 hex = 26 bytes, under the endpoint path cap.
+    PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
+}
+
 /// Host-provided contextual signal, appended to the captured tool envelope.
 /// The subprocess byte streams and its exit status remain unchanged.
 pub type ContextStatusHook = fn(&Path, &[String], &str) -> Option<String>;
