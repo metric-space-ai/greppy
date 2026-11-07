@@ -547,7 +547,11 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
         None,
         Some(Arc::clone(&messages)),
     );
-    let output = Command::new(binary_path())
+    // A test-owned in-memory capability can clean up the deliberate no-shutdown
+    // mutant through the official FD provider; never put it in argv/env/evidence.
+    let cleanup_token = greppy::generate_attach_token().expect("test cleanup capability");
+    let mut agent_command = Command::new(binary_path());
+    agent_command
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", root.join("store"))
         .env("GREPPY_WORKSPACE_DIR", root.join("no-provider"))
@@ -570,9 +574,11 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
             "--deadline-secs",
             "30",
             "--json",
-        ])
-        .output()
-        .unwrap();
+        ]);
+    let attach = greppy::give_child_attach_token(&mut agent_command, &cleanup_token)
+        .expect("official agent control FD");
+    let output = agent_command.output().unwrap();
+    drop(attach);
     stop.store(true, Ordering::SeqCst);
     handle.join().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -630,7 +636,8 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
             Ok(_) => {
                 // A cleanup mutant must still release its own authenticated test
                 // runtime through the public stop operation before failing.
-                let stopped = Command::new(binary_path())
+                let mut stop_command = Command::new(binary_path());
+                stop_command
                     .current_dir(&repo)
                     .env("GREPPY_STORE_DIR", root.join("store"))
                     .env("GREPPY_WEB_RUNTIME", &runtime)
@@ -640,9 +647,11 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
                         greppy_agent::greppy_env::agent_runtime_dir(&run_id),
                     )
                     .env_remove("GREPPY_WEB_RUNTIME_DIST")
-                    .args(["web", "runtime", "stop", "--json"])
-                    .output()
-                    .unwrap();
+                    .args(["web", "runtime", "stop", "--json"]);
+                let attach = greppy::give_child_attach_token(&mut stop_command, &cleanup_token)
+                    .expect("official cleanup control FD");
+                let stopped = stop_command.output().unwrap();
+                drop(attach);
                 assert!(
                     stopped.status.success(),
                     "test could not stop its retained runtime"

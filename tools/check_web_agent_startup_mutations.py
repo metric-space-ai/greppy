@@ -27,19 +27,27 @@ def require_positive(native):
     assert result.returncode == 0 and name in result.stdout and "test result: ok." in result.stdout
 
 
-def mutation(source, old, new, expected, native):
-    path = ROOT / source
-    original = path.read_text()
-    assert original.count(old) == 1, (source, old)
+def mutation(source, old, new, expected, native, *, companion=None):
+    changes = [(ROOT / source, old, new)]
+    if companion is not None:
+        changes.append((ROOT / companion[0], companion[1], companion[2]))
+    originals = {}
+    for path, old, _ in changes:
+        original = path.read_text()
+        assert original.count(old) == 1, (str(path), old)
+        originals[path] = original
     try:
-        path.write_text(original.replace(old, new))
+        for path, old, new in changes:
+            path.write_text(originals[path].replace(old, new))
         result, _ = run_case(native)
         assert result.returncode == 101 and expected in result.stdout + result.stderr
         print("mutation: expected incident detected:", expected, flush=True)
     finally:
-        path.write_text(original)
+        for path, original in originals.items():
+            path.write_text(original)
     require_positive(native)
-    subprocess.run(["git", "diff", "--exit-code", "--", str(path)], cwd=ROOT, check=True)
+    subprocess.run(["git", "diff", "--exit-code", "--",
+                    *(str(path) for path in originals)], cwd=ROOT, check=True)
 
 
 def main():
@@ -58,21 +66,17 @@ def main():
                  "confined web tool did not read the genuine native page", True)
         mutation(source,
                  "let owned = std::mem::take(\n        &mut *agent_runtimes()\n            .lock()\n            .unwrap_or_else(|error| error.into_inner()),\n    );",
-                 # The deliberately detached runtime outlives the agent. Its
-                 # normal in-memory capability dies with that process; publish
-                 # only this mutant's already-owned token via the production
-                 # reconnect-cookie provider so the test can use public stop.
-                 # Do not weaken ownership checks or change the positive path.
-                 """{
-        let retained = agent_runtimes()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for (ctx, _) in retained.values() {
-            save_attach_cookie(&ctx.socket, &ctx.capability);
-        }
-    }
-    let owned: AgentRuntimeScopes = Default::default();""",
-                 "agent exit retained its authenticated runtime socket", True)
+                 "let owned: AgentRuntimeScopes = Default::default();",
+                 "agent exit retained its authenticated runtime socket", True,
+                 # Only this deliberate omission adopts the test parent's
+                 # official inherited capability before the normal claim.
+                 # Recovery then uses the same in-memory token over FD4;
+                 # no reconnect-cookie assumption or product-auth change.
+                 companion=(
+                     "crates/cli/src/agent.rs",
+                     "        match crate::web_attach::claim_persistent_parent() {",
+                     '        assert!(crate::web_attach::current_token().is_some(), "mutant cleanup control FD unavailable");\n'
+                     "        match crate::web_attach::claim_persistent_parent() {"))
         mutation("crates/cli/tests/agent_p.rs",
                  "remaining = &candidate[documents.byte_offset()..];",
                  "break; // fault: ignore later runtime-status documents",
