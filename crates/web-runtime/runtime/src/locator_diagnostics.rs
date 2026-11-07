@@ -21,6 +21,17 @@ pub(crate) fn concise_selection_failure(message: &str) -> Option<&str> {
         .then_some(message)
 }
 
+const UNOBSERVED_DOM_RECOVERY: &str = "the DOM query did not yield usable evidence within the action deadline; inspect the supplied page_state before another action";
+
+pub(crate) fn actionability_timeout_message(last: &str) -> String {
+    let detail = if last.contains("failed_check=") {
+        last.to_owned()
+    } else {
+        format!("failed_check=unobserved; {last}")
+    };
+    format!("timed out waiting for actionable locator target ({detail})")
+}
+
 pub(crate) fn failure_observation_budget(deadline_ms: u64, elapsed: Duration) -> Duration {
     Duration::from_millis(deadline_ms)
         .saturating_sub(elapsed)
@@ -47,6 +58,9 @@ pub(crate) fn recovery_for_locator_error(message: &str) -> (&'static str, &'stat
         if message.contains(marker) {
             return (code, next);
         }
+    }
+    if message.contains("timed out") && message.contains("failed_check=unobserved") {
+        return ("TIMEOUT", UNOBSERVED_DOM_RECOVERY);
     }
     if message.contains("STALE_REF") {
         (
@@ -79,6 +93,31 @@ pub(crate) fn recovery_for_locator_error(message: &str) -> (&'static str, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unobserved_actionability_deadline_never_fabricates_a_failed_check() {
+        for last in ["failed_check=unobserved", "count=1 width=10 height=10"] {
+            let message = actionability_timeout_message(last);
+            assert!(
+                message.contains("failed_check=unobserved"),
+                "unobserved actionability deadline fabricated a failed check"
+            );
+            assert!(
+                !message.contains("failed_check=stable"),
+                "unobserved actionability deadline fabricated a failed check"
+            );
+            assert_eq!(
+                recovery_for_locator_error(&message).0,
+                "TIMEOUT",
+                "unobserved actionability deadline fabricated NO_MATCH"
+            );
+        }
+        let empty = actionability_timeout_message("failed_check=attached; count=0");
+        assert_eq!(recovery_for_locator_error(&empty).0, "NO_MATCH");
+        let moving = actionability_timeout_message("failed_check=stable; count=1");
+        assert!(moving.contains("failed_check=stable"));
+        assert_eq!(recovery_for_locator_error(&moving).0, "TIMEOUT");
+    }
 
     #[test]
     fn stale_ref_uses_supplied_state_without_requesting_another_observation() {

@@ -258,6 +258,9 @@ jobs:
               subprocess.run(command, check=True, timeout=180)
               subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
+      - name: Prove actionability timeout diagnostics never invent DOM evidence
+        run: python3 tools/check_unobserved_dom_deadline_mutations.py
+
       - name: Check coalesced heartbeat lifetime and receipt clocks
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml

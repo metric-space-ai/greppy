@@ -4971,18 +4971,13 @@ impl ContentEngine {
         self.present_exclusively(&webview);
         let script = resolve_script(&selector);
         let deadline = Instant::now() + call_timeout(params);
-        let mut last = String::from("failed_check=stable");
+        let mut last = String::from("failed_check=unobserved");
         let mut stable: Option<ResolvedNode> = None;
         let mut stable_since: Option<Instant> = None;
         let timeout_err = |last: &str| {
-            let detail = if last.contains("failed_check=") {
-                last.to_owned()
-            } else {
-                format!("failed_check=stable; {last}")
-            };
             io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("timed out waiting for actionable locator target ({detail})"),
+                crate::locator_diagnostics::actionability_timeout_message(last),
             )
         };
         loop {
@@ -5074,10 +5069,10 @@ impl ContentEngine {
                         };
                     }
                 }
-                other => {
+                _ => {
                     stable = None;
                     stable_since = None;
-                    last = format!("failed_check=attached; {other:?}");
+                    last = String::from("failed_check=unobserved; invalid DOM resolver response");
                 }
             }
             if Instant::now() >= deadline {

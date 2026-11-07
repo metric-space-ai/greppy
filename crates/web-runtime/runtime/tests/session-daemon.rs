@@ -7815,7 +7815,15 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
         let missing = call(method, payload);
         assert_eq!(missing.status, "error", "{missing:?}");
         let error = missing.error.as_ref().unwrap();
-        assert_eq!(error.code, "NO_MATCH", "{missing:?}");
+        if method == "web.click" && error.message.contains("failed_check=unobserved") {
+            // A first DOM reply is not guaranteed inside this finite deadline.
+            // Only explicit absent evidence may select NO_MATCH.
+            assert_eq!(error.code, "TIMEOUT", "{missing:?}");
+            assert!(!error.message.contains("count="), "{missing:?}");
+            assert!(!error.message.contains("failed_check=stable"), "{missing:?}");
+        } else {
+            assert_eq!(error.code, "NO_MATCH", "{missing:?}");
+        }
         assert_eq!(error.exit_code, 34);
         assert!(!error.next_action.contains("narrow"));
         let state = &missing.result.as_ref().unwrap()["page_state"];
@@ -7865,7 +7873,13 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
         }),
     );
     assert_eq!(missing.status, "error");
-    assert_eq!(missing.error.as_ref().unwrap().code, "NO_MATCH");
+    let diagnostic = missing.error.as_ref().unwrap();
+    if diagnostic.message.contains("failed_check=unobserved") {
+        assert_eq!(diagnostic.code, "TIMEOUT");
+        assert!(!diagnostic.message.contains("count="));
+    } else {
+        assert_eq!(diagnostic.code, "NO_MATCH");
+    }
     assert_eq!(missing.error.as_ref().unwrap().exit_code, 34);
     assert_eq!(
         missing.result.as_ref().unwrap()["page_state"]["status"],
@@ -7881,6 +7895,83 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
         Some(0.0),
         "no failed action may be replayed"
     );
+}
+
+#[test]
+fn unobserved_first_dom_native_actions_return_current_state_without_replay() {
+    let fixture = recorded_http_fixture::HttpFixture::start(|_| {
+        recorded_http_fixture::http_response(
+            br#"<!doctype html><title>Before</title><button onclick="window.clicks++">Save</button>
+<input id="quantity" aria-label="Quantity" disabled><input type="password" value="never-disclose-this">
+<script>window.clicks=0;</script>"#,
+            "text/html; charset=utf-8",
+            "",
+        )
+    });
+    let socket = std::env::temp_dir().join(format!("greppy-unobserved-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_unobserved", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_unobserved", method, payload),
+            Duration::from_secs(30)).expect("unobserved-action request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture.origin}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let setup = call("web.evaluate", json!({
+        "session_id":session,
+        "source":r#"
+document.title='Changed before error';
+document.getElementById('quantity').disabled=false;
+window.blockedStarted=0; window.blockedFinished=0; window.blockedMillis=0;
+const originalQuery = document.querySelectorAll.bind(document);
+document.querySelectorAll=function(selector) {
+    if (selector === '#deadline-absent') {
+        window.blockedStarted++;
+        const started=Date.now();
+        while (Date.now()-started < 150) {}
+        window.blockedMillis=Date.now()-started;
+        window.blockedFinished++;
+    }
+    return originalQuery(selector);
+};
+true
+"#
+    }));
+    assert_eq!(setup.status, "ok", "{setup:?}");
+    let refused = call("web.click", json!({
+        "session_id":session,"selector":{"type":"css","value":"#deadline-absent"},"timeout":100
+    }));
+    assert_eq!(refused.status, "error", "{refused:?}");
+    let error = refused.error.as_ref().unwrap();
+    assert_eq!(error.code, "TIMEOUT",
+        "unobserved DOM deadline fabricated NO_MATCH: {refused:?}");
+    assert!(error.message.contains("failed_check=unobserved"),
+        "unobserved DOM deadline fabricated a failed check: {refused:?}");
+    assert!(!error.message.contains("failed_check=stable"),
+        "unobserved DOM deadline fabricated a failed check: {refused:?}");
+    assert!(!error.message.contains("count="),
+        "unobserved DOM deadline fabricated a DOM count: {refused:?}");
+    let result = refused.result.as_ref().unwrap();
+    assert_eq!(result["tab_id"], went.result.as_ref().unwrap()["tab_id"]);
+    assert_eq!(result["page_state"]["status"], "available", "{refused:?}");
+    let snapshot = &result["page_state"]["snapshot"];
+    assert_eq!(snapshot["title"], "Changed before error", "{refused:?}");
+    assert!(snapshot["actionables"].as_array().unwrap().iter()
+        .any(|node| node["name"] == "Quantity" && node["disabled"] == false));
+    assert!(!serde_json::to_string(&refused).unwrap().contains("never-disclose-this"));
+    let proof = call("web.evaluate", json!({"session_id":session,
+        "source":"[window.blockedStarted,window.blockedFinished,window.blockedMillis,window.clicks]"}));
+    assert_eq!(proof.status, "ok", "{proof:?}");
+    let values = proof.result.as_ref().unwrap()["value"].as_array().unwrap();
+    assert_eq!(values[0].as_f64(), Some(1.0), "the actual DOM resolver was not delayed");
+    assert_eq!(values[1].as_f64(), Some(1.0));
+    assert!(values[2].as_f64().unwrap() >= 150.0);
+    assert_eq!(values[3].as_f64(), Some(0.0), "failed action was replayed");
 }
 
 #[test]

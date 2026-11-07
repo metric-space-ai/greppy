@@ -117,6 +117,9 @@ jobs:
           --test session-daemon
           --no-run
 
+      - name: Prove first DOM deadlines preserve unobserved state without false NO_MATCH
+        run: python3 tools/check_unobserved_dom_deadline_mutations.py --native
+
       - name: Check lifecycle fixture never fabricates requests from silent connections
         shell: bash
         run: >-
