@@ -7415,7 +7415,8 @@ fn extract_c_cpp(
     //   * `type_definition` (typedef) nodes carry NO label — a typedef whose
     //     bare name equals its struct/enum (`typedef struct Vec Vec;`) would
     //     collide, and no standalone `Type` nodes are emitted for the remainder,
-    //     so we drop every spec-emitted "Type" node;
+    //     so we drop every spec-emitted "Type" node. The member pass restores
+    //     only direct aliases of anonymous compound definitions as owner types;
     //   * `namespace_definition` nodes are NOT graph nodes here (they fold into
     //     the module spine), so we drop every "Namespace" node;
     //   * struct / class / union body `field_declaration`s yield "Field" nodes
@@ -7484,6 +7485,9 @@ fn c_cpp_member_pass(
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
+            "type_definition" => {
+                c_cpp_anonymous_compound_typedef(source, file_path, node, result);
+            }
             // `#define NAME ...` / `#define FN(x) ...` → a Macro node. The macro
             // body is a `preproc_arg`, so there is nothing to descend into.
             "preproc_def" | "preproc_function_def" => {
@@ -7533,9 +7537,48 @@ fn c_cpp_type_body<'a>(type_node: Node<'a>) -> Option<Node<'a>> {
     type_node.child_by_field_name("body")
 }
 
-/// Emit the `Field` / `Variable` member nodes for one C / C++ type specifier
-/// `type_node` (kind → `label`). Only the type's OWN body is scanned; nested
-/// types are reached by the outer walk in [`c_cpp_member_pass`].
+/// Restore direct aliases of anonymous compound definitions after spec typedef
+/// pruning. Tagged types and non-compound / indirect aliases keep existing rules.
+fn c_cpp_anonymous_compound_typedef(
+    source: &[u8],
+    file_path: &str,
+    typedef: Node<'_>,
+    result: &mut ExtractionResult,
+) {
+    let Some(compound) = typedef.child_by_field_name("type") else {
+        return;
+    };
+    let Some(label) = c_cpp_type_label(compound.kind()) else {
+        return;
+    };
+    if compound.child_by_field_name("name").is_some() || c_cpp_type_body(compound).is_none() {
+        return;
+    }
+    let mut cursor = typedef.walk();
+    for alias in typedef.children_by_field_name("declarator", &mut cursor) {
+        // Pointer/array/function aliases do not name this compound itself.
+        if !matches!(alias.kind(), "type_identifier" | "identifier") {
+            continue;
+        }
+        let name = node_text(source, alias);
+        if name.is_empty() {
+            continue;
+        }
+        result.nodes.push(ExtractedNode {
+            label: label.into(),
+            name: name.into(),
+            qualified_name: format!("{file_path}::{label}::{name}"),
+            file_path: file_path.into(),
+            start_line: typedef.start_position().row as u32 + 1,
+            end_line: typedef.end_position().row as u32 + 1,
+            properties: serde_json::json!({}),
+        });
+        c_cpp_named_type_members(source, file_path, compound, label, name, result);
+    }
+}
+
+/// Emit members of a named specifier; anonymous typedef owners are supplied by
+/// `c_cpp_anonymous_compound_typedef` to the same member implementation.
 fn c_cpp_type_members(
     source: &[u8],
     file_path: &str,
@@ -7552,6 +7595,17 @@ fn c_cpp_type_members(
     if type_name.is_empty() {
         return;
     }
+    c_cpp_named_type_members(source, file_path, type_node, label, type_name, result);
+}
+
+fn c_cpp_named_type_members(
+    source: &[u8],
+    file_path: &str,
+    type_node: Node<'_>,
+    label: &str,
+    type_name: &str,
+    result: &mut ExtractionResult,
+) {
     // The (relabelled) type node's qname is `{file}::{label}::{name}`; a member
     // hangs off it as `{file}::{label}::{type}::{member}`.
     let owner_prefix = format!("{file_path}::{label}::{type_name}");
@@ -22380,6 +22434,58 @@ typedef int MyInt;
             "typedef must not emit a Type node: {:?}",
             r.nodes
         );
+    }
+
+    #[test]
+    fn anonymous_compound_typedef_keeps_alias_span_members_and_tag_collisions() {
+        let src = "typedef struct {\n    int frames;\n    float gain;\n} Workspace, WorkspaceAlias, *WorkspacePtr;\ntypedef union { int bits; float sample; } SampleWord;\ntypedef enum { Idle, Active } RunMode;\ntypedef struct Tagged { int retained; } Tagged;\ntypedef int Scalar;\n";
+        for (language, path) in [
+            (Language::C, "fixture.c"),
+            (Language::C, "fixture.h"),
+            (Language::Cpp, "fixture.hpp"),
+        ] {
+            let result = extract(language, src.as_bytes(), path).unwrap();
+            for alias in ["Workspace", "WorkspaceAlias"] {
+                let nodes: Vec<_> = result.nodes.iter().filter(|n| n.name == alias).collect();
+                assert_eq!(
+                    nodes.len(),
+                    1,
+                    "anonymous compound typedef alias missing: {path}::{alias}"
+                );
+                let node = nodes[0];
+                assert_eq!(node.label, "Class");
+                assert_eq!((node.start_line, node.end_line), (1, 4));
+                for field in ["frames", "gain"] {
+                    assert!(
+                        result.nodes.iter().any(|n| n.label == "Field"
+                            && n.qualified_name == format!("{path}::Class::{alias}::{field}")),
+                        "anonymous compound typedef member missing: {alias}::{field}"
+                    );
+                }
+            }
+            assert!(result
+                .nodes
+                .iter()
+                .any(|n| n.name == "SampleWord" && n.label == "Class"));
+            assert!(result
+                .nodes
+                .iter()
+                .any(|n| n.qualified_name == format!("{path}::Enum::RunMode::Idle")));
+            assert_eq!(
+                result.nodes.iter().filter(|n| n.name == "Tagged").count(),
+                1,
+                "tagged typedef must keep its single existing definition"
+            );
+            assert!(!result
+                .nodes
+                .iter()
+                .any(|n| n.label == "Type" || n.name == "Scalar" || n.name == "WorkspacePtr"));
+        }
+        let result = cpp("typedef class { public: int value; } Box;", "box.hpp");
+        assert!(result
+            .nodes
+            .iter()
+            .any(|n| n.qualified_name == "box.hpp::Class::Box::value"));
     }
 
     #[test]
