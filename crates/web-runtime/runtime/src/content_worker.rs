@@ -2196,21 +2196,36 @@ impl ContentEngine {
         script: &str,
         timeout: Duration,
     ) -> io::Result<JSValue> {
+        self.evaluate_before_deadline(webview, script, Instant::now() + timeout)
+    }
+
+    fn evaluate_before_deadline(
+        &self,
+        webview: WebView,
+        script: &str,
+        deadline: Instant,
+    ) -> io::Result<JSValue> {
+        let unobserved = || io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out evaluating page JavaScript (failed_check=unobserved)",
+        );
+        if Instant::now() >= deadline {
+            return Err(unobserved());
+        }
         let saved = Rc::new(RefCell::new(None));
         let callback_slot = Rc::clone(&saved);
         webview.evaluate_javascript(script, move |result| {
-            *callback_slot.borrow_mut() = Some(result);
+            *callback_slot.borrow_mut() = Some((Instant::now(), result));
         });
         let ready = Rc::clone(&saved);
-        if !self.spin_until(timeout.max(Duration::from_millis(1)), move || {
+        // The generic pump can notice a reply before checking its own clock.
+        // Keep the original caller's absolute deadline and check actual receipt.
+        self.spin_until(deadline.saturating_duration_since(Instant::now()), move || {
             ready.borrow().is_some()
-        })? {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out evaluating page JavaScript (failed_check=unobserved)",
-            ));
-        }
-        let result = saved.borrow_mut().take().expect("evaluation completed");
+        })?;
+        let result = crate::locator_diagnostics::take_timely_dom_reply(
+            deadline, saved.borrow_mut().take(),
+        ).ok_or_else(unobserved)?;
         result.map_err(|error| {
             let concise = match &error {
                 servo::JavaScriptEvaluationError::CompilationFailure => Some(
@@ -4987,8 +5002,7 @@ impl ContentEngine {
             if Instant::now() >= deadline {
                 return Err(timeout_err(&last));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let sampled = match self.evaluate_until(webview.clone(), &script, remaining) {
+            let sampled = match self.evaluate_before_deadline(webview.clone(), &script, deadline) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     return Err(timeout_err(&last));
@@ -5040,6 +5054,9 @@ impl ContentEngine {
                                     since.elapsed() >= Duration::from_millis(32)
                                 }) {
                                     self.settle_pump_tokens(&webview);
+                                    if Instant::now() >= deadline {
+                                        return Err(timeout_err(&last));
+                                    }
                                     return Ok(node);
                                 }
                             } else {

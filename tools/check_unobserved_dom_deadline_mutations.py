@@ -30,6 +30,11 @@ def main():
             'format!("failed_check=stable; {last}")',
             "unobserved actionability deadline fabricated a failed check")]
         no_match_marker = "unobserved actionability deadline fabricated NO_MATCH"
+    if not args.native:
+        cases.append((POLICY,
+            '(received <= deadline).then_some(value)',
+            '(received <= deadline || received > deadline).then_some(value)',
+            'late DOM reply exceeded the original deadline'))
     cases.append((POLICY,
         'return ("TIMEOUT", UNOBSERVED_DOM_RECOVERY);',
         'return ("NO_MATCH", UNOBSERVED_DOM_RECOVERY);',

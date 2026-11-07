@@ -1,6 +1,13 @@
 //! Pure locator recovery policy, independently testable without starting engines.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub(crate) fn take_timely_dom_reply<T>(
+    deadline: Instant,
+    reply: Option<(Instant, T)>,
+) -> Option<T> {
+    reply.and_then(|(received, value)| (received <= deadline).then_some(value))
+}
 
 const SELECTION_RECOVERY: [(&str, &str, &str); 6] = [
     ("OPTION_NOT_FOUND:", "OPTION_NOT_FOUND", "choose an exact value from the select_choices data, not its label; use greppy web select TARGET VALUE"),
@@ -96,6 +103,18 @@ mod tests {
 
     #[test]
     fn unobserved_actionability_deadline_never_fabricates_a_failed_check() {
+        let begin = Instant::now();
+        let deadline = begin + Duration::from_millis(100);
+        assert_eq!(
+            take_timely_dom_reply(deadline, Some((begin + Duration::from_millis(150), 0))),
+            None,
+            "late DOM reply exceeded the original deadline"
+        );
+        assert_eq!(
+            take_timely_dom_reply(deadline, Some((begin + Duration::from_millis(90), 0))),
+            Some(0)
+        );
+        assert_eq!(take_timely_dom_reply::<u8>(deadline, None), None);
         for last in ["failed_check=unobserved", "count=1 width=10 height=10"] {
             let message = actionability_timeout_message(last);
             assert!(
