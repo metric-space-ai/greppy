@@ -105,10 +105,45 @@ and the outer process deadline is finite.
   Playwright/browser version and browser executable hash. A harness commit is
   not an attestation of a separately supplied runtime binary's source commit.
 
-This comparison covers the standalone runtime/Playwright execution boundary.
-It does not exercise CLI daemon session budgets, an LLM/model/prompt, arbitrary
-public websites, or full Web-Worker-Agent resource totals. Those measurements
-remain necessary before claiming general efficiency leadership.
+The native and Chromium modes cover standalone runtime/Playwright execution.
+The optional CLI mode runs the same hashed workload and independent POST oracle
+through the public CLI and the supplied exact runtime:
+
+```sh
+python3 crates/web-runtime/scripts/measure-web-efficiency.py \
+  --engine cli --cli "$GREPPY_BINARY" --runtime "$RUNTIME_BINARY" \
+  --state-parent "$SHORT_STATE_PARENT" \
+  --rounds 3 --tasks 2 --concurrency 1 --nodes 100 \
+  --output "$OUTPUT_DIR/cli.json"
+```
+
+This composes `web do session new --profile project :: run --mode standalone`
+in one CLI process. It uses normal session limits and binds the generated
+loopback fixture URL inside the hashed module. No fixture environment override,
+shared user session or inherited Greppy owner identity is used. CLI and runtime
+paths/hashes and the unique private state path are recorded separately.
+The caller supplies an existing absolute state parent of at most20 bytes
+(for example the designated disposable volume root on a Mac); the generated
+private path stays within the CLI's32-byte direct socket-directory limit.
+Output and state paths remain caller-owned. The state is preserved for lifecycle
+inspection, not automatically deleted while a detached process might still own
+it. Normal CLI shutdown is requested by the product; this meter does not prove
+that every descendant exited. The normal admission/lifecycle owner must verify
+termination before releasing state. A successful POST oracle is not that proof.
+
+Keep execution surfaces separate when reporting results. CLI mode includes CLI
+startup/composition and the runtime descendants actually observed by the sampler.
+The Linux sampler can miss a child that detaches before its first observation,
+and wait4 CPU includes only waited descendants; these limits remain explicit.
+CLI mode therefore reports whole-surface PSS/private peaks as unknown, not as
+the CLI process's small footprint. Partial samples remain under
+`metrics.observed_process_family_memory`. A future complete measurement must
+register the detached owner's PID and birth identity from its supported owner
+receipt; a process-name scan is not that receipt.
+No mode exercises an LLM/model/prompt, arbitrary public websites, or full
+Web-Worker-Agent resource totals. Those measurements remain necessary before
+claiming general efficiency leadership. CLI parser/adversarial receipt tests
+alone do not qualify real browser execution.
 
 ## Outcome-verification contracts
 

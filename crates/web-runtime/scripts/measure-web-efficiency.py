@@ -2,10 +2,11 @@
 """Bounded, opt-in comparison of one identical complete browser workload.
 
 Requires existing binaries/packages. Never installs, builds, changes host limits,
-or claims that a standalone runtime measurement covers an LLM agent or CLI daemon.
+or claims that a scripted web measurement covers LLM/model-provider work.
 """
 import argparse
 from collections import Counter
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import html
@@ -49,19 +50,111 @@ def source_identity():
                                          'runtime/fixtures/efficiency-native.mjs', ':(top)bench/process_memory.py')}
 
 
-def host_envelope():
-    result = {'platform': platform.platform(), 'logical_cpus': os.cpu_count(),
-              'cpu_affinity': sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
-              'limits_modified_by_harness': False, 'cgroup_v2': None}
+def cgroup_v2_envelope(proc_self=pathlib.Path('/proc/self')):
+    """Observe visible ancestor ceilings, never reserved or guaranteed capacity."""
+    from fractions import Fraction
+
+    result = {'leaf': None, 'visible_ancestors': [], 'errors': [],
+              'cpu_quota_upper_bound': None, 'cpu_quota_upper_bound_ratio': None,
+              'memory_max_upper_bound_bytes': None, 'swap_max_upper_bound_bytes': None,
+              'scope': 'visible cgroup-v2 ancestor ceilings; hidden namespace ancestors and competing workloads are unknown'}
+
+    def bounded_text(path, maximum=1024 * 1024):
+        with path.open(encoding='utf-8') as source:
+            value = source.read(maximum + 1)
+        if len(value) > maximum:
+            raise ValueError('resource metadata exceeds observation bound')
+        return value.strip()
+
+    def mount_field(value):
+        for escaped, literal in (('\\040', ' '), ('\\011', '\t'), ('\\012', '\n'), ('\\134', '\\')):
+            value = value.replace(escaped, literal)
+        return value
+
     try:
-        entries = pathlib.Path('/proc/self/cgroup').read_text().splitlines()
-        relative = next(row[3:] for row in entries if row.startswith('0::'))
-        if '..' not in pathlib.PurePosixPath(relative).parts:
-            group = pathlib.Path('/sys/fs/cgroup') / relative.lstrip('/')
-            result['cgroup_v2'] = {name: (group / name).read_text().strip()
-                                   for name in ('cpu.max', 'memory.max', 'memory.swap.max')}
-    except (OSError, StopIteration):
-        pass
+        rows = bounded_text(proc_self / 'cgroup').splitlines()
+        member = next(row[3:] for row in rows if row.startswith('0::'))
+        membership = pathlib.PurePosixPath(member)
+        if not membership.is_absolute() or '..' in membership.parts:
+            raise ValueError('invalid cgroup-v2 membership')
+        candidates = []
+        for row in bounded_text(proc_self / 'mountinfo').splitlines():
+            before, separator, after = row.partition(' - ')
+            if not separator or not after.split() or after.split()[0] != 'cgroup2':
+                continue
+            fields = before.split()
+            if len(fields) < 6:
+                raise ValueError('invalid cgroup-v2 mount metadata')
+            root = pathlib.PurePosixPath(mount_field(fields[3]))
+            mount = pathlib.Path(mount_field(fields[4]))
+            if not root.is_absolute() or '..' in root.parts or not mount.is_absolute() or '..' in mount.parts:
+                raise ValueError('invalid cgroup-v2 mount path')
+            if membership.is_relative_to(root):
+                candidates.append((root, mount))
+        if not candidates:
+            raise ValueError('cgroup-v2 membership cannot be mapped to a visible mount')
+        root, mount = max(candidates, key=lambda item: len(item[0].parts))
+        group = mount / membership.relative_to(root)
+        result.update(membership=member, mount_root=str(root), mount_point=str(mount))
+        quotas, memory, swap = [], [], []
+        for _ in range(256):
+            values = {'path': str(group)}
+            for name in ('cpu.max', 'memory.max', 'memory.swap.max'):
+                try:
+                    values[name] = bounded_text(group / name, 4096)
+                except FileNotFoundError:
+                    # The hierarchy root, or a disabled controller, has no file.
+                    values[name] = None
+                except (OSError, UnicodeError, ValueError) as error:
+                    values[name] = None
+                    result['errors'].append(f'{group / name}: {error}')
+            if result['leaf'] is None:
+                result['leaf'] = {name: values[name] for name in ('cpu.max', 'memory.max', 'memory.swap.max')}
+            result['visible_ancestors'].append(values)
+            try:
+                if values['cpu.max'] is not None:
+                    quota, period = values['cpu.max'].split()
+                    if int(period) <= 0 or (quota != 'max' and int(quota) <= 0):
+                        raise ValueError('nonpositive CPU quota or period')
+                    if quota != 'max':
+                        quotas.append(Fraction(int(quota), int(period)))
+                for name, target in (('memory.max', memory), ('memory.swap.max', swap)):
+                    value = values[name]
+                    if value is not None and value != 'max':
+                        if int(value) < 0:
+                            raise ValueError('negative memory ceiling')
+                        target.append(int(value))
+            except ValueError as error:
+                result['errors'].append(f'{group}: {error}')
+            if group == mount:
+                break
+            group = group.parent
+        else:
+            result['errors'].append('visible cgroup ancestry exceeds 256 levels')
+        if quotas:
+            quota = min(quotas)
+            result['cpu_quota_upper_bound'] = float(quota)
+            result['cpu_quota_upper_bound_ratio'] = [quota.numerator, quota.denominator]
+        result['memory_max_upper_bound_bytes'] = min(memory) if memory else None
+        result['swap_max_upper_bound_bytes'] = min(swap) if swap else None
+    except StopIteration:
+        result['errors'].append('no cgroup-v2 membership')
+    except (OSError, UnicodeError, ValueError) as error:
+        result['errors'].append(str(error))
+    return result
+
+
+def host_envelope():
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
+    result = {'platform': platform.platform(), 'logical_cpus': os.cpu_count(),
+              'cpu_affinity': affinity, 'limits_modified_by_harness': False, 'cgroup_v2': None}
+    cgroup = cgroup_v2_envelope()
+    result['cgroup_v2'] = cgroup['leaf']
+    result['cgroup_v2_observation'] = cgroup
+    bounds = [value for value in (len(affinity) if affinity else os.cpu_count(),
+                                  cgroup['cpu_quota_upper_bound']) if value is not None]
+    result['sustained_cpu_capacity_upper_bound'] = min(bounds) if bounds else None
+    result['capacity_scope'] = 'receipt-time affinity/logical-CPU and visible quota rates averaged over their periods; no reserved capacity, hidden-ancestor or interval-stability claim'
     return result
 
 
@@ -241,69 +334,182 @@ def log_tail(path):
         return stream.read(8192).decode('utf-8', 'replace')
 
 
-def execute(command, directory, timeout, started=None, memory_log_path=None):
+def execute(command, directory, timeout, started=None, memory_log_path=None, *,
+            env=None, cwd=None, cleanup_command=None, runtime_identity=None, resource_group=None):
     started = time.monotonic() if started is None else started
+    monitor_cpu_started = time.thread_time_ns()
     terminated_at = None
     memory_log_path = memory_log_path or directory / 'process-memory.jsonl'
-    sampling_wall_ns = sampling_cpu_ns = 0
-    # Both engines use this same bounded monitor. Stream raw receipts instead
-    # of retaining a sample history in the harness heap.
-    with (directory / 'stdout.log').open('wb') as stdout, (directory / 'stderr.log').open('wb') as stderr, memory_log_path.open('x') as memory_log:
-        child = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
-        try:
+    sampling_wall_ns = 0
+    custody = _memory_module.ProcessFamilyCustody()
+    child = cleanup = memory = None
+    known_direct = {}
+    controls = {}
+    totals = [0.0, 0.0, 0]
+    runtime_seen = None
+
+    def refresh_roots():
+        if custody.supported:
+            for pid, birth in custody.children().items():
+                known_direct[pid] = birth
+                if memory is not None and memory.identities.get(pid) != birth:
+                    memory.register_root(pid, expected_starttime=birth)
+
+    def reap():
+        changed = False
+        for pid in list(known_direct):
+            try:
+                exited, status, usage = os.wait4(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                known_direct.pop(pid)
+                process = controls.pop(pid, None)
+                if process is not None:
+                    process.returncode = -1
+                raise RuntimeError('measurement child was reaped outside its custody scope')
+            if not exited:
+                continue
+            known_direct.pop(pid)
+            process = controls.pop(pid, None)
+            if process is not None:
+                process.returncode = os.waitstatus_to_exitcode(status)
+            totals[0] += usage.ru_utime
+            totals[1] += usage.ru_stime
+            totals[2] = max(totals[2], usage.ru_maxrss)
+            changed = True
+        return changed
+
+    def signal_owned(sig):
+        if custody.supported:
+            # A fresh direct child remains ours, with an unreusable PID until wait4.
+            for pid in custody.children():
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        else:
+            for pid, process in controls.items():
+                if process.returncode is None:
+                    try:
+                        os.killpg(pid, sig)
+                    except ProcessLookupError:
+                        pass
+
+    def observe_runtime():
+        nonlocal runtime_seen
+        if runtime_seen is not None or runtime_identity is None or memory is None:
+            return
+        for pid, birth in memory.identities.items():
+            if pid in controls:
+                continue
+            identity = _memory_module._stat(pid)
+            if identity is None or identity[1] != birth:
+                continue
+            try:
+                image = pathlib.Path(f'/proc/{pid}/exe').stat()
+            except OSError:
+                continue
+            if (image.st_dev, image.st_ino) == runtime_identity:
+                runtime_seen = {'pid': pid, 'starttime_ticks': birth}
+                break
+
+    try:
+        with ((directory / 'stdout.log').open('wb') as stdout,
+              (directory / 'stderr.log').open('wb') as stderr,
+              (directory / 'cleanup-stdout.log').open('wb') as cleanup_stdout,
+              (directory / 'cleanup-stderr.log').open('wb') as cleanup_stderr,
+              memory_log_path.open('x') as memory_log):
+            child_command = resource_group.wrap_command(command) if resource_group else command
+            child = subprocess.Popen(child_command, stdout=stdout, stderr=stderr,
+                                     start_new_session=True, env=env, cwd=cwd)
+            controls[child.pid] = child
+            known_direct[child.pid] = None
             memory = ProcessTreeMemorySampler(child.pid)
             next_sample = time.monotonic()
             while True:
-                pid, status, usage = os.wait4(child.pid, os.WNOHANG)
-                if pid:
-                    child.returncode = os.waitstatus_to_exitcode(status)
-                    break
+                changed = reap()
                 now = time.monotonic()
+                if child.returncode is not None and cleanup_command is not None and cleanup is None and terminated_at is None:
+                    cleanup_arguments = resource_group.wrap_command(cleanup_command) if resource_group else cleanup_command
+                    cleanup = subprocess.Popen(
+                        cleanup_arguments, stdout=cleanup_stdout, stderr=cleanup_stderr,
+                        start_new_session=True, env=env, cwd=cwd)
+                    controls[cleanup.pid] = cleanup
+                    known_direct[cleanup.pid] = None
+                    memory.register_root(cleanup.pid)
+                    changed = True
+                controls_done = (child.returncode is not None
+                                 and (cleanup is None or cleanup.returncode is not None))
+                if changed or now >= next_sample or controls_done or terminated_at is not None:
+                    refresh_roots()
                 if memory.supported and now >= next_sample:
                     sample_started = time.monotonic_ns()
-                    cpu_started = time.thread_time_ns()
                     sample = memory.sample()
                     memory_log.write(json.dumps(sample, separators=(',', ':')) + '\n')
-                    sampling_cpu_ns += time.thread_time_ns() - cpu_started
                     sampling_wall_ns += time.monotonic_ns() - sample_started
-                    # Never catch up with a burst of scans after a slow sample.
+                    observe_runtime()
+                    # Do not burst scans to catch up after a slow sample.
                     next_sample = time.monotonic() + 0.25
-                elapsed = time.monotonic() - started
-                if elapsed >= timeout and terminated_at is None:
-                    os.killpg(child.pid, signal.SIGTERM)
-                    terminated_at = time.monotonic()
-                elif terminated_at is not None and time.monotonic() - terminated_at >= 5:
-                    os.killpg(child.pid, signal.SIGKILL)
+                if controls_done and not known_direct:
+                    break
+                if now - started >= timeout and terminated_at is None:
+                    terminated_at = now
+                if terminated_at is not None:
+                    signal_owned(signal.SIGKILL if now - terminated_at >= 5 else signal.SIGTERM)
+                    if now - terminated_at >= 10:
+                        raise RuntimeError('owned process family exceeded its forced-cleanup deadline')
                 time.sleep(0.02)
-        except BaseException:
-            os.killpg(child.pid, signal.SIGKILL)
-            _, status, usage = os.wait4(child.pid, 0)
-            child.returncode = os.waitstatus_to_exitcode(status)
-            raise
-    peak = usage.ru_maxrss * (1 if platform.system() == 'Darwin' else 1024)
-    return {'exit_code': child.returncode, 'timed_out': terminated_at is not None,
-            'process_cold_total_ms': (time.monotonic() - started) * 1000,
-            'user_cpu_seconds': usage.ru_utime, 'system_cpu_seconds': usage.ru_stime,
-            'max_individual_process_rss_bytes': peak,
-            'cpu_scope': 'wait4 child plus waited descendants; excludes fixture server and harness',
-            'rss_scope': 'OS wait4 maximum individual process RSS; not concurrent process-tree aggregate',
-            'process_family_memory': {
-                'supported': memory.supported,
-                'sample_count': memory.samples, 'incomplete_sample_count': memory.incomplete_samples,
-                'peak_sampled_pss_bytes': memory.peak_pss_bytes,
-                'peak_sampled_private_bytes': memory.peak_private_bytes,
-                'minimum_sampling_gap_ms': 250,
-                'sampling_wall_ms': sampling_wall_ns / 1_000_000,
-                'monitor_thread_cpu_seconds': sampling_cpu_ns / 1_000_000_000,
-                'samples_path': str(memory_log_path), 'samples_sha256': digest(memory_log_path),
-                'sampler_sha256': digest(pathlib.Path(_memory_module.__file__)),
-                'scope': 'observed Linux child process-family mappings; sampled peaks are lower bounds; excludes kernel/GPU/unmapped cache, fixture and harness; no inference about LLM/CLI-daemon memory',
-                'timing_scope': 'process time includes concurrent sampling overhead; monitor CPU reported separately'},
-            'stdout_tail': log_tail(directory / 'stdout.log'),
-            'stderr_tail': log_tail(directory / 'stderr.log')}
+    except BaseException:
+        # No new control process is launched during exception cleanup.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            refresh_roots()
+            signal_owned(signal.SIGKILL)
+            reap()
+            refresh_roots()
+            if not known_direct:
+                break
+            time.sleep(0.02)
+        raise
+    finally:
+        custody.close()
+    peak = totals[2] * (1 if platform.system() == 'Darwin' else 1024)
+    return {
+        'exit_code': child.returncode, 'timed_out': terminated_at is not None,
+        'cleanup_exit_code': cleanup.returncode if cleanup is not None else None,
+        'process_cold_total_ms': (time.monotonic() - started) * 1000,
+        'kernel_resource_accounting': resource_group.snapshot() if resource_group else None,
+        'lifecycle_accounting_version': 'kernel-custody-v1',
+        'user_cpu_seconds': totals[0], 'system_cpu_seconds': totals[1],
+        'max_individual_process_rss_bytes': peak,
+        'cpu_scope': 'wait4 original child, cleanup CLI and adopted roots plus their waited descendants; excludes fixture and monitor; auto-reaped unobserved CPU remains outside this accounting',
+        'rss_scope': 'OS wait4 maximum individual process RSS; not concurrent process-tree aggregate',
+        'process_custody': {
+            'supported': custody.supported, 'unavailable_reason': custody.reason,
+            'all_reaped': not known_direct if custody.supported else None,
+            'runtime_image_observed': runtime_seen is not None,
+            'runtime_image_process': runtime_seen,
+            'scope': 'private monitor Linux child-subreaper ownership, not a caller-declared PID receipt'},
+        'process_family_memory': {
+            'supported': memory.supported,
+            'sample_count': memory.samples, 'incomplete_sample_count': memory.incomplete_samples,
+            'peak_sampled_pss_bytes': memory.peak_pss_bytes,
+            'peak_sampled_private_bytes': memory.peak_private_bytes,
+            'minimum_sampling_gap_ms': 250,
+            'sampling_wall_ms': sampling_wall_ns / 1_000_000,
+            'monitor_thread_cpu_seconds': (time.thread_time_ns() - monitor_cpu_started) / 1_000_000_000,
+            'samples_path': str(memory_log_path), 'samples_sha256': digest(memory_log_path),
+            'sampler_sha256': digest(pathlib.Path(_memory_module.__file__)),
+            'scope': 'observed Linux owned process-family mappings; sampled peaks are lower bounds; excludes kernel/GPU/unmapped cache, fixture, monitor and LLM/model providers',
+            'timing_scope': 'process time includes custody, cleanup and sampling overhead; complete monitor main-thread CPU is separate'},
+        'stdout_tail': log_tail(directory / 'stdout.log'),
+        'stderr_tail': log_tail(directory / 'stderr.log'),
+        'cleanup_stdout_tail': log_tail(directory / 'cleanup-stdout.log'),
+        'cleanup_stderr_tail': log_tail(directory / 'cleanup-stderr.log')}
 
 
-def prepare_native_entry(path):
+def prepare_native_entry(path, fixture_url=None):
     """Inline the exact shared source at the native adapter's sole file import."""
     adapter_path = ROOT / 'runtime/fixtures/efficiency-native.mjs'
     workload_path = ROOT / 'runtime/fixtures/efficiency-workload.mjs'
@@ -313,10 +519,15 @@ def prepare_native_entry(path):
     if adapter.count(import_line) != 1:
         raise ValueError('native adapter must contain exactly one shared-workload import')
     source = adapter.replace(import_line, workload, 1)
+    if fixture_url is not None:
+        # The public CLI run verb has no runtime fixture flag. Bind only the
+        # generated loopback URL in the same hashed module as the workload.
+        source = b'const fixtureUrl = ' + json.dumps(fixture_url).encode('utf-8') + b';\n' + source
     with path.open('xb') as entry:
         entry.write(source)
     return {'path': str(path), 'sha256': hashlib.sha256(source).hexdigest(),
             'composition': 'inline-native-workload-v1',
+            'fixture_binding': 'module-local literal' if fixture_url is not None else 'runtime fixture flag',
             'adapter_path': str(adapter_path), 'adapter_sha256': hashlib.sha256(adapter).hexdigest(),
             'workload_path': str(workload_path), 'workload_sha256': hashlib.sha256(workload).hexdigest(),
             'generator_sha256': digest(pathlib.Path(__file__)),
@@ -328,10 +539,36 @@ def prepare_native_entry(path):
                                      'contexts': 'unchanged newContext() per worker'}}
 
 
+def cli_execution(cli, runtime, entry, state, timeout):
+    """Use public CLI composition; never attach to a user's existing owner."""
+    workspace = state / 'workspace'
+    workspace.mkdir()
+    temporary = state / 'tmp'
+    temporary.mkdir()
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith('GREPPY_')}
+    environment.update({
+        'GREPPY_WEB_RUNTIME': str(runtime),
+        'GREPPY_WEB_RUNTIME_DIR': str(state),
+        'GREPPY_RUNTIME_DIR': str(state),
+        'GREPPY_STORE_DIR': str(state / 'store'),
+        'GREPPY_WEB_AGENT': state.name,
+        'TMPDIR': str(temporary),
+    })
+    command = [str(cli), 'web', 'do', '--json',
+               'session', 'new', '--profile', 'project', '::',
+               'run', '--mode', 'standalone', '--script-file', str(entry),
+               '--timeout', str(int(timeout * 1000))]
+    return command, environment, workspace
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--engine', choices=('native', 'chromium'), required=True)
+    parser.add_argument('--engine', choices=('native', 'chromium', 'cli'), required=True)
     parser.add_argument('--runtime', type=pathlib.Path)
+    parser.add_argument('--cli', type=pathlib.Path)
+    parser.add_argument('--state-parent', type=pathlib.Path,
+                        help='CLI only: existing absolute private-state parent of at most20 bytes')
     parser.add_argument('--node', default='node')
     parser.add_argument('--output', required=True, type=pathlib.Path)
     parser.add_argument('--rounds', type=int, default=3)
@@ -339,20 +576,38 @@ def main():
     parser.add_argument('--concurrency', type=int, default=1)
     parser.add_argument('--nodes', type=int, default=100)
     parser.add_argument('--timeout', type=float, default=90)
+    parser.add_argument('--kernel-cgroup-parent', type=pathlib.Path,
+                        help='optional existing delegated cgroup-v2 parent of this sole worker monitor leaf; no privilege escalation')
     args = parser.parse_args()
     if (not args.output.is_absolute() or not 1 <= args.rounds <= 100 or not 1 <= args.tasks <= 100
             or not 1 <= args.concurrency <= 16 or not 1 <= args.nodes <= 100000
             or args.rounds * args.tasks * args.concurrency > 1000 or not 1 <= args.timeout <= 600):
         parser.error('absolute output path and bounded workload required (at most1000 total tasks)')
+    if args.kernel_cgroup_parent and (not args.kernel_cgroup_parent.is_absolute()
+                                     or not args.kernel_cgroup_parent.is_dir()):
+        parser.error('--kernel-cgroup-parent must be an absolute existing delegated directory')
     if args.output.exists():
         parser.error('output already exists; preserve existing measurement')
     reference = ROOT / 'scripts/efficiency-reference.mjs'
-    executable = args.runtime.resolve() if args.runtime else pathlib.Path(shutil.which(args.node) or args.node)
-    if args.engine == 'native' and not args.runtime:
+    executable = (args.cli.resolve() if args.engine == 'cli' and args.cli else
+                  args.runtime.resolve() if args.runtime else pathlib.Path(shutil.which(args.node) or args.node))
+    if args.engine in ('native', 'cli') and not args.runtime:
         parser.error('--runtime must name the existing exact runtime binary')
+    if args.engine == 'cli' and (not args.cli or not args.state_parent
+                                or not args.state_parent.is_absolute()
+                                or not args.state_parent.is_dir()
+                                or len(os.fsencode(args.state_parent)) + 12 > 32):
+        parser.error('CLI mode requires --cli and an existing absolute --state-parent of at most20 bytes')
+    if args.engine != 'cli' and (args.cli or args.state_parent):
+        parser.error('--cli and --state-parent apply only to --engine cli')
     if not executable.is_file():
         parser.error(f'executable does not exist: {executable}')
     executable_before = executable.stat()
+    runtime = args.runtime.resolve() if args.engine == 'cli' else None
+    if runtime is not None and not runtime.is_file():
+        parser.error(f'runtime executable does not exist: {runtime}')
+    runtime_before = runtime.stat() if runtime is not None else None
+    runtime_sha256 = digest(runtime) if runtime is not None else None
     provenance = source_identity()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     native_entry = None
@@ -363,21 +618,51 @@ def main():
             parser.error(str(error))
     config = {key: getattr(args, key) for key in ('rounds', 'tasks', 'concurrency', 'nodes')}
     fixture = Fixture(config)
+    url = f'http://127.0.0.1:{fixture.server_port}/'
+    state = None
+    if args.engine == 'cli':
+        try:
+            native_entry = prepare_native_entry(args.output.with_name(args.output.name + '.entry.mjs'), url)
+            state = pathlib.Path(tempfile.mkdtemp(prefix='gw-', dir=args.state_parent))
+            if len(os.fsencode(state)) > 32:
+                raise ValueError('generated CLI private state exceeds32 bytes; use a shorter --state-parent')
+        except (FileExistsError, ValueError) as error:
+            fixture.server_close()
+            parser.error(str(error))
     thread = threading.Thread(target=fixture.serve_forever, name='owned-efficiency-fixture', daemon=True)
     thread.start()
-    url = f'http://127.0.0.1:{fixture.server_port}/'
     command = ([str(executable), '--script', native_entry['path'], '--fixture-url', url] if native_entry
                else [str(executable), str(reference), url])
     try:
         with tempfile.TemporaryDirectory(prefix='web-efficiency-', dir=args.output.parent) as temporary:
+            environment = cwd = None
+            if state is not None:
+                command, environment, cwd = cli_execution(executable, runtime, native_entry['path'], state, args.timeout)
             fixture.started_at = time.monotonic()
-            measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
-                               args.output.with_name(args.output.name + '.memory.jsonl'))
+            with (_memory_module.OwnedKernelGroup(args.kernel_cgroup_parent, cgroup_v2_envelope())
+                  if args.kernel_cgroup_parent else nullcontext(None)) as resource_group:
+                measured = execute(command, pathlib.Path(temporary), args.timeout, fixture.started_at,
+                                   args.output.with_name(args.output.name + '.memory.jsonl'), env=environment, cwd=cwd,
+                                   cleanup_command=([str(executable), 'web', 'runtime', 'stop', '--json']
+                                                    if state is not None else None),
+                                   runtime_identity=((runtime_before.st_dev, runtime_before.st_ino)
+                                                     if runtime_before is not None else None),
+                                   resource_group=resource_group)
+            if resource_group is not None:
+                measured['kernel_resource_accounting']['group_removed'] = resource_group.closed
         audit = fixture.audit()
         valid = audit['all_tasks_verified'] and measured['exit_code'] == 0 and not measured['timed_out']
         reason = audit['error']
+        kernel = measured['kernel_resource_accounting']
+        if kernel is not None and (not kernel['target_entry_observed']
+                                   or kernel['memory_events'].get('oom_kill', 0) != 0):
+            valid, reason = False, 'kernel resource group target entry missing or OOM kill observed'
         if reason is None and not valid:
             reason = 'process timed out' if measured['timed_out'] else 'engine process failed'
+        if state is not None and measured['cleanup_exit_code'] != 0:
+            valid = False
+            if reason is None:
+                reason = 'owned runtime cleanup command failed'
         executable_after = executable.stat()
         if (executable_before.st_dev, executable_before.st_ino, executable_before.st_size, executable_before.st_mtime_ns) != (
                 executable_after.st_dev, executable_after.st_ino, executable_after.st_size, executable_after.st_mtime_ns):
@@ -389,6 +674,34 @@ def main():
                 entry_unchanged = False
             if not entry_unchanged:
                 valid, reason = False, 'executed native entry changed during measurement'
+        if runtime is not None:
+            runtime_after = runtime.stat()
+            if ((runtime_before.st_dev, runtime_before.st_ino, runtime_before.st_size, runtime_before.st_mtime_ns)
+                    != (runtime_after.st_dev, runtime_after.st_ino, runtime_after.st_size, runtime_after.st_mtime_ns)
+                    or digest(runtime) != runtime_sha256):
+                valid, reason = False, 'CLI runtime executable changed during measurement'
+            measured['process_family_memory']['scope'] = (
+                'observed Linux CLI and runtime descendant mappings; sampled peaks are lower bounds; '
+                'detached roots are adopted when Linux kernel custody is supported; '
+                'excludes kernel/GPU/unmapped cache, fixture, harness and LLM/model providers')
+            observed = measured['process_family_memory']
+            measured['observed_process_family_memory'] = observed
+            measured['process_family_memory'] = {
+                **observed,
+                'peak_sampled_pss_bytes': None,
+                'peak_sampled_private_bytes': None,
+                'complete_for_execution_surface': False,
+                'scope': 'unknown whole CLI/runtime memory: complete kernel custody and the configured runtime image were not verified; observed samples are separate',
+            }
+            family = measured['process_custody']
+            if (family['supported'] and family['all_reaped'] and family['runtime_image_observed']
+                    and observed['incomplete_sample_count'] == 0
+                    and observed['peak_sampled_pss_bytes'] is not None):
+                measured['process_family_memory'] = {
+                    **observed,
+                    'complete_for_execution_surface': True,
+                    'scope': 'sampled Linux CLI/runtime family under kernel custody through explicit cleanup; transient peaks, kernel/GPU/cache and LLM/model providers remain excluded',
+                }
         measured['verified_completed_tasks_per_second_including_all_process_time'] = (
             audit['independently_verified_completed_tasks'] * 1000 / measured['process_cold_total_ms'])
         boundaries = [fixture.started_at] + [event[0] for event in fixture.round_events]
@@ -404,7 +717,9 @@ def main():
                    'source_provenance': provenance,
                    'workload_sha256': (native_entry['workload_sha256'] if native_entry
                                        else digest(ROOT / 'runtime/fixtures/efficiency-workload.mjs')),
-                   'execution_surface': 'standalone runtime/Playwright; excludes LLM and CLI daemon session limits',
+                   'execution_surface': ('public CLI web do/session/run and owned runtime stop; excludes LLM/model-provider work'
+                                         if state is not None else
+                                         'standalone runtime/Playwright; excludes LLM and CLI daemon session limits'),
                    'cold_scope': 'new process/browser; OS caches are not cleared or claimed cold',
                    'metrics': measured, 'audit': audit,
                    'workload': fixture.receipts[0] if len(fixture.receipts) == 1 else None,
@@ -415,6 +730,16 @@ def main():
                                        'network_scope': 'fixture HTTP bodies only; excludes headers, TCP/TLS and IPC'}}
         if native_entry:
             receipt['native_entry_provenance'] = native_entry
+        if state is not None:
+            receipt['cli_provenance'] = {
+                'executable': str(executable), 'sha256': receipt['executable_sha256'],
+                'runtime_executable': str(runtime), 'runtime_sha256': runtime_sha256,
+                'private_state_directory': str(state),
+                'state_cleanup': 'preserved for ownership/lifecycle inspection; not automatically deleted',
+                'lifecycle_scope': 'explicit runtime stop is measured; descendant exit is proved only where process_custody.all_reaped is true',
+                'session_profile': 'project; explicit loopback fixture, normal session limits',
+                'entry_url_binding': 'module-local generated loopback URL; no production fixture env',
+            }
         if args.engine == 'chromium':
             try:
                 metadata = json.loads(measured['stdout_tail'].splitlines()[0])['engine_metadata']
