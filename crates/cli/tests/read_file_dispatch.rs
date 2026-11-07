@@ -3,6 +3,33 @@
 use std::path::{Path, PathBuf};
 
 #[test]
+fn anonymous_compound_typedef_read_returns_complete_definition() {
+    let definition = "typedef struct {\n    int frames;\n    float gain;\n} SyntheticWorkspace;\n";
+    for file in ["workspace.c", "workspace.h", "workspace.hpp"] {
+        let (repo, store) = fresh_workspace(file);
+        std::fs::write(
+            repo.join(file),
+            format!("{definition}int unrelated(void);\n"),
+        )
+        .unwrap();
+        index(&repo, &store);
+        let (code, out, err) = run(&repo, &store, &["read", "SyntheticWorkspace", "--json"]);
+        assert_eq!(
+            code, 0,
+            "anonymous compound typedef read failed: {file}: {out}\n{err}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(
+            value["source"].as_str().unwrap().trim(),
+            definition.trim(),
+            "anonymous compound typedef read must preserve its entire declaration"
+        );
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
 fn read_file_clamps_past_eof_without_opening_a_graph() {
     let (repo, store) = fresh_workspace("clamped-range");
     std::fs::write(repo.join("sample.txt"), "first\nsecond\nthird").unwrap();

@@ -128,7 +128,19 @@ jobs:
       - name: cargo build --workspace (fast test assets)
         run: cargo build --workspace --features greppy/ci-test-assets
 
+      - name: Literal search definition source mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_search_pattern_source_mutation.py
+
       # Reuse the existing build before the bounded transport mutation proof.
+      - name: Rust cfg sibling identity mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_rust_cfg_identity_mutation.py
+
+      - name: Anonymous compound typedef parser and CLI read mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anonymous_compound_typedef_mutation.py
+
       - name: Unix request absolute-deadline mutation proof
         if: runner.os == 'Linux'
         run: python3 tools/check_unix_deadline_mutation.py
@@ -170,6 +182,10 @@ jobs:
       - name: Agent HTTP error-body mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_agent_http_error_mutation.py
+
+      - name: Ignored web runtime proposal mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_ignored_runtime_proposal_mutation.py
 
       - name: Web argument dispatch mutation proof
         if: runner.os == 'Linux'
