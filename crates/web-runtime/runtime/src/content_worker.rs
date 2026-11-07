@@ -5034,8 +5034,15 @@ impl ContentEngine {
                         .unwrap_or(false);
                     let offset_left = number_field(&values, "offsetLeft").unwrap_or(0.0);
                     let offset_top = number_field(&values, "offsetTop").unwrap_or(0.0);
+                    let failed_check = crate::locator_diagnostics::observed_actionability_check(
+                        count,
+                        visible,
+                        hit,
+                        disabled,
+                        need_editable && readonly,
+                    );
                     last = format!(
-                        "count={count} width={width} height={height} offsetLeft={offset_left} offsetTop={offset_top} disabled={disabled} readonly={readonly} visible={visible} hit={hit}"
+                        "failed_check={failed_check}; count={count} width={width} height={height} offsetLeft={offset_left} offsetTop={offset_top} disabled={disabled} readonly={readonly} visible={visible} hit={hit}"
                     );
                     if count == 1 && visible && hit && !disabled && (!need_editable || !readonly) {
                         let node = ResolvedNode {
@@ -5065,7 +5072,6 @@ impl ContentEngine {
                                 }
                             } else {
                                 stable_since = Some(Instant::now());
-                                last = format!("failed_check=stable; {last}");
                             }
                         } else {
                             stable_since = Some(Instant::now());
@@ -5079,15 +5085,6 @@ impl ContentEngine {
                                 "strict mode: selector matched {count} nodes"
                             )));
                         }
-                        last = if count == 0 {
-                            format!("failed_check=attached; {last}")
-                        } else if !visible {
-                            format!("failed_check=visible; {last}")
-                        } else if !hit {
-                            format!("failed_check=hit; {last}")
-                        } else {
-                            format!("failed_check=enabled; {last}")
-                        };
                     }
                 }
                 _ => {

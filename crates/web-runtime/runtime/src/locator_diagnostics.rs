@@ -30,6 +30,28 @@ pub(crate) fn concise_selection_failure(message: &str) -> Option<&str> {
 
 const UNOBSERVED_DOM_RECOVERY: &str = "the DOM query did not yield usable evidence within the action deadline; inspect the supplied page_state before another action";
 
+/// The next unproven check after a real DOM sample. This is not a substitute
+/// for observing the DOM, nor proof that the stability interval has completed.
+pub(crate) fn observed_actionability_check(
+    count: usize,
+    visible: bool,
+    hit: bool,
+    disabled: bool,
+    editable_blocked: bool,
+) -> &'static str {
+    if count != 1 {
+        "attached"
+    } else if !visible {
+        "visible"
+    } else if !hit {
+        "hit"
+    } else if disabled || editable_blocked {
+        "enabled"
+    } else {
+        "stable"
+    }
+}
+
 pub(crate) fn actionability_timeout_message(last: &str) -> String {
     let detail = if last.contains("failed_check=") {
         last.to_owned()
@@ -133,6 +155,17 @@ mod tests {
         }
         let empty = actionability_timeout_message("failed_check=attached; count=0");
         assert_eq!(recovery_for_locator_error(&empty).0, "NO_MATCH");
+        // One eligible reply proves the earlier checks, even if the deadline
+        // expires before the second geometry sample or its stability interval.
+        let pending = observed_actionability_check(1, true, true, false, false);
+        let first_sample =
+            actionability_timeout_message(&format!("failed_check={pending}; count=1"));
+        assert!(
+            first_sample.contains("failed_check=stable")
+                && !first_sample.contains("failed_check=unobserved"),
+            "observed DOM sample lost pending stability check"
+        );
+        assert_eq!(recovery_for_locator_error(&first_sample).0, "TIMEOUT");
         let moving = actionability_timeout_message("failed_check=stable; count=1");
         assert!(moving.contains("failed_check=stable"));
         assert_eq!(recovery_for_locator_error(&moving).0, "TIMEOUT");
