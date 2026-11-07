@@ -2625,14 +2625,27 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn sleeping_child() -> std::process::Command {
-        let mut command = std::process::Command::new("/bin/sleep");
+    fn lease_probe_command() -> std::process::Command {
+        // Keep the probe alive until its owner closes stdin, even if another
+        // child's pre-exec descriptor scan takes longer than a fixed sleep.
+        let mut command = std::process::Command::new("/bin/cat");
         command
-            .arg("5")
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command
+    }
+
+    #[cfg(unix)]
+    struct LeaseProbe(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for LeaseProbe {
+        fn drop(&mut self) {
+            // Reap only this test's child, including during assertion unwind.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[cfg(unix)]
@@ -2643,9 +2656,9 @@ mod tests {
         let lease = inheritable_locked_file(&path);
         use std::os::fd::AsRawFd;
         let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
-        let mut command = sleeping_child();
+        let mut command = lease_probe_command();
         seal_detached_child_fds(&mut command).unwrap();
-        let mut daemon = command.spawn().unwrap();
+        let mut daemon = LeaseProbe(command.spawn().unwrap());
         assert_eq!(
             unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
             flags_before
@@ -2656,11 +2669,9 @@ mod tests {
             "detached daemon inherited the host lease"
         );
         assert!(
-            daemon.try_wait().unwrap().is_none(),
+            daemon.0.try_wait().unwrap().is_none(),
             "daemon did not remain alive"
         );
-        let _ = daemon.kill();
-        let _ = daemon.wait();
     }
 
     #[cfg(unix)]
@@ -2791,18 +2802,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("heavy.lock");
         let lease = inheritable_locked_file(&path);
-        let mut child = sleeping_child().spawn().unwrap();
+        let mut child = LeaseProbe(lease_probe_command().spawn().unwrap());
         drop(lease);
         assert!(
             !lock_available(&path),
             "ordinary heavy child lost its inherited lease"
         );
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.0.try_wait().unwrap().is_none(),
             "child did not remain alive"
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         assert!(lock_available(&path));
     }
 
@@ -2815,31 +2825,32 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let detached_barrier = barrier.clone();
         let detached = std::thread::spawn(move || {
-            let mut command = sleeping_child();
+            let mut command = lease_probe_command();
             seal_detached_child_fds(&mut command).unwrap();
             detached_barrier.wait();
-            command.spawn().unwrap()
+            LeaseProbe(command.spawn().unwrap())
         });
         let ordinary_barrier = barrier.clone();
         let ordinary = std::thread::spawn(move || {
-            let mut command = sleeping_child();
+            let mut command = lease_probe_command();
             ordinary_barrier.wait();
-            command.spawn().unwrap()
+            LeaseProbe(command.spawn().unwrap())
         });
         barrier.wait();
         let mut detached = detached.join().unwrap();
         let mut ordinary = ordinary.join().unwrap();
+        assert!(
+            ordinary.0.try_wait().unwrap().is_none(),
+            "ordinary lease probe exited before the inheritance assertion"
+        );
         drop(lease);
         assert!(
             !lock_available(&path),
             "concurrent ordinary child lost the lease"
         );
-        let _ = ordinary.kill();
-        let _ = ordinary.wait();
+        drop(ordinary);
         assert!(lock_available(&path), "detached child retained the lease");
-        assert!(detached.try_wait().unwrap().is_none());
-        let _ = detached.kill();
-        let _ = detached.wait();
+        assert!(detached.0.try_wait().unwrap().is_none());
     }
 
     #[cfg(unix)]
