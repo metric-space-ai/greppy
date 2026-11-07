@@ -106,6 +106,15 @@ try:
     finally:
         EXTRACT.write_bytes(original[EXTRACT])
 
+    role = "    anonymous_aliases.contains(&(node.start_byte(), node.end_byte()))"
+    assert text.count(role) == 1
+    try:
+        EXTRACT.write_text(text.replace(role, "    let _ = (node, anonymous_aliases);\n    false", 1))
+        run("parser", "anonymous alias declarator became a reference")
+        print("mutation: disabling shared anonymous-alias declaration role creates the false self-usage; actual parser contract red while real outer and tagged references stay required", flush=True)
+    finally:
+        EXTRACT.write_bytes(original[EXTRACT])
+
     text = original[POLICY].decode()
     anchor = "    expected == LEGACY_EXTRACTION_REVISION || revision == expected"
     assert text.count(anchor) == 1

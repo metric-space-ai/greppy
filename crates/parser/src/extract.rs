@@ -7537,6 +7537,35 @@ fn c_cpp_type_body<'a>(type_node: Node<'a>) -> Option<Node<'a>> {
     type_node.child_by_field_name("body")
 }
 
+struct CAnonymousCompoundAliases<'tree> {
+    compound: Node<'tree>,
+    label: &'static str,
+    aliases: Vec<Node<'tree>>,
+}
+
+/// Shared definition/reference policy: only direct declarators of an unnamed
+/// compound with a body name the newly supported owner type.
+fn c_cpp_anonymous_compound_aliases(typedef: Node<'_>) -> Option<CAnonymousCompoundAliases<'_>> {
+    if typedef.kind() != "type_definition" {
+        return None;
+    }
+    let compound = typedef.child_by_field_name("type")?;
+    let label = c_cpp_type_label(compound.kind())?;
+    if compound.child_by_field_name("name").is_some() || c_cpp_type_body(compound).is_none() {
+        return None;
+    }
+    let mut cursor = typedef.walk();
+    let aliases = typedef
+        .children_by_field_name("declarator", &mut cursor)
+        .filter(|alias| matches!(alias.kind(), "type_identifier" | "identifier"))
+        .collect();
+    Some(CAnonymousCompoundAliases {
+        compound,
+        label,
+        aliases,
+    })
+}
+
 /// Restore direct aliases of anonymous compound definitions after spec typedef
 /// pruning. Tagged types and non-compound / indirect aliases keep existing rules.
 fn c_cpp_anonymous_compound_typedef(
@@ -7545,21 +7574,15 @@ fn c_cpp_anonymous_compound_typedef(
     typedef: Node<'_>,
     result: &mut ExtractionResult,
 ) {
-    let Some(compound) = typedef.child_by_field_name("type") else {
+    let Some(CAnonymousCompoundAliases {
+        compound,
+        label,
+        aliases,
+    }) = c_cpp_anonymous_compound_aliases(typedef)
+    else {
         return;
     };
-    let Some(label) = c_cpp_type_label(compound.kind()) else {
-        return;
-    };
-    if compound.child_by_field_name("name").is_some() || c_cpp_type_body(compound).is_none() {
-        return;
-    }
-    let mut cursor = typedef.walk();
-    for alias in typedef.children_by_field_name("declarator", &mut cursor) {
-        // Pointer/array/function aliases do not name this compound itself.
-        if !matches!(alias.kind(), "type_identifier" | "identifier") {
-            continue;
-        }
+    for alias in aliases {
         let name = node_text(source, alias);
         if name.is_empty() {
             continue;
@@ -7835,8 +7858,25 @@ fn c_cpp_usage_pass(
     };
     let tree = crate::parse(usage_language, source)?;
     let mut stack = vec![tree.root_node()];
+    let mut anonymous_aliases = std::collections::HashSet::new();
     while let Some(node) = stack.pop() {
-        c_cpp_try_emit_usage(node, source, file_path, call_kinds, import_kinds, result);
+        if let Some(policy) = c_cpp_anonymous_compound_aliases(node) {
+            anonymous_aliases.extend(
+                policy
+                    .aliases
+                    .iter()
+                    .map(|alias| (alias.start_byte(), alias.end_byte())),
+            );
+        }
+        c_cpp_try_emit_usage(
+            node,
+            source,
+            file_path,
+            call_kinds,
+            import_kinds,
+            &anonymous_aliases,
+            result,
+        );
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 stack.push(child);
@@ -7853,6 +7893,7 @@ fn c_cpp_try_emit_usage(
     file_path: &str,
     call_kinds: &[&str],
     import_kinds: &[&str],
+    anonymous_aliases: &std::collections::HashSet<(usize, usize)>,
     result: &mut ExtractionResult,
 ) {
     // C / C++ references are `identifier` / `type_identifier`.
@@ -7861,6 +7902,11 @@ fn c_cpp_try_emit_usage(
     }
     let name = node_text(source, node);
     if name.is_empty() || C_CPP_KEYWORDS.contains(&name) {
+        return;
+    }
+    // These exact declarators are definitions even inside an enclosing type's
+    // `type:` range. Do not change the existing named-tag/type-reference rules.
+    if c_cpp_is_anonymous_alias_declarator(node, anonymous_aliases) {
         return;
     }
     // Type positions have to be classified before the generic definition-name
@@ -7884,7 +7930,7 @@ fn c_cpp_try_emit_usage(
     }
     // Skip a node that IS the `name:` field of its own parent (a definition
     // name, not a reference).
-    if c_cpp_is_definition_name(node) {
+    if c_cpp_is_definition_name(node, anonymous_aliases) {
         return;
     }
     // Every C / C++ usage is attributed to the per-file MODULE node, not the
@@ -8015,7 +8061,20 @@ fn c_cpp_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
 /// parse exposes as the `type_definition`'s `declarator` (a standalone
 /// `type_identifier`). A `typedef struct S S;` alias IS a real reference and is
 /// kept, so this is scoped to `type:` being an `enum_specifier`.
-fn c_cpp_is_definition_name(node: Node<'_>) -> bool {
+fn c_cpp_is_anonymous_alias_declarator(
+    node: Node<'_>,
+    anonymous_aliases: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    anonymous_aliases.contains(&(node.start_byte(), node.end_byte()))
+}
+
+fn c_cpp_is_definition_name(
+    node: Node<'_>,
+    anonymous_aliases: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    if c_cpp_is_anonymous_alias_declarator(node, anonymous_aliases) {
+        return true;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -22438,7 +22497,7 @@ typedef int MyInt;
 
     #[test]
     fn anonymous_compound_typedef_keeps_alias_span_members_and_tag_collisions() {
-        let src = "typedef struct {\n    int frames;\n    float gain;\n} Workspace, WorkspaceAlias, *WorkspacePtr;\ntypedef union { int bits; float sample; } SampleWord;\ntypedef enum { Idle, Active } RunMode;\ntypedef struct Tagged { int retained; } Tagged;\ntypedef int Scalar;\n";
+        let src = "typedef struct {\n    int frames;\n    float gain;\n} Workspace, WorkspaceAlias, *WorkspacePtr;\ntypedef union { int bits; float sample; } SampleWord, SampleAlias;\ntypedef enum { Idle, Active } RunMode, RunModeAlias;\ntypedef struct Tagged { int retained; } Tagged;\ntypedef int Scalar;\nstruct Forward { int value; };\ntypedef struct Forward Forward;\nint consume(Workspace a, WorkspaceAlias b, SampleWord c, SampleAlias d, RunMode e, RunModeAlias f) { return a.frames + b.frames + c.bits + d.bits + e + f; }\n";
         for (language, path) in [
             (Language::C, "fixture.c"),
             (Language::C, "fixture.h"),
@@ -22480,12 +22539,51 @@ typedef int MyInt;
                 .nodes
                 .iter()
                 .any(|n| n.label == "Type" || n.name == "Scalar" || n.name == "WorkspacePtr"));
+            for (name, declaration_line) in [
+                ("Workspace", 4),
+                ("WorkspaceAlias", 4),
+                ("SampleWord", 5),
+                ("SampleAlias", 5),
+                ("RunMode", 6),
+                ("RunModeAlias", 6),
+            ] {
+                assert!(
+                    result.nodes.iter().any(|node| node.name == name),
+                    "direct alias definition missing: {name}"
+                );
+                assert!(
+                    !result.edges.iter().any(|edge| edge.line == declaration_line
+                        && matches!(edge.edge_type.as_str(), "USAGE" | "TYPE_REF")
+                        && (edge.properties.get("ref_name").and_then(|v| v.as_str())
+                            == Some(name)
+                            || edge.properties.get("type_name").and_then(|v| v.as_str())
+                                == Some(name))),
+                    "anonymous alias declarator became a reference: {path}::{name}"
+                );
+                assert!(
+                    result.edges.iter().any(|edge| edge.edge_type == "TYPE_REF"
+                        && edge.line == 11
+                        && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some(name)),
+                    "real outer alias type reference lost: {path}::{name}"
+                );
+            }
+            assert!(
+                result.edges.iter().any(|edge| edge.edge_type == "USAGE"
+                    && edge.line == 10
+                    && edge.properties.get("ref_name").and_then(|v| v.as_str()) == Some("Forward")),
+                "tagged typedef reference must remain a usage"
+            );
         }
-        let result = cpp("typedef class { public: int value; } Box;", "box.hpp");
+        let result = cpp("typedef class { public: int value; } Box;\nint use_box(Box value) { return value.value; }\n", "box.hpp");
         assert!(result
             .nodes
             .iter()
             .any(|n| n.qualified_name == "box.hpp::Class::Box::value"));
+        assert!(!result.edges.iter().any(|edge| edge.line == 1
+            && edge.properties.get("ref_name").and_then(|v| v.as_str()) == Some("Box")));
+        assert!(result.edges.iter().any(|edge| edge.edge_type == "TYPE_REF"
+            && edge.line == 2
+            && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some("Box")));
     }
 
     #[test]
