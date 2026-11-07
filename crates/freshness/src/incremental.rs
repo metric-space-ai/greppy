@@ -106,6 +106,7 @@ pub fn compute_file_diff(
                 f.rel_path,
                 PersistedStat {
                     sha256: f.sha256,
+                    extractor_version: f.extractor_version,
                     size: f.size,
                     mtime_ns: f.mtime_ns,
                     ctime_ns: identity.and_then(|value| value.ctime_ns),
@@ -190,6 +191,20 @@ pub fn compute_file_diff(
             continue;
         }
 
+        // Identical bytes/stat do not certify results from an older extractor.
+        // Use the normal Modified path so the existing writer re-extracts only
+        // this file and publishes through its ordinary snapshot boundary.
+        if let Some(p) = by_rel.get(&entry.rel_path) {
+            if !greppy_parser::extraction_revision_matches(&entry.abs_path, &p.extractor_version) {
+                let p = by_rel.remove(&entry.rel_path).unwrap();
+                diffs.push(FileDiff::Modified {
+                    entry: entry.clone(),
+                    old_sha256: p.sha256,
+                });
+                continue;
+            }
+        }
+
         // Stat tier: all reliable persisted identity fields match the
         // on-disk stat ⇒ Unchanged without reading the body. `mtime_ns == 0` is the
         // "mtime unknown" sentinel some writers record; never fast-path
@@ -256,6 +271,7 @@ pub fn compute_file_diff(
 /// Persisted stat columns we need to diff a file without reading it.
 struct PersistedStat {
     sha256: String,
+    extractor_version: String,
     size: i64,
     mtime_ns: i64,
     ctime_ns: Option<i64>,
@@ -543,7 +559,7 @@ pub fn incremental_update(
                     mtime_ns: metadata.mtime_ns.unwrap_or(0),
                     size: bytes.len() as i64,
                     parser_version: "tree-sitter-0.25".into(),
-                    extractor_version: "greppy-extractor-v1".into(),
+                    extractor_version: greppy_parser::extraction_revision(lang).into(),
                     last_indexed_generation: 0,
                 })?;
                 store.upsert_file_identity(
@@ -1147,6 +1163,7 @@ mod tests {
     fn coarse_proof_rejects_a_read_that_started_before_bucket_closed() {
         let persisted = PersistedStat {
             sha256: sha256_hex(b"old-body"),
+            extractor_version: greppy_parser::LEGACY_EXTRACTION_REVISION.into(),
             size: 8,
             mtime_ns: 10_000_000_000,
             ctime_ns: Some(10_000_000_000),
