@@ -128,19 +128,21 @@ jobs:
         shell: python
         run: |
           import pathlib, subprocess
-          source = pathlib.Path('crates/web-runtime/runtime/tests/session-daemon.rs')
+          source = pathlib.Path('crates/web-runtime/runtime/tests/support/navigation_fixture_stream.rs')
           original = source.read_text()
-          old = 'let n = match stream.read(&mut buffer) {\n                    Ok(0) => return,\n                    Ok(n) => n,'
+          old = 'let count = stream.read(&mut buffer)?;'
           assert original.count(old) == 1
-          old_error = '.push(format!("request read error: {error}"));\n                        return;'
-          assert original.count(old_error) == 1
           command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
                      '--package', 'web-runtime', '--test', 'session-daemon',
                      'navigation_fixture_closes_silent_connections_without_response',
                      '--', '--test-threads=1', '--nocapture']
           try:
-              mutated = original.replace(old, old.replace('                    Ok(0) => return,\n', ''))
-              mutated = mutated.replace(old_error, old_error.replace('return;', '0'))
+              # The shared transport now owns EOF/read-error handling. Restore
+              # the real defect there: fabricate a valid GET without any bytes.
+              mutated = original.replace(old, '''let count = match stream.read(&mut buffer) {
+                          Ok(0) | Err(_) => return Ok(Some(b"GET / HTTP/1.1\\r\\n\\r\\n".to_vec())),
+                          Ok(count) => count,
+                      };''')
               source.write_text(mutated)
               result = subprocess.run(command, capture_output=True, text=True, timeout=300)
               print(result.stdout, result.stderr)
