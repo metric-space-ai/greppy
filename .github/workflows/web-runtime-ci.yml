@@ -8,6 +8,7 @@ on:
       - 'assets/prompts/web-beta.md'
       - 'crates/agent/**'
       - 'crates/cli/src/web/**'
+      - 'crates/cli/tests/web_cli.rs'
       - 'crates/web-runtime/**'
   push:
     branches: ['main']
