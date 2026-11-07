@@ -35,6 +35,36 @@ pub use provider::{
 pub use query::{CompiledQuery, QueryKind};
 pub use registry::LangDef;
 
+/// Compatibility of persisted extraction results, independently of source bytes.
+/// Unchanged languages retain the legacy revision and their cached graph work.
+pub const LEGACY_EXTRACTION_REVISION: &str = "greppy-extractor-v1";
+
+pub fn extraction_revision(language: Language) -> &'static str {
+    match language {
+        Language::C | Language::Cpp => "greppy-extractor-c-cpp-v2",
+        Language::Rust => "greppy-extractor-rust-v2",
+        _ => LEGACY_EXTRACTION_REVISION,
+    }
+}
+
+pub fn extraction_revision_matches(path: &std::path::Path, revision: &str) -> bool {
+    let expected = extraction_revision(language_for_path(path));
+    // Only explicitly advanced languages migrate; legacy languages keep their
+    // previous compatibility behavior and valid cached work.
+    expected == LEGACY_EXTRACTION_REVISION || revision == expected
+}
+
+/// A freshness TTL proof must not survive a change in extraction compatibility.
+pub fn extraction_revision_policy_key() -> String {
+    format!(
+        "default={};c={};cpp={};rust={}",
+        LEGACY_EXTRACTION_REVISION,
+        extraction_revision(Language::C),
+        extraction_revision(Language::Cpp),
+        extraction_revision(Language::Rust)
+    )
+}
+
 use greppy_core::Result;
 use tree_sitter::{Parser, Tree};
 
