@@ -1,4 +1,13 @@
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../vendor/servo-paint/shared_render_workers.rs"]
+mod shared_render_workers_contract;
+#[cfg(all(test, unix))]
+#[path = "../tests/support/navigation_fixture_stream.rs"]
+mod navigation_fixture_stream_contract;
 pub mod artifacts;
+#[cfg(test)]
+mod download_staging;
 #[cfg(feature = "controller-runtime")]
 pub mod controller_worker;
 #[cfg(feature = "content-runtime")]
@@ -10,9 +19,15 @@ pub mod limits;
 pub mod linux_sandbox;
 mod observed_refs;
 #[cfg(unix)]
+mod operation_control;
+#[cfg(unix)]
+mod heartbeat_inbox;
+#[cfg(unix)]
 mod fork_exec_window;
 mod locator_diagnostics;
 mod wait_contract;
+#[cfg(any(feature = "content-runtime", test))]
+mod history_receipt;
 pub mod policy;
 pub mod profile_lock;
 pub mod policy_proxy;

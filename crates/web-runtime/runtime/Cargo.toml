@@ -34,6 +34,7 @@ libc = "0.2"
 
 [dev-dependencies]
 fst = "0.4"
+rayon = "=1.12.0"
 
 [[bin]]
 name = "web-runtime"

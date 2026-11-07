@@ -36,6 +36,35 @@ function fixture() {
   vm.runInContext(source, world, { filename: "shipped-playwright.mjs" });
   return { world, calls, records, ops, chromium: vm.runInContext("chromium", world) };
 }
+test("download saveAs keeps synthetic bodies out of native file custody", async () => {
+  const f = fixture();
+  const browser = await f.chromium.launch();
+  const page = await browser.newPage();
+  const calls = [];
+  const original = f.ops.op_engine_call;
+  f.ops.op_engine_call = async (method, params) => {
+    if (method === "page.saveDownload") {
+      calls.push(params);
+      return { bytes: 2, hex: "0102" };
+    }
+    return original(method, params);
+  };
+  const synthetic = page._downloadFromRecord({
+    requestId: "route-one", url: "https://fixture.invalid/same.bin",
+    byteLength: 2, bodyBase64: "AQI=",
+  });
+  await synthetic.saveAs("/owned/synthetic.bin");
+  assert.equal(calls[0].downloadId, undefined,
+    "synthetic download was sent to native file custody");
+  const native = page._downloadFromRecord({
+    requestId: "native-one", url: "https://fixture.invalid/same.bin",
+    byteLength: 2, path: "/owned/original.bin",
+  });
+  await native.saveAs("/owned/native.bin");
+  assert.equal(calls[1].downloadId, "native-one", "native download lost its file identity");
+  await browser.close();
+});
+
 test("browser.newPage owns its implicit context while explicit contexts stay open", async () => {
   const f = fixture();
   const browser = await f.chromium.launch();

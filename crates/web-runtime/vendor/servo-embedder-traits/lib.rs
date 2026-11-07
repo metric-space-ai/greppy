@@ -698,6 +698,49 @@ pub struct WebResourceRequest {
     pub is_redirect: bool,
 }
 
+/// Shared session authority and file custody; the implementation is also
+/// compiled without Servo for its real filesystem/ownership contracts.
+#[path = "../../runtime/src/download_staging.rs"]
+mod download_staging;
+pub use download_staging::{DownloadBudget, DownloadBudgets};
+pub type CapturedWebResourceDownload = download_staging::CapturedDownload;
+
+impl download_staging::CapturedDownload {
+    pub fn capture(
+        headers: &HeaderMap,
+        body: &[u8],
+        budget: Option<std::sync::Arc<DownloadBudget>>,
+    ) -> Option<std::sync::Arc<Self>> {
+        let attachment = headers.get(http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("attachment"));
+        let binary = headers.get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/octet-stream"));
+        if !attachment && !binary { return None; }
+        // Synthetic/intercepted responses retain their existing body record;
+        // only a real request carrying native staging authority creates a file.
+        let budget = budget?;
+        Some(Self::stage(body, Some(budget), || {
+            for _ in 0..16 {
+                let path = std::env::temp_dir().join(format!("greppy-download-{}.bin", Uuid::new_v4()));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)] {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&path) {
+                    Ok(file) => return Ok((path, file)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::other("download temporary-file collision limit"))
+        }))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct WebResourceResponseCompleted {
     pub id: WebResourceLoadId,
@@ -711,6 +754,10 @@ pub struct WebResourceResponseCompleted {
     pub status_code: Option<u16>,
     pub status_message: Vec<u8>,
     pub body_bytes: u64,
+    /// Native shared custody only; never serialized into a page or protocol.
+    #[serde(skip)]
+    #[ignore_malloc_size_of = "Shared private download file, no retained body"]
+    pub download: Option<std::sync::Arc<CapturedWebResourceDownload>>,
     pub from_cache: bool,
     pub failure: Option<String>,
 }
@@ -738,6 +785,8 @@ pub enum WebResourceResponseMsg {
             serialize_with = "::hyper_serde::serialize"
         )]
         headers: HeaderMap,
+        #[serde(skip)]
+        download_budget: Option<std::sync::Arc<DownloadBudget>>,
     },
 }
 
