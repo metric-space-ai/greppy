@@ -88,6 +88,7 @@ use crate::decoder::Decoder;
 use crate::devtools::{
     prepare_devtools_request, send_request_to_devtools, send_response_values_to_devtools,
 };
+use crate::devtools_body::response_body_for_devtools;
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::FetchParams;
@@ -2389,13 +2390,18 @@ async fn http_network_fetch(
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
                 };
-                let devtools_response_body = completed_body.clone();
+                let devtools_response_body = response_body_for_devtools(
+                    &completed_body,
+                    devtools_chan.is_some(),
+                    devtools_request.pipeline_id.is_some(),
+                    devtools_request.target_webview_id.is_some(),
+                );
                 let body_bytes = completed_body.len() as u64;
                 *body = ResponseBody::Done(completed_body);
                 send_response_values_to_devtools(
                     Some(headers),
                     status,
-                    Some(devtools_response_body),
+                    devtools_response_body,
                     CacheState::None,
                     &devtools_request,
                     devtools_chan,
