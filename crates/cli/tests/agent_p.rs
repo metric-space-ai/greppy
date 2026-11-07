@@ -499,6 +499,31 @@ fn collect_runtime_scopes(
     }
 }
 
+/// Run only as an actual child process of the confinement contract below.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires a task-owned confinement canary"]
+fn sandbox_canary_child_probe() {
+    use std::io::Write;
+    let path = std::env::var_os("GREPPY_TEST_SANDBOX_CANARY")
+        .expect("task-owned canary path");
+    let result = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(b"canary-write-attempt\n"));
+    match result {
+        Ok(()) => println!("sandbox-canary-write-allowed"),
+        Err(error) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "canary failed for a reason other than OS write denial: {error}"
+            );
+            println!("sandbox-canary-write-denied");
+        }
+    }
+}
+
 /// Real native startup and DOM read through the confined agent tool. A scripted
 /// gateway selects the tool; the HTTP fixture's opaque title is the oracle.
 /// The compatibility job builds and supplies the actual native runtime.
@@ -514,6 +539,42 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
     let repo = root.join("repo");
     std::fs::create_dir(&repo).unwrap();
     init_repo(&repo);
+    // A separate sibling belongs to this test, but to none of the agent's
+    // worktree, Git, private data, per-run scratch or runtime write roots.
+    // The actual denied write also catches any future overly broad root grant.
+    let canary_dir = unique_temp("outside-confined-web");
+    std::fs::create_dir_all(&canary_dir).unwrap();
+    struct CanaryDirectory(std::path::PathBuf);
+    impl Drop for CanaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _canary_owner = CanaryDirectory(canary_dir.clone());
+    let canary = canary_dir.join("outside-write-canary");
+    let original_canary: &[u8] = b"task-owned-canary-must-not-change\n";
+    std::fs::write(&canary, original_canary).unwrap();
+    let canary = std::fs::canonicalize(canary).unwrap();
+    assert!(!canary.starts_with(std::fs::canonicalize(&root).unwrap()));
+    let probe_binary = std::env::current_exe().unwrap();
+    let probe_args = [
+        "--exact", "sandbox_canary_child_probe",
+        "--ignored", "--nocapture", "--test-threads=1",
+    ];
+    // The same executable and file must really be writable before confinement;
+    // a read-only file, nonexistent path or broken probe cannot pass as denial.
+    let control = Command::new(&probe_binary)
+        .env("GREPPY_TEST_SANDBOX_CANARY", &canary)
+        .args(probe_args)
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success()
+            && String::from_utf8_lossy(&control.stdout).contains("sandbox-canary-write-allowed")
+            && std::fs::read(&canary).unwrap() != original_canary,
+        "unconfined canary control did not perform the real write: {control:?}"
+    );
+    std::fs::write(&canary, original_canary).unwrap();
     let title = format!(
         "native-proof-{}",
         SystemTime::now()
@@ -524,6 +585,16 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
     let html = format!("<!doctype html><title>{title}</title><h1>{title}</h1>");
     let fixture = HttpFixture::start(move |_| http_response(html.as_bytes(), "text/html", ""));
     let responses = vec![
+        web_gateway_response(
+            serde_json::json!({"args":[
+                "bash-smart", "--", "/usr/bin/env",
+                format!("GREPPY_TEST_SANDBOX_CANARY={}", canary.display()),
+                probe_binary.to_str().unwrap(),
+                "--exact", "sandbox_canary_child_probe",
+                "--ignored", "--nocapture", "--test-threads=1"
+            ]}),
+            "toolu_sandbox_canary",
+        ),
         web_gateway_response(
             serde_json::json!({"args":[
                 "web","do","--json","session","new","--profile","project","::",
@@ -558,6 +629,7 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env("GREPPY_WEB_RUNTIME", &runtime)
         .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .env_remove("GREPPY_NO_SANDBOX")
         .args([
             "-p",
             "Read the real page title with the browser",
@@ -570,7 +642,7 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
             "--enable",
             "web",
             "--max-turns",
-            "3",
+            "4",
             "--deadline-secs",
             "30",
             "--json",
@@ -583,18 +655,37 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
     handle.join().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let finishes: Vec<_> = stdout
+    assert_eq!(
+        std::fs::read(&canary).unwrap(),
+        original_canary,
+        "confined tool changed outside-write canary"
+    );
+    let events: Vec<_> = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    let session = events.iter().find(|event| event["type"] == "session")
+        .expect("actual agent session event");
+    assert_eq!(
+        session["sandbox"], "confined",
+        "native agent test did not select confined mode: {stdout}\n{stderr}"
+    );
+    let finishes: Vec<_> = events.iter()
         .filter(|event| event["type"] == "tool_finish")
         .collect();
     let wire = messages.lock().unwrap();
     let mut genuine = std::collections::BTreeSet::new();
     let mut scopes = std::collections::BTreeSet::new();
+    let mut canary_denied = false;
     for request in wire.iter() {
         for message in request["messages"].as_array().into_iter().flatten() {
             for block in message["content"].as_array().into_iter().flatten() {
                 if block["type"] == "tool_result" && block["is_error"] != true {
+                    if block["tool_use_id"] == "toolu_sandbox_canary"
+                        && block.to_string().contains("sandbox-canary-write-denied")
+                    {
+                        canary_denied = true;
+                    }
                     if block.to_string().contains(&title) {
                         genuine.insert(block["tool_use_id"].as_str().unwrap().to_owned());
                     }
@@ -604,10 +695,14 @@ fn confined_web_uses_parent_runtime_and_reads_real_page() {
         }
     }
     assert!(
+        canary_denied,
+        "confined tool did not report real OS canary write denial: {stdout}\n{stderr}"
+    );
+    assert!(
         output.status.success()
             && genuine.contains("toolu_web_first")
             && genuine.contains("toolu_web_reuse")
-            && finishes.len() == 2
+            && finishes.len() == 3
             && finishes.iter().all(|event| event["failed"] == false),
         "confined web tool did not read the genuine native page: {stdout}\n{stderr}"
     );

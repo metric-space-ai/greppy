@@ -59,6 +59,12 @@ def main():
         assert runtime.is_file(), runtime
     require_positive(args.native)
     if args.native:
+        # Keep mode=Enforce and its JSON label, but omit real tool confinement.
+        # Only the actual outside-root write oracle may reject this fault.
+        mutation("crates/agent/src/sandbox.rs",
+                 "SandboxMode::Enforce(spec) => apply_enforce(cmd, bin, args, spec),",
+                 "SandboxMode::Enforce(_) => { *cmd = Command::new(bin); cmd.args(args.iter().map(AsRef::as_ref)); Ok(()) },",
+                 "confined tool changed outside-write canary", True)
         source = "crates/cli/src/web/common.rs"
         mutation(source,
                  "let (run_id, identity) = runtime_run_id(identity_root);",
