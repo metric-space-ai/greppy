@@ -1170,6 +1170,96 @@ fn search_pattern_row_json(
     }))
 }
 
+fn print_search_pattern_line(
+    root_path: &std::path::Path,
+    file: &str,
+    number: i64,
+    text: &str,
+    anchor: Option<usize>,
+) {
+    let preview = source_preview::line(text, anchor);
+    if preview.omitted_before == 0 && preview.omitted_after == 0 {
+        println!("{}", preview.text);
+    } else {
+        println!(
+            "[source preview: {} bytes omitted before; {} after; {} total bytes]",
+            preview.omitted_before,
+            preview.omitted_after,
+            text.len()
+        );
+        println!("{}", preview.text);
+        let file = root_path.join(file);
+        let line = number.max(1);
+        println!(
+            "full source line (current file): greppy read-file {} --lines {line}:{line}",
+            shell_quote_cli(&file.to_string_lossy())
+        );
+    }
+}
+
+fn search_pattern_display_anchor(
+    text: &str,
+    query: &str,
+    mode: PatternMode,
+    pattern: Option<&regex::Regex>,
+) -> Option<usize> {
+    if mode.fixed && mode.ignore_case {
+        text.to_lowercase().find(&query.to_lowercase())
+    } else if mode.fixed {
+        text.find(query)
+    } else {
+        pattern
+            .and_then(|pattern| pattern.find(text))
+            .map(|hit| hit.start())
+    }
+}
+
+fn print_search_pattern_definition_source(
+    row: &SearchPatternRow,
+    root_path: &std::path::Path,
+    query: &str,
+    mode: PatternMode,
+    pattern: Option<&regex::Regex>,
+    shown_definitions: &mut std::collections::HashSet<(String, i64, i64)>,
+) -> Result<bool> {
+    let Some(node) = row.node.as_ref() else {
+        return Ok(false);
+    };
+    let identity = (node.file_path.clone(), node.start_line, node.end_line);
+    if shown_definitions.contains(&identity) {
+        println!(
+            "[definition source already shown; match at line {}]",
+            row.hit.line
+        );
+        return Ok(true);
+    }
+    let graph_row = greppy_search::graph::SearchGraphRow {
+        id: node.id,
+        project: node.project.clone(),
+        label: node.label.clone(),
+        name: node.name.clone(),
+        qualified_name: node.qualified_name.clone(),
+        file_path: node.file_path.clone(),
+        start_line: node.start_line,
+        end_line: node.end_line,
+    };
+    let Some(definition) = search_code_definition_entry(root_path, &graph_row)? else {
+        println!("[incomplete source: definition unavailable; matching line only]");
+        return Ok(false);
+    };
+    shown_definitions.insert(identity);
+    for (offset, line) in definition.source.lines().enumerate() {
+        print_search_pattern_line(
+            root_path,
+            &definition.file,
+            definition.start_line + offset as i64,
+            line,
+            search_pattern_display_anchor(line, query, mode, pattern),
+        );
+    }
+    Ok(true)
+}
+
 fn print_search_pattern_rows(
     rows: &[SearchPatternRow],
     code: bool,
@@ -1177,7 +1267,7 @@ fn print_search_pattern_rows(
     query: &str,
     mode: PatternMode,
     root_path: &std::path::Path,
-) {
+) -> Result<()> {
     let fixed = mode.fixed;
     const FULL_LIMIT: usize = 25;
     // Five rows made agents re-query for the next page on every larger
@@ -1205,7 +1295,6 @@ fn print_search_pattern_rows(
         });
     }
     if !buffered && shown < rows.len() {
-        // A limited query must not list every omitted file in its preamble.
         println!(
             "— {} matches in {} files; showing {}",
             rows.len(),
@@ -1224,6 +1313,7 @@ fn print_search_pattern_rows(
     } else {
         None
     };
+    let mut shown_definitions = std::collections::HashSet::new();
     let mut context_files: std::collections::HashMap<String, Option<Vec<String>>> =
         Default::default();
     for (index, row) in rows.iter().skip(start).take(shown).enumerate() {
@@ -1240,32 +1330,25 @@ fn print_search_pattern_rows(
             println!("{}:{}", row.hit.file, row.hit.line.max(1));
         }
         if code {
-            let anchor = if fixed && mode.ignore_case {
-                row.hit.text.to_lowercase().find(&query.to_lowercase())
-            } else if fixed {
-                row.hit.text.find(query)
-            } else {
-                display_regex
-                    .as_ref()
-                    .and_then(|pattern| pattern.find(&row.hit.text))
-                    .map(|hit| hit.start())
-            };
-            let preview = source_preview::line(&row.hit.text, anchor);
-            if preview.omitted_before == 0 && preview.omitted_after == 0 {
-                println!("{}", preview.text);
-            } else {
-                println!(
-                    "[source preview: {} bytes omitted before; {} after; {} total bytes]",
-                    preview.omitted_before,
-                    preview.omitted_after,
-                    row.hit.text.len()
-                );
-                println!("{}", preview.text);
-                let file = root_path.join(&row.hit.file);
-                let line = row.hit.line.max(1);
-                println!(
-                    "full source line (current file): greppy read-file {} --lines {line}:{line}",
-                    shell_quote_cli(&file.to_string_lossy())
+            if !print_search_pattern_definition_source(
+                row,
+                root_path,
+                query,
+                mode,
+                display_regex.as_ref(),
+                &mut shown_definitions,
+            )? {
+                print_search_pattern_line(
+                    root_path,
+                    &row.hit.file,
+                    row.hit.line,
+                    &row.hit.text,
+                    search_pattern_display_anchor(
+                        &row.hit.text,
+                        query,
+                        mode,
+                        display_regex.as_ref(),
+                    ),
                 );
             }
             if index + 1 < shown {
@@ -1291,6 +1374,7 @@ fn print_search_pattern_rows(
         }
         record_nav_text_row(start + index, row_start);
     }
+    Ok(())
 }
 
 /// How `search-pattern` matches and how much surrounding source it prints:
@@ -1453,7 +1537,7 @@ pub(crate) fn dispatch_search_code(
         // status block above carries the guidance.
         return Ok(1);
     }
-    print_search_pattern_rows(&rows, code, all, q, mode, &root_path);
+    print_search_pattern_rows(&rows, code, all, q, mode, &root_path)?;
     Ok(0)
 }
 
