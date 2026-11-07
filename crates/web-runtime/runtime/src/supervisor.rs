@@ -375,6 +375,28 @@ fn fixture_url_grants_project_loopback(fixture_url: &str) -> bool {
     )
 }
 
+fn strip_controller_download_authority(method: &str, params: &mut serde_json::Value) {
+    if method == "session.setProfile" {
+        if let Some(object) = params.as_object_mut() {
+            object.remove("__download_session");
+            object.remove("max_download_bytes");
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn controller_cannot_replace_download_session_authority() {
+    let mut params = serde_json::json!({
+        "profile": "project", "__download_session": "foreign-session",
+        "max_download_bytes": u64::MAX,
+    });
+    strip_controller_download_authority("session.setProfile", &mut params);
+    assert!(params.get("__download_session").is_none(), "controller replaced download session authority");
+    assert!(params.get("max_download_bytes").is_none(), "controller replaced download byte authority");
+    assert_eq!(params["profile"], "project");
+}
+
 pub(crate) trait EngineGate {
     fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String>;
     fn after_call(&mut self, _method: &str, _params: &serde_json::Value, _ok: bool, _result: &serde_json::Value) -> Result<(), String> {
@@ -526,6 +548,7 @@ pub(crate) fn route_until_script_complete_gated(
                     wait_point = format!("content:{method}");
                     phase!("web-runtime: phase run-wait point={wait_point}");
                     let mut params = params;
+                    strip_controller_download_authority(&method, &mut params);
                     if let Err(error) = content.prepare_engine_params(&method, &mut params) {
                         let _ = gate.after_call(&method, &params, false, &serde_json::Value::Null);
                         controller.send_timeout(

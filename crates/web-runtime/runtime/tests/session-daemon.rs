@@ -17,8 +17,13 @@ use web_runtime::worker::give_child_attach_token;
 
 #[path = "cases/workflow_cases.rs"]
 mod workflow_cases;
+
 #[path = "support/navigation_fixture_stream.rs"]
 mod navigation_fixture_stream;
+
+#[path = "support/recorded_http_fixture.rs"]
+mod recorded_http_fixture;
+
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const SOCKET_WAIT: Duration = Duration::from_secs(30);
@@ -4704,6 +4709,236 @@ fn download_is_recorded_from_fulfilled_binary() {
     run.deadline_ms = 60_000;
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn real_http_download_wait_allows_click_and_owns_complete_file() {
+    use recorded_http_fixture::{http_response, HttpFixture};
+    let payload: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
+    let served_payload = payload.clone();
+    let second_payload: Vec<u8> = payload.iter().map(|byte| byte ^ 0xa5).collect();
+    let served_second = second_payload.clone();
+    let _server = HttpFixture::start(move |path| {
+        let (body, content_type, disposition) = if path == "/file-second" {
+            (served_second.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"second.bin\"\r\n")
+        } else if path == "/file" || path == "/background.bin" {
+            (served_payload.as_slice(), "application/octet-stream", "Content-Disposition: attachment; filename=\"fixture.bin\"\r\n")
+        } else {
+            (b"<!doctype html><button id='trigger' onclick=\"fetch('/signal')\">Trigger</button><a id='download' href='/file' download>Download</a><a id='second' href='/file-second' download>Second</a>".as_slice(), "text/html", "")
+        };
+        http_response(body, content_type, disposition)
+    });
+    let origin = _server.origin.clone();
+    let requests = Arc::clone(&_server.requests);
+    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("greppy-http-download-{}", std::process::id())));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("runtime.sock");
+    let _guard = Supervisor::spawn(&socket, "real_http_download", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(&socket, &Request::new("real_http_download", "web.session.create",
+        json!({"profile": "project"})), Duration::from_secs(10)).unwrap();
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let script = dir.join("download.mjs");
+    let source = r##"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+page.setDefaultTimeout(50);
+let timedOut = false;
+try { await page.waitForResponse("/never-requested"); }
+catch (error) {
+  if (error.name !== "TimeoutError" || !String(error.message).includes("waitForResponse")) throw error;
+  timedOut = true;
+}
+if (!timedOut) throw new Error("missing response did not preserve its timeout");
+page.setDefaultTimeout(2000);
+const [request, response] = await Promise.all([
+  page.waitForRequest("/signal"), page.waitForResponse("/signal"),
+  page.locator("#trigger").click()
+]);
+if (request.url() !== fixtureUrl + "signal" || response.url() !== request.url() || !response.ok())
+  throw new Error("recorded request/response wait blocked its triggering click");
+page.setDefaultTimeout(50);
+for (const method of ["waitForRequest", "waitForResponse"]) {
+  let expired = false;
+  try { await page[method]("/signal"); }
+  catch (error) {
+    if (error.name !== "TimeoutError") throw error;
+    expired = true;
+  }
+  if (!expired) throw new Error(method + " replayed retained history");
+}
+page.setDefaultTimeout(2000);
+await page.evaluate(() => {
+  document.querySelector("#trigger").onclick = () => fetch("/signal?next=1");
+});
+const [nextRequest, sameRequest, nextResponse] = await Promise.all([
+  page.waitForRequest("/signal"), page.waitForRequest("/signal"),
+  page.waitForResponse("/signal"), page.locator("#trigger").click()
+]);
+if (nextRequest.url() !== fixtureUrl + "signal?next=1" || sameRequest.url() !== nextRequest.url())
+  throw new Error("second request wait reused retained history");
+if (nextResponse.url() !== nextRequest.url() || !nextResponse.ok())
+  throw new Error("second response wait reused retained history");
+// An ordinary fetch of the same MIME/attachment headers is not a download.
+await page.evaluate(async url => { await (await fetch(url)).arrayBuffer(); }, fixtureUrl + "background.bin");
+const events = [];
+context.on("download", d => events.push(d.suggestedFilename()));
+const [download] = await Promise.all([
+  page.waitForEvent("download"), page.locator("#download").click()
+]);
+if (download.suggestedFilename() !== "fixture.bin") throw new Error("wrong HTTP download filename");
+if (download.url() !== fixtureUrl + "file") throw new Error("ordinary fetch fabricated a download");
+if (await download.failure()) throw new Error("HTTP download failed");
+if (events.join() !== "fixture.bin") throw new Error("download event missing or duplicated");
+const original = await download.path();
+if (!original) throw new Error("native download has no path");
+await download.saveAs(original);
+await download.saveAs(original + ".copy");
+// Reopen in the same live page/session; its native download history remains.
+await page.goto(fixtureUrl);
+const [second, same] = await Promise.all([
+  page.waitForEvent("download"), page.waitForEvent("download"), page.locator("#second").click()
+]);
+if (second.suggestedFilename() !== "second.bin" || same.suggestedFilename() !== "second.bin")
+  throw new Error("second download reused first event");
+const secondPath = await second.path();
+if (!secondPath || secondPath === original || secondPath !== await same.path())
+  throw new Error("simultaneous download listeners disagree on the second file");
+if (events.join() !== "fixture.bin,second.bin") throw new Error("physical download event emitted more than once");
+console.log(JSON.stringify({ original, saved: await download.path(), second: secondPath }));
+"##;
+    std::fs::write(&script, source).unwrap();
+    let mut request = Request::new("real_http_download", "web.run", json!({
+        "session_id": session, "script_source": "file",
+        "script_file": script, "script_text": source,
+    }));
+    request.deadline_ms = 30_000;
+    let result = unix_request(&socket, &request, Duration::from_secs(35)).unwrap();
+    assert_eq!(result.status, "ok", "download Promise.all failed: {result:?}; HTTP paths={:?}", requests.lock().unwrap());
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/file").count(), 1,
+        "download must use exactly one real HTTP request");
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/file-second").count(), 1,
+        "second download must use exactly one new HTTP request");
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal").count(), 1,
+        "recorded request and response waits must allow exactly one triggering fetch");
+    assert_eq!(requests.lock().unwrap().iter().filter(|path| path.as_str() == "/signal?next=1").count(), 1,
+        "second request/response waits must allow exactly one new triggering fetch");
+    assert!(!requests.lock().unwrap().iter().any(|path| path == "/never-requested"),
+        "a response wait must never issue its own request");
+    let stdout = result.result.as_ref().unwrap()["stdout"].as_str().unwrap().trim();
+    let files: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let original = PathBuf::from(files["original"].as_str().unwrap());
+    let saved = PathBuf::from(files["saved"].as_str().unwrap());
+    let second = PathBuf::from(files["second"].as_str().unwrap());
+    assert_eq!(std::fs::read(&original).unwrap(), payload, "original HTTP download bytes");
+    assert_eq!(std::fs::read(&saved).unwrap(), payload, "saved HTTP download bytes");
+    assert_eq!(std::fs::read(&second).unwrap(), second_payload, "second HTTP download bytes must differ");
+    let closed = unix_request(&socket, &Request::new("real_http_download", "web.session.close",
+        json!({"session_id":session})), Duration::from_secs(10)).unwrap();
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    assert!(!original.exists(), "session close leaked its captured download file");
+    assert!(!second.exists(), "session close leaked its second download file");
+    let _ = std::fs::remove_file(saved);
+}
+
+#[test]
+fn native_download_staging_shares_session_quota_across_contexts() {
+    use recorded_http_fixture::{http_response, HttpFixture};
+    let _server = HttpFixture::start(|path| {
+        let (body, kind, disposition) = if path == "/file" {
+            (b"12345678".as_slice(), "application/octet-stream",
+             "Content-Disposition: attachment; filename=quota.bin\r\n")
+        } else {
+            (b"<!doctype html><a id='download' href='/file' download>Download</a>".as_slice(),
+             "text/html", "")
+        };
+        http_response(body, kind, disposition)
+    });
+    let origin = _server.origin.clone();
+    let dir = TempDirGuard::at(std::env::temp_dir().join(format!("gq-{}", std::process::id())));
+    let capture = dir.join("capture");
+    std::fs::create_dir_all(&capture).unwrap();
+    let socket = dir.join("runtime.sock");
+    let _guard = Supervisor::spawn(&socket, "native_quota", |command| {
+        command.arg("--fixture-url").arg(&origin).env("TMPDIR", &capture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let create = || {
+        let result = unix_request(&socket, &Request::new("native_quota", "web.session.create",
+            json!({"profile":"project","limits":{"max_download_bytes":10}})), Duration::from_secs(10)).unwrap();
+        assert_eq!(result.status, "ok", "{result:?}");
+        result.result.unwrap()["session_id"].as_str().unwrap().to_owned()
+    };
+    let run = |session: &str, name: &str, source: &str| {
+        let script = dir.join(name);
+        std::fs::write(&script, source).unwrap();
+        let mut request = Request::new("native_quota", "web.run", json!({
+            "session_id":session,"script_source":"file","script_file":script,"script_text":source,
+        }));
+        request.deadline_ms = 30_000;
+        unix_request(&socket, &request, Duration::from_secs(35)).unwrap()
+    };
+    let first = r##"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+page.setDefaultTimeout(2000);
+const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#download").click()]);
+if (await download.failure()) throw new Error("first download failed");
+console.log(JSON.stringify({ path: await download.path() }));
+"##;
+    let a = create();
+    let b = create();
+    let first_a = run(&a, "a-first.mjs", first);
+    assert_eq!(first_a.status, "ok", "{first_a:?}");
+    let path = |response: &greppy_web_client::Response| {
+        let stdout = response.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        PathBuf::from(value["path"].as_str().unwrap())
+    };
+    let a_path = path(&first_a);
+    assert_eq!(std::fs::read(&a_path).unwrap(), b"12345678");
+    let first_b = run(&b, "b-first.mjs", first);
+    assert_eq!(first_b.status, "ok", "foreign session consumed download quota: {first_b:?}");
+    let b_path = path(&first_b);
+    assert_ne!(a_path, b_path);
+    assert_eq!(std::fs::read(&b_path).unwrap(), b"12345678");
+    let refused = run(&a, "a-second-context.mjs", r##"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const context = await browser.newContext();
+const page = await context.newPage();
+await page.goto(fixtureUrl);
+page.setDefaultTimeout(2000);
+const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#download").click()]);
+if (!String(await download.failure()).includes("resource_limit"))
+  throw new Error("cross-context staging quota bypassed");
+let rejected = false;
+try { await download.path(); } catch { rejected = true; }
+if (!rejected) throw new Error("refused download exposed a successful path");
+"##);
+    if refused.status != "ok" {
+        assert_eq!(refused.error.as_ref().unwrap().code, "resource_limit", "{refused:?}");
+    }
+    assert_eq!(std::fs::read(&b_path).unwrap(), b"12345678",
+        "quota refusal in A damaged session B");
+    for session in [&a, &b] {
+        let closed = unix_request(&socket, &Request::new("native_quota", "web.session.close",
+            json!({"session_id":session})), Duration::from_secs(10)).unwrap();
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(!a_path.exists() && !b_path.exists(), "session closure retained staged files");
+    assert_eq!(std::fs::read_dir(&capture).unwrap().filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("greppy-download-")).count(), 0,
+        "native staging retained a refused or closed file");
 }
 
 #[test]

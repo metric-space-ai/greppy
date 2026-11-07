@@ -2344,6 +2344,7 @@ async fn http_network_fetch(
         .await
         .embedder_proxy();
     let completed_embedder = response_embedder.clone();
+    let download_budget = context.request_interceptor.lock().await.download_budget();
     let failed_embedder = response_embedder;
     let completed_request = devtools_request.clone();
     let failed_request = devtools_request.clone();
@@ -2391,6 +2392,9 @@ async fn http_network_fetch(
                 };
                 let devtools_response_body = completed_body.clone();
                 let body_bytes = completed_body.len() as u64;
+                let download = if matches!(&completed_request.destination, content_security_policy::Destination::Document) {
+                    embedder_traits::CapturedWebResourceDownload::capture(&completed_headers, &completed_body, download_budget)
+                } else { None };
                 *body = ResponseBody::Done(completed_body);
                 send_response_values_to_devtools(
                     Some(headers),
@@ -2412,6 +2416,7 @@ async fn http_network_fetch(
                         status_code: Some(completed_status.as_u16()),
                         status_message: completed_status_message,
                         body_bytes,
+                        download,
                         from_cache: false,
                         failure: None,
                     },
@@ -2449,6 +2454,7 @@ async fn http_network_fetch(
                         status_code: Some(failed_status.as_u16()),
                         status_message: failed_status_message,
                         body_bytes,
+                        download: None,
                         from_cache: false,
                         failure: Some(failure),
                     },

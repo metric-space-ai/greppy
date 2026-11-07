@@ -2,6 +2,8 @@
 #[path = "../tests/support/navigation_fixture_stream.rs"]
 mod navigation_fixture_stream_contract;
 pub mod artifacts;
+#[cfg(test)]
+mod download_staging;
 #[cfg(feature = "controller-runtime")]
 pub mod controller_worker;
 #[cfg(feature = "content-runtime")]
