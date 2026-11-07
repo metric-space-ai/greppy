@@ -1968,7 +1968,11 @@ fn run_headless_session(
                 summary.last_stop = Some(LoopStop::Cancelled);
                 Ok(summary)
             } else {
-                Err(message)
+                eprintln!("greppy -p: agent error: {message}");
+                // The common finish path saves edits, keeps the error exit,
+                // and refuses automatic application of a failed proposal.
+                summary.error = Some(message);
+                Ok(summary)
             }
         }
     }
