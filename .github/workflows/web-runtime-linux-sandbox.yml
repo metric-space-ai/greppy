@@ -261,6 +261,9 @@ jobs:
       - name: Prove actionability timeout diagnostics never invent DOM evidence
         run: python3 tools/check_unobserved_dom_deadline_mutations.py
 
+      - name: Prove HTML fixtures release listener, thread, connections and owned body
+        run: python3 tools/check_owned_html_fixture_mutations.py
+
       - name: Check coalesced heartbeat lifetime and receipt clocks
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
