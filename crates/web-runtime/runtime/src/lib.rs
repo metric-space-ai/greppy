@@ -15,6 +15,10 @@ pub mod limits;
 pub mod linux_sandbox;
 mod observed_refs;
 #[cfg(unix)]
+mod operation_control;
+#[cfg(unix)]
+mod heartbeat_inbox;
+#[cfg(unix)]
 mod fork_exec_window;
 mod locator_diagnostics;
 mod wait_contract;

@@ -145,6 +145,55 @@ jobs:
 
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
+      - name: Check cancellation identity and completed-receipt memory lifetime
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features operation_control -- --test-threads=1 --nocapture
+
+      - name: Prove finished operations cannot remain active
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/operation_control.rs')
+          original = source.read_text()
+          old = 'state.active.take()'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'finished_runs_are_not_active_and_old_cancellation_cannot_reach_a_new_run',
+                     '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'state.active.clone()'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'finished operation remained active or cancellable' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove kernel private memory detects leaked completion receipts
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/operation_control.rs')
+          original = source.read_text()
+          old = 'state.completed = Some(pair);'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'completion_receipts_release_private_memory_after_cancelled_runs',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, 'std::mem::forget(state.completed.replace(pair));'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'completed cancellation receipts retained private memory' in (result.stdout + result.stderr)
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
       - name: Check concurrent fork exec cannot capture unsealed sibling descriptors
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
@@ -174,6 +223,82 @@ jobs:
           subprocess.run(command, check=True, timeout=180)
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
+      - name: Check bounded supervisor inbox and moved request payloads
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features request_inbox_tests -- --test-threads=1
+
+      - name: Prove excess-request and payload-copy regressions are detected
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          cases = [
+              ('mpsc::sync_channel(1)', 'mpsc::sync_channel(2)',
+               'saturated_inbox_rejects_excess_work_without_blocking_control',
+               'saturated supervisor inbox did not reject the excess request'),
+              ('std::panic::AssertUnwindSafe(|| handle(request))',
+               'std::panic::AssertUnwindSafe(|| handle(request.clone()))',
+               'dispatch_moves_payload_and_preserves_panic_correlation',
+               'dispatch copied the full request payload'),
+          ]
+          for old, mutant, case, marker in cases:
+              assert original.count(old) == 1
+              command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                         '-p', 'web-runtime', '--lib', '--no-default-features',
+                         case, '--', '--test-threads=1']
+              try:
+                  source.write_text(original.replace(old, mutant))
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and marker in (result.stdout + result.stderr)
+              finally:
+                  source.write_text(original)
+              subprocess.run(command, check=True, timeout=180)
+              subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check coalesced heartbeat lifetime and receipt clocks
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features heartbeat -- --test-threads=1 --nocapture
+
+      - name: Prove heartbeat replay retention and clock regressions are detected
+        shell: python
+        run: |
+          import pathlib, subprocess
+          cases = [
+              ('crates/web-runtime/runtime/src/heartbeat_inbox.rs',
+               'entry.received.take()', 'entry.received',
+               'known_sessions_coalesce_and_consumed_or_closed_receipts_do_not_replay',
+               'drained heartbeat was replayed'),
+              ('crates/web-runtime/runtime/src/heartbeat_inbox.rs',
+               'entry.received = Some(entry.received.map_or(received, |old| old.max(received)));',
+               'entry.received = Some(entry.received.map_or(received, |old| old.max(received)));\n        std::mem::forget(session.to_owned());',
+               'repeated_heartbeats_release_private_memory_in_a_fresh_process',
+               'heartbeat receipts retained private memory'),
+              ('crates/web-runtime/runtime/src/daemon.rs',
+               'session.last_heartbeat = session.last_heartbeat.max(received);',
+               'session.last_heartbeat = Instant::now();',
+               'heartbeat_receipts_refresh_only_their_session_at_the_actual_receipt_time',
+               'queued heartbeat must retain actual receipt time'),
+          ]
+          for path, old, mutant, case, marker in cases:
+              source = pathlib.Path(path)
+              original = source.read_text()
+              assert original.count(old) == 1
+              command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                         '-p', 'web-runtime', '--lib', '--no-default-features',
+                         case, '--', '--test-threads=1', '--nocapture']
+              try:
+                  source.write_text(original.replace(old, mutant))
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and marker in (result.stdout + result.stderr)
+              finally:
+                  source.write_text(original)
+              subprocess.run(command, check=True, timeout=180)
+              subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
       - name: Prove failed worker preparation releases kernel descriptors
         run: python3 tools/check_worker_fd_mutation.py
 

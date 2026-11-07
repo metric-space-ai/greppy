@@ -9980,19 +9980,16 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
         controller_generation_after > controller_generation_before,
         "controller generation must increase, before={controller_generation_before} after={controller_generation_after}"
     );
-    let follow = unix_request(
-        &socket,
-        &Request::new(
-            "run_cancel",
-            "web.run",
-            json!({
-                "session_id": other_id,
-                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto(\"about:blank\");\nawait page.evaluate(() => document.readyState);\nawait browser.close();\n"
-            }),
-        ),
-        Duration::from_secs(40),
-    )
-    .expect("follow-up web.run");
+    let follow_request = Request::new(
+        "run_cancel",
+        "web.run",
+        json!({
+            "session_id": other_id,
+            "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto(\"about:blank\");\nawait page.evaluate(() => document.readyState);\nawait browser.close();\n"
+        }),
+    );
+    let follow = unix_request(&socket, &follow_request, Duration::from_secs(40))
+        .expect("follow-up web.run");
     assert_eq!(
         follow.status, "ok",
         "worker must remain usable after cancel: {follow:?}"
@@ -10004,6 +10001,29 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             .and_then(|value| value.get("completed")),
         Some(&json!(true)),
         "{follow:?}"
+    );
+    let after_success = unix_request(
+        &socket,
+        &Request::new(
+            "run_cancel",
+            "web.cancel",
+            json!({
+                "session_id": other_id,
+                "target_request_id": follow_request.request_id
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("cancel completed successful run");
+    assert_eq!(
+        after_success.result.as_ref().unwrap()["cancelled"],
+        json!(false),
+        "finished successful web.run remained cancellable: {after_success:?}"
+    );
+    assert_eq!(
+        after_success.result.as_ref().unwrap()["reason"],
+        json!("already_completed"),
+        "latest completed operation must retain a bounded diagnostic receipt"
     );
     drop(guard);
     assert_no_leftover_web_runtime_processes("run_cancel");
@@ -11881,6 +11901,85 @@ fn web_read_metrics_include_network_and_rss() {
         "expected sampled content rss, got {:?}",
         read.metrics
     );
+}
+
+#[test]
+fn heartbeats_keep_only_their_idle_session_alive_and_stop_after_receipts_end() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-hbidle-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_heartbeat_idle", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let create = || {
+        let response = unix_request(
+            &socket,
+            &Request::new(
+                "run_heartbeat_idle",
+                "web.session.create",
+                json!({ "profile": "project", "limits": { "idle_ttl_ms": 2000 } }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("create heartbeat session");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let kept = create();
+    let untouched = create();
+    let list = || {
+        let response = unix_request(
+            &socket,
+            &Request::new("run_heartbeat_idle", "web.session.list", json!({})),
+            Duration::from_secs(5),
+        )
+        .expect("list heartbeat sessions");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(200));
+        let beat = unix_request(
+            &socket,
+            &Request::new(
+                "run_heartbeat_idle",
+                "web.heartbeat",
+                json!({ "session_id": kept }),
+            ),
+            Duration::from_secs(5),
+        )
+        .expect("heartbeat outside web.run");
+        assert_eq!(beat.status, "ok", "{beat:?}");
+        let rows = list();
+        assert!(
+            rows.iter().any(|row| row["session_id"] == kept),
+            "idle session was reaped despite valid heartbeats: {rows:?}"
+        );
+    }
+    let rows = list();
+    assert!(
+        !rows.iter().any(|row| row["session_id"] == untouched),
+        "heartbeat kept an unrelated idle session alive: {rows:?}"
+    );
+    let expires = Instant::now() + Duration::from_secs(4);
+    loop {
+        let rows = list();
+        if !rows.iter().any(|row| row["session_id"] == kept) {
+            break;
+        }
+        assert!(
+            Instant::now() < expires,
+            "session remained alive after heartbeats stopped: {rows:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_heartbeat_idle");
 }
 
 #[test]
