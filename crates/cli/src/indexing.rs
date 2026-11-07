@@ -552,7 +552,7 @@ fn compact_health_keeps_failed_inference_reason() {
 fn published_coverage_warning(
     indexed_files: Option<u64>,
     graph_generation: Option<u64>,
-    git_tracked: Option<u64>,
+    git_tracked: Option<GitTrackedFiles>,
 ) -> Option<String> {
     // An allocated store is not a published graph. In particular, admission
     // can leave an empty store without ever running discovery.
@@ -561,9 +561,10 @@ fn published_coverage_warning(
     else {
         return None;
     };
+    let tracked = tracked.non_skip_worktree();
     (tracked >= 100 && indexed_files.saturating_mul(5) < tracked).then(|| {
         format!(
-            "store indexed {indexed_files} files but git tracks {tracked} — \
+            "store indexed {indexed_files} files but git tracks {tracked} non-skip-worktree files — \
              discovery may be dropping files (nested-repo ignore rules?); \
              re-run `greppy index` with the current binary"
         )
@@ -573,13 +574,35 @@ fn published_coverage_warning(
 #[cfg(test)]
 #[test]
 fn coverage_warning_requires_publication_but_keeps_real_underindexing_visible() {
-    assert!(published_coverage_warning(None, None, Some(1063)).is_none());
-    assert!(published_coverage_warning(Some(0), None, Some(1063)).is_none());
-    assert!(published_coverage_warning(None, Some(1), Some(1063)).is_none());
-    let warning = published_coverage_warning(Some(0), Some(1), Some(1063)).unwrap();
+    let full = |total| {
+        Some(GitTrackedFiles {
+            total,
+            skip_worktree: 0,
+        })
+    };
+    assert!(published_coverage_warning(None, None, full(1063)).is_none());
+    assert!(published_coverage_warning(Some(0), None, full(1063)).is_none());
+    assert!(published_coverage_warning(None, Some(1), full(1063)).is_none());
+    let warning = published_coverage_warning(Some(0), Some(1), full(1063)).unwrap();
     assert!(warning.contains("store indexed 0 files but git tracks 1063"));
-    assert!(published_coverage_warning(Some(100), Some(1), Some(101)).is_none());
-    assert!(published_coverage_warning(Some(0), Some(1), Some(99)).is_none());
+    assert!(published_coverage_warning(Some(100), Some(1), full(101)).is_none());
+    assert!(published_coverage_warning(Some(0), Some(1), full(99)).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn coverage_warning_respects_sparse_scope_without_hiding_real_gaps() {
+    let sparse = Some(GitTrackedFiles {
+        total: 1220,
+        skip_worktree: 1100,
+    });
+    assert!(published_coverage_warning(Some(120), Some(1), sparse).is_none());
+    assert!(published_coverage_warning(Some(0), Some(1), sparse).is_some());
+    let full = Some(GitTrackedFiles {
+        total: 1220,
+        skip_worktree: 0,
+    });
+    assert!(published_coverage_warning(Some(120), Some(1), full).is_some());
 }
 
 fn background_health_state(
@@ -1424,7 +1447,7 @@ fn dispatch_index_health_with_detail(
     //     O9-class) shows up as a tiny fraction of the tracked files.
     //   * vectors: a configured embedding model with zero stored vectors
     //     means every semantic query silently degrades to lexical.
-    let git_tracked = git_tracked_file_count(&effective_root);
+    let git_tracked = git_tracked_file_counts(&effective_root);
     let coverage_warning = published_coverage_warning(
         project_diag.map(|p| p.stats.file_count as u64),
         graph_generation,
@@ -1460,7 +1483,8 @@ fn dispatch_index_health_with_detail(
     let js_ts_usage_repair_skips = js_ts_usage_repair_skip_diagnostic(&store);
 
     if json {
-        let value = serde_json::json!({
+        let git_tracked_total = git_tracked.map(|counts| counts.total);
+        let mut value = serde_json::json!({
             "command": command,
             "status": status_label,
             "healthy": healthy,
@@ -1494,7 +1518,7 @@ fn dispatch_index_health_with_detail(
             "provider_failure_count": provider_failure_count,
             "providers": provider_states,
             "skip_counts_by_reason": skip_counts,
-            "git_tracked_files": git_tracked,
+            "git_tracked_files": git_tracked_total,
             "coverage_warning": coverage_warning,
             "vectors_missing_with_model": vectors_missing_with_model,
             "inference_healthy": inference_healthy,
@@ -1503,6 +1527,11 @@ fn dispatch_index_health_with_detail(
             "inference": inference_diagnostics,
             "js_ts_usage_repair_skips": js_ts_usage_repair_skips,
         });
+        // Keep supplementary scope evidence outside the large json! expansion.
+        value["git_skip_worktree_files"] =
+            serde_json::json!(git_tracked.map(|counts| counts.skip_worktree));
+        value["git_tracked_non_skip_worktree_files"] =
+            serde_json::json!(git_tracked.map(GitTrackedFiles::non_skip_worktree));
         println!(
             "{}",
             serde_json::to_string_pretty(&index_health_output(value, detailed))
