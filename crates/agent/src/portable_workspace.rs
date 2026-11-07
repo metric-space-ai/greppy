@@ -784,18 +784,11 @@ impl AgentWorkspace {
         self.finish_with_ref(message, format!("{}-turn-{sequence}", self.ref_name()))
     }
 
-    fn finish_with_ref(
+    /// Stage raw backend paths through one shared ignore/index/hardlink policy.
+    fn stage_proposal_paths(
         &self,
-        message: &str,
-        ref_name: String,
-    ) -> Result<RunOutcome, WorkspaceError> {
-        self.verify_identity()?;
-        let backend_changed_paths = match &self.backend {
-            WorkspaceBackend::Provider { .. } => self.core.changed_paths(&self.handle)?,
-            WorkspaceBackend::Ordinary { .. } => {
-                ordinary_changed_paths(&self.worktree, &self.private_index, &self.baseline_tree)?
-            }
-        };
+        backend_changed_paths: Vec<String>,
+    ) -> Result<Vec<Vec<String>>, WorkspaceError> {
         let changed_paths = filter_agent_owned_ephemeral_paths(
             &self.worktree,
             &self.baseline_tree,
@@ -804,8 +797,15 @@ impl AgentWorkspace {
         let excluded_paths: Vec<_> = backend_changed_paths
             .iter()
             .filter(|path| !changed_paths.contains(path) && is_web_ephemeral_path(path))
-            .map(|path| format!(":(literal,exclude){path}"))
+            .cloned()
             .collect();
+        // Git already excludes ignored metadata. An explicit negative pathspec
+        // below an ignored directory makes `git add` reject that directory.
+        let excluded_paths: Vec<_> =
+            filter_ignored_paths(&self.worktree, &self.private_index, excluded_paths)?
+                .into_iter()
+                .map(|path| format!(":(literal,exclude){path}"))
+                .collect();
         let changed_paths =
             filter_ignored_paths(&self.worktree, &self.private_index, changed_paths)?;
         let hardlink_groups = match &self.backend {
@@ -819,10 +819,31 @@ impl AgentWorkspace {
             )?,
         };
         if !changed_paths.is_empty() {
-            let mut arguments = vec!["add", "-A", "--"];
-            arguments.extend(changed_paths.iter().map(String::as_str));
-            arguments.extend(excluded_paths.iter().map(String::as_str));
-            git_with_index(&self.worktree, &self.private_index, &arguments)?;
+            let mut query = vec!["ls-files", "-z", "--"];
+            query.extend(changed_paths.iter().map(String::as_str));
+            let tracked = git_with_index(&self.worktree, &self.private_index, &query)?;
+            let tracked: std::collections::HashSet<_> = tracked
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .collect();
+            let (tracked_paths, new_paths): (Vec<_>, Vec<_>) = changed_paths
+                .iter()
+                .map(String::as_str)
+                .partition(|path| tracked.contains(path));
+            if !tracked_paths.is_empty() {
+                // Even an already tracked file under an ignored directory can
+                // make add -A return an ignored-path error after staging it.
+                // Update known entries without asking Git to add ignored paths.
+                let mut arguments = vec!["add", "-u", "--"];
+                arguments.extend(tracked_paths);
+                git_with_index(&self.worktree, &self.private_index, &arguments)?;
+            }
+            if !new_paths.is_empty() {
+                let mut arguments = vec!["add", "-A", "--"];
+                arguments.extend(new_paths);
+                arguments.extend(excluded_paths.iter().map(String::as_str));
+                git_with_index(&self.worktree, &self.private_index, &arguments)?;
+            }
         }
         stage_hardlink_groups(
             &self.core,
@@ -832,6 +853,22 @@ impl AgentWorkspace {
             &hardlink_groups,
             matches!(&self.backend, WorkspaceBackend::Provider { .. }),
         )?;
+        Ok(hardlink_groups)
+    }
+
+    fn finish_with_ref(
+        &self,
+        message: &str,
+        ref_name: String,
+    ) -> Result<RunOutcome, WorkspaceError> {
+        self.verify_identity()?;
+        let backend_changed_paths = match &self.backend {
+            WorkspaceBackend::Provider { .. } => self.core.changed_paths(&self.handle)?,
+            WorkspaceBackend::Ordinary { .. } => {
+                ordinary_changed_paths(&self.worktree, &self.private_index, &self.baseline_tree)?
+            }
+        };
+        let hardlink_groups = self.stage_proposal_paths(backend_changed_paths)?;
         let final_tree = git_with_index(&self.worktree, &self.private_index, &["write-tree"])?;
         if final_tree == self.baseline_tree {
             return Ok(RunOutcome::Clean);
@@ -7190,6 +7227,87 @@ mod tests {
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&replacement, &path).unwrap();
         assert!(verify_ordinary_identity(&root, "run", "git-run", "nonce").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_finish_ignored_runtime_metadata_does_not_block_proposal() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir_all(repo.join(".greppy/web/runtime-routes")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        let baseline_route = format!(".greppy/web/runtime-routes/{}.json", "b".repeat(64));
+        fs::write(repo.join(&baseline_route), b"user baseline").unwrap();
+        git(&repo, &["add", ".greppy"]);
+        git(&repo, &["commit", "-qm", "tracked user route"]);
+        fs::write(repo.join(".gitignore"), b".greppy/\n").unwrap();
+        fs::write(repo.join("source.txt"), b"before\n").unwrap();
+        git(&repo, &["add", ".gitignore", "source.txt"]);
+        git(
+            &repo,
+            &["commit", "-qm", "ignore newly generated runtime files"],
+        );
+        let index_before = fs::read(repo.join(".git/index")).unwrap();
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "ignored-web-runtime").unwrap();
+        let route = format!(".greppy/web/runtime-routes/{}.json", "a".repeat(64));
+        fs::write(workspace.worktree_path().join(&route), b"runtime only").unwrap();
+        fs::write(
+            workspace.worktree_path().join(&baseline_route),
+            b"user change",
+        )
+        .unwrap();
+        fs::write(workspace.worktree_path().join("source.txt"), b"after\n").unwrap();
+        fs::write(workspace.worktree_path().join("added.txt"), b"new source\n").unwrap();
+        // A provider journal reports ignored writes, unlike ordinary Git
+        // discovery. Exercise the actual shared staging boundary with that raw
+        // path, then publish through the normal ordinary finish as well.
+        let mut raw_paths = ordinary_changed_paths(
+            workspace.worktree_path(),
+            &workspace.private_index,
+            &workspace.baseline_tree,
+        )
+        .unwrap();
+        assert!(!raw_paths.contains(&route));
+        raw_paths.push(route.clone());
+        let _ = workspace
+            .stage_proposal_paths(raw_paths)
+            .expect("ignored runtime exclusion must not block a source proposal");
+        let outcome = workspace
+            .finish("preserve source despite ignored web runtime")
+            .expect("ignored runtime exclusion must not block a source proposal");
+        let (commit, ref_name) = match outcome {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("source change must produce a proposal"),
+        };
+        assert_eq!(git(&repo, &["rev-parse", &ref_name]), commit);
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:source.txt")]),
+            "after"
+        );
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:added.txt")]),
+            "new source"
+        );
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:{baseline_route}")]),
+            "user change"
+        );
+        assert!(git(&repo, &["ls-tree", "-r", &commit, "--", &route]).is_empty());
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index_before);
+        assert!(workspace.worktree_path().join(&route).exists());
+        workspace.cleanup().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
     }
 
     #[cfg(unix)]
