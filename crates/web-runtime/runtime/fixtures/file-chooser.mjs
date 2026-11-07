@@ -6,7 +6,12 @@ const page = await context.newPage();
 await page.setContent(
   "<!DOCTYPE html><html><body><input id='f' type='file'></body></html>",
 );
-await page.setInputFiles("#f", ["FILE_PATH"]);
+page.setDefaultTimeout(2000);
+const [chooser] = await Promise.all([
+  page.waitForEvent("filechooser"), page.locator("#f").click()
+]);
+if (chooser.page() !== page || chooser.isMultiple()) throw new Error("wrong file chooser event");
+await chooser.setFiles(["FILE_PATH"]);
 const got = await page.evaluate(() => {
   const el = document.getElementById("f");
   return {

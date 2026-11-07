@@ -18,23 +18,29 @@ use crate::fetch::methods::FetchContext;
 #[derive(Clone)]
 pub struct RequestInterceptor {
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    download_budget: Option<std::sync::Arc<embedder_traits::DownloadBudget>>,
 }
 
 impl RequestInterceptor {
     pub fn new(embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>) -> RequestInterceptor {
-        RequestInterceptor { embedder_proxy }
+        RequestInterceptor { embedder_proxy, download_budget: None }
     }
 
     pub fn embedder_proxy(&self) -> GenericEmbedderProxy<NetToEmbedderMsg> {
         self.embedder_proxy.clone()
     }
 
+    pub fn download_budget(&self) -> Option<std::sync::Arc<embedder_traits::DownloadBudget>> {
+        self.download_budget.clone()
+    }
+
     pub async fn intercept_request(
-        &self,
+        &mut self,
         request: &mut Request,
         response: &mut Option<Response>,
         context: &FetchContext,
     ) {
+        self.download_budget = None;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let is_for_main_frame = matches!(request.destination, Destination::Document);
         let web_resource_request = WebResourceRequest {
@@ -92,7 +98,8 @@ impl RequestInterceptor {
                     *response = Some(Response::network_error(NetworkError::LoadCancelled));
                     break;
                 },
-                WebResourceResponseMsg::Continue { headers } => {
+                WebResourceResponseMsg::Continue { headers, download_budget } => {
+                    self.download_budget = download_budget;
                     for (name, value) in headers.iter() {
                         request.headers.insert(name.clone(), value.clone());
                     }

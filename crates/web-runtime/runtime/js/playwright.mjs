@@ -1953,20 +1953,12 @@ class Page {
   async waitForResponse(pattern) {
     const needle = String(pattern);
     const timeout = this._timeout || 30_000;
-    try {
-      const result = await engineCall("page.waitForResponse", {
-        page: this,
-        needle,
-        timeout,
-      });
-      return this._responseFromRecord(result.response);
-    } catch (error) {
-      const message = String(error && error.message ? error.message : error);
-      if (message.includes("timeout") || message.includes("timed out")) {
-        return unsupported("Page.waitForResponse.unintercepted")();
-      }
-      throw error;
-    }
+    const result = await engineCall("page.waitForResponse", {
+      page: this,
+      needle,
+      timeout,
+    });
+    return this._responseFromRecord(result.response);
   }
 
   async goto(url, options) {
@@ -2102,13 +2094,17 @@ class Page {
       url: () => rec.url,
       suggestedFilename: () => rec.suggestedFilename || "download",
       page: () => page,
-      failure: async () => null,
-      path: async () => rec.path || null,
+      failure: async () => rec.failure || null,
+      path: async () => {
+        if (rec.failure) throw new Error(rec.failure);
+        return rec.path || null;
+      },
       cancel: async () => unsupported("Download.cancel")(),
       saveAs: async (path) => {
         const result = await engineCall("page.saveDownload", {
           page: page,
           url: rec.url,
+          downloadId: rec.bodyBase64 == null ? rec.requestId : undefined,
           path: String(path),
         });
         if (Number(result.bytes) !== Number(rec.byteLength || 0)) {
@@ -2116,9 +2112,11 @@ class Page {
             "saveAs wrote " + result.bytes + " bytes, expected " + rec.byteLength,
           );
         }
-        const expectedHex = hexEncode(decodeBase64(rec.bodyBase64 || ""));
-        if (String(result.hex) !== expectedHex) {
-          throw new Error("saveAs hex " + result.hex + " expected " + expectedHex);
+        if (rec.bodyBase64 != null) {
+          const expectedHex = hexEncode(decodeBase64(rec.bodyBase64));
+          if (String(result.hex) !== expectedHex) {
+            throw new Error("saveAs hex " + result.hex + " expected " + expectedHex);
+          }
         }
         rec.path = String(path);
       },
@@ -2611,7 +2609,11 @@ class Page {
         timeout: this._timeout || 30_000,
       });
       const download = this._downloadFromRecord(result.download);
-      this._emit("download", download);
+      const eventId = result.download.requestId;
+      if (eventId !== this._lastDownloadEventId) {
+        this._lastDownloadEventId = eventId;
+        this._emit("download", download);
+      }
       return download;
     }
     if (event === "request") {

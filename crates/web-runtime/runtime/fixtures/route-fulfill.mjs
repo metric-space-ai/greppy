@@ -9,13 +9,14 @@ await page.route("**/intercepted", (route) =>
     status: 200,
   }),
 );
+const pendingResponse = page.waitForResponse("intercepted");
 const navigationResponse = await page.goto(fixtureUrl + "intercepted");
 const navigationRequest = navigationResponse.request();
 const navigationRoundTrip = await navigationRequest.response();
 if (!navigationRoundTrip || navigationRoundTrip.status() !== 200) {
   throw new Error("navigation request.response");
 }
-const response = await page.waitForResponse("intercepted");
+const response = await pendingResponse;
 if (response.status() !== 200) throw new Error("status " + response.status());
 if (!response.ok()) throw new Error("ok");
 if (response.statusText() !== "OK") throw new Error("statusText " + response.statusText());
@@ -76,8 +77,9 @@ await page.route("**/data.json", (route) =>
     status: 200,
   }),
 );
+const pendingJson = page.waitForResponse("data.json");
 await page.goto(fixtureUrl + "data.json");
-const jsonResp = await page.waitForResponse("data.json");
+const jsonResp = await pendingJson;
 const data = await jsonResp.json();
 if (!data || data.k !== 1) throw new Error("json " + JSON.stringify(data));
 const recorded = await page.requests();
