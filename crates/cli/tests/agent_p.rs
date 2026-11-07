@@ -83,6 +83,15 @@ fn spawn_gateway_contract(
     catalog: &'static str,
     caller_bound: Option<(&'static str, u64)>,
 ) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway_contract_with_error(responses, catalog, caller_bound, None)
+}
+
+fn spawn_gateway_contract_with_error(
+    responses: Vec<&'static str>,
+    catalog: &'static str,
+    caller_bound: Option<(&'static str, u64)>,
+    error_after_edit: Option<u16>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     assert!(!responses.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
@@ -128,6 +137,30 @@ fn spawn_gateway_contract(
                                 body["max_tokens"].as_u64().is_some_and(|n| (1..=1024).contains(&n)),
                                 "Messages requires a positive numeric bound within the advertised fixture cap"
                             );
+                        }
+                        if let Some(status) = error_after_edit.filter(|_| message_index > 0) {
+                            let edited = body["messages"].as_array().is_some_and(|messages| {
+                                messages.iter().any(|message| {
+                                    message["content"].as_array().is_some_and(|parts| {
+                                        parts.iter().any(|part| {
+                                            part["type"] == "tool_result"
+                                                && part["is_error"] != true
+                                        })
+                                    })
+                                })
+                            });
+                            assert!(
+                                edited,
+                                "fixture must observe a successful real edit before HTTP error"
+                            );
+                            // Valid close-delimited HTTP isolates lifecycle handling from
+                            // the separately tracked buffered-response transport failure.
+                            let resp = format!(
+                                "HTTP/1.1 {status} Fixture failure\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"error\":\"controlled lifecycle error\"}}"
+                            );
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.flush();
+                            continue;
                         }
                         let sse = responses[message_index.min(responses.len() - 1)];
                         message_index += 1;
@@ -418,6 +451,119 @@ fn assert_provider_optional_proposal(installed_inactive: bool) {
         "must not activate a provider"
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn greppy_p_http_error_saves_partial_proposal_without_applying() {
+    for status in [502_u16, 503] {
+        let root = unique_temp("http-error-proposal");
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("hello.txt"), "staged\n").unwrap();
+        git(&repo, &["add", "hello.txt"]);
+        std::fs::write(repo.join("hello.txt"), "local\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "keep me\n").unwrap();
+        let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+        let (endpoint, stop, handle) = spawn_gateway_contract_with_error(
+            vec![edit_gateway_response()],
+            r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#,
+            None,
+            Some(status),
+        );
+        let mut command = Command::new(binary_path());
+        command
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", root.join("store"))
+            .env("GREPPY_WORKSPACE_DIR", root.join("ordinary-workspace"))
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_MODEL")
+            .env_remove("GREPPY_ENDPOINT")
+            .env_remove("GREPPY_API_KEY")
+            .args([
+                "-p",
+                "change hello.txt",
+                "--model",
+                "test",
+                "--endpoint",
+                &endpoint,
+                "--deadline-secs",
+                "120",
+                "--private-store",
+                "--skip-selfcheck",
+                "--apply",
+                "--json",
+            ]);
+        if std::env::var_os("GREPPY_ACCEPTANCE_BINARY").is_some() {
+            command
+                .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+                .env_remove("CI");
+        }
+        let output = command.output().expect("real agent edit then HTTP error");
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{stdout}\n{stderr}");
+        let events: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let result = events
+            .iter()
+            .find(|event| event["type"] == "result")
+            .expect("failed agent result");
+        assert_eq!(result["status"], "error", "{result}");
+        assert_eq!(result["applied"], false, "{result}");
+        assert!(
+            stderr.contains("agent error:") && stderr.contains(&status.to_string()),
+            "HTTP error must remain visible: {stderr}"
+        );
+        let proposal = result["proposal_ref"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .expect("HTTP error must publish the partial proposal");
+        let shown = Command::new("git")
+            .current_dir(&repo)
+            .args(["show", &format!("{proposal}:hello.txt")])
+            .output()
+            .unwrap();
+        assert!(shown.status.success(), "{shown:?}");
+        assert_eq!(
+            shown.stdout, b"partial\n",
+            "real edit must be preserved exactly"
+        );
+        let changed = Command::new("git")
+            .current_dir(&repo)
+            .args(["diff-tree", "--no-commit-id", "--name-only", "-r", proposal])
+            .output()
+            .unwrap();
+        assert!(changed.status.success(), "{changed:?}");
+        assert_eq!(
+            changed.stdout, b"hello.txt\n",
+            "user changes are not the agent delta"
+        );
+        assert_eq!(std::fs::read(repo.join("hello.txt")).unwrap(), b"local\n");
+        assert_eq!(
+            std::fs::read(repo.join("untracked.txt")).unwrap(),
+            b"keep me\n"
+        );
+        assert_eq!(
+            std::fs::read(repo.join(".git/index")).unwrap(),
+            index_before
+        );
+        let worktree = events
+            .iter()
+            .find(|event| event["type"] == "session")
+            .unwrap()["worktree"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !PathBuf::from(worktree).exists(),
+            "saved partial proposal must release its temporary worktree"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
