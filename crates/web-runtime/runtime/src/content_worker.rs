@@ -2207,7 +2207,7 @@ impl ContentEngine {
         })? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "timed out evaluating page JavaScript",
+                "timed out evaluating page JavaScript (failed_check=unobserved)",
             ));
         }
         let result = saved.borrow_mut().take().expect("evaluation completed");

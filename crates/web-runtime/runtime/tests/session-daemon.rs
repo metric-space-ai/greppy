@@ -7801,6 +7801,7 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
         }),
     );
     assert_eq!(changed.status, "ok", "{changed:?}");
+    let mut observed_zero = 0;
     for (method, extra) in [
         ("web.click", json!({})),
         ("web.type", json!({"text":"not typed"})),
@@ -7815,7 +7816,7 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
         let missing = call(method, payload);
         assert_eq!(missing.status, "error", "{missing:?}");
         let error = missing.error.as_ref().unwrap();
-        if method == "web.click" && error.message.contains("failed_check=unobserved") {
+        if error.message.contains("failed_check=unobserved") {
             // A first DOM reply is not guaranteed inside this finite deadline.
             // Only explicit absent evidence may select NO_MATCH.
             assert_eq!(error.code, "TIMEOUT", "{missing:?}");
@@ -7823,6 +7824,9 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
             assert!(!error.message.contains("failed_check=stable"), "{missing:?}");
         } else {
             assert_eq!(error.code, "NO_MATCH", "{missing:?}");
+            assert!(error.message.contains("count=0")
+                || error.message.contains("strict mode: expected 1 node, got 0"), "{missing:?}");
+            observed_zero += 1;
         }
         assert_eq!(error.exit_code, 34);
         assert!(!error.next_action.contains("narrow"));
@@ -7846,6 +7850,7 @@ fn failed_native_actions_return_current_state_without_replay_or_false_success() 
             .unwrap()
             .contains("never-disclose-this"));
     }
+    assert!(observed_zero > 0, "fixture did not obtain a genuine zero-match response");
     let ambiguous = call(
         "web.click",
         json!({
