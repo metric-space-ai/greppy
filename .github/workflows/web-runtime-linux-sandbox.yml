@@ -87,6 +87,9 @@ jobs:
                          check=True, timeout=60)
           subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
 
+      - name: Check fixed-comparison evidence integrity and source counterproofs
+        run: python3 -B bench/check_web_comparison_mutations.py
+
       - name: Collect an optional real released web worker baseline
         if: github.event_name == 'workflow_dispatch' && inputs.profile_release != ''
         env:
