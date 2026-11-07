@@ -33,7 +33,7 @@ const PAGE: &str = r#"<!doctype html><html><body>
 
 #[test]
 fn native_workflow_preflight_diagnoses_the_exact_field_before_any_mutation() {
-    let fixture = serve_fixture(
+    let (_fixture, fixture) = serve_fixture(
         r#"<!doctype html><html><body>
       <select id="region"><option>All</option><option>EU</option></select>
       <input id="enabled" type="checkbox">
@@ -134,7 +134,7 @@ fn native_workflow_preflight_diagnoses_the_exact_field_before_any_mutation() {
 
 #[test]
 fn native_workflow_preflights_all_steps_and_preserves_partial_effects() {
-    let fixture = serve_fixture(PAGE);
+    let (_fixture, fixture) = serve_fixture(PAGE);
     let socket = std::env::temp_dir().join(format!(
         "greppy-workflow-effects-{}.sock",
         std::process::id()
@@ -262,7 +262,7 @@ fn native_workflow_preflights_all_steps_and_preserves_partial_effects() {
 
 #[test]
 fn native_workflow_keeps_explicit_tab_through_navigation_and_request_timeout() {
-    let fixture = serve_fixture(PAGE);
+    let (_fixture, fixture) = serve_fixture(PAGE);
     let socket =
         std::env::temp_dir().join(format!("greppy-workflow-scope-{}.sock", std::process::id()));
     let _guard = workflow_supervisor(&socket, "run_workflow_scope", &fixture);
