@@ -4962,6 +4962,7 @@ impl ContentEngine {
     }
 
     fn resolve_actionable(&self, params: &serde_json::Value) -> io::Result<ResolvedNode> {
+        let deadline = Instant::now() + call_timeout(params);
         let page_id = required_str(params, "page")?;
         let selector = params
             .get("selector")
@@ -4970,7 +4971,6 @@ impl ContentEngine {
         let (webview, _) = self.page(&page_id)?.clone();
         self.present_exclusively(&webview);
         let script = resolve_script(&selector);
-        let deadline = Instant::now() + call_timeout(params);
         let mut last = String::from("failed_check=unobserved");
         let mut stable: Option<ResolvedNode> = None;
         let mut stable_since: Option<Instant> = None;
