@@ -1002,7 +1002,7 @@ fn search_pattern_definition_entry(
         file: node.file_path.clone(),
         start_line: span.start_line,
         end_line: span.end_line,
-        source: span.text().lines().collect::<Vec<_>>().join("\n"),
+        source: span.text().into_owned(),
         handle: handle.encode(),
         matches: Vec::new(),
     }))

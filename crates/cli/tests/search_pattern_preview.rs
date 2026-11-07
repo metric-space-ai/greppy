@@ -385,13 +385,52 @@ fn code_reads_rust_python_definitions_without_repeating_bodies() {
         ]);
         assert_eq!(json.status.code(), Some(0));
         let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        let expected_source = format!("{first_line}\n");
         assert_eq!(
             json["hits"][0]["source"].as_str(),
-            Some(first_line),
-            "live JSON definition must exclude its unrelated neighbor"
+            Some(expected_source.as_str()),
+            "JSON source must equal its addressed bytes"
         );
         assert_eq!(json["hits"][0]["span"]["start_line"], 1);
         assert_eq!(json["hits"][0]["span"]["end_line"], 1);
+    }
+
+    for (file, newline) in [("adjacent-lf.py", "\n"), ("adjacent-crlf.py", "\r\n")] {
+        let first = format!("def first():{newline}    return 1{newline}");
+        let original = format!("{first}def next_one():{newline}    return 2{newline}");
+        std::fs::write(fixture.repo.join(file), &original).unwrap();
+        let output = fixture.run(&[
+            "search-pattern",
+            "^def first",
+            "--code",
+            "--json",
+            "--path",
+            file,
+        ]);
+        assert_eq!(output.status.code(), Some(0));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hit = &result["hits"][0];
+        assert_eq!(
+            hit["source"].as_str(),
+            Some(first.as_str()),
+            "JSON source must equal its addressed bytes"
+        );
+        let replaced = fixture.run(&[
+            "replace-span",
+            hit["handle"].as_str().unwrap(),
+            hit["source"].as_str().unwrap(),
+        ]);
+        assert_eq!(
+            replaced.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&replaced.stderr)
+        );
+        assert_eq!(
+            std::fs::read(fixture.repo.join(file)).unwrap(),
+            original.as_bytes(),
+            "unchanged source/handle roundtrip must preserve neighbors and line endings"
+        );
     }
 
     let repeated = fixture.run(&[

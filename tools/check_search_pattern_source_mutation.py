@@ -40,6 +40,9 @@ faults = [
     ("live definition must exclude its unrelated neighbor",
      "    let end_line = node.end_line;",
      "    let end_line = read_span_with_meta(root_path, &node.file_path, start_line, node.end_line, usize::MAX, false).map(|span| span.end_line).unwrap_or(node.end_line);"),
+    ("JSON source must equal its addressed bytes",
+     "        source: span.text().into_owned(),",
+     "        source: span.text().trim_end_matches('\\n').to_owned(),"),
 ]
 for diagnostic, anchor, mutant in faults:
     assert original.decode().count(anchor) == 1, "source target must be unique"
