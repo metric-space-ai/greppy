@@ -1003,7 +1003,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1095,7 +1098,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1153,7 +1159,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1232,7 +1241,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1433,7 +1445,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();

@@ -4260,7 +4260,10 @@ mod tests {
                     mtime_ns: metadata.mtime_ns.unwrap_or_default(),
                     size: metadata.size as i64,
                     parser_version: "fixture".into(),
-                    extractor_version: "fixture".into(),
+                    extractor_version: greppy_parser::extraction_revision(
+                        greppy_parser::Language::Rust,
+                    )
+                    .into(),
                     last_indexed_generation: 7,
                 })
                 .unwrap();
@@ -4347,7 +4350,10 @@ mod tests {
                     mtime_ns: caller_metadata.mtime_ns.unwrap_or_default(),
                     size: caller_metadata.size as i64,
                     parser_version: "fixture".into(),
-                    extractor_version: "fixture".into(),
+                    extractor_version: greppy_parser::extraction_revision(
+                        greppy_parser::Language::Rust,
+                    )
+                    .into(),
                     last_indexed_generation: 7,
                 })
                 .unwrap();

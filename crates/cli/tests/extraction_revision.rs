@@ -44,8 +44,8 @@ fn fixture(root: &Path, extension: &str) -> PathBuf {
     .unwrap();
     std::fs::write(repo.join("keep.c"), "int retained_c(void) { return 7; }\n").unwrap();
     std::fs::write(
-        repo.join("keep.rs"),
-        "pub fn retained_rust() -> usize { 11 }\n",
+        repo.join("keep.go"),
+        "package fixture\nfunc retained_go() int { return 11 }\n",
     )
     .unwrap();
     git(&repo, &["init", "-q"]);
@@ -198,7 +198,7 @@ fn identities(graph: &Path) -> Vec<(String, i64)> {
             .unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT name,id FROM nodes WHERE name IN ('retained_c','retained_rust') ORDER BY name",
+            "SELECT name,id FROM nodes WHERE name IN ('retained_c','retained_go') ORDER BY name",
         )
         .unwrap();
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
@@ -261,14 +261,14 @@ fn extraction_revision_warm_private_read_preserves_other_languages_and_reuse() {
         let graph = indexed_legacy(&repo, &store, None);
         let seed = cache_pass(&graph, &repo);
         assert!(seed.inputs.iter().any(|s| s.contains("retained_c")));
-        assert!(seed.inputs.iter().any(|s| s.contains("retained_rust")));
+        assert!(seed.inputs.iter().any(|s| s.contains("retained_go")));
         let old_ids = identities(&graph);
         let old_vectors = vectors(&graph);
         let fingerprint = greppy_core::GitFingerprint::capture(&repo);
         let hashes = [
             format!("types.{extension}"),
             "keep.c".into(),
-            "keep.rs".into(),
+            "keep.go".into(),
         ]
         .map(|p| git(&repo, &["hash-object", &p]));
         read_current(&repo, &store, None);
@@ -288,14 +288,14 @@ fn extraction_revision_warm_private_read_preserves_other_languages_and_reuse() {
         let after = [
             format!("types.{extension}"),
             "keep.c".into(),
-            "keep.rs".into(),
+            "keep.go".into(),
         ]
         .map(|p| git(&repo, &["hash-object", &p]));
         assert_eq!(after, hashes, "warm upgrade changed source bytes");
         let current =
             greppy_store::Store::open_with(&graph, greppy_store::OpenOptions::read_only()).unwrap();
         for state in current.list_file_states(PROJECT).unwrap() {
-            let expected = if state.rel_path == "keep.rs" {
+            let expected = if state.rel_path == "keep.go" {
                 greppy_parser::LEGACY_EXTRACTION_REVISION
             } else {
                 greppy_parser::extraction_revision(greppy_parser::Language::C)
@@ -312,7 +312,7 @@ fn extraction_revision_warm_private_read_preserves_other_languages_and_reuse() {
             !reused
                 .inputs
                 .iter()
-                .any(|s| s.contains("retained_c") || s.contains("retained_rust")),
+                .any(|s| s.contains("retained_c") || s.contains("retained_go")),
             "unchanged embedding input reached backend instead of actual cache reuse"
         );
     }
@@ -370,7 +370,7 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
         let hashes = [
             format!("types.{extension}"),
             "keep.c".into(),
-            "keep.rs".into(),
+            "keep.go".into(),
         ]
         .map(|path| git(&task, &["hash-object", &path]));
         read_current(&task, &delta, overlay);
@@ -387,7 +387,7 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
         let hashes_after = [
             format!("types.{extension}"),
             "keep.c".into(),
-            "keep.rs".into(),
+            "keep.go".into(),
         ]
         .map(|path| git(&task, &["hash-object", &path]));
         assert_eq!(
@@ -436,7 +436,7 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
         );
         let rust: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE file_path='keep.rs' AND label <> 'Folder'",
+                "SELECT COUNT(*) FROM nodes WHERE file_path='keep.go' AND label <> 'Folder'",
                 [],
                 |r| r.get(0),
             )
