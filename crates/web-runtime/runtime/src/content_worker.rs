@@ -3235,21 +3235,13 @@ impl ContentEngine {
                 Ok(json!({}))
             }
             "locator.fill" => {
-                let resolved = self.resolve_actionable(&params)?;
+                self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let value = required_str(&params, "value")?;
-                let (webview, delegate) = self.page(&page_id)?.clone();
+                let (webview, _) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
-                click_at(
-                    &webview,
-                    &delegate,
-                    resolved.x,
-                    resolved.y,
-                    resolved.width,
-                    resolved.height,
-                    || self.spin_all_event_loops(),
-                )?;
-                self.spin_all_event_loops();
+                // fill_script focuses the field. Pointer input here is both
+                // redundant work and an observable, unintended click.
                 let selector = params
                     .get("selector")
                     .cloned()

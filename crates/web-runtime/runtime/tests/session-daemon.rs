@@ -5877,8 +5877,19 @@ fn web_click_and_fill_drive_a_fixture() {
         "<!DOCTYPE html><html><body>\
 <button id=\"go\">go</button>\
 <input id=\"name\" value=\"\">\
+<p id=\"fill-proof\">not-filled</p>\
 <p id=\"out\">waiting</p>\
 <script>\
+window.fillPointerEvents = 0;\
+const field = document.getElementById('name');\
+for (const kind of ['mousedown', 'mouseup', 'click']) {\
+  field.addEventListener(kind, function() { window.fillPointerEvents++; });\
+}\
+field.addEventListener('input', function() {\
+  document.getElementById('fill-proof').textContent =\
+    'fill-proof:pointer=' + window.fillPointerEvents + ';focus=' +\
+    (document.activeElement === field) + ';value=' + field.value;\
+});\
 document.getElementById('go').addEventListener('click', function() {\
   document.getElementById('out').textContent = 'clicked:' + document.getElementById('name').value;\
 });\
@@ -5931,6 +5942,26 @@ document.getElementById('go').addEventListener('click', function() {\
     )
     .expect("fill");
     assert_eq!(filled.status, "ok", "{filled:?}");
+    let fill_observed = unix_request(
+        &socket,
+        &Request::new(
+            "run_act",
+            "web.observe",
+            json!({ "session_id": session_id, "format": "text" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("observe fill effects");
+    assert_eq!(fill_observed.status, "ok", "{fill_observed:?}");
+    let fill_dump = fill_observed.result.as_ref().unwrap().to_string();
+    assert!(
+        fill_dump.contains("fill-proof:pointer=0;"),
+        "fill unexpectedly dispatched pointer events: {fill_observed:?}"
+    );
+    assert!(
+        fill_dump.contains(";focus=true;value=Ada"),
+        "fill did not focus and update the field: {fill_observed:?}"
+    );
     let clicked = unix_request(
         &socket,
         &Request::new(
