@@ -226,14 +226,15 @@ fn cache_pass(store: &mut greppy_store::Store, repo: &Path) -> Vec<String> {
 }
 
 fn stable_vectors(conn: &rusqlite::Connection) -> Vec<(i64, i64, String, Vec<u8>)> {
-    conn.prepare("SELECT v.id,v.node_id,v.content_sha256,v.vector FROM vector_embeddings v JOIN nodes n ON n.id=v.node_id WHERE n.name IN ('unix_leaf','other_leaf','caller') ORDER BY n.name,v.chunk_idx").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap()
+    conn.prepare("SELECT v.id,v.node_id,v.content_sha256,v.vector FROM vector_embeddings v JOIN nodes n ON n.id=v.node_id WHERE n.name IN ('unix_leaf','other_leaf','caller','Retained') ORDER BY n.name,v.chunk_idx").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap()
 }
 
 fn assert_cache_inputs(inputs: &[String]) {
     assert!(
         !inputs.iter().any(|s| s.contains("fn unix_leaf(")
             || s.contains("fn other_leaf(")
-            || s.contains("fn caller(")),
+            || s.contains("fn caller(")
+            || s.contains("func Retained(")),
         "unchanged definition reached fixture backend instead of actual reuse: {inputs:?}"
     );
     assert_eq!(
@@ -370,12 +371,21 @@ fn warm_case(use_base: bool) {
         let old_vectors = stable_vectors(seeded.conn());
         assert_eq!(
             old_vectors.len(),
-            3,
-            "real cache seeding missed stable Rust definitions"
+            4,
+            "real cache seeding missed stable Rust/Go definitions"
         );
         drop(seeded);
         let before_conn = rusqlite::Connection::open(&old_graph).unwrap();
-        let control_state: String = before_conn.query_row("SELECT sha256||':'||extractor_version||':'||last_indexed_generation FROM file_state WHERE rel_path='control.go'", [], |r| r.get(0)).unwrap();
+        // Successful incremental publication advances every surviving file's
+        // generation. Hash/revision plus node/vector identity prove retention;
+        // that shared publication stamp does not prove re-extraction.
+        let control_state: String = before_conn
+            .query_row(
+                "SELECT sha256||':'||extractor_version FROM file_state WHERE rel_path='control.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         let stable_id: i64 = before_conn
             .query_row(
                 "SELECT id FROM nodes WHERE name='unix_leaf' AND label='Function'",
@@ -402,7 +412,7 @@ fn warm_case(use_base: bool) {
                 stable_id,
                 "unchanged Rust definition identity was discarded"
             );
-            assert_eq!(conn.query_row("SELECT sha256||':'||extractor_version||':'||last_indexed_generation FROM file_state WHERE rel_path='control.go'", [], |r| r.get::<_, String>(0)).unwrap(), control_state, "unaffected language re-extracted");
+            assert_eq!(conn.query_row("SELECT sha256||':'||extractor_version FROM file_state WHERE rel_path='control.go'", [], |r| r.get::<_, String>(0)).unwrap(), control_state, "unaffected language re-extracted");
             drop(conn);
             let mut refreshed = greppy_store::Store::open(&old_graph).unwrap();
             assert_cache_inputs(&cache_pass(&mut refreshed, &repo));
