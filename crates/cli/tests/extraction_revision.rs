@@ -367,6 +367,12 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
         let overlay = Some((layout.graph.as_path(), commit.as_str()));
         let delta_graph = indexed_legacy(&task, &delta, overlay);
         let fingerprint = greppy_core::GitFingerprint::capture(&task);
+        let hashes = [
+            format!("types.{extension}"),
+            "keep.c".into(),
+            "keep.rs".into(),
+        ]
+        .map(|path| git(&task, &["hash-object", &path]));
         read_current(&task, &delta, overlay);
         assert_eq!(
             std::fs::read(&layout.graph).unwrap(),
@@ -378,6 +384,17 @@ fn extraction_revision_warm_immutable_base_read_uses_only_private_delta() {
             greppy_core::GitFingerprint::capture(&task).head_oid,
             fingerprint.head_oid
         );
+        let hashes_after = [
+            format!("types.{extension}"),
+            "keep.c".into(),
+            "keep.rs".into(),
+        ]
+        .map(|path| git(&task, &["hash-object", &path]));
+        assert_eq!(
+            hashes_after, hashes,
+            "warm Base upgrade changed source bytes"
+        );
+        assert_eq!(git(&task, &["status", "--porcelain"]), "");
         let conn = rusqlite::Connection::open_with_flags(
             &delta_graph,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
