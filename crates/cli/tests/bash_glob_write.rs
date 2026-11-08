@@ -56,6 +56,21 @@ fn complete_bash_absolute_glob_write_matches_native_syntax() {
     eprintln!("BASH_GLOB_SYNTAX_VALID");
     let tree = greppy_parser::parse(greppy_parser::Language::Bash, VALID.as_bytes()).unwrap();
     eprintln!("ORIGINAL_BASH_TREE={}", tree.root_node().to_sexp());
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "test_command" | "binary_expression" | "regex")
+            || node.is_missing()
+        {
+            eprintln!(
+                "BASH_NODE kind={} range={:?} bytes={:?}",
+                node.kind(),
+                node.byte_range(),
+                &VALID.as_bytes()[node.byte_range()]
+            );
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
     let result = write(
         &repo,
         &scratch.path().join("store"),
