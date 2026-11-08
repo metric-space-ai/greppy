@@ -193,10 +193,58 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     let Ok(tree) = greppy_parser::parse(Language::Bash, content) else {
         return Cow::Borrowed(content);
     };
+    // Restrict the Bash-only glob recovery to an explicit Bash dialect.
+    // This is metadata, never a command to resolve or execute.
+    let shebang = content
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let explicit_bash = [
+        b"#!/bin/bash".as_slice(),
+        b"#!/usr/bin/bash",
+        b"#!/usr/bin/env bash",
+    ]
+    .contains(&shebang);
     let mut normalized: Option<Vec<u8>> = None;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
+        // The bundled grammar tokenizes the exact bare `/*` equality
+        // operand as regex and prematurely inserts `]]` before a boolean
+        // continuation. A fixed two-byte word validates the surrounding
+        // syntax without changing offsets or the proposed/published source.
+        if explicit_bash && node.kind() == "regex" && content.get(node.byte_range()) == Some(b"/*")
+        {
+            if let Some(binary) = node
+                .parent()
+                .filter(|parent| parent.kind() == "binary_expression")
+            {
+                let right = binary.child_by_field_name("right");
+                let left = binary.child_by_field_name("left");
+                let test = binary
+                    .parent()
+                    .filter(|parent| parent.kind() == "test_command");
+                if right == Some(node)
+                    && left.is_some_and(|left| !left.has_error())
+                    && test.is_some_and(|test| {
+                        (0..test.child_count())
+                            .filter_map(|i| test.child(i))
+                            .any(|child| {
+                                child.is_missing()
+                                    && child.kind() == "]]"
+                                    && child.start_byte() == node.end_byte()
+                            })
+                    })
+                {
+                    let operator =
+                        content[left.unwrap().end_byte()..node.start_byte()].trim_ascii();
+                    if operator == b"=" || operator == b"==" || operator == b"!=" {
+                        let output = normalized.get_or_insert_with(|| content.to_vec());
+                        output[node.start_byte()..node.end_byte()].copy_from_slice(b"xx");
+                    }
+                }
+            }
+        }
         if node.is_error() && content.get(node.start_byte()..node.end_byte()) == Some(b">") {
             if let Some(redirect) = node.parent().filter(|p| p.kind() == "file_redirect") {
                 let start = node.start_byte();
