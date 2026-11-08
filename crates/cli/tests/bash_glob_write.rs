@@ -36,6 +36,12 @@ fn write(repo: &Path, store: &Path, file: &str, content: &str) -> Output {
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("BASH_ENV", repo.join("bash-startup.sh"))
+        .env("ENV", repo.join("bash-startup.sh"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", repo.join("bin").display()),
+        )
         .env_remove("GREPPY_AGENT_STORE_MODE")
         .env_remove("GREPPY_AGENT_BASE_STORE")
         .env_remove("GREPPY_AGENT_BASE_COMMIT")
@@ -126,5 +132,63 @@ fn broken_complete_bash_remains_atomic() {
                 assert!(!file.exists());
             }
         }
+    }
+}
+
+#[test]
+fn bash_recovery_is_dialect_bound_and_never_executes_script_or_startup_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = tempfile::tempdir().unwrap();
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir(repo.join("bin")).unwrap();
+    std::fs::write(
+        repo.join("bin/bash"),
+        "#!/bin/sh\nprintf spoofed > validator-executed\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        repo.join("bin/bash"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("bash-startup.sh"),
+        "printf sourced > startup-executed\n",
+    )
+    .unwrap();
+    let store = scratch.path().join("store");
+    for (index, shebang) in ["#!/usr/bin/env bash", "#!/bin/bash", "#!/usr/bin/bash"]
+        .iter()
+        .enumerate()
+    {
+        let source = VALID.replacen("#!/usr/bin/env bash", shebang, 1)
+            + "printf executed > script-executed\n";
+        assert!(bash_n(&repo, &source).status.success());
+        let name = format!("valid-{index}.sh");
+        let output = write(&repo, &store, &name, &source);
+        assert!(
+            output.status.success(),
+            "trusted Bash source rejected: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(repo.join(name)).unwrap(), source);
+    }
+    for shebang in ["#!/bin/sh", "#!/usr/bin/env sh", "#!/synthetic-node/bash"] {
+        let source = VALID.replacen("#!/usr/bin/env bash", shebang, 1);
+        let output = write(&repo, &store, "other-dialect.sh", &source);
+        assert_eq!(
+            output.status.code(),
+            Some(13),
+            "Bash-only recovery escaped dialect boundary: {source}"
+        );
+        assert!(!repo.join("other-dialect.sh").exists());
+    }
+    for marker in ["validator-executed", "startup-executed", "script-executed"] {
+        assert!(
+            !repo.join(marker).exists(),
+            "syntax validation executed code: {marker}"
+        );
     }
 }
