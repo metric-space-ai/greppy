@@ -105,6 +105,7 @@ fn broken_complete_bash_remains_atomic() {
     for bad in [
         VALID.replace(" ]]", " ]"),
         VALID.replace("done\n", ""),
+        VALID.replace("\" ]]", "\"]]"),
         VALID.replace(" && -x", " && && -x"),
         VALID.replace("\" ]]", " ]]"),
         format!("{VALID}if then\n"),

@@ -238,7 +238,22 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
                 {
                     let operator =
                         content[left.unwrap().end_byte()..node.start_byte()].trim_ascii();
-                    if operator == b"=" || operator == b"==" || operator == b"!=" {
+                    let separated = content
+                        .get(left.unwrap().end_byte())
+                        .is_some_and(u8::is_ascii_whitespace)
+                        && node
+                            .start_byte()
+                            .checked_sub(1)
+                            .and_then(|at| content.get(at))
+                            .is_some_and(u8::is_ascii_whitespace)
+                        && content
+                            .get(node.end_byte())
+                            .is_some_and(u8::is_ascii_whitespace);
+                    let suffix = content[node.end_byte()..].trim_ascii_start();
+                    if separated
+                        && (suffix.starts_with(b"&&") || suffix.starts_with(b"||"))
+                        && (operator == b"=" || operator == b"==" || operator == b"!=")
+                    {
                         let output = normalized.get_or_insert_with(|| content.to_vec());
                         output[node.start_byte()..node.end_byte()].copy_from_slice(b"xx");
                     }
