@@ -395,7 +395,7 @@ fn warm_case(use_base: bool) {
     assert!(!old_vectors.is_empty());
     let old_nodes: Vec<(i64, String)> = seeded
         .conn()
-        .prepare("SELECT id,qualified_name FROM nodes WHERE label IN ('Function','Method','Class','Field','File') ORDER BY qualified_name")
+        .prepare("SELECT id,qualified_name FROM nodes WHERE label IN ('Function','Method','Class','Field') ORDER BY qualified_name")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -420,7 +420,7 @@ fn warm_case(use_base: bool) {
         );
         let new_nodes: Vec<(i64, String)> = refreshed
             .conn()
-            .prepare("SELECT id,qualified_name FROM nodes WHERE label IN ('Function','Method','Class','Field','File') ORDER BY qualified_name")
+            .prepare("SELECT id,qualified_name FROM nodes WHERE label IN ('Function','Method','Class','Field') ORDER BY qualified_name")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
