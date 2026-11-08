@@ -898,8 +898,20 @@ fn cpp_member_receiver(
             ) {
                 let mut cursor = node.walk();
                 for decl in node.children_by_field_name("declarator", &mut cursor) {
-                    if let Some((name, _)) = c_declarator_name(source, decl) {
-                        names.insert(name.to_string());
+                    // C++ reference declarators have an unnamed identifier
+                    // child. Walk declarator syntax, excluding initializer values.
+                    let mut declarators = vec![decl];
+                    while let Some(decl) = declarators.pop() {
+                        if matches!(decl.kind(), "identifier" | "field_identifier") {
+                            names.insert(node_text(source, decl).to_string());
+                        } else if decl.kind() == "init_declarator" {
+                            if let Some(binding) = decl.child_by_field_name("declarator") {
+                                declarators.push(binding);
+                            }
+                        } else {
+                            let mut cursor = decl.walk();
+                            declarators.extend(decl.named_children(&mut cursor));
+                        }
                     }
                 }
             }
