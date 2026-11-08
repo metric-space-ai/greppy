@@ -894,7 +894,10 @@ fn cpp_member_receiver(
         while let Some(node) = stack.pop() {
             if matches!(
                 node.kind(),
-                "parameter_declaration" | "optional_parameter_declaration" | "declaration"
+                "parameter_declaration"
+                    | "optional_parameter_declaration"
+                    | "declaration"
+                    | "for_range_loop"
             ) {
                 let mut cursor = node.walk();
                 for decl in node.children_by_field_name("declarator", &mut cursor) {

@@ -2,8 +2,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const HEADER: &str = "struct PrimaryJob { void begin(); };\nstruct OtherJob { void begin(); };\nstruct Unknown {};\nstruct Pipeline {\n PrimaryJob job_;\n OtherJob other_;\n void run(); void run_other(); void shadow(Unknown& job_);\n void local_shadow(); void unknown(Unknown& value);\n};\n";
-const CALLER: &str = "#include \"jobs.hpp\"\nvoid Pipeline::run() { job_.begin(); }\nvoid Pipeline::run_other() { other_.begin(); }\nvoid Pipeline::shadow(Unknown& job_) { job_.begin(); }\nvoid Pipeline::local_shadow() { Unknown job_; job_.begin(); }\nvoid Pipeline::unknown(Unknown& value) { value.begin(); }\n";
+const HEADER: &str = "struct PrimaryJob { void begin(); };\nstruct OtherJob { void begin(); };\nstruct Unknown {};\nstruct Pipeline {\n PrimaryJob job_;\n OtherJob other_;\n void run(); void run_other(); void shadow(Unknown& job_);\n void local_shadow(); void unknown(Unknown& value); void range_shadow();\n};\n";
+const CALLER: &str = "#include \"jobs.hpp\"\nvoid Pipeline::run() { job_.begin(); }\nvoid Pipeline::run_other() { other_.begin(); }\nvoid Pipeline::shadow(Unknown& job_) { job_.begin(); }\nvoid Pipeline::local_shadow() { Unknown job_; job_.begin(); }\nvoid Pipeline::unknown(Unknown& value) { value.begin(); }\nvoid Pipeline::range_shadow() { Unknown jobs[1]; for (auto& job_ : jobs) { job_.begin(); } }\n";
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -96,7 +96,7 @@ fn cpp_typed_members_keep_owner_and_reject_shadowed_or_unknown_receivers() {
             .iter()
             .filter(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "begin")
             .count(),
-        5,
+        6,
         "real C++ call syntax must be covered"
     );
     let (code, out, err) = run(&repo, &store, &["index", "."]);
@@ -135,7 +135,7 @@ fn cpp_typed_members_keep_owner_and_reject_shadowed_or_unknown_receivers() {
             !hit.contains(&format!("{wrong}\"")),
             "wrong C++ owner: {value}"
         );
-        for rejected in ["::shadow", "::local_shadow", "::unknown"] {
+        for rejected in ["::shadow", "::local_shadow", "::range_shadow", "::unknown"] {
             assert!(
                 !hit.contains(rejected),
                 "unproven/shadowed receiver gained a CALLS edge: {value}"
