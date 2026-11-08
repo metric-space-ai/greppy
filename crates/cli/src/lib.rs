@@ -10464,8 +10464,7 @@ mod embeddinggemma_assets {
 }
 
 mod qwen35_assets {
-    pub const GGUF_BYTES: u64 =
-        include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH")).len() as u64;
+    pub const GGUF_BYTES: u64 = include!(concat!(env!("OUT_DIR"), "/qwen35_gguf_size.rs"));
     const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
     const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
 

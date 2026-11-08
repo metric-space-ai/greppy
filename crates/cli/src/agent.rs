@@ -1196,16 +1196,7 @@ fn run_agent(
             Ok(_) => {
                 let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
                     .set(crate::web_attach::inherit_attach_for_agent);
-                // Start the runtime HERE, while this process is still
-                // unsandboxed. The runtime sandboxes its own workers, and macOS
-                // Seatbelt does not nest: started from a sandboxed tool child it
-                // dies with "worker sandbox: Operation not permitted", and the
-                // agent only ever sees "web-runtime did not create its socket".
-                // Started here, the tool children merely connect.
-                let worktree_root = workspace.worktree_path().to_string_lossy().into_owned();
-                if let Err(error) = crate::web::prestart_unsandboxed(Some(&worktree_root)) {
-                    eprintln!("greppy: browser unavailable to the agent ({error})");
-                }
+                // The web-only attach hook starts the runtime lazily in this parent.
             }
             Err(error) => {
                 eprintln!("greppy: browser unavailable to the agent (no attach token: {error})");
@@ -1216,7 +1207,7 @@ fn run_agent(
         struct ShutdownWebOnDrop;
         impl Drop for ShutdownWebOnDrop {
             fn drop(&mut self) {
-                crate::web::shutdown_if_running();
+                crate::web::shutdown_agent_runtimes();
             }
         }
         let _shutdown_web = ShutdownWebOnDrop;
@@ -2440,7 +2431,7 @@ fn run_interactive_session(
     struct ShutdownWebOnDrop;
     impl Drop for ShutdownWebOnDrop {
         fn drop(&mut self) {
-            crate::web::shutdown_if_running();
+            crate::web::shutdown_agent_runtimes();
         }
     }
     let _shutdown_web = ShutdownWebOnDrop;
@@ -2954,13 +2945,7 @@ fn resolve_sandbox_mode(
 /// capped near 104 bytes — which is exactly why the default is under `/tmp`
 /// and not the long macOS temp root.
 pub(crate) fn agent_runtime_dir(run_id: &str) -> std::path::PathBuf {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in run_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // "/tmp/greppy-agent-" + 8 hex = 26 bytes, comfortably under the cap.
-    std::path::PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
+    greppy_agent::greppy_env::agent_runtime_dir(run_id)
 }
 
 /// Removes only this invocation's empty browser-runtime directory.
