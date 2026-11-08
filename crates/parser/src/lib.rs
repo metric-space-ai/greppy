@@ -41,7 +41,7 @@ pub const LEGACY_EXTRACTION_REVISION: &str = "greppy-extractor-v1";
 
 pub fn extraction_revision(language: Language) -> &'static str {
     match language {
-        Language::C | Language::Cpp => "greppy-extractor-c-cpp-v2",
+        Language::C | Language::Cpp => "greppy-extractor-c-cpp-v3",
         Language::Rust => "greppy-extractor-rust-v2",
         _ => LEGACY_EXTRACTION_REVISION,
     }

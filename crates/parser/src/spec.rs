@@ -808,6 +808,7 @@ fn spec_calls(
     spans: &[CallableSpan],
     result: &mut ExtractionResult,
 ) {
+    let mut cpp_bindings = std::collections::HashMap::new();
     for cq in queries.iter().filter(|cq| cq.kind == QueryKind::Calls) {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&cq.query, root, source);
@@ -840,12 +841,79 @@ fn spec_calls(
                         target_qualified_name: format!("{file_path}::Function::{text}"),
                         file_path: file_path.to_string(),
                         line: node.start_position().row as u32 + 1,
-                        properties: json!({ "callee_text": text, "callee_name": text }),
+                        properties: {
+                            let mut props = json!({ "callee_text": text, "callee_name": text });
+                            if matches!(spec.imports, ImportStrategy::Cpp)
+                                && node
+                                    .parent()
+                                    .is_some_and(|p| p.kind() == "field_expression")
+                            {
+                                // A receiver miss cannot name an unrelated method.
+                                props["callee_form"] = json!("receiver");
+                                if let Some(fact) =
+                                    cpp_member_receiver(source, node, &mut cpp_bindings)
+                                {
+                                    props["receiver_provenance"] = fact;
+                                }
+                            }
+                            props
+                        },
                     });
                 }
             }
         }
     }
+}
+
+/// Only an unshadowed direct member inside a represented C++ method supplies
+/// field provenance. Unsupported receiver expressions remain unresolved.
+fn cpp_member_receiver(
+    source: &[u8],
+    callee: Node<'_>,
+    bindings: &mut std::collections::HashMap<usize, std::collections::HashSet<String>>,
+) -> Option<serde_json::Value> {
+    let receiver = callee.parent()?.child_by_field_name("argument")?;
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let field = node_text(source, receiver);
+    let mut function = callee.parent()?;
+    while function.kind() != "function_definition" {
+        if function.kind() == "lambda_expression" {
+            return None;
+        }
+        function = function.parent()?;
+    }
+    let owner = cpp_function_owner(source, function)?;
+    if !owner.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let names = bindings.entry(function.id()).or_insert_with(|| {
+        let mut names = std::collections::HashSet::new();
+        let mut stack = vec![function];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "parameter_declaration" | "optional_parameter_declaration" | "declaration"
+            ) {
+                let mut cursor = node.walk();
+                for decl in node.children_by_field_name("declarator", &mut cursor) {
+                    if let Some((name, _)) = c_declarator_name(source, decl) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        names
+    });
+    // Conservative across nested scopes and declaration order: require the
+    // absence of a local/parameter binding rather than guessing name lookup.
+    if names.contains(field) {
+        return None;
+    }
+    Some(json!({"kind":"cpp_direct_member", "base_type":owner, "field":field}))
 }
 
 #[allow(clippy::too_many_arguments)]
