@@ -91,6 +91,16 @@ try:
     finally:
         SPEC.write_bytes(original[SPEC])
 
+    text = original[SPEC].decode()
+    anchor = '| "for_range_loop"'
+    assert text.count(anchor) == 1
+    try:
+        SPEC.write_text(text.replace(anchor, "", 1))
+        run(red="typed C++ member caller missing or falsely assigned", needle="Pipeline::range_shadow")
+        print("mutation: removing only range-for binding recognition creates the false member caller; real stored public graph negative contract red", flush=True)
+    finally:
+        SPEC.write_bytes(original[SPEC])
+
     text = original[POLICY].decode()
     anchor = "    expected == LEGACY_EXTRACTION_REVISION || revision == expected"
     assert text.count(anchor) == 1
