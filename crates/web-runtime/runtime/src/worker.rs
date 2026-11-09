@@ -948,34 +948,30 @@ exit 0;
         );
     }
 
-    /// ELF whose behavior does not depend on argv[0].
-    ///
-    /// Ubuntu 26.04 hard-links `/bin/sleep` and `/bin/true` to the uutils
-    /// multicall image. A copy under another filename exits 1: that image
-    /// refuses to dispatch on argv[0] (`unix_wait_status(256)`). GNU `true`
-    /// would have exited 0, so that status is not the replaced path winning.
-    /// The pin test needs two different programs.
+    /// Standalone exec image for the fd-backed spawn tests. Coreutils cannot
+    /// serve: on Ubuntu 26.04 `sleep` and `true` are one uutils multicall
+    /// binary that dispatches on argv[0] and refuses the `/proc/self/fd/N`
+    /// name fexecve presents ("Requested utility `6` does not match
+    /// executable name"). The shell ignores argv[0] and runs `-c` scripts.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn fixture_executable(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
-        let source = dir.join(format!("{name}.c"));
-        let output = dir.join(name);
-        std::fs::write(
-            &source,
-            format!("#include <unistd.h>\nint main(void) {{\n{body}\n}}\n"),
-        )
-        .unwrap();
-        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let status = std::process::Command::new(&cc)
-            .arg("-O2")
-            .arg("-o")
-            .arg(&output)
-            .arg(&source)
-            .status()
-            .unwrap_or_else(|error| {
-                panic!("cc ({cc}) is required to build an argv0-independent fixture: {error}")
-            });
-        assert!(status.success(), "{cc} failed to compile {name}");
-        output
+    fn linux_shell() -> std::path::PathBuf {
+        let path = std::path::PathBuf::from("/bin/sh");
+        assert!(path.is_file(), "missing /bin/sh");
+        path
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn linux_test_dir(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[cfg(unix)]
@@ -1056,29 +1052,28 @@ exit 0;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn linux_spawn_uses_fd_backed_exec() {
+        use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
-        let root = std::env::temp_dir().join(format!(
-            "greppy-fexecve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let probe = fixture_executable(&root, "probe", "for (;;) pause();");
-        let _replacement = fixture_executable(&root, "replacement", "return 42;");
+        let root = linux_test_dir("fexecve");
+        let probe = root.join("probe");
+        std::fs::copy(linux_shell(), &probe).unwrap();
         let image = PinnedSupervisorImage::open_path(&probe).unwrap();
         assert_eq!(image.exec_kind(), ImageExecKind::Fexecve);
         assert!(image.is_fd_backed());
         // Replace the directory entry with a different inode. Copying directly
         // to `probe` would truncate and rewrite the already pinned inode, which
         // is not a path-lookup TOCTOU and necessarily changes what the FD sees.
-        std::fs::rename(root.join("replacement"), &probe).unwrap();
+        // The pinned shell blocks reading the open stdin pipe; the
+        // replacement exits at once whatever its arguments.
+        let replacement = root.join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&replacement, &probe).unwrap();
         let mut command = Command::new(&probe);
         command
+            .args(["-c", "read line"])
             .env_clear()
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         image.bind_command(&mut command).unwrap();
@@ -1087,7 +1082,7 @@ exit 0;
         let early_status = child.try_wait().unwrap();
         assert!(
             early_status.is_none(),
-            "fexecve must run the pinned ELF, not the replaced one (exit 42); status={early_status:?}"
+            "fexecve must run the pinned blocking image, not the replaced exiting path; status={early_status:?}"
         );
         image.prove_child(child.id()).unwrap();
         let _ = child.kill();
@@ -1127,17 +1122,8 @@ exit 0;
             return;
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "greppy-fexecve-fd-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let true_bin = fixture_executable(&root, "exit0", "return 0;");
-        let image = PinnedSupervisorImage::open_path(&true_bin).unwrap();
+        let shell = linux_shell();
+        let image = PinnedSupervisorImage::open_path(&shell).unwrap();
         assert_eq!(image.as_raw_fd(), 3, "isolated image must occupy FD 3");
         let null = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(null.as_raw_fd(), 4, "FD 4 must be free for the exec pin");
@@ -1150,7 +1136,8 @@ exit 0;
         // duplicate, bind_command chooses FD 4, overwritten by the first hook.
         for _ in 0..2 {
             let channel_fd = channel.as_raw_fd();
-            let mut command = Command::new(&true_bin);
+            let mut command = Command::new(&shell);
+            command.args(["-c", "exit 0"]);
             unsafe {
                 command.pre_exec(move || {
                     for fd in [
@@ -1177,37 +1164,31 @@ exit 0;
     #[test]
     fn linux_identity_mismatch_kills_child() {
         use std::process::{Command, Stdio};
-        let root = std::env::temp_dir().join(format!(
-            "greppy-fexecve-id-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let sleep = fixture_executable(&root, "sleeper", "for (;;) pause();");
-        let true_bin = fixture_executable(&root, "other", "return 0;");
-        let sleep_img = PinnedSupervisorImage::open_path(&sleep).unwrap();
-        let true_img = PinnedSupervisorImage::open_path(&true_bin).unwrap();
+        let shell = linux_shell();
+        let root = linux_test_dir("identity");
+        let other = root.join("other");
+        std::fs::copy(&shell, &other).unwrap();
+        let running_img = PinnedSupervisorImage::open_path(&shell).unwrap();
+        let other_img = PinnedSupervisorImage::open_path(&other).unwrap();
         assert_ne!(
-            sleep_img.dev_ino().unwrap(),
-            true_img.dev_ino().unwrap(),
-            "fixture ELFs must be distinct inodes"
+            running_img.dev_ino().unwrap(),
+            other_img.dev_ino().unwrap(),
+            "the shell and its copy must be distinct inodes"
         );
-        let mut command = Command::new(&sleep);
+        let mut command = Command::new(&shell);
         command
-            .arg("30")
+            .args(["-c", "read line"])
             .env_clear()
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        sleep_img.bind_command(&mut command).unwrap();
-        let mut child = command.spawn().expect("sleep spawn");
-        let error = true_img.prove_child_or_kill(&mut child).unwrap_err();
+        running_img.bind_command(&mut command).unwrap();
+        let mut child = command.spawn().expect("shell spawn");
+        let error = other_img.prove_child_or_kill(&mut child).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("identity mismatch"), "{error}");
         let status = child.wait().unwrap();
         assert!(!status.success(), "mismatch must kill the child");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

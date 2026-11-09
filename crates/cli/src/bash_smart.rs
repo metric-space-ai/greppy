@@ -60,6 +60,21 @@ const PACK_HEAD_BYTES: u64 = 32 * 1024 * 1024;
 const PACK_TAIL_BYTES: u64 = 32 * 1024 * 1024;
 const INITIAL_HEARTBEAT_MS: u64 = 15_000;
 const HEARTBEAT_INTERVAL_MS: u64 = 60_000;
+// Normalize terminal styling only for classification. Raw capture and rendered
+// diagnostic bytes remain unchanged, including escapes and non-UTF-8 paths.
+static ANSI_SGR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?-u)\x1b\[[0-9;:]*m").expect("bash-smart ANSI styling regex")
+});
+static OXC_RULE_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*(\xE2\x9A\xA0(?:\xEF\xB8\x8F)?|\xC3\x97)[\t ]+[A-Za-z][A-Za-z0-9_/-]*\([A-Za-z0-9_@./-]+\):(?:[\t ]|$)",
+    ).expect("bash-smart Oxc rule regex")
+});
+static OXC_SUMMARY_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*Found[\t ]+([0-9]+)[\t ]+errors?[\t ]+and[\t ]+([0-9]+)[\t ]+warnings?(?:\.|[\t ]+in[\t ]+[0-9]+[\t ]+files?(?:[\t ]+\([^\r\n)]*\))?\.?)?[\t ]*$",
+    ).expect("bash-smart Oxc summary regex")
+});
 #[cfg(unix)]
 const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -501,11 +516,7 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     let stderr_lines = split_lines(&raw.stderr);
     let blocks = detect_blocks(&stdout_lines, &stderr_lines);
     let matches = collect_matches(&stdout_lines, &stderr_lines, &matchers);
-    let error_count = blocks
-        .iter()
-        .filter(|block| block.kind == BlockKind::Error)
-        .count();
-    let warning_count = blocks.len().saturating_sub(error_count);
+    let (error_count, warning_count) = diagnostic_counts(&blocks);
     let annotation = termination_annotation(timed_out, forwarded_signal, &status);
     let interrupted = timed_out || forwarded_signal.is_some() || status.code().is_none();
     let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
@@ -823,12 +834,116 @@ fn signal_name(signal: i32) -> String {
         .unwrap_or_else(|| format!("signal {signal}"))
 }
 
-/// Mechanical v1 diagnostic detection. This is deliberately the sole function
-/// that decides whether lines form error or warning blocks, so a classifier
-/// head can replace it without changing the rendering interface. stderr is
-/// retained as an origin signal on every line, but never starts a block by
-/// itself; an ambiguous stderr singleton therefore cannot be promoted solely
-/// because of its stream.
+/// Normalize styling for classification without changing captured bytes.
+fn diagnostic_text(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !bytes.contains(&0x1b) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    ANSI_SGR_RE.replace_all(bytes, &b""[..])
+}
+
+fn oxc_summary_counts(bytes: &[u8]) -> Option<[usize; 2]> {
+    let captures = OXC_SUMMARY_RE.captures(bytes)?;
+    Some([
+        std::str::from_utf8(&captures[1]).ok()?.parse().ok()?,
+        std::str::from_utf8(&captures[2]).ok()?.parse().ok()?,
+    ])
+}
+
+fn oxc_rule_kind(bytes: &[u8]) -> Option<BlockKind> {
+    let captures = OXC_RULE_RE.captures(bytes)?;
+    Some(if captures[1].starts_with(b"\xc3\x97") {
+        BlockKind::Error
+    } else {
+        BlockKind::Warning
+    })
+}
+
+fn diagnostic_kind(content: &[u8]) -> Option<BlockKind> {
+    if let Some(kind) = oxc_rule_kind(content) {
+        return Some(kind);
+    }
+    if let Some([errors, warnings]) = oxc_summary_counts(content) {
+        return if errors > 0 {
+            Some(BlockKind::Error)
+        } else if warnings > 0 {
+            Some(BlockKind::Warning)
+        } else {
+            None
+        };
+    }
+    if error_recap_count(content).is_some()
+        || ((ERROR_MARKER_RE.is_match(content) || NODE_ERROR_RE.is_match(content))
+            && !ZERO_FAILURE_COUNT_RE.is_match(content)
+            && !AAPT_XML_ELEMENT_RE.is_match(content)
+            && !RUST_ERROR_FIELD_RE.is_match(content))
+    {
+        Some(BlockKind::Error)
+    } else if WARNING_MARKER_RE.is_match(content)
+        || PYTHON_WARNING_RE.is_match(content)
+        || NODE_WARNING_RE.is_match(content)
+    {
+        Some(BlockKind::Warning)
+    } else {
+        TYPESCRIPT_DIAGNOSTIC_RE
+            .captures(content)
+            .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(content))
+            .or_else(|| CMAKE_DIAGNOSTIC_RE.captures(content))
+            .map(|captures| {
+                if captures[1].eq_ignore_ascii_case(b"warning") {
+                    BlockKind::Warning
+                } else {
+                    BlockKind::Error
+                }
+            })
+    }
+}
+
+/// Oxc reports aggregate diagnostics, not an additional warning for its footer.
+/// Keep ordinary block counts, and close each Oxc group using its reported
+/// totals (never discard more explicitly emitted rule diagnostics).
+fn diagnostic_counts(blocks: &[DiagnosticBlock]) -> (usize, usize) {
+    let mut counts = [0usize; 2];
+    let mut pending = [[0usize; 2]; 2];
+    let mut covered = [[0usize; 2]; 2];
+    let mut summarized = [false; 2];
+    for block in blocks {
+        let first = &block.lines[0];
+        let stream = usize::from(first.stream == OutputStream::Stderr);
+        let kind = usize::from(block.kind == BlockKind::Warning);
+        let content = diagnostic_text(&first.bytes);
+        if let Some(reported) = oxc_summary_counts(&content) {
+            for severity in 0..2 {
+                counts[severity] = counts[severity]
+                    .saturating_add(reported[severity].max(pending[stream][severity]));
+                covered[stream][severity] = covered[stream][severity]
+                    .saturating_add(reported[severity].saturating_sub(pending[stream][severity]));
+            }
+            pending[stream] = [0; 2];
+            summarized[stream] = true;
+        } else if oxc_rule_kind(&content).is_some() {
+            pending[stream][kind] = pending[stream][kind].saturating_add(1);
+        } else {
+            counts[kind] = counts[kind].saturating_add(1);
+        }
+    }
+    for stream in 0..2 {
+        for severity in 0..2 {
+            // A footer may be on stdout while its rule diagnostics use stderr.
+            // Same-stream rule blocks after a footer belong to subsequent work.
+            let extra = if summarized[stream] {
+                pending[stream][severity]
+            } else {
+                pending[stream][severity].saturating_sub(covered[1 - stream][severity])
+            };
+            counts[severity] = counts[severity].saturating_add(extra);
+        }
+    }
+    (counts[0], counts[1])
+}
+
+/// Mechanical block detection retains stream origin, which alone never
+/// promotes an ambiguous line to a diagnostic.
 fn detect_blocks(
     stdout_lines: &[RawLine<'_>],
     stderr_lines: &[RawLine<'_>],
@@ -869,7 +984,8 @@ fn detect_blocks(
         let mut index = 0usize;
         let mut formatting_diff = false;
         while index < lines.len() {
-            let content = lines[index].content;
+            let normalized = diagnostic_text(lines[index].content);
+            let content = normalized.as_ref();
             if content.starts_with(b"Diff in ") && content.ends_with(b":") {
                 formatting_diff = true;
                 index += 1;
@@ -888,42 +1004,18 @@ fn detect_blocks(
                 index += 1;
                 continue;
             }
-            let kind = if error_recap_count(lines[index].content).is_some()
-                || ((ERROR_MARKER_RE.is_match(lines[index].content)
-                    || NODE_ERROR_RE.is_match(lines[index].content))
-                    && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
-                    && !AAPT_XML_ELEMENT_RE.is_match(lines[index].content)
-                    && !RUST_ERROR_FIELD_RE.is_match(lines[index].content))
-            {
-                Some(BlockKind::Error)
-            } else if WARNING_MARKER_RE.is_match(lines[index].content)
-                || PYTHON_WARNING_RE.is_match(lines[index].content)
-                || NODE_WARNING_RE.is_match(lines[index].content)
-            {
-                Some(BlockKind::Warning)
-            } else {
-                TYPESCRIPT_DIAGNOSTIC_RE
-                    .captures(lines[index].content)
-                    .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(lines[index].content))
-                    .or_else(|| CMAKE_DIAGNOSTIC_RE.captures(lines[index].content))
-                    .map(|captures| {
-                        if captures[1].eq_ignore_ascii_case(b"warning") {
-                            BlockKind::Warning
-                        } else {
-                            BlockKind::Error
-                        }
-                    })
-            };
+            let kind = diagnostic_kind(content);
             let Some(kind) = kind else {
                 index += 1;
                 continue;
             };
 
-            let marker_indent = indentation(lines[index].content);
+            let marker_indent = indentation(content);
             let mut end = index + 1;
             while end < lines.len() {
-                let content = lines[end].content;
-                if is_success_status(content) {
+                let normalized = diagnostic_text(lines[end].content);
+                let content = normalized.as_ref();
+                if is_success_status(content) || oxc_summary_counts(content).is_some() {
                     break;
                 }
                 if indentation(content) > marker_indent || blank(content) || detail_prefix(content)
@@ -950,7 +1042,14 @@ fn detect_blocks(
         let mut substantive_warnings = 0usize;
         let mut substantive_errors = 0usize;
         for block in stream_blocks {
-            if let Some(summary_count) = error_recap_count(&block.lines[0].bytes) {
+            let heading = diagnostic_text(&block.lines[0].bytes).into_owned();
+            if oxc_summary_counts(&heading).is_some() {
+                filtered_blocks.push(block);
+                substantive_errors = 0;
+                substantive_warnings = 0;
+                continue;
+            }
+            if let Some(summary_count) = error_recap_count(&heading) {
                 // A recap closes the preceding failure group. Only suppress it
                 // when the emitted error-block count proves it is redundant;
                 // otherwise retain the uncertain recap (same rule as Cargo).
@@ -961,7 +1060,7 @@ fn detect_blocks(
                 continue;
             }
             let summary = (block.kind == BlockKind::Warning)
-                .then(|| CARGO_WARNING_SUMMARY_RE.captures(&block.lines[0].bytes))
+                .then(|| CARGO_WARNING_SUMMARY_RE.captures(&heading))
                 .flatten();
             if let Some(captures) = summary {
                 let summary_count = std::str::from_utf8(&captures[1])
@@ -998,23 +1097,26 @@ fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
 }
 
 fn is_success_status(bytes: &[u8]) -> bool {
-    SUCCESS_STATUS_RE.is_match(bytes) && !ERROR_MARKER_RE.is_match(bytes)
+    let bytes = diagnostic_text(bytes);
+    SUCCESS_STATUS_RE.is_match(&bytes) && !ERROR_MARKER_RE.is_match(&bytes)
 }
 
 fn is_unittest_header(bytes: &[u8]) -> bool {
+    let bytes = diagnostic_text(bytes);
     bytes.starts_with(b"FAIL:") || bytes.starts_with(b"ERROR:")
 }
 
 fn is_traceback_start(bytes: &[u8]) -> bool {
-    trim_ascii_start(bytes).starts_with(b"Traceback")
+    trim_ascii_start(&diagnostic_text(bytes)).starts_with(b"Traceback")
 }
 
 fn is_exception_terminator(bytes: &[u8]) -> bool {
-    EXCEPTION_TERMINATOR_RE.is_match(bytes)
+    EXCEPTION_TERMINATOR_RE.is_match(&diagnostic_text(bytes))
 }
 
 fn is_rule_banner(bytes: &[u8]) -> bool {
-    let trimmed = trim_ascii_start(bytes);
+    let normalized = diagnostic_text(bytes);
+    let trimmed = trim_ascii_start(&normalized);
     let end = trimmed
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
@@ -1025,7 +1127,7 @@ fn is_rule_banner(bytes: &[u8]) -> bool {
 }
 
 fn line_is_blank(bytes: &[u8]) -> bool {
-    bytes.iter().all(u8::is_ascii_whitespace)
+    diagnostic_text(bytes).iter().all(u8::is_ascii_whitespace)
 }
 
 fn gap_is_banner_or_blank(lines: &[RawLine<'_>], end_line: usize, start_line: usize) -> bool {
@@ -1045,6 +1147,8 @@ fn block_has_traceback(block: &DiagnosticBlock) -> bool {
 }
 
 fn error_recap_count(bytes: &[u8]) -> Option<usize> {
+    let normalized = diagnostic_text(bytes);
+    let bytes = normalized.as_ref();
     if let Some(captures) = PYTEST_FAILED_RECAP_RE.captures(bytes) {
         return std::str::from_utf8(&captures[1]).ok()?.parse().ok();
     }
@@ -3784,6 +3888,72 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Error);
         assert_eq!(blocks[0].lines.len(), 2);
         assert_eq!(blocks[1].kind, BlockKind::Warning);
+    }
+
+    #[test]
+    fn ansi_oxc_headers_preserve_capture_bytes_and_reject_source() {
+        // Saved ANSI Error replay; classification must not alter captured bytes.
+        let error = b"\x1b[31mError\x1b[39m: Test timed out in 60000ms.\n";
+        for (stdout, stderr) in [(error.as_slice(), &b""[..]), (&b""[..], error.as_slice())] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(
+                diagnostic_counts(&blocks),
+                (1, 0),
+                "SGR styling must not hide diagnostic headers"
+            );
+            assert_eq!(blocks[0].lines[0].bytes, &error[..error.len() - 1]);
+        }
+        let source = b"\x1b[31merror:\x1b[0m SomeError {\n\x1b[33mwarn!(\"source\");\x1b[0m\n";
+        assert!(detect_blocks(&split_lines(source), &[]).is_empty());
+        let traceback = b"\x1b[31mERROR:\x1b[0m test_case\n---\n\x1b[31mTraceback\x1b[0m (most recent call last):\n  File \"a.py\", line 1\n\x1b[31mValueError:\x1b[0m broken\nFAILED (errors=1)\n";
+        assert_eq!(
+            diagnostic_counts(&detect_blocks(&split_lines(traceback), &[])),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn ansi_oxc_summary_totals_cover_rules_without_losing_other_work() {
+        // This is the saved synthetic Oxc-shaped replay, not a project result.
+        let rule = "\x1b[33m⚠ eslint(no-unused-vars)\x1b[0m: fixture warning\n";
+        let summary = "Found 0 errors and 1058 warnings in 3920 files (7.5s, 2 threads)\n";
+        for (stdout, stderr) in [
+            (format!("{rule}{summary}"), String::new()),
+            (summary.into(), rule.into()),
+        ] {
+            let blocks = detect_blocks(
+                &split_lines(stdout.as_bytes()),
+                &split_lines(stderr.as_bytes()),
+            );
+            assert_eq!(
+                diagnostic_counts(&blocks),
+                (0, 1058),
+                "Oxc recap totals must replace duplicate rule/footer counts"
+            );
+        }
+        let groups = format!(
+            "{rule}Found 0 errors and 2 warnings.\n{rule}Found 0 errors and 3 warnings.\n{rule}"
+        );
+        let other = b"warning: independent compiler diagnostic\n";
+        assert_eq!(
+            diagnostic_counts(&detect_blocks(
+                &split_lines(groups.as_bytes()),
+                &split_lines(other)
+            )),
+            (0, 7)
+        );
+        let mixed = "× eslint(no-debugger): fixture error\nFound 2 errors and 3 warnings.\n";
+        assert_eq!(
+            diagnostic_counts(&detect_blocks(&split_lines(mixed.as_bytes()), &[])),
+            (2, 3)
+        );
+        let zero_and_prose = "Found 0 errors and 0 warnings.\n⚠ ordinary prose\nFound errors and warnings in this guide\n";
+        assert!(detect_blocks(&split_lines(zero_and_prose.as_bytes()), &[]).is_empty());
+        let repeated = format!("{rule}{rule}");
+        assert_eq!(
+            diagnostic_counts(&detect_blocks(&split_lines(repeated.as_bytes()), &[])),
+            (0, 2)
+        );
     }
 
     #[test]

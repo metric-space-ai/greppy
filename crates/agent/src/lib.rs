@@ -13,8 +13,8 @@
 //! - [`workspace`] — per-repository agent worktree isolation and review-patch proposals.
 //! - [`agent_loop`] — ported multi-turn agent loop (pi v0.80.2 semantics, MIT).
 //!
-//! Dependencies are deliberately minimal (`serde` / `serde_json` / plain-HTTP
-//! `ureq`). No async runtime.
+//! Plain-HTTP gateway requests use `reqwest` on a request-local Tokio runtime;
+//! the public synchronous API and interruptible turns share that transport.
 
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
@@ -39,9 +39,8 @@ pub mod wire;
 pub mod workspace;
 
 pub use agent_loop::{
-    compaction_token_limit, model_context_window_tokens, parse_compact_ratio, run_agent_loop,
-    run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult, LoopStop,
-    DEFAULT_COMPACT_RATIO,
+    run_agent_loop, run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult,
+    LoopStop,
 };
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
@@ -54,13 +53,16 @@ pub use model::ModelStream;
 pub mod prompt_contract;
 pub use in_place::InPlaceWorkspace;
 pub use prompt::{
-    browser_prompt, compose_one_shot_prompt, export_prompt, prompt_metadata,
-    prompt_metadata_for_mode, system_prompt, system_prompt_for_mode, AgentPromptStyle,
-    BuiltinPromptMode, PUBLIC_PROMPT, SYSTEM_PROMPT,
+    browser_prompt, capability_manual, capability_sections, capability_source,
+    compose_one_shot_prompt, desktop_prompt, export_prompt, fence_untrusted_desktop,
+    merge_capability_sections, omit_untrusted_desktop_for_log, prompt_metadata,
+    prompt_metadata_for_mode, system_prompt, system_prompt_for_mode,
+    system_prompt_with_capabilities, AgentPromptStyle, BuiltinPromptMode, CapabilitySet,
+    PUBLIC_PROMPT, SYSTEM_PROMPT,
 };
 pub use protocol::{
-    ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,
-    Usage,
+    ContentPart, Message, ModelRequest, OutputTokenLimit, Role, StopReason, StreamEvent,
+    ToolChoice, ToolDefinition, Usage,
 };
 pub use sandbox::{SandboxError, SandboxMode, SandboxSpec};
 pub use wire::{

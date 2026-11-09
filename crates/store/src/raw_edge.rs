@@ -323,6 +323,33 @@ impl Store {
         if previous == current {
             return Ok(0);
         }
+        // Reference repair may now refresh only Go files in an already repaired
+        // JS/TS namespace. Preserve masks and replacement rows for other files.
+        let mut override_files = files
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut base_replacements = Vec::<serde_json::Value>::new();
+        let rows_key = format!("greppy.{namespace}_{prefix}_override_rows.{project}");
+        if overlay {
+            let load = |key: &str| -> Result<String> {
+                Ok(self.conn().query_row(
+                    "SELECT COALESCE((SELECT value FROM main.schema_meta WHERE key=?1), '[]')",
+                    [key],
+                    |row| row.get(0),
+                )?)
+            };
+            let retained_files: Vec<String> = serde_json::from_str(&load(&key)?)
+                .map_err(|error| Error::Invalid(format!("reference repair file mask: {error}")))?;
+            override_files.extend(retained_files);
+            let retained_rows: Vec<serde_json::Value> = serde_json::from_str(&load(&rows_key)?)
+                .map_err(|error| Error::Invalid(format!("reference repair rows: {error}")))?;
+            base_replacements.extend(retained_rows.into_iter().filter(|row| {
+                row.get("file_path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|path| !file_set.contains(path))
+            }));
+        }
         let tx = self.transaction()?;
         if overlay {
             tx.raw().execute(
@@ -334,7 +361,7 @@ impl Store {
             tx.raw().execute(
                 "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, serde_json::to_string(files)?],
+                params![key, serde_json::to_string(&override_files)?],
             )?;
         }
         for file in files {
@@ -343,7 +370,6 @@ impl Store {
                 params![project, file, kind],
             )?;
         }
-        let mut base_replacements = Vec::new();
         for edge in edges {
             let owned: bool = !overlay
                 || tx.raw().query_row(
@@ -365,10 +391,7 @@ impl Store {
             tx.raw().execute(
                 "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![
-                    format!("greppy.{namespace}_{prefix}_override_rows.{project}"),
-                    serde_json::to_string(&base_replacements)?
-                ],
+                params![rows_key, serde_json::to_string(&base_replacements)?],
             )?;
         }
         tx.commit()?;

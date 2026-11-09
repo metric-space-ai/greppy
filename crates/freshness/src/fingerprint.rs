@@ -568,8 +568,9 @@ fn write_stamp(
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
     let body = format!(
-        "v1\n{now}\n{total_inventory}\n{}\n{project}\n{scope}\n",
-        root.display()
+        "v1\n{now}\n{total_inventory}\n{}\n{project}\n{scope}\n{}\n",
+        root.display(),
+        greppy_parser::extraction_revision_policy_key()
     );
     // Atomic-enough: write a unique temp sibling, rename over the stamp.
     let tmp = path.with_extension(format!("freshstamp.tmp{}", std::process::id()));
@@ -600,6 +601,9 @@ fn read_valid_stamp(
         return None;
     }
     if lines.next()? != scope {
+        return None;
+    }
+    if lines.next()? != greppy_parser::extraction_revision_policy_key() {
         return None;
     }
     let now = std::time::SystemTime::now()
@@ -999,7 +1003,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1091,7 +1098,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1149,7 +1159,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1228,7 +1241,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();
@@ -1429,7 +1445,10 @@ mod tests {
                 mtime_ns: 1,
                 size: bytes.len() as i64,
                 parser_version: "tree-sitter-0.25".into(),
-                extractor_version: "greppy-extractor-v1".into(),
+                extractor_version: greppy_parser::extraction_revision(
+                    greppy_parser::Language::Rust,
+                )
+                .into(),
                 last_indexed_generation: 1,
             })
             .unwrap();

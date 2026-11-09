@@ -160,6 +160,33 @@ pub struct BaseStoreLayout {
 }
 
 impl BaseStoreLayout {
+    /// Verify exactly this published graph, without searching other identities.
+    pub fn read_verified_graph_manifest(path: &Path) -> io::Result<BaseStoreManifest> {
+        let identity_dir = path
+            .parent()
+            .ok_or_else(|| io::Error::other("Base graph has no identity directory"))?;
+        let repo_dir = identity_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("Base graph has no repository directory"))?;
+        let version_dir = repo_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("Base graph has no format directory"))?;
+        let stores_dir = version_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("Base graph has no stores directory"))?;
+        let data_root = stores_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("Base graph has no data root"))?;
+        let bytes = fs::read(identity_dir.join(BASE_STORE_MANIFEST_FILE))?;
+        let manifest: BaseStoreManifest = serde_json::from_slice(&bytes)
+            .map_err(|issue| io::Error::other(format!("decode Base manifest: {issue}")))?;
+        let layout = Self::new(data_root, &manifest.identity)?;
+        if layout.graph != path {
+            return Err(io::Error::other("Base graph path does not match identity"));
+        }
+        layout.read_verified_manifest()
+    }
+
     pub fn new(data_root: &Path, identity: &BaseStoreIdentity) -> io::Result<Self> {
         let identity_hash = identity.hash()?;
         let repo_hash = hex_sha256(identity.canonical_repository_identity.as_bytes());

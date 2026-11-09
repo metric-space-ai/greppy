@@ -39,11 +39,25 @@ pub const DEFAULT_DEADLINE_GRACE: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
 
 /// Installs the parent-owned attach token onto an authorized `greppy web`
-/// child via inherited FD 4. The returned value must be held until after
+/// child via inherited FD 4. Preparation runs in the trusted parent and
+/// receives the actual tool argv before the child is spawned. The returned
+/// value must be held until after
 /// `spawn` so the CLOEXEC pipe end stays open through fork.
 type AttachHold = Box<dyn Send>;
-type PrepareAttachFd = fn(&mut Command) -> io::Result<AttachHold>;
+type PrepareAttachFd = fn(&mut Command, &[String]) -> io::Result<AttachHold>;
 pub static PREPARE_ATTACH_FD: OnceLock<PrepareAttachFd> = OnceLock::new();
+
+/// Raw namespace input for this agent's browser owner. Retain this path for
+/// later CLI lifecycle operations: its text is part of the endpoint identity.
+pub fn agent_runtime_dir(run_id: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // "/tmp/greppy-agent-" + 8 hex = 26 bytes, under the endpoint path cap.
+    PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
+}
 
 /// Host-provided contextual signal, appended to the captured tool envelope.
 /// The subprocess byte streams and its exit status remain unchanged.
@@ -86,6 +100,9 @@ pub struct GreppyEnv {
     sandbox: SandboxMode,
     context_status: Option<(String, ContextStatusHook)>,
     git_identity: Option<GitIdentity>,
+    /// Web and desktop manuals enabled for this run. Shared so `&self` tool
+    /// calls (including a batch) can record `capabilities enable`.
+    capabilities: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl GreppyEnv {
@@ -118,6 +135,7 @@ impl GreppyEnv {
             sandbox: SandboxMode::Off,
             context_status: None,
             git_identity: None,
+            capabilities: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 
@@ -175,10 +193,20 @@ impl GreppyEnv {
     ///
     /// Defaults to [`SandboxMode::Off`] so non-`-p` callers are unchanged.
     /// `greppy -p` enables [`SandboxMode::Enforce`] with the run's writable
-    /// roots (worktree, temp, greppy data root, `~/.cargo`, platform cache).
+    /// roots (worktree, private Git state, per-run scratch and agent data).
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
         self
+    }
+
+    /// Manuals included from the first turn (`--enable`), before any tool call.
+    pub fn with_capabilities(self, caps: crate::prompt::CapabilitySet) -> Self {
+        self.capabilities.fetch_or(caps.bits(), Ordering::Relaxed);
+        self
+    }
+
+    pub fn capabilities(&self) -> crate::prompt::CapabilitySet {
+        crate::prompt::CapabilitySet::from_bits(self.capabilities.load(Ordering::Relaxed))
     }
 
     /// Attach the host contextual status engine for this agent session.
@@ -348,6 +376,12 @@ impl GreppyEnv {
         if let Some(msg) = greppy_guard(&args) {
             return ToolOutcome::err(msg);
         }
+        let desktop_screenshot = args.first().map(String::as_str) == Some("desktop")
+            && args.get(1).map(String::as_str) == Some("screenshot");
+        // The desktop CLI defaults to human text; images require its stable envelope.
+        if desktop_screenshot && !args.iter().any(|arg| arg == "--json") {
+            args.push("--json".to_owned());
+        }
 
         let configured_timeout = if args.first().map(String::as_str) == Some("bash-smart") {
             self.bash_timeout
@@ -383,14 +417,27 @@ impl GreppyEnv {
             cmd.env("GREPPY_CONTEXT_SCOPE", scope)
                 .env("GREPPY_CONTEXT_ENVELOPE", "1");
         }
+        let caps = self.capabilities.load(Ordering::Relaxed);
+        if caps & crate::prompt::CapabilitySet::WEB != 0 {
+            cmd.env("GREPPY_CAPABILITY_WEB", "1");
+        }
+        if caps & crate::prompt::CapabilitySet::DESKTOP != 0 {
+            cmd.env("GREPPY_CAPABILITY_DESKTOP", "1");
+        }
+        if args.first().map(String::as_str) == Some("desktop") {
+            // Upstream traces at debug can include tree text. Keep the child
+            // quiet so that text cannot land on stderr and then in the log.
+            cmd.env("GREPPY_LOG", "error");
+            cmd.env("RUST_LOG", "error");
+        }
         // Register attach pre_exec AFTER sandbox::apply so callbacks run
         // sandbox first, then child-local dup2 onto FD 4.
         let attach_hold = if args.first().map(String::as_str) == Some("web") {
             match PREPARE_ATTACH_FD.get() {
-                Some(prepare) => match prepare(&mut cmd) {
+                Some(prepare) => match prepare(&mut cmd, &args) {
                     Ok(hold) => Some(hold),
                     Err(error) => {
-                        return ToolOutcome::err(format!("attach token fd: {error}"));
+                        return ToolOutcome::err(format!("web parent preparation: {error}"));
                     }
                 },
                 None => {
@@ -432,6 +479,8 @@ impl GreppyEnv {
                     && args.get(1).map(String::as_str) == Some("screenshot")
                 {
                     extract_png_base64(&merge_stdio(&captured.stdout, &captured.stderr))
+                } else if desktop_screenshot && actual_success {
+                    extract_desktop_png_base64(&String::from_utf8_lossy(&captured.stdout))
                 } else {
                     None
                 };
@@ -448,8 +497,39 @@ impl GreppyEnv {
                 if let Some(data) = screenshot {
                     outcome.image_png_base64 = Some(data);
                     outcome.content = "screenshot attached as image for the model".to_owned();
+                } else if args.first().map(String::as_str) == Some("desktop") {
+                    if desktop_screenshot && actual_success {
+                        outcome.is_error = true;
+                        outcome.content.push_str(
+                            "\ndesktop screenshot returned no usable PNG image in greppy.desktop.v1; \
+                             no image was attached and visual verification did not occur",
+                        );
+                    }
+                    outcome.content = crate::prompt::fence_untrusted_desktop(&outcome.content);
                 }
-                outcome.content = self.fold_output(outcome.content, &raw_stdout, &raw_stderr);
+                if args.first().map(String::as_str) == Some("desktop") {
+                    // Do not keep a second raw copy. The model still sees the
+                    // fenced body; session logs strip that fence.
+                    let omitted = crate::prompt::omit_untrusted_desktop_for_log(&outcome.content)
+                        .into_owned();
+                    outcome.content = self.fold_output(
+                        std::mem::take(&mut outcome.content),
+                        omitted.as_bytes(),
+                        b"",
+                    );
+                } else {
+                    outcome.content = self.fold_output(outcome.content, &raw_stdout, &raw_stderr);
+                }
+                if actual_success {
+                    if let Some(name) = capability_enable_name(&args) {
+                        let bit = match name {
+                            "web" => crate::prompt::CapabilitySet::WEB,
+                            "desktop" => crate::prompt::CapabilitySet::DESKTOP,
+                            _ => 0,
+                        };
+                        self.capabilities.fetch_or(bit, Ordering::Relaxed);
+                    }
+                }
                 if actual_success {
                     if let Some((scope, hook)) = self.context_status.as_ref() {
                         if let Some(notice) =
@@ -743,6 +823,8 @@ fn prepare_tool_env(cmd: &mut Command) {
 
 /// Keep tool-created package/build caches within this run's writable scratch.
 /// Provider credentials are loaded in the parent, before child HOME changes.
+/// Operator cache aliases are not sandbox grants; CARGO_HOME and target writes
+/// use the same scratch tree granted by the CLI's writable_roots_for.
 fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
     let home = scratch.join("home");
     if let Some(original_home) = std::env::var_os("HOME") {
@@ -778,6 +860,15 @@ fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
     ] {
         cmd.env(variable, scratch.join(directory));
     }
+    // Desktop state must stay inside the scratch grant. An inherited
+    // AGENT_DESKTOP_HOME outside that grant cannot be written under Landlock
+    // or Seatbelt, and widening the sandbox to follow it would let a tool
+    // write the operator's real home. The default `$HOME/.agent-desktop` would
+    // also land in the redirected HOME, which is already under scratch; pinning
+    // the variable makes that location explicit and ignores an outside override.
+    let desktop_state = agent_desktop_state_dir(scratch);
+    let _ = std::fs::create_dir_all(&desktop_state);
+    cmd.env("AGENT_DESKTOP_HOME", &desktop_state);
     let maven = format!(
         "{} -Dmaven.repo.local={}",
         std::env::var("MAVEN_OPTS").unwrap_or_default(),
@@ -787,6 +878,13 @@ fn prepare_tool_cache_env(cmd: &mut Command, scratch: &Path) {
         .env("CARGO_BUILD_JOBS", "2")
         .env("RUST_TEST_THREADS", "2")
         .env("CMAKE_BUILD_PARALLEL_LEVEL", "2");
+}
+
+/// Desktop state directory for a sandboxed tool child. It is under `scratch`,
+/// which is already a writable sandbox root, so Landlock and Seatbelt do not
+/// need another grant.
+pub fn agent_desktop_state_dir(scratch: &Path) -> PathBuf {
+    scratch.join("agent-desktop")
 }
 
 /// Strip credential / secret env vars from a tool `Command`.
@@ -1104,6 +1202,40 @@ unsafe fn libc_kill_pg(pgid: i32, sig: i32) -> i32 {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
     unsafe { killpg(pgid, sig) }
+}
+
+fn capability_enable_name(args: &[String]) -> Option<&'static str> {
+    let mut parts = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "greppy");
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("capabilities"), Some("enable"), Some("web"), None) => Some("web"),
+        (Some("capabilities"), Some("enable"), Some("desktop"), None) => Some("desktop"),
+        _ => None,
+    }
+}
+
+fn extract_desktop_png_base64(stdout: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdout).ok()?;
+    if value.get("schema")?.as_str()? != "greppy.desktop.v1"
+        || !value.get("ok")?.as_bool()?
+        || value.get("command")?.as_str()? != "screenshot"
+        || value.get("truncated").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let data = value.get("data")?;
+    if data.get("format")?.as_str()? != "png"
+        || data.get("width")?.as_u64()? == 0
+        || data.get("height")?.as_u64()? == 0
+    {
+        return None;
+    }
+    data.get("png_base64")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 fn extract_png_base64(stdout: &str) -> Option<String> {
@@ -1601,6 +1733,175 @@ done
         );
         assert!(!out.is_error, "content={}", out.content);
         assert_eq!(out.content, "who-calls\nmy_func\n--code\n");
+    }
+
+    #[test]
+    fn desktop_screenshot_attaches_envelope_image_without_logging_pixels() {
+        for explicit_json in [false, true] {
+            let (mut env, _, _) = env_with_stub(
+                r#"
+case " $* " in *" --json "*) ;; *) exit 2 ;; esac
+printf '%s\n' '{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","truncated":false,"data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}'
+printf 'capture diagnostic\n' >&2
+"#,
+            );
+            // A screenshot exceeds the normal text budget; extraction precedes folding.
+            env.max_output_bytes = 64;
+            let mut args = vec!["desktop", "screenshot", "--app", "Greppy Desktop Fixture"];
+            if explicit_json {
+                args.push("--json");
+            }
+            let out = env.call_tool("greppy", &json!({"args": args}));
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(out.image_png_base64.as_deref(), Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="));
+            assert!(!out.content.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="));
+            assert!(out.content.contains("attached as image"));
+        }
+    }
+
+    #[test]
+    fn desktop_screenshot_failure_never_becomes_an_image_success() {
+        for (body, exit) in [
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":false,"command":"screenshot","data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},"error":{"code":"permission_denied"}}"#,
+                40,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}"#,
+                1,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","data":{"format":"png","width":1,"height":1}}"#,
+                0,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":false,"command":"screenshot","error":{"code":"permission_denied"}}"#,
+                0,
+            ),
+            (
+                r#"{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","truncated":true,"data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}"#,
+                0,
+            ),
+        ] {
+            let (mut env, _, _) = env_with_stub(&format!("printf '%s\\n' '{body}'\nexit {exit}"));
+            let out = env.call_tool("greppy", &json!({"args": ["desktop", "screenshot"]}));
+            assert!(out.is_error, "{exit}: {}", out.content);
+            assert!(out.image_png_base64.is_none());
+            assert!(!out.content.contains("attached as image"));
+            let logged = crate::prompt::omit_untrusted_desktop_for_log(&out.content);
+            assert!(!logged.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="));
+            if body.contains("permission_denied") {
+                assert!(out.content.contains("permission_denied"));
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_screenshot_reaches_next_model_request_in_both_modes() {
+        use crate::{
+            run_agent_loop, AgentConfig, BuiltinPromptMode, ClientError, ContentPart, Message,
+            ModelRequest, ModelStream, Role, StopReason, StreamEvent, TurnResult, Usage,
+        };
+        struct InspectImage(bool);
+        impl ModelStream for InspectImage {
+            fn stream_turn(
+                &mut self,
+                request: &ModelRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> Result<TurnResult, ClientError> {
+                let content = if !self.0 {
+                    self.0 = true;
+                    vec![ContentPart::ToolCall {
+                        id: "capture".into(),
+                        name: "greppy".into(),
+                        arguments: json!({"args": ["desktop", "screenshot"]}),
+                    }]
+                } else {
+                    assert!(request.messages.iter().flat_map(|m| &m.content).any(|part| {
+                        matches!(part, ContentPart::Image { media_type, data }
+                            if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==")
+                    }), "the model's next request lost the desktop image");
+                    vec![ContentPart::Text {
+                        text: "image received".into(),
+                    }]
+                };
+                let stop_reason = if matches!(content[0], ContentPart::ToolCall { .. }) {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                };
+                Ok(TurnResult {
+                    message: Message {
+                        role: Role::Assistant,
+                        content,
+                    },
+                    stop_reason,
+                    usage: Usage::default(),
+                })
+            }
+        }
+        for mode in [BuiltinPromptMode::OneShot, BuiltinPromptMode::Interactive] {
+            let (mut env, _, _) = env_with_stub(
+                r#"
+printf '%s\n' '{"schema":"greppy.desktop.v1","ok":true,"command":"screenshot","data":{"format":"png","width":1,"height":1,"png_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="}}'
+"#,
+            );
+            let config = AgentConfig::default()
+                .with_model("scripted-contract")
+                .with_system(crate::system_prompt_for_mode(mode));
+            let result = run_agent_loop(
+                &mut InspectImage(false),
+                &mut env,
+                &config,
+                "capture",
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.stop, crate::LoopStop::EndTurn);
+        }
+    }
+
+    #[test]
+    fn enabling_desktop_unlocks_the_session_without_fencing_the_enable_reply() {
+        let (mut env, _, _) = env_with_stub(
+            r#"
+printf 'cap=%s\n' "${GREPPY_CAPABILITY_DESKTOP:-unset}"
+printf '%s\n' "$1"
+"#,
+        );
+        let before = env.call_tool("greppy", &json!({"args": ["desktop", "status"]}));
+        assert!(before.content.contains("cap=unset"), "{}", before.content);
+        assert!(before.content.contains("UNTRUSTED_DESKTOP_CONTENT"));
+        let enable = env.call_tool(
+            "greppy",
+            &json!({"args": ["capabilities", "enable", "desktop"]}),
+        );
+        assert!(!enable.is_error, "{}", enable.content);
+        assert!(
+            !enable.content.contains("UNTRUSTED_DESKTOP_CONTENT"),
+            "enable returns greppy instructions, not fenced desktop content: {}",
+            enable.content
+        );
+        assert!(env.capabilities().desktop);
+        let again = env.call_tool(
+            "greppy",
+            &json!({"args": ["capabilities", "enable", "desktop"]}),
+        );
+        assert!(!again.is_error, "{}", again.content);
+        assert!(env.capabilities().desktop);
+        let after = env.call_tool("greppy", &json!({"args": ["desktop", "status"]}));
+        assert!(after.content.contains("cap=1"), "{}", after.content);
+        let logged = crate::prompt::omit_untrusted_desktop_for_log(&after.content);
+        assert!(!logged.contains("cap=1"));
+        assert!(logged.contains("omitted from log"));
+    }
+
+    #[test]
+    fn sandboxed_desktop_state_stays_under_the_scratch_grant() {
+        let scratch = std::path::Path::new("/tmp/greppy-agent-scratch");
+        let state = agent_desktop_state_dir(scratch);
+        assert!(state.starts_with(scratch));
+        assert_eq!(state.file_name().unwrap(), "agent-desktop");
     }
 
     #[test]
@@ -2165,6 +2466,31 @@ printf 'ran:%s\n' "$1""#,
         ] {
             assert!(envs[key].starts_with(&scratch), "{key}: {:?}", envs[key]);
         }
+        // Execute a tiny real child using these exact environment assignments,
+        // rather than proving only the shape of Command::get_envs(). No Cargo,
+        // dependency access or model is involved. The CLI regression separately
+        // proves the parent grants only this run's scratch, not operator caches.
+        #[cfg(unix)]
+        {
+            let mut child = Command::new("/bin/sh");
+            child.arg("-c").arg(
+                r#"mkdir -p "$CARGO_HOME/registry" "$CARGO_TARGET_DIR" &&
+                   printf cache > "$CARGO_HOME/registry/probe" &&
+                   printf build > "$CARGO_TARGET_DIR/probe""#,
+            );
+            prepare_tool_cache_env(&mut child, &scratch);
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(envs["CARGO_HOME"].join("registry/probe")).unwrap(),
+                b"cache"
+            );
+            assert_eq!(
+                std::fs::read(envs["CARGO_TARGET_DIR"].join("probe")).unwrap(),
+                b"build"
+            );
+        }
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub struct Store {
 #[derive(Debug, Clone)]
 struct OverlayInfo {
     base_path: PathBuf,
+    reuse_identity: std::sync::OnceLock<Option<crate::BaseStoreIdentity>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -325,6 +326,10 @@ impl Store {
         self.conn.execute_batch(OVERLAY_VIEWS_SQL)?;
         self.overlay = Some(OverlayInfo {
             base_path: base_path.to_path_buf(),
+            // Optional content reuse must not add manifest/digest reads to
+            // basic graph opens. Both successful validation and misses are
+            // memoized for this attached immutable Base only, on first use.
+            reuse_identity: std::sync::OnceLock::new(),
         });
         Ok(self)
     }
@@ -335,6 +340,18 @@ impl Store {
 
     pub fn overlay_base_path(&self) -> Option<&Path> {
         self.overlay.as_ref().map(|info| info.base_path.as_path())
+    }
+
+    pub(crate) fn overlay_reuse_identity(&self) -> Option<&crate::BaseStoreIdentity> {
+        let overlay = self.overlay.as_ref()?;
+        overlay
+            .reuse_identity
+            .get_or_init(|| {
+                crate::BaseStoreLayout::read_verified_graph_manifest(&overlay.base_path)
+                    .ok()
+                    .map(|manifest| manifest.identity)
+            })
+            .as_ref()
     }
 
     /// Begin a write transaction. Rolls back on drop if neither
@@ -702,7 +719,39 @@ mod tests {
             &crate::VisibilityIndex::default(),
         )
         .unwrap();
+        assert!(
+            overlay
+                .overlay
+                .as_ref()
+                .unwrap()
+                .reuse_identity
+                .get()
+                .is_none(),
+            "basic overlay open eagerly validated optional content reuse"
+        );
         assert!(overlay.list_nodes("p", "", "", 0, 10).unwrap().is_empty());
+        assert!(
+            overlay
+                .overlay
+                .as_ref()
+                .unwrap()
+                .reuse_identity
+                .get()
+                .is_none(),
+            "ordinary graph read validated optional content reuse"
+        );
+        assert!(overlay.overlay_reuse_identity().is_none());
+        assert!(
+            overlay
+                .overlay
+                .as_ref()
+                .unwrap()
+                .reuse_identity
+                .get()
+                .is_some(),
+            "failed optional validation was not memoized"
+        );
+        assert!(overlay.overlay_reuse_identity().is_none());
         assert_eq!(overlay.schema_version().unwrap(), 16);
         drop(overlay);
         let upgraded = Store::open(&delta_path).unwrap();

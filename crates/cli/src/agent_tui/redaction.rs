@@ -85,7 +85,7 @@ pub fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
 }
 
 pub fn redact_text(input: &str) -> String {
-    let mut out = input.to_string();
+    let mut out = greppy_agent::omit_untrusted_desktop_for_log(input).into_owned();
     for key in [
         "GREPPY_API_KEY",
         "ANTHROPIC_API_KEY",

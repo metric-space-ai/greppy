@@ -305,7 +305,42 @@ fn enclosing_impl_type<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> 
 /// Walk `node`'s ancestors and return the first enclosing
 /// `function_item`'s qname (constructed with the same collision-
 /// avoiding rules as the definition pass).
-fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+/// Disambiguate colliding free functions without evaluating cfg on the host.
+/// Build once per tree; definition and reference passes share exact AST owners.
+fn rust_free_function_qnames(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+) -> std::collections::HashMap<usize, String> {
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "function_item" && enclosing_impl_type(source, node).is_none() {
+            if let Some(name) = node.child_by_field_name("name") {
+                let qname = format!("{file_path}::Function::{}", node_text(source, name));
+                groups.entry(qname).or_default().push(node.start_byte());
+            }
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let mut identities = std::collections::HashMap::new();
+    for (qname, starts) in groups {
+        if starts.len() > 1 {
+            for start in starts {
+                identities.insert(start, format!("{qname}@{start}"));
+            }
+        }
+    }
+    identities
+}
+
+fn enclosing_function_qname(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
+) -> Option<String> {
     let mut p = node.parent();
     while let Some(cur) = p {
         if cur.kind() == "function_item" {
@@ -317,7 +352,10 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
                         let impl_ctx = enclosing_impl_type(source, cur);
                         return Some(match impl_ctx {
                             Some(t) => format!("{file_path}::{t}::{name}"),
-                            None => format!("{file_path}::Function::{name}"),
+                            None => free_function_qnames
+                                .get(&cur.start_byte())
+                                .cloned()
+                                .unwrap_or_else(|| format!("{file_path}::Function::{name}")),
                         });
                     }
                 }
@@ -1838,7 +1876,12 @@ fn rust_local_binding_owner<'a>(
 ///
 /// Construction mirrors PASS 1's qname scheme so the endpoints resolve
 /// against the nodes emitted there.
-fn enclosing_def_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option<String> {
+fn enclosing_def_qname(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
+) -> Option<String> {
     let mut p = node.parent();
     while let Some(cur) = p {
         match cur.kind() {
@@ -1847,7 +1890,10 @@ fn enclosing_def_qname(source: &[u8], node: Node<'_>, file_path: &str) -> Option
                 let name = node_text(source, name_node);
                 return Some(match enclosing_impl_type(source, cur) {
                     Some(t) => format!("{file_path}::{t}::{name}"),
-                    None => format!("{file_path}::Function::{name}"),
+                    None => free_function_qnames
+                        .get(&cur.start_byte())
+                        .cloned()
+                        .unwrap_or_else(|| format!("{file_path}::Function::{name}")),
                 });
             }
             "struct_item" | "union_item" => {
@@ -4765,6 +4811,7 @@ fn rust_expression_macro_calls(
     source: &[u8],
     root: Node<'_>,
     file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
 ) -> greppy_core::Result<Vec<ExtractedEdge>> {
     const PREFIX: &str = "async fn __greppy_macro_arguments__() { let _ = (";
     const MACROS: &[&str] = &[
@@ -4804,7 +4851,7 @@ fn rust_expression_macro_calls(
                 node.child_by_field_name("macro"),
                 node.named_children(&mut node.walk())
                     .find(|n| n.kind() == "token_tree"),
-                enclosing_function_qname(source, node, file_path),
+                enclosing_function_qname(source, node, file_path, free_function_qnames),
             ) {
                 let name = node_text(source, name);
                 if admitted(name, &shadowed) && tokens.end_byte() > tokens.start_byte() + 1 {
@@ -4862,8 +4909,12 @@ fn rust_expression_macro_calls(
                         != Some("callee")
                         || node.start_byte() < PREFIX.len()
                         || node.end_byte() > PREFIX.len() + body.len()
-                        || enclosing_function_qname(&wrapped, node, file_path)
-                            != Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+                        || enclosing_function_qname(
+                            &wrapped,
+                            node,
+                            file_path,
+                            &std::collections::HashMap::new(),
+                        ) != Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
                     {
                         continue;
                     }
@@ -4926,8 +4977,12 @@ fn rust_expression_macro_calls(
         let mut nested = vec![tree.root_node()];
         while let Some(node) = nested.pop() {
             if node.kind() == "macro_invocation"
-                && enclosing_function_qname(&wrapped, node, file_path)
-                    == Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+                && enclosing_function_qname(
+                    &wrapped,
+                    node,
+                    file_path,
+                    &std::collections::HashMap::new(),
+                ) == Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
             {
                 if let (Some(name), Some(tokens)) = (
                     node.child_by_field_name("macro"),
@@ -4983,6 +5038,7 @@ fn rust_expression_macro_calls(
 
 fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
     let tree = crate::parse(Language::Rust, source)?;
+    let free_function_qnames = rust_free_function_qnames(source, tree.root_node(), file_path);
     let queries = crate::query::cached_query_set(&Language::Rust)
         .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
 
@@ -5033,7 +5089,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     // (`enclosing_def_qname` walks to the nearest struct/enum/
                     // trait/function and rebuilds its qname with the same
                     // label scheme).
-                    let Some(owner_qn) = enclosing_def_qname(source, node, file_path) else {
+                    let Some(owner_qn) =
+                        enclosing_def_qname(source, node, file_path, &free_function_qnames)
+                    else {
                         continue;
                     };
                     let decl = node.parent().unwrap_or(node);
@@ -5133,7 +5191,10 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         let impl_ctx = enclosing_impl_type(source, node);
                         match impl_ctx {
                             Some(t) => format!("{file_path}::{t}::{text}"),
-                            None => format!("{file_path}::Function::{text}"),
+                            None => free_function_qnames
+                                .get(&node.parent().unwrap_or(node).start_byte())
+                                .cloned()
+                                .unwrap_or_else(|| format!("{file_path}::Function::{text}")),
                         }
                     }
                     _ => format!("{file_path}::{label}::{text}"),
@@ -5442,7 +5503,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 // CALLS edge below targets the real `file::Function::<text>`
                 // qname (resolved by name when cross-file); the Call node was
                 // never a resolution endpoint, only dead weight + search noise.
-                if let Some(caller_qname) = enclosing_function_qname(source, node, file_path) {
+                if let Some(caller_qname) =
+                    enclosing_function_qname(source, node, file_path, &free_function_qnames)
+                {
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
                         source_qualified_name: caller_qname,
@@ -5546,6 +5609,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
         source,
         tree.root_node(),
         file_path,
+        &free_function_qnames,
     )?);
 
     // PASS 4+5 — usages (the unified reference model). There are NO separate
@@ -5571,8 +5635,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
             // The nearest enclosing function's qname, with the same file-node
             // fallback the resolver applies when the reference is not inside
             // any function.
-            let source_qname = enclosing_function_qname(source, node, file_path)
-                .unwrap_or_else(|| file_qname.clone());
+            let source_qname =
+                enclosing_function_qname(source, node, file_path, &free_function_qnames)
+                    .unwrap_or_else(|| file_qname.clone());
             result.edges.push(ExtractedEdge {
                 edge_type: "USAGE".into(),
                 source_qualified_name: source_qname,
@@ -5660,7 +5725,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 let Some(type_node) = node.child_by_field_name("type") else {
                     continue;
                 };
-                let Some(source_qname) = enclosing_def_qname(source, node, file_path) else {
+                let Some(source_qname) =
+                    enclosing_def_qname(source, node, file_path, &free_function_qnames)
+                else {
                     // Top-level const/static with no enclosing def — skip;
                     // type-assigns are attached to an enclosing function.
                     continue;
@@ -6239,7 +6306,13 @@ fn extract_go(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionR
                 if text.is_empty() || is_go_keyword(text) {
                     continue;
                 }
-                if is_definition_name(node) {
+                // A qualified type's `name:` field is a reference (ast.VarStmt),
+                // not a declaration. Other definition-name filtering is unchanged.
+                if is_definition_name(node)
+                    && node
+                        .parent()
+                        .is_none_or(|parent| parent.kind() != "qualified_type")
+                {
                     continue;
                 }
                 if is_inside_kind(node, &["call_expression"]) {
@@ -7409,7 +7482,8 @@ fn extract_c_cpp(
     //   * `type_definition` (typedef) nodes carry NO label — a typedef whose
     //     bare name equals its struct/enum (`typedef struct Vec Vec;`) would
     //     collide, and no standalone `Type` nodes are emitted for the remainder,
-    //     so we drop every spec-emitted "Type" node;
+    //     so we drop every spec-emitted "Type" node. The member pass restores
+    //     only direct aliases of anonymous compound definitions as owner types;
     //   * `namespace_definition` nodes are NOT graph nodes here (they fold into
     //     the module spine), so we drop every "Namespace" node;
     //   * struct / class / union body `field_declaration`s yield "Field" nodes
@@ -7478,6 +7552,9 @@ fn c_cpp_member_pass(
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
+            "type_definition" => {
+                c_cpp_anonymous_compound_typedef(source, file_path, node, result);
+            }
             // `#define NAME ...` / `#define FN(x) ...` → a Macro node. The macro
             // body is a `preproc_arg`, so there is nothing to descend into.
             "preproc_def" | "preproc_function_def" => {
@@ -7527,9 +7604,71 @@ fn c_cpp_type_body<'a>(type_node: Node<'a>) -> Option<Node<'a>> {
     type_node.child_by_field_name("body")
 }
 
-/// Emit the `Field` / `Variable` member nodes for one C / C++ type specifier
-/// `type_node` (kind → `label`). Only the type's OWN body is scanned; nested
-/// types are reached by the outer walk in [`c_cpp_member_pass`].
+struct CAnonymousCompoundAliases<'tree> {
+    compound: Node<'tree>,
+    label: &'static str,
+    aliases: Vec<Node<'tree>>,
+}
+
+/// Shared definition/reference policy: only direct declarators of an unnamed
+/// compound with a body name the newly supported owner type.
+fn c_cpp_anonymous_compound_aliases(typedef: Node<'_>) -> Option<CAnonymousCompoundAliases<'_>> {
+    if typedef.kind() != "type_definition" {
+        return None;
+    }
+    let compound = typedef.child_by_field_name("type")?;
+    let label = c_cpp_type_label(compound.kind())?;
+    if compound.child_by_field_name("name").is_some() || c_cpp_type_body(compound).is_none() {
+        return None;
+    }
+    let mut cursor = typedef.walk();
+    let aliases = typedef
+        .children_by_field_name("declarator", &mut cursor)
+        .filter(|alias| matches!(alias.kind(), "type_identifier" | "identifier"))
+        .collect();
+    Some(CAnonymousCompoundAliases {
+        compound,
+        label,
+        aliases,
+    })
+}
+
+/// Restore direct aliases of anonymous compound definitions after spec typedef
+/// pruning. Tagged types and non-compound / indirect aliases keep existing rules.
+fn c_cpp_anonymous_compound_typedef(
+    source: &[u8],
+    file_path: &str,
+    typedef: Node<'_>,
+    result: &mut ExtractionResult,
+) {
+    let Some(CAnonymousCompoundAliases {
+        compound,
+        label,
+        aliases,
+    }) = c_cpp_anonymous_compound_aliases(typedef)
+    else {
+        return;
+    };
+    for alias in aliases {
+        let name = node_text(source, alias);
+        if name.is_empty() {
+            continue;
+        }
+        result.nodes.push(ExtractedNode {
+            label: label.into(),
+            name: name.into(),
+            qualified_name: format!("{file_path}::{label}::{name}"),
+            file_path: file_path.into(),
+            start_line: typedef.start_position().row as u32 + 1,
+            end_line: typedef.end_position().row as u32 + 1,
+            properties: serde_json::json!({}),
+        });
+        c_cpp_named_type_members(source, file_path, compound, label, name, result);
+    }
+}
+
+/// Emit members of a named specifier; anonymous typedef owners are supplied by
+/// `c_cpp_anonymous_compound_typedef` to the same member implementation.
 fn c_cpp_type_members(
     source: &[u8],
     file_path: &str,
@@ -7546,6 +7685,17 @@ fn c_cpp_type_members(
     if type_name.is_empty() {
         return;
     }
+    c_cpp_named_type_members(source, file_path, type_node, label, type_name, result);
+}
+
+fn c_cpp_named_type_members(
+    source: &[u8],
+    file_path: &str,
+    type_node: Node<'_>,
+    label: &str,
+    type_name: &str,
+    result: &mut ExtractionResult,
+) {
     // The (relabelled) type node's qname is `{file}::{label}::{name}`; a member
     // hangs off it as `{file}::{label}::{type}::{member}`.
     let owner_prefix = format!("{file_path}::{label}::{type_name}");
@@ -7775,8 +7925,25 @@ fn c_cpp_usage_pass(
     };
     let tree = crate::parse(usage_language, source)?;
     let mut stack = vec![tree.root_node()];
+    let mut anonymous_aliases = std::collections::HashSet::new();
     while let Some(node) = stack.pop() {
-        c_cpp_try_emit_usage(node, source, file_path, call_kinds, import_kinds, result);
+        if let Some(policy) = c_cpp_anonymous_compound_aliases(node) {
+            anonymous_aliases.extend(
+                policy
+                    .aliases
+                    .iter()
+                    .map(|alias| (alias.start_byte(), alias.end_byte())),
+            );
+        }
+        c_cpp_try_emit_usage(
+            node,
+            source,
+            file_path,
+            call_kinds,
+            import_kinds,
+            &anonymous_aliases,
+            result,
+        );
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 stack.push(child);
@@ -7793,6 +7960,7 @@ fn c_cpp_try_emit_usage(
     file_path: &str,
     call_kinds: &[&str],
     import_kinds: &[&str],
+    anonymous_aliases: &std::collections::HashSet<(usize, usize)>,
     result: &mut ExtractionResult,
 ) {
     // C / C++ references are `identifier` / `type_identifier`.
@@ -7801,6 +7969,11 @@ fn c_cpp_try_emit_usage(
     }
     let name = node_text(source, node);
     if name.is_empty() || C_CPP_KEYWORDS.contains(&name) {
+        return;
+    }
+    // These exact declarators are definitions even inside an enclosing type's
+    // `type:` range. Do not change the existing named-tag/type-reference rules.
+    if c_cpp_is_anonymous_alias_declarator(node, anonymous_aliases) {
         return;
     }
     // Type positions have to be classified before the generic definition-name
@@ -7824,7 +7997,7 @@ fn c_cpp_try_emit_usage(
     }
     // Skip a node that IS the `name:` field of its own parent (a definition
     // name, not a reference).
-    if c_cpp_is_definition_name(node) {
+    if c_cpp_is_definition_name(node, anonymous_aliases) {
         return;
     }
     // Every C / C++ usage is attributed to the per-file MODULE node, not the
@@ -7955,7 +8128,20 @@ fn c_cpp_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
 /// parse exposes as the `type_definition`'s `declarator` (a standalone
 /// `type_identifier`). A `typedef struct S S;` alias IS a real reference and is
 /// kept, so this is scoped to `type:` being an `enum_specifier`.
-fn c_cpp_is_definition_name(node: Node<'_>) -> bool {
+fn c_cpp_is_anonymous_alias_declarator(
+    node: Node<'_>,
+    anonymous_aliases: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    anonymous_aliases.contains(&(node.start_byte(), node.end_byte()))
+}
+
+fn c_cpp_is_definition_name(
+    node: Node<'_>,
+    anonymous_aliases: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    if c_cpp_is_anonymous_alias_declarator(node, anonymous_aliases) {
+        return true;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -22374,6 +22560,97 @@ typedef int MyInt;
             "typedef must not emit a Type node: {:?}",
             r.nodes
         );
+    }
+
+    #[test]
+    fn anonymous_compound_typedef_keeps_alias_span_members_and_tag_collisions() {
+        let src = "typedef struct {\n    int frames;\n    float gain;\n} Workspace, WorkspaceAlias, *WorkspacePtr;\ntypedef union { int bits; float sample; } SampleWord, SampleAlias;\ntypedef enum { Idle, Active } RunMode, RunModeAlias;\ntypedef struct Tagged { int retained; } Tagged;\ntypedef int Scalar;\nstruct Forward { int value; };\ntypedef struct Forward Forward;\nint consume(Workspace a, WorkspaceAlias b, SampleWord c, SampleAlias d, RunMode e, RunModeAlias f) { return a.frames + b.frames + c.bits + d.bits + e + f; }\n";
+        for (language, path) in [
+            (Language::C, "fixture.c"),
+            (Language::C, "fixture.h"),
+            (Language::Cpp, "fixture.hpp"),
+        ] {
+            let result = extract(language, src.as_bytes(), path).unwrap();
+            for alias in ["Workspace", "WorkspaceAlias"] {
+                let nodes: Vec<_> = result.nodes.iter().filter(|n| n.name == alias).collect();
+                assert_eq!(
+                    nodes.len(),
+                    1,
+                    "anonymous compound typedef alias missing: {path}::{alias}"
+                );
+                let node = nodes[0];
+                assert_eq!(node.label, "Class");
+                assert_eq!((node.start_line, node.end_line), (1, 4));
+                for field in ["frames", "gain"] {
+                    assert!(
+                        result.nodes.iter().any(|n| n.label == "Field"
+                            && n.qualified_name == format!("{path}::Class::{alias}::{field}")),
+                        "anonymous compound typedef member missing: {alias}::{field}"
+                    );
+                }
+            }
+            assert!(result
+                .nodes
+                .iter()
+                .any(|n| n.name == "SampleWord" && n.label == "Class"));
+            assert!(result
+                .nodes
+                .iter()
+                .any(|n| n.qualified_name == format!("{path}::Enum::RunMode::Idle")));
+            assert_eq!(
+                result.nodes.iter().filter(|n| n.name == "Tagged").count(),
+                1,
+                "tagged typedef must keep its single existing definition"
+            );
+            assert!(!result
+                .nodes
+                .iter()
+                .any(|n| n.label == "Type" || n.name == "Scalar" || n.name == "WorkspacePtr"));
+            for (name, declaration_line) in [
+                ("Workspace", 4),
+                ("WorkspaceAlias", 4),
+                ("SampleWord", 5),
+                ("SampleAlias", 5),
+                ("RunMode", 6),
+                ("RunModeAlias", 6),
+            ] {
+                assert!(
+                    result.nodes.iter().any(|node| node.name == name),
+                    "direct alias definition missing: {name}"
+                );
+                assert!(
+                    !result.edges.iter().any(|edge| edge.line == declaration_line
+                        && matches!(edge.edge_type.as_str(), "USAGE" | "TYPE_REF")
+                        && (edge.properties.get("ref_name").and_then(|v| v.as_str())
+                            == Some(name)
+                            || edge.properties.get("type_name").and_then(|v| v.as_str())
+                                == Some(name))),
+                    "anonymous alias declarator became a reference: {path}::{name}"
+                );
+                assert!(
+                    result.edges.iter().any(|edge| edge.edge_type == "TYPE_REF"
+                        && edge.line == 11
+                        && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some(name)),
+                    "real outer alias type reference lost: {path}::{name}"
+                );
+            }
+            assert!(
+                result.edges.iter().any(|edge| edge.edge_type == "USAGE"
+                    && edge.line == 10
+                    && edge.properties.get("ref_name").and_then(|v| v.as_str()) == Some("Forward")),
+                "tagged typedef reference must remain a usage"
+            );
+        }
+        let result = cpp("typedef class { public: int value; } Box;\nint use_box(Box value) { return value.value; }\n", "box.hpp");
+        assert!(result
+            .nodes
+            .iter()
+            .any(|n| n.qualified_name == "box.hpp::Class::Box::value"));
+        assert!(!result.edges.iter().any(|edge| edge.line == 1
+            && edge.properties.get("ref_name").and_then(|v| v.as_str()) == Some("Box")));
+        assert!(result.edges.iter().any(|edge| edge.edge_type == "TYPE_REF"
+            && edge.line == 2
+            && edge.properties.get("type_name").and_then(|v| v.as_str()) == Some("Box")));
     }
 
     #[test]

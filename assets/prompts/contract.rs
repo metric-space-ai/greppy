@@ -31,8 +31,22 @@ pub mod render;
 // (b) new sentence after the opening paragraph: "The task is a change to
 // deliver: make the edits with greppy and verify them; do not stop at an
 // analysis." v4: 12,900 bytes, SHA256 below. Adapter unchanged.
+// 2026-11-05: Owner signature for PR #325, reviewed head
+// 66e7808f508f561e63a9806719068b55b9f220e1, manifest SHA256
+// 1b0907acac2cc0c6c140282cff60a17e806b8d480877b1ba2ea34841044ad6bb.
+// Covers the exact sources, prepared manuals and all sixteen mode/capability
+// starts below. The November 3 request was not a signature for these bytes.
+// Adapter unchanged. Previous public hash 12bb2db4… (12,900 bytes).
 pub const APPROVED_SHA256: &str =
-    "12bb2db4bce1ab2603279913aeb676f7b68115143a42170091f5842a6cf0d84f";
+    "cbc854763d4ddbcf349d60f038aeb61e971e5987a0a8bb202b512f4123d1fd80";
+pub const APPROVED_WEB_CAPABILITY_SHA256: &str =
+    "47b03e776795bf61101cb74e3522e0d57a0c01d184ff0f485a853f8aec5ef1bb";
+pub const APPROVED_DESKTOP_CAPABILITY_SHA256: &str =
+    "9a396328ae2393b7f771cda55936cd2f240bde0c23a7748413fe9fd1cf4dbbe6";
+pub const APPROVED_WEB_BUILTIN_CAPABILITY_SHA256: &str =
+    "cc2374d6e9cd742c8dd32a42ff6e1cdb3aac5ba18a7be51ca6190138652d16bc";
+pub const APPROVED_DESKTOP_BUILTIN_CAPABILITY_SHA256: &str =
+    "75c0143c2990aa6a46ae26afc49dd2a646d3cba731e2090d607aba7b58bfdae4";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
 // 2026-10-06 consolidated owner order A: exact coding-agent introduction,
@@ -63,16 +77,55 @@ pub const APPROVED_SHA256: &str =
 // unchanged. ACP still uses only the first sentence, so its rendered hash
 // is unchanged. Previous adapter 9facb78a…; previous one-shot d3eb31ba…,
 // interactive 6dc67477…, serve 117dde23….
+// 2026-11-09: merge of origin/main (#325 capability manuals) into PR #321.
+// The PR's owner-approved adapter wording (11-03, 11-04 above) is combined
+// with main's signed rendering and manuals; the sixteen start digests below
+// are regenerated from render::render_start over these exact sources. ACP
+// digests are unchanged (ACP uses only the role sentence).
 pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
     "2494fd281878fe2de692b647bcb3c39dd6b22c86b8332026494ac71dd5aaec61";
 
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "931009d769441b0e6739016d4fe81cf18d04f0d7453316ddf665e112b0239916",
-        Interactive => "33a0ff9e4d81c85f80191dade56acc3e32b69de2aaa40ce8b1eaba1aea50c79d",
-        Serve => "af84fffe6167fed83b04e18a30d982be1ba2d4070531067491c3915bf31d00cc",
-        Acp => "3683b8542fc14de0b9c46a3ebbed630f076dde4d56bb0523f587e93454198b44",
+        OneShot => "ca66effc20b8d2d8a1aa25215f330a103ecbb1c6ca3b897abcb7744c6e134437",
+        Interactive => "13ab08b65cabac34fcf72392460057aaa5fa1284ce906a5b78ec99e66038276e",
+        Serve => "0dfef323eada5f385b5d94e74bb59c0f393b7905c35b557baf442af7f70fba59",
+        Acp => "d9d5fa63fa9c9ad05584d534d9800a3d00ee9c480412bc4e8a40f40b7a39df1b",
+    }
+}
+
+/// Owner-signed effective start prompt, including optional capability manuals.
+pub fn approved_start_sha256(
+    mode: render::BuiltinPromptMode,
+    web: bool,
+    desktop: bool,
+) -> &'static str {
+    use render::BuiltinPromptMode::*;
+    match (mode, web, desktop) {
+        (mode, false, false) => approved_rendered_sha256(mode),
+        (OneShot, true, false) => {
+            "12ba29cfac06269a82110e86bde95cd469054c5075ffc02229658b3575a30c50"
+        }
+        (OneShot, false, true) => {
+            "6fa6fca3a1c4c94a5eb6dfe900a86297652ff609aec08eaebc4f1801f54f9e30"
+        }
+        (OneShot, true, true) => "2ff36a12a7fd17e763878916f1a13e235f188b06b660a726c3ee1981fc9682f0",
+        (Interactive, true, false) => {
+            "c1eb7c9cb80a604b55402f1c889799ad84d2e7376daebb680d5fc400cce09606"
+        }
+        (Interactive, false, true) => {
+            "79daf56c7b3504d4a3414dd4393c71df20048b2a6ed41a0b1a3d5f0156ccc4c6"
+        }
+        (Interactive, true, true) => {
+            "fb980dc69d16b6d51790ac44e2df666de43d26704fd0f2654e0ea490edddd8ab"
+        }
+        (Serve, true, false) => "ebcf66551c67f3f18288c63d7d880f56bc0a4768ba599969e5f42442798706f0",
+        (Serve, false, true) => "49662f7d3a236cccf5db5f9e3daf78323aba29e68357d0a20d66bffe21d4718b",
+        (Serve, true, true) => "94e3331e58a09c335fe75a72ed1e4ca50deb3dd7fc62509fc778a5f18b007f47",
+        (Acp, true, false) => "fd86b895e615fbec6d9c2e1bd55cd8f7fa9957ed7241ea257127a0d39691af8e",
+        (Acp, false, true) => "f7b837ec737da01bf05030396d21d36148597fa4643a3cf4c11dde02957f347d",
+        (Acp, true, true) => "297a40c5bad538aeace2cbfe3b0b9de0b85323b8da7326d5883000388536ea29",
     }
 }
 
@@ -105,6 +158,14 @@ pub fn verify_repository(root: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
         "assets/prompts/agent-adapter.md",
         APPROVED_AGENT_ADAPTER_SHA256,
     )?;
+    let web = read(
+        "assets/prompts/capabilities/web.md",
+        APPROVED_WEB_CAPABILITY_SHA256,
+    )?;
+    let desktop = read(
+        "assets/prompts/capabilities/desktop.md",
+        APPROVED_DESKTOP_CAPABILITY_SHA256,
+    )?;
     println!(
         "cargo:rerun-if-changed={}",
         root.join("assets/prompts/contract.rs").display()
@@ -115,9 +176,43 @@ pub fn verify_repository(root: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     );
     let public_text = std::str::from_utf8(&public).map_err(|e| format!("prompt UTF-8: {e}"))?;
     let adapter_text = std::str::from_utf8(&adapter).map_err(|e| format!("adapter UTF-8: {e}"))?;
+    let web_text = std::str::from_utf8(&web).map_err(|e| format!("web UTF-8: {e}"))?;
+    let desktop_text = std::str::from_utf8(&desktop).map_err(|e| format!("desktop UTF-8: {e}"))?;
+    for (name, source, approved) in [
+        (
+            "built-in web manual",
+            web_text,
+            APPROVED_WEB_BUILTIN_CAPABILITY_SHA256,
+        ),
+        (
+            "built-in desktop manual",
+            desktop_text,
+            APPROVED_DESKTOP_BUILTIN_CAPABILITY_SHA256,
+        ),
+    ] {
+        verify_bytes(
+            name,
+            render::prepare_capability(source).as_bytes(),
+            approved,
+        )?;
+    }
     for mode in render::BUILTIN_MODES {
-        let text = render::render_builtin(public_text, adapter_text, mode);
-        verify_bytes(mode.name(), text.as_bytes(), approved_rendered_sha256(mode))?;
+        for (web, desktop) in [(false, false), (true, false), (false, true), (true, true)] {
+            let text = render::render_start(
+                public_text,
+                adapter_text,
+                mode,
+                web_text,
+                desktop_text,
+                web,
+                desktop,
+            );
+            verify_bytes(
+                mode.name(),
+                text.as_bytes(),
+                approved_start_sha256(mode, web, desktop),
+            )?;
+        }
     }
     Ok((public, adapter))
 }
@@ -140,6 +235,29 @@ pub fn write_snapshots(root: &Path, out: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_start_variant_matches_the_owner_signed_manifest() {
+        for mode in render::BUILTIN_MODES {
+            for (web, desktop) in [(false, false), (true, false), (false, true), (true, true)] {
+                let text = render::render_start(
+                    include_str!("../../AGENTS.md"),
+                    include_str!("agent-adapter.md"),
+                    mode,
+                    include_str!("capabilities/web.md"),
+                    include_str!("capabilities/desktop.md"),
+                    web,
+                    desktop,
+                );
+                verify_bytes(
+                    mode.name(),
+                    text.as_bytes(),
+                    approved_start_sha256(mode, web, desktop),
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn changed_prompt_is_refused_with_both_digests() {
         let approved = digest(b"approved");

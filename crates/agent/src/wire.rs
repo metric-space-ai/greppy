@@ -18,17 +18,24 @@ use crate::protocol::{
 /// Always sets `stream: true`. Identified Anthropic models receive explicit
 /// system/tool/history cache breakpoints; other models receive no cache fields.
 /// `tool_choice` maps as `auto` / `none` / `any` (Anthropic's "required").
-pub fn to_messages_request_body(req: &ModelRequest) -> Value {
+pub fn to_messages_request_body(req: &ModelRequest) -> Result<Value, String> {
+    to_messages_request_body_with_limit(req, req.max_tokens)
+}
+
+pub(crate) fn to_messages_request_body_with_limit(
+    req: &ModelRequest,
+    max_tokens: u64,
+) -> Result<Value, String> {
+    if max_tokens == 0 || max_tokens == u64::MAX {
+        return Err("Anthropic Messages requires a resolved finite positive max_tokens".into());
+    }
     let mut body = json!({
         "model": req.model,
         "messages": map_messages(&req.messages),
         "stream": true,
     });
 
-    // u64::MAX is the loop budget sentinel, never a provider output limit.
-    if req.max_tokens != u64::MAX {
-        body["max_tokens"] = json!(req.max_tokens);
-    }
+    body["max_tokens"] = json!(max_tokens);
     let cache = req.model.starts_with("claude-") || req.model.starts_with("anthropic/claude-");
     if let Some(system) = &req.system {
         body["system"] = if cache {
@@ -79,7 +86,7 @@ pub fn to_messages_request_body(req: &ModelRequest) -> Value {
         ToolChoice::Required => json!({"type": "any"}),
     };
 
-    body
+    Ok(body)
 }
 
 /// Sampling fields of a request body as they are about to be sent.
@@ -1020,7 +1027,7 @@ mod tests {
 
     #[test]
     fn request_body_golden() {
-        let body = to_messages_request_body(&sample_request());
+        let body = to_messages_request_body(&sample_request()).expect("bounded request");
         let mut expected = json!({
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 1024,
@@ -1078,12 +1085,16 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_and_foreign_model_have_no_fabricated_metadata() {
+    fn required_anthropic_output_limit_is_numeric_and_finite() {
         let mut req = sample_request();
         req.model = "gpt-custom".into();
-        req.max_tokens = u64::MAX;
-        let body = to_messages_request_body(&req);
-        assert!(body.get("max_tokens").is_none());
+        for invalid in [0, u64::MAX] {
+            req.max_tokens = invalid;
+            assert!(to_messages_request_body(&req).is_err());
+        }
+        req.max_tokens = 65536;
+        let body = to_messages_request_body(&req).expect("resolved bound");
+        assert_eq!(body["max_tokens"].as_u64(), Some(65536));
         assert!(!body.to_string().contains("cache_control"));
         let facts = sent_request_facts(&body);
         assert_eq!(facts["first_user_message"], "list files");
@@ -1093,7 +1104,7 @@ mod tests {
 
     #[test]
     fn sent_request_facts_copy_posted_sampling_fields() {
-        let body = to_messages_request_body(&sample_request());
+        let body = to_messages_request_body(&sample_request()).expect("bounded request");
         let facts = sent_request_facts(&body);
         assert_eq!(facts["first_user_message"], "list files");
         assert!(facts["temperature"].is_null());
@@ -1886,7 +1897,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\"}}
     fn tool_choice_required_maps_to_any() {
         let mut req = sample_request();
         req.tool_choice = ToolChoice::Required;
-        let body = to_messages_request_body(&req);
+        let body = to_messages_request_body(&req).expect("bounded request");
         assert_eq!(body["tool_choice"], json!({"type": "any"}));
     }
 
@@ -1894,7 +1905,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\"}}
     fn tool_choice_none() {
         let mut req = sample_request();
         req.tool_choice = ToolChoice::None;
-        let body = to_messages_request_body(&req);
+        let body = to_messages_request_body(&req).expect("bounded request");
         assert_eq!(body["tool_choice"], json!({"type": "none"}));
     }
 
