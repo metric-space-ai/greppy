@@ -345,6 +345,19 @@ impl FairRequestQueue {
         }
     }
 
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.by_client.values().map(VecDeque::len).sum())
+            .unwrap_or_default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.rotation.is_empty())
+    }
+
     fn pop_timeout(&self, timeout: Duration) -> Option<RequestJob> {
         let mut state = self.state.lock().ok()?;
         if state.rotation.is_empty() {
@@ -645,6 +658,49 @@ fn worker_watchdog_timed_out(
                 || (state == LifecycleState::Loading && state_elapsed >= hard_timeout)
         }
     }
+}
+
+#[derive(Debug)]
+struct WatchdogExpiry {
+    phase: LifecycleState,
+    budget: Duration,
+    elapsed: Duration,
+}
+
+fn worker_watchdog_expiry(
+    status: &RuntimeStatus,
+    hard_timeout: Duration,
+    load_budget: Option<Duration>,
+    now: Instant,
+) -> Option<WatchdogExpiry> {
+    let state_elapsed = now.saturating_duration_since(status.state_started);
+    // A cold load has its own budget. Inference starts at the later of the
+    // request and Ready transition; its clock must not include model loading.
+    let active_elapsed = status
+        .active_request_started
+        .map(|started| now.saturating_duration_since(started.max(status.state_started)));
+    if !worker_watchdog_timed_out(
+        status.state,
+        state_elapsed,
+        active_elapsed,
+        hard_timeout,
+        load_budget,
+    ) {
+        return None;
+    }
+    Some(WatchdogExpiry {
+        phase: status.state,
+        budget: if status.state == LifecycleState::Loading {
+            load_budget.unwrap_or(hard_timeout)
+        } else {
+            hard_timeout
+        },
+        elapsed: if status.state == LifecycleState::Loading {
+            state_elapsed
+        } else {
+            active_elapsed.unwrap_or_default()
+        },
+    })
 }
 
 pub(super) fn diagnostic(endpoint: &Endpoint) -> serde_json::Value {
@@ -1414,7 +1470,7 @@ where
         }
 
         let model_idle = last_model_completed.elapsed();
-        if model.is_some() && model_idle >= policy.model_ttl {
+        if model.is_some() && model_idle >= policy.model_ttl && job_queue.is_empty() {
             model = None;
             set_state(&status, LifecycleState::Evicted, None);
             if log_enabled(log_prefix) {
@@ -1581,6 +1637,7 @@ fn read_and_queue(
                 status,
                 &id,
                 pending_requests.load(std::sync::atomic::Ordering::Acquire),
+                jobs.len(),
             );
             write_response(&mut stream, response, policy.max_response_bytes);
             finish_request(pending_requests, last_activity);
@@ -1606,6 +1663,7 @@ fn status_response(
     status: &Arc<Mutex<RuntimeStatus>>,
     request_id: &str,
     pending_requests: usize,
+    queued_requests: usize,
 ) -> serde_json::Value {
     let Ok(status) = status.lock() else {
         return serde_json::json!({"request_id": request_id, "error": "status unavailable"});
@@ -1630,6 +1688,7 @@ fn status_response(
         "backend": status.backend,
         "queue_policy": "fair-round-robin-unbounded",
         "pending_requests": pending_requests,
+        "queued_requests": queued_requests,
     })
 }
 
@@ -1905,21 +1964,16 @@ fn spawn_hung_worker_watchdog(
     std::thread::spawn(move || {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             std::thread::sleep(LOOP_INTERVAL);
-            let timed_out = status.lock().ok().is_some_and(|status| {
-                worker_watchdog_timed_out(
-                    status.state,
-                    status.state_started.elapsed(),
-                    status
-                        .active_request_started
-                        .map(|started| started.elapsed()),
-                    timeout,
-                    load_budget,
-                )
+            let expired = status.lock().ok().and_then(|status| {
+                worker_watchdog_expiry(&status, timeout, load_budget, Instant::now())
             });
-            if timed_out {
+            if let Some(expired) = expired {
                 if log_enabled(log_prefix) {
                     eprintln!(
-                        "{log_prefix}: inference worker exceeded hard timeout {timeout:?}; exiting"
+                        "{log_prefix}: inference worker watchdog timeout phase={} budget_ms={} elapsed_ms={}; exiting",
+                        expired.phase.as_str(),
+                        expired.budget.as_millis(),
+                        expired.elapsed.as_millis(),
                     );
                 }
                 // Inference backends cannot be safely interrupted in-process.
@@ -2571,14 +2625,27 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn sleeping_child() -> std::process::Command {
-        let mut command = std::process::Command::new("/bin/sleep");
+    fn lease_probe_command() -> std::process::Command {
+        // Keep the probe alive until its owner closes stdin, even if another
+        // child's pre-exec descriptor scan takes longer than a fixed sleep.
+        let mut command = std::process::Command::new("/bin/cat");
         command
-            .arg("5")
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command
+    }
+
+    #[cfg(unix)]
+    struct LeaseProbe(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for LeaseProbe {
+        fn drop(&mut self) {
+            // Reap only this test's child, including during assertion unwind.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[cfg(unix)]
@@ -2589,9 +2656,9 @@ mod tests {
         let lease = inheritable_locked_file(&path);
         use std::os::fd::AsRawFd;
         let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
-        let mut command = sleeping_child();
+        let mut command = lease_probe_command();
         seal_detached_child_fds(&mut command).unwrap();
-        let mut daemon = command.spawn().unwrap();
+        let mut daemon = LeaseProbe(command.spawn().unwrap());
         assert_eq!(
             unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
             flags_before
@@ -2602,11 +2669,9 @@ mod tests {
             "detached daemon inherited the host lease"
         );
         assert!(
-            daemon.try_wait().unwrap().is_none(),
+            daemon.0.try_wait().unwrap().is_none(),
             "daemon did not remain alive"
         );
-        let _ = daemon.kill();
-        let _ = daemon.wait();
     }
 
     #[cfg(unix)]
@@ -2737,18 +2802,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("heavy.lock");
         let lease = inheritable_locked_file(&path);
-        let mut child = sleeping_child().spawn().unwrap();
+        let mut child = LeaseProbe(lease_probe_command().spawn().unwrap());
         drop(lease);
         assert!(
             !lock_available(&path),
             "ordinary heavy child lost its inherited lease"
         );
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.0.try_wait().unwrap().is_none(),
             "child did not remain alive"
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         assert!(lock_available(&path));
     }
 
@@ -2761,31 +2825,32 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let detached_barrier = barrier.clone();
         let detached = std::thread::spawn(move || {
-            let mut command = sleeping_child();
+            let mut command = lease_probe_command();
             seal_detached_child_fds(&mut command).unwrap();
             detached_barrier.wait();
-            command.spawn().unwrap()
+            LeaseProbe(command.spawn().unwrap())
         });
         let ordinary_barrier = barrier.clone();
         let ordinary = std::thread::spawn(move || {
-            let mut command = sleeping_child();
+            let mut command = lease_probe_command();
             ordinary_barrier.wait();
-            command.spawn().unwrap()
+            LeaseProbe(command.spawn().unwrap())
         });
         barrier.wait();
         let mut detached = detached.join().unwrap();
         let mut ordinary = ordinary.join().unwrap();
+        assert!(
+            ordinary.0.try_wait().unwrap().is_none(),
+            "ordinary lease probe exited before the inheritance assertion"
+        );
         drop(lease);
         assert!(
             !lock_available(&path),
             "concurrent ordinary child lost the lease"
         );
-        let _ = ordinary.kill();
-        let _ = ordinary.wait();
+        drop(ordinary);
         assert!(lock_available(&path), "detached child retained the lease");
-        assert!(detached.try_wait().unwrap().is_none());
-        let _ = detached.kill();
-        let _ = detached.wait();
+        assert!(detached.0.try_wait().unwrap().is_none());
     }
 
     #[cfg(unix)]
@@ -2813,12 +2878,12 @@ mod tests {
         let status = Arc::new(Mutex::new(RuntimeStatus::default()));
         set_ready(&status, "cuda".into());
         set_active(&status, Some("active-summary".into()));
-        let running = status_response(&status, "probe", 2);
+        let running = status_response(&status, "probe", 2, 0);
         assert_eq!(running["state"], "busy");
         assert_eq!(running["backend"], "cuda");
         assert_eq!(running["active_request_id"], "active-summary");
         complete(&status, true, None);
-        let finished = status_response(&status, "probe", 1);
+        let finished = status_response(&status, "probe", 1, 0);
         assert_eq!(finished["state"], "ready");
         assert_eq!(finished["backend"], "cuda");
         assert!(finished["active_request_id"].is_null());
@@ -2827,16 +2892,16 @@ mod tests {
     #[test]
     fn runtime_status_reports_only_the_loaded_backend() {
         let status = Arc::new(Mutex::new(RuntimeStatus::default()));
-        assert!(status_response(&status, "starting", 0)["backend"].is_null());
+        assert!(status_response(&status, "starting", 0, 0)["backend"].is_null());
 
         set_state(&status, LifecycleState::Loading, None);
-        assert!(status_response(&status, "loading", 0)["backend"].is_null());
+        assert!(status_response(&status, "loading", 0, 0)["backend"].is_null());
 
         set_ready(&status, "metal".into());
-        assert_eq!(status_response(&status, "ready", 0)["backend"], "metal");
+        assert_eq!(status_response(&status, "ready", 0, 0)["backend"], "metal");
 
         set_state(&status, LifecycleState::Evicted, None);
-        assert!(status_response(&status, "evicted", 0)["backend"].is_null());
+        assert!(status_response(&status, "evicted", 0, 0)["backend"].is_null());
 
         set_ready(&status, "metal".into());
         set_state(
@@ -2844,7 +2909,7 @@ mod tests {
             LifecycleState::Faulted,
             Some("inference failed".into()),
         );
-        assert!(status_response(&status, "faulted", 0)["backend"].is_null());
+        assert!(status_response(&status, "faulted", 0, 0)["backend"].is_null());
     }
 
     /// The embedding daemon writes its response and closes. On macOS the
@@ -3576,12 +3641,15 @@ mod tests {
         let handled = Arc::new(AtomicUsize::new(0));
         let server_loads = Arc::clone(&loads);
         let server_handled = Arc::clone(&handled);
+        let (release_first_tx, release_first_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
             run_server(
                 server_endpoint,
                 &server_address,
                 ServerPolicy {
-                    model_ttl: Duration::from_millis(150),
+                    // Even an expired model stays loaded for accepted work.
+                    // This proves queue ownership without depending on CPU scheduling.
+                    model_ttl: Duration::ZERO,
                     exit_ttl: Duration::from_millis(700),
                     request_deadline: Duration::from_secs(10),
                     hard_request_timeout: None,
@@ -3604,7 +3672,11 @@ mod tests {
                     }
                 },
                 move |_raw, model| {
-                    server_handled.fetch_add(1, Ordering::SeqCst);
+                    if server_handled.fetch_add(1, Ordering::SeqCst) == 0 {
+                        release_first_rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("release the accepted request burst");
+                    }
                     std::thread::sleep(Duration::from_millis(15));
                     serde_json::json!({
                         "ok": model.is_some(),
@@ -3634,6 +3706,10 @@ mod tests {
         }
         assert!(reachable, "lifecycle daemon became reachable");
 
+        // A client that has not sent a frame is not queued inference work and
+        // must not pin GPU memory after the real request burst drains.
+        let slow = TransportStream::connect(&endpoint, Duration::from_secs(1)).unwrap();
+
         let barrier = Arc::new(std::sync::Barrier::new(33));
         let mut clients = Vec::new();
         for _ in 0..32 {
@@ -3651,6 +3727,22 @@ mod tests {
             }));
         }
         barrier.wait();
+        let accepted_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = diagnostic(&endpoint);
+            // One client is being handled; the other 31 must be fully queued.
+            if status["queued_requests"].as_u64().unwrap_or_default() == 31 {
+                break;
+            }
+            assert!(
+                Instant::now() < accepted_deadline,
+                "concurrent clients were not accepted before release: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        release_first_tx
+            .send(())
+            .expect("release the accepted request burst");
         let mut model_owners = std::collections::BTreeSet::new();
         for client in clients {
             match client.join().expect("client thread") {
@@ -3669,7 +3761,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(model_owners, std::collections::BTreeSet::from([1]));
+        assert_eq!(
+            model_owners,
+            std::collections::BTreeSet::from([1]),
+            "accepted requests must retain the current model until the queue drains"
+        );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         assert_eq!(handled.load(Ordering::SeqCst), 32);
         assert_eq!(
@@ -3694,10 +3790,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        drop(slow);
         // The reload is proven by the response itself: the second model owner
-        // served it. The status probe can only confirm the backend while the
-        // model is still loaded; with a 150 ms model TTL a slow runner may
-        // already have evicted it again (macOS CI, PR #307).
+        // served it. With the deliberately zero idle TTL it may already be evicted
+        // again before the diagnostic probe reaches the server.
         match request(
             &endpoint,
             serde_json::json!({"op": "infer"}),
@@ -4402,10 +4498,41 @@ mod tests {
         assert!(model_load_budget_for("embed-daemon").is_none());
     }
 
+    #[test]
+    fn cold_model_load_does_not_consume_ready_watchdog_budget() {
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        set_active(&status, Some("cold-request".into()));
+        set_state(&status, LifecycleState::Loading, None);
+        {
+            let mut state = status.lock().unwrap();
+            state.active_request_started = Some(state.state_started - Duration::from_secs(2));
+        }
+        set_ready(&status, "metal".into());
+        let state = status.lock().unwrap();
+        let hard = Duration::from_millis(100);
+        let load = Some(Duration::from_millis(800));
+        assert!(
+            worker_watchdog_expiry(
+                &state,
+                hard,
+                load,
+                state.state_started + Duration::from_millis(99)
+            )
+            .is_none(),
+            "cold model load consumed the ready inference budget"
+        );
+        let expiry = worker_watchdog_expiry(&state, hard, load, state.state_started + hard)
+            .expect("ready inference must still expire at its hard budget");
+        assert_eq!(expiry.phase, LifecycleState::Ready);
+        assert_eq!(expiry.budget, hard);
+        assert_eq!(expiry.elapsed, hard);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn summary_loading_watchdog_uses_model_load_budget() {
         let _lock = test_env_lock();
+        let log = tempfile::NamedTempFile::new().expect("watchdog failure log");
         let identity = format!("{}-{}", std::process::id(), request_id());
         let endpoint = Endpoint::for_identity("crash-test", &identity).unwrap();
         let mut hung = std::process::Command::new(std::env::current_exe().unwrap())
@@ -4416,39 +4543,12 @@ mod tests {
             .env(HANG_LOAD_HELPER, "1")
             .env(WATCHDOG_PREFIX, SUMMARY_LOG_PREFIX)
             .env("GREPPY_TEST_MODEL_LOAD_BUDGET_MS", "800")
+            .env("GREPPY_SUMMARIZE_DAEMON_LOG", "1")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log.reopen().unwrap()))
             .spawn()
             .expect("spawn summary load watchdog child");
-        let observe_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if hung
-                .try_wait()
-                .expect("poll summary load watchdog")
-                .is_some()
-            {
-                panic!("summary model load exited before its load budget");
-            }
-            let status = diagnostic(&endpoint);
-            if status["state"] == "loading" {
-                break;
-            }
-            if Instant::now() >= observe_deadline {
-                let _ = hung.kill();
-                let _ = hung.wait();
-                panic!("summary model load did not report loading: {status}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // The helper's ready-request hard timeout is 100ms. Loading must survive it.
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            hung.try_wait()
-                .expect("poll summary load watchdog")
-                .is_none(),
-            "summary model load was killed by the ready-request hard timeout"
-        );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = hung.try_wait().expect("poll summary load watchdog") {
                 break status;
@@ -4461,6 +4561,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(status.code(), Some(70));
+        // Parent scheduling cannot establish when the child's watchdog fired.
+        // Its own monotonic observation proves the actual phase and budget.
+        let diagnostic = std::fs::read_to_string(log.path()).unwrap();
+        let timeout = diagnostic
+            .lines()
+            .find(|line| line.contains("watchdog timeout phase=loading "))
+            .unwrap_or_else(|| panic!("missing loading watchdog diagnostic: {diagnostic}"));
+        let field = |name: &str| -> u128 {
+            timeout
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(name))
+                .unwrap_or_else(|| panic!("missing {name}: {timeout}"))
+                .trim_end_matches(';')
+                .parse()
+                .expect("watchdog timing must be numeric")
+        };
+        assert_eq!(field("budget_ms="), 800);
+        assert!(
+            field("elapsed_ms=") >= 800,
+            "summary model load ended before its load budget: {timeout}"
+        );
         #[cfg(unix)]
         let _ = std::fs::remove_file(endpoint.address());
         let _ = std::fs::remove_file(endpoint.cooldown_path());

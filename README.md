@@ -36,8 +36,16 @@ and summaries are computed locally by the embedded models. They make no network
 calls, send no telemetry, and need no account, so the code-analysis surface
 works offline and air-gapped. The optional `greppy web` beta accesses only the
 URLs an agent explicitly opens, searches, or researches; it never uploads the
-repository. Model files are downloaded only at build time (release packages
-already contain them).
+repository. `greppy desktop` drives a local GUI through the accessibility tree
+(macOS AX, Windows UIA, Linux AT-SPI; each build links only that OS's
+adapter). Web and desktop manuals are not in the built-in system prompt.
+`greppy capabilities enable web` and `greppy capabilities enable desktop`
+return greppy's own manual as the tool result; that result counts as part of
+the system prompt and does not rewrite it. `--enable web,desktop` on
+`greppy -p`, `greppy agent`, and `greppy agent stdio` includes a manual from
+the first turn. Desktop commands stay refused inside that agent until
+`enable desktop` has run in the session. Model files are downloaded only at
+build time (release packages already contain them).
 
 ```bash
 # Standard grep — every command works, unchanged:
@@ -266,6 +274,33 @@ greppy agent --model MODEL
 greppy agent "TASK" --model MODEL
 greppy -p "TASK" --model MODEL
 ```
+
+If a harness already knows the verified per-response output limit for its exact
+model/provider/endpoint route, pass `--max-output-tokens N`. This optional flag
+is accepted by `greppy -p`, `greppy agent`, `greppy agent serve`, and
+`greppy agent stdio`; provide the initial model with `--model` or `GREPPY_MODEL`.
+`N` must be a positive integer below `18446744073709551615`. It is neither a
+context-window size nor a turn/deadline budget. It reaches the numeric wire
+`max_tokens` field through `AgentConfig::with_max_tokens` and remains in effect
+when a truncated response continues.
+
+The caller owns verification of the route metadata. Greppy does not infer a
+vendor-wide cap or load a harness's protected configuration. The value is not
+saved in sessions or settings: changing the model (even back again), endpoint,
+or live session discards it. A setup endpoint override also discards the old
+value. ACP's initial configuration applies it only to a new session's initial
+model; `session/load` discards it. Supply freshly verified metadata on a new
+launch for a new route, or through the announced Greppy ACP extension
+`_greppy/set_output_limit`. Check `agentCapabilities._meta.greppyOutputLimit`
+(version 1) first. Its request supplies `sessionId`, the exact current `modelId`
+and `endpoint`, and a positive JSON integer `maxOutputTokens`. A stale or missing
+route identity is rejected; a busy/closed session cannot change its metadata.
+This free-form value does not use standard ACP configuration selectors. See
+[the extension contract](docs/acp.md#verified-route-output-metadata).
+With no caller value, Greppy
+resolves advertised/registered output metadata and clearly refuses unknown limits.
+Rust callers can validate metadata with `greppy_agent::OutputTokenLimit::try_from`
+and pass `limit.get()` to the existing `with_max_tokens` builder.
 
 An absent or inactive filesystem provider does not prevent agent work. Each workspace
 has private Git control state: it reads the pinned base commit's objects

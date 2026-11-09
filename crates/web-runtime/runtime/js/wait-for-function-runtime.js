@@ -66,18 +66,22 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
     } catch (_e) {}
     cleanup();
     signal(status);
+    if (status === "timeout") {
+      // The controller can observe this timeout before its slot read, and
+      // the next script checks window for leftover __greppyWait_* keys.
+      // Delete on every path, not only strictBoolean. Successful values stay
+      // until that read, or until the strict budget expires below.
+      try { delete window[key]; } catch (_e) {}
+      return;
+    }
     if (strictBoolean) {
       // The caller may run out of budget before its final slot-read. Do not
       // retain completed predicate values forever in that case. This expiry
       // only drops bookkeeping; it never reevaluates the page or adds time.
-      if (status === "timeout") {
+      expirationId = window.setTimeout(function () {
+        expirationId = 0;
         try { delete window[key]; } catch (_e) {}
-      } else {
-        expirationId = window.setTimeout(function () {
-          expirationId = 0;
-          try { delete window[key]; } catch (_e) {}
-        }, Math.max(0, expiresAt - Date.now()));
-      }
+      }, Math.max(0, expiresAt - Date.now()));
     }
   }
 

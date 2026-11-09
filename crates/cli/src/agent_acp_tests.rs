@@ -3,6 +3,137 @@ mod imported_history;
 #[path = "agent_acp_import_durability_tests.rs"]
 mod imported_history_durability;
 #[test]
+fn caller_output_limit_belongs_only_to_the_selected_acp_model() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut server, rx) = fixture(root.path());
+    server.config.max_output_tokens = Some(OutputTokenLimit::try_from(65536).unwrap());
+    let init = request(
+        &server,
+        &rx,
+        "init",
+        "initialize",
+        json!({"protocolVersion":1}),
+    );
+    let capability = &init["result"]["agentCapabilities"]["_meta"]["greppyOutputLimit"];
+    assert_eq!(
+        capability,
+        &json!({"version":1,"method":"_greppy/set_output_limit"})
+    );
+    let method = capability["method"].as_str().unwrap();
+    let id = new_session(&server, &rx, root.path());
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens.unwrap().get(),
+        65536
+    );
+
+    // Free route metadata must never masquerade as a standard ACP selector.
+    let rejected = request(
+        &server,
+        &rx,
+        "standard-numeric",
+        "session/set_config_option",
+        json!({
+            "sessionId":id, "configId":"max_output_tokens", "value":131072,
+            "modelId":"fixture-model", "endpoint":"http://127.0.0.1:1"
+        }),
+    );
+    assert_eq!(rejected["error"]["code"], -32602);
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens.unwrap().get(),
+        65536
+    );
+    for (selection, params) in [
+        (
+            "session/set_model",
+            json!({"sessionId":id, "modelId":"MiniMax-M3"}),
+        ),
+        (
+            "session/set_config_option",
+            json!({"sessionId":id, "configId":"model", "value":"fixture-model"}),
+        ),
+    ] {
+        let result = request(&server, &rx, "switch", selection, params);
+        assert!(result.get("error").is_none(), "{result}");
+        if selection == "session/set_config_option" {
+            assert_eq!(
+                result["result"]["configOptions"],
+                json!([model_config("fixture-model")])
+            );
+        }
+        assert_eq!(prepared_for(&server, &id).max_output_tokens, None);
+    }
+    // Exercise the advertised method through real framed dispatch, not its helper.
+    for (model, endpoint, value) in [
+        ("MiniMax-M3", "http://127.0.0.1:1", json!(131072)),
+        ("fixture-model", "http://127.0.0.1:2", json!(131072)),
+        ("fixture-model", "http://127.0.0.1:1", json!(0)),
+        ("fixture-model", "http://127.0.0.1:1", json!(u64::MAX)),
+        ("fixture-model", "http://127.0.0.1:1", json!(-1)),
+        ("fixture-model", "http://127.0.0.1:1", json!(1.5)),
+        ("fixture-model", "http://127.0.0.1:1", json!("131072")),
+        ("fixture-model", "http://127.0.0.1:1", json!(true)),
+    ] {
+        let rejected = request(
+            &server,
+            &rx,
+            "invalid",
+            method,
+            json!({
+                "sessionId":id, "maxOutputTokens":value, "modelId":model, "endpoint":endpoint
+            }),
+        );
+        assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+        assert_eq!(prepared_for(&server, &id).max_output_tokens, None);
+    }
+    let metadata = json!({"sessionId":id, "maxOutputTokens":131072,
+                         "modelId":"fixture-model", "endpoint":"http://127.0.0.1:1"});
+    let refreshed = request(&server, &rx, "fresh", method, metadata.clone());
+    assert_eq!(refreshed["result"], metadata);
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens.unwrap().get(),
+        131072
+    );
+    lock_state(&server.state)
+        .sessions
+        .get_mut(&id)
+        .unwrap()
+        .busy = true;
+    let busy = request(&server, &rx, "busy", method, metadata.clone());
+    assert_eq!(busy["error"]["code"], -32600);
+    lock_state(&server.state)
+        .sessions
+        .get_mut(&id)
+        .unwrap()
+        .busy = false;
+    assert!(request(
+        &server,
+        &rx,
+        "close",
+        "session/close",
+        json!({"sessionId":id})
+    )
+    .get("error")
+    .is_none());
+    let closed = request(&server, &rx, "closed", method, metadata);
+    assert_eq!(closed["error"]["code"], -32600);
+    let loaded = request(
+        &server,
+        &rx,
+        "load",
+        "session/load",
+        json!({
+            "sessionId":id, "cwd":root.path(), "mcpServers":[]
+        }),
+    );
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    assert_eq!(
+        prepared_for(&server, &id).max_output_tokens,
+        None,
+        "resume must not revive the process-start bound"
+    );
+}
+
+#[test]
 fn rejected_model_changes_preserve_the_active_and_persisted_model() {
     let root = tempfile::tempdir().unwrap();
     let (server, rx) = fixture(root.path());
@@ -67,6 +198,7 @@ fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
             data_root: session.data_root.clone(),
             project: session.project.clone(),
             model: session.model.clone(),
+            max_output_tokens: session.max_output_tokens,
             history: vec![],
             cancel: Arc::clone(&session.cancel),
             perms: Arc::clone(&session.perms),
@@ -125,6 +257,8 @@ fn fixture(root: &Path) -> (Server, Receiver<Value>) {
         model: "fixture-model".into(),
         api_key: None,
         max_turns: 2,
+        max_output_tokens: None,
+        capabilities: greppy_agent::CapabilitySet::default(),
         data_root: Some(root.join("state")),
         after_messages: None,
         after_import_rename: None,
@@ -383,6 +517,7 @@ fn prepared_for(server: &Server, id: &str) -> PreparedPrompt {
         data_root: session.data_root.clone(),
         project: session.project.clone(),
         model: session.model.clone(),
+        max_output_tokens: session.max_output_tokens,
         history: session.messages.clone(),
         cancel: Arc::clone(&session.cancel),
         perms: Arc::clone(&session.perms),

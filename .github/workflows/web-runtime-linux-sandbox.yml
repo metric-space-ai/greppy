@@ -6,9 +6,25 @@ name: web-runtime Linux sandbox
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      profile_release:
+        description: 'Optional official release vN.N.N for a real CLI/browser baseline'
+        required: false
+        default: ''
+        type: string
+      profile_cpu_percent:
+        description: 'Worker CPU quota percent (50..400)'
+        required: false
+        default: '200'
+        type: string
+      profile_memory_mib:
+        description: 'Whole worker memory budget MiB (256..4096)'
+        required: false
+        default: '2048'
+        type: string
 
 permissions:
   contents: read
@@ -20,6 +36,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "1"
   RUST_BACKTRACE: "1"
   GREPPY_REQUIRE_LIVE_LANDLOCK: "1"
 
@@ -31,10 +49,488 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
+      - name: Prove runtime diagnostics reject foreign state and process identities
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'runtime-diagnostic-contract'
+          root.mkdir()
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          def run_case(label):
+              return subprocess.run(
+                  ['python3', '-B', '-X', 'pycache_prefix=' + str(root / label),
+                   'bench/check_runtime_diagnostic.py'],
+                  capture_output=True, text=True, timeout=20)
+          cases = [
+              ('state', 'or not original.resolve().is_relative_to(state.resolve())):', '):', 'diagnostic_foreign_state'),
+              ('birth', 'identity[1] == birth', 'True', 'diagnostic_foreign_birth'),
+              ('image', 'and (image.st_dev, image.st_ino) == runtime_identity', 'and True', 'diagnostic_foreign_image'),
+              ('close', 'os.close(self.descriptor)', 'pass # fault: retained descriptor leaked', 'diagnostic_descriptor_release'),
+          ]
+          positive = run_case('positive')
+          print(positive.stdout, positive.stderr)
+          assert positive.returncode == 0
+          for label, old, new, marker in cases:
+              assert original.count(old) == 1
+              try:
+                  source.write_text(original.replace(old, new))
+                  result = run_case(label)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 1 and marker in result.stdout + result.stderr, label
+                  print('OWNED_DIAGNOSTIC_COUNTER_REJECTED', label, marker)
+              finally:
+                  source.write_text(original)
+          restored = run_case('restored')
+          print(restored.stdout, restored.stderr)
+          assert restored.returncode == 0
+          subprocess.run(['python3', '-B', 'bench/check_meter_cleanup.py',
+                          '--output', str(root / 'owner-cleanup'), '--mutations'],
+                         check=True, timeout=60)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check fixed-comparison evidence integrity and source counterproofs
+        run: python3 -B bench/check_web_comparison_mutations.py
+
+      - name: Collect an optional real released web worker baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.profile_release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GREPPY_PROFILE_RELEASE: ${{ inputs.profile_release }}
+          GREPPY_PROFILE_CPU: ${{ inputs.profile_cpu_percent }}
+          GREPPY_PROFILE_MEMORY: ${{ inputs.profile_memory_mib }}
+        run: >-
+          python3 -B bench/profile_released_web.py
+          --release "$GREPPY_PROFILE_RELEASE"
+          --cpu-percent "$GREPPY_PROFILE_CPU" --memory-mib "$GREPPY_PROFILE_MEMORY"
+          --output "$RUNNER_TEMP/web-release-profile" --provision-dependencies
+
+      - name: Preserve the released worker measurement including failures
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.profile_release != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: released-web-worker-profile
+          path: ${{ runner.temp }}/web-release-profile/evidence/
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: "1.95.0"
+
+      - name: Prove a silent HTTP connection cannot block another request
+        shell: python
+        run: |
+          import os, pathlib, subprocess, tempfile
+          source = pathlib.Path('crates/web-runtime/runtime/tests/support/recorded_http_fixture.rs')
+          original = source.read_text()
+          old = 'while index < clients.len() {'
+          assert original.count(old) == 1
+          with tempfile.TemporaryDirectory(prefix='http-fixture-', dir=os.environ['RUNNER_TEMP']) as directory:
+              binary = pathlib.Path(directory) / 'contract'
+              def build():
+                  subprocess.run(['rustc', '--edition=2021', '--test', str(source), '-o', str(binary)],
+                                 check=True, timeout=30)
+              command = [str(binary), '--test-threads=1', '--nocapture']
+              build()
+              subprocess.run(command, check=True, timeout=10)
+              try:
+                  source.write_text(original.replace(old, 'while index < clients.len().min(1) {'))
+                  build()
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and 'independent HTTP request was blocked by silent connection' in result.stdout + result.stderr
+              finally:
+                  source.write_text(original)
+              build()
+              subprocess.run(command, check=True, timeout=10)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove unobserved HTTP bodies allocate no DevTools copy
+        shell: python
+        run: |
+          import os, pathlib, subprocess, tempfile
+          source = pathlib.Path('crates/web-runtime/vendor/servo-net/devtools_body.rs')
+          original = source.read_text()
+          old = 'if !channel_present || !pipeline_present || !webview_present {'
+          assert original.count(old) == 1
+          with tempfile.TemporaryDirectory(prefix='devtools-body-', dir=os.environ['RUNNER_TEMP']) as directory:
+              binary = pathlib.Path(directory) / 'contract'
+              def build():
+                  subprocess.run(['rustc', '--edition=2021', '--test', str(source), '-o', str(binary)],
+                                 check=True, timeout=30)
+              command = [str(binary), '--test-threads=1', '--nocapture']
+              build()
+              subprocess.run(command, check=True, timeout=10)
+              try:
+                  source.write_text(original.replace(old, 'if false && (!channel_present || !pipeline_present || !webview_present) {'))
+                  build()
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and 'unobserved HTTP body allocated a DevTools copy' in result.stdout + result.stderr
+              finally:
+                  source.write_text(original)
+              build()
+              subprocess.run(command, check=True, timeout=10)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Calibrate the actual web meter with real private memory and CPU
+        run: >-
+          python3 -B bench/calibrate_web_meter.py
+          --output "$RUNNER_TEMP/web-meter-calibration.json" --pairs 6
+
+      - name: Prove omitted CPU and PSS counters invalidate calibration
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'web-meter-counterproof'
+          root.mkdir()
+          def run_case(label, capture=False):
+              command = ['python3', '-B', '-X', 'pycache_prefix=' + str(root / (label + '.pycache')),
+                         'bench/calibrate_web_meter.py', '--contracts-only',
+                         '--output', str(root / (label + '.json'))]
+              result = subprocess.run(command, capture_output=capture, text=True,
+                                      timeout=35, check=not capture)
+              if capture:
+                  print(result.stdout, result.stderr)
+              return result
+          cases = [
+              ('cpu', pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py'),
+               'totals[0] += usage.ru_utime', 'totals[0] += 0.0', 'calibration.cpu_accounting'),
+              ('pss', pathlib.Path('bench/process_memory.py'),
+               'pss_bytes += metrics["Pss"]', 'pss_bytes += 0', 'calibration.pss_step'),
+          ]
+          for label, source, old, new, expected in cases:
+              original = source.read_text()
+              assert original.count(old) == 1
+              try:
+                  source.write_text(original.replace(old, new))
+                  result = run_case(label, capture=True)
+                  record = json.loads((root / (label + '.json')).read_text())
+                  assert result.returncode == 1 and record['status'] == 'failed'
+                  assert expected in record['error'], record
+                  print('WEB_METER_COUNTER_REJECTED', label, expected)
+              finally:
+                  source.write_text(original)
+          run_case('restored')
+          subprocess.run(['git', 'diff', '--exit-code', '--',
+                          'crates/web-runtime/scripts/measure-web-efficiency.py',
+                          'bench/process_memory.py'], check=True)
+
+      - name: Capture transient peaks in fresh owned kernel cgroups
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'web-meter-kernel-counterproof'
+          root.mkdir()
+          def run_case(label, capture=False):
+              unit = 'greppy-meter-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '-' + label
+              parent = '/sys/fs/cgroup/system.slice/' + unit + '.service'
+              command = ['sudo', '-n', 'systemd-run', '--unit=' + unit,
+                         '--wait', '--collect', '--pipe', '--service-type=exec',
+                         '--uid=' + str(os.getuid()), '--gid=' + str(os.getgid()),
+                         '--property=Delegate=memory', '--property=DelegateSubgroup=monitor',
+                         '--property=MemoryMax=256M', '--property=MemorySwapMax=0',
+                         '--property=CPUQuota=100%', '--property=TasksMax=32',
+                         '--property=RuntimeMaxSec=60', '--expand-environment=no',
+                         '--working-directory=' + str(pathlib.Path.cwd()),
+                         'python3', '-B', '-X', 'pycache_prefix=' + str(root / (label + '.pycache')),
+                         'bench/calibrate_web_meter.py', '--contracts-only',
+                         '--kernel-cgroup-parent', parent, '--output', str(root / (label + '.json'))]
+              result = subprocess.run(command, capture_output=capture, text=True,
+                                      timeout=75, check=not capture)
+              if capture:
+                  print(result.stdout, result.stderr)
+              return result
+          # Only this ephemeral hosted-CI unit gets the declared budget and
+          # delegation. No persistent service, parent limit change or host PID
+          # migration. systemd waits, bounds the run and collects the unit.
+          run_case('normal')
+          source = pathlib.Path('bench/process_memory.py')
+          cases = [
+              ('shared', source, 'or set(map(int, (self.monitor / "cgroup.procs").read_text().split())) != {os.getpid()}', '',
+               'calibration.kernel_foreign_monitor'),
+              ('outside', source, 'echo "$$" > "$1/cgroup.procs"; ', '', 'calibration.kernel_entry'),
+              ('current', source, '"memory_peak_bytes": int((self.path / "memory.peak").read_text())',
+               '"memory_peak_bytes": int((self.path / "memory.current").read_text())', 'calibration.kernel_peak'),
+              ('rss', pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py'),
+               "'kernel_resource_accounting': resource_group.snapshot() if resource_group else None,",
+               "'kernel_resource_accounting': dict(resource_group.snapshot(), memory_peak_bytes=peak) if resource_group else None,",
+               'calibration.kernel_family_peak'),
+          ]
+          for label, source, old, new, expected in cases:
+              original = source.read_text()
+              assert original.count(old) == 1
+              try:
+                  source.write_text(original.replace(old, new))
+                  result = run_case(label, capture=True)
+                  record = json.loads((root / (label + '.json')).read_text())
+                  assert result.returncode == 1 and record['status'] == 'failed'
+                  assert expected in record['error'], record
+                  print('WEB_METER_KERNEL_COUNTER_REJECTED', label, expected)
+              finally:
+                  source.write_text(original)
+          run_case('restored')
+          subprocess.run(['git', 'diff', '--exit-code', '--', 'bench/process_memory.py',
+                          'crates/web-runtime/scripts/measure-web-efficiency.py'], check=True)
+
+      - name: Preserve raw meter calibration and counterproofs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: web-meter-calibration
+          path: ${{ runner.temp }}/web-meter-*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Check real process-family PSS and cleanup
+        run: python3 bench/test_process_memory.py
+
+      - name: Prove shared pages cannot be reported as summed RSS
+        shell: python
+        run: |
+          import pathlib, subprocess, tempfile
+          def run_case(capture=False):
+              # Restored equal-size source can otherwise reuse the mutant's
+              # timestamp-based .pyc within the same clock second.
+              with tempfile.TemporaryDirectory(prefix='greppy-pss-pycache-') as cache:
+                  return subprocess.run(['python3', '-X', 'pycache_prefix=' + cache,
+                                         'bench/test_process_memory.py'],
+                                        capture_output=capture, text=True, timeout=45,
+                                        check=not capture)
+          source = pathlib.Path('bench/process_memory.py')
+          original = source.read_text()
+          old = 'pss_bytes += metrics["Pss"]'
+          assert original.count(old) == 1
+          try:
+              source.write_text(original.replace(old, 'pss_bytes += metrics["Rss"]'))
+              result = run_case(capture=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'AssertionError' in result.stderr
+          finally:
+              source.write_text(original)
+          run_case()
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check typed status over private Unix sockets
+        run: cargo test --locked -p greppy-web-client --lib status_probe_ -- --test-threads=1
+
+      - name: Prove transport failure cannot be called an ownership denial
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-client/src/status_probe.rs')
+          original = source.read_text()
+          old = '_ => StatusProbeError::Transport,'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '-p', 'greppy-web-client', '--lib',
+                     'status_probe_silent_connected_peer_is_not_an_ownership_denial', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, '_ => StatusProbeError::NotOwned,'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'NotOwned' in result.stdout and 'Transport' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check nonretrying engine recovery
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features engine_failure_guidance_is_nonretrying -- --test-threads=1
+
+      - name: Prove engine recovery rejects the old replay recommendation
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          old = 'inspect greppy web doctor and the current page state; do not automatically repeat the failed operation'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'engine_failure_guidance_is_nonretrying', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'retry the operation or inspect web.doctor'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'engine_failure_guidance_is_nonretrying' in result.stdout and 'FAILED' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check cancellation identity and completed-receipt memory lifetime
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features operation_control -- --test-threads=1 --nocapture
+
+      - name: Prove finished operations cannot remain active
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/operation_control.rs')
+          original = source.read_text()
+          old = 'state.active.take()'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'finished_runs_are_not_active_and_old_cancellation_cannot_reach_a_new_run',
+                     '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'state.active.clone()'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'finished operation remained active or cancellable' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove kernel private memory detects leaked completion receipts
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/operation_control.rs')
+          original = source.read_text()
+          old = 'state.completed = Some(pair);'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'completion_receipts_release_private_memory_after_cancelled_runs',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, 'std::mem::forget(state.completed.replace(pair));'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'completed cancellation receipts retained private memory' in (result.stdout + result.stderr)
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check concurrent fork exec cannot capture unsealed sibling descriptors
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features
+          concurrent_fork_exec_does_not_capture_an_unsealed_descriptor
+          -- --test-threads=1 --nocapture
+
+      - name: Prove early spawn unlock leaks a real descriptor across exec
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/fork_exec_window.rs')
+          original = source.read_text()
+          old = '    let _guard = WINDOW.lock().unwrap_or_else(|error| error.into_inner());'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'concurrent_fork_exec_does_not_capture_an_unsealed_descriptor',
+                     '--', '--test-threads=1', '--nocapture']
+          try:
+              source.write_text(original.replace(old, old + '\n    drop(_guard);'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'child inherited a descriptor from another spawn window' in (result.stdout + result.stderr)
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=180)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check bounded supervisor inbox and moved request payloads
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features request_inbox_tests -- --test-threads=1
+
+      - name: Prove excess-request and payload-copy regressions are detected
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/daemon.rs')
+          original = source.read_text()
+          cases = [
+              ('mpsc::sync_channel(1)', 'mpsc::sync_channel(2)',
+               'saturated_inbox_rejects_excess_work_without_blocking_control',
+               'saturated supervisor inbox did not reject the excess request'),
+              ('std::panic::AssertUnwindSafe(|| handle(request))',
+               'std::panic::AssertUnwindSafe(|| handle(request.clone()))',
+               'dispatch_moves_payload_and_preserves_panic_correlation',
+               'dispatch copied the full request payload'),
+          ]
+          for old, mutant, case, marker in cases:
+              assert original.count(old) == 1
+              command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                         '-p', 'web-runtime', '--lib', '--no-default-features',
+                         case, '--', '--test-threads=1']
+              try:
+                  source.write_text(original.replace(old, mutant))
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and marker in (result.stdout + result.stderr)
+              finally:
+                  source.write_text(original)
+              subprocess.run(command, check=True, timeout=180)
+              subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove actionability timeout diagnostics never invent DOM evidence
+        run: python3 tools/check_unobserved_dom_deadline_mutations.py
+
+      - name: Prove shared render capacity releases workers before restart
+        run: python3 tools/check_shared_render_workers.py
+
+      - name: Prove HTML fixtures release listener, thread, connections and owned body
+        run: python3 tools/check_owned_html_fixture_mutations.py
+
+      - name: Check coalesced heartbeat lifetime and receipt clocks
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features heartbeat -- --test-threads=1 --nocapture
+
+      - name: Prove heartbeat replay retention and clock regressions are detected
+        shell: python
+        run: |
+          import pathlib, subprocess
+          cases = [
+              ('crates/web-runtime/runtime/src/heartbeat_inbox.rs',
+               'entry.received.take()', 'entry.received',
+               'known_sessions_coalesce_and_consumed_or_closed_receipts_do_not_replay',
+               'drained heartbeat was replayed'),
+              ('crates/web-runtime/runtime/src/heartbeat_inbox.rs',
+               'entry.received = Some(entry.received.map_or(received, |old| old.max(received)));',
+               'entry.received = Some(entry.received.map_or(received, |old| old.max(received)));\n        std::mem::forget(session.to_owned());',
+               'repeated_heartbeats_release_private_memory_in_a_fresh_process',
+               'heartbeat receipts retained private memory'),
+              ('crates/web-runtime/runtime/src/daemon.rs',
+               'session.last_heartbeat = session.last_heartbeat.max(received);',
+               'session.last_heartbeat = Instant::now();',
+               'heartbeat_receipts_refresh_only_their_session_at_the_actual_receipt_time',
+               'queued heartbeat must retain actual receipt time'),
+          ]
+          for path, old, mutant, case, marker in cases:
+              source = pathlib.Path(path)
+              original = source.read_text()
+              assert original.count(old) == 1
+              command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                         '-p', 'web-runtime', '--lib', '--no-default-features',
+                         case, '--', '--test-threads=1', '--nocapture']
+              try:
+                  source.write_text(original.replace(old, mutant))
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+                  print(result.stdout, result.stderr)
+                  assert result.returncode == 101 and marker in (result.stdout + result.stderr)
+              finally:
+                  source.write_text(original)
+              subprocess.run(command, check=True, timeout=180)
+              subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+      - name: Prove failed worker preparation releases kernel descriptors
+        run: python3 tools/check_worker_fd_mutation.py
+
+      - name: Prove accepted navigation sockets and fragmented headers are real
+        run: python3 tools/check_navigation_fixture_stream_mutations.py
 
       - name: Run Linux sandbox and fexecve gates
         run: crates/web-runtime/scripts/run-linux-sandbox-gates.sh
@@ -48,3 +544,367 @@ jobs:
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
           -p web-runtime --lib --no-default-features model_facing_source -- --test-threads=1
+
+      - name: Check identity-based live object quota
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features object_usage -- --test-threads=1
+
+      - name: Prove live page closure returns only its own quota
+        run: python3 tools/check_web_resource_mutations.py --slots
+
+
+      - name: Check bounded native history receipt ownership
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features history_receipt -- --test-threads=1
+
+      - name: Prove history receipts reject foreign tokens and release ownership
+        run: python3 tools/check_web_history_receipt_mutation.py
+
+      - name: Check shared session download staging before file creation
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features download_staging -- --test-threads=1
+
+      - name: Check controller cannot replace download quota authority
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features
+          controller_cannot_replace_download_session_authority -- --test-threads=1
+
+      - name: Prove session quota, last file owner and controller authority invariants
+        run: python3 tools/check_web_download_staging_mutations.py
+
+
+      - name: Check bounded retained records
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features retained_records -- --test-threads=1
+
+      - name: Prove event cursors cannot be replaced by rotating buffer length
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/retained_records.rs')
+          original = source.read_text()
+          old = '        self.sequence\n    }\n    pub fn first_after'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'event_cursor_survives_rotation_updates_pruning_and_clear', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, old.replace('self.sequence', 'self.rows.len() as u64')))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'rotation replayed a retained event as new' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=300)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove pending event waits return their context budget
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/retained_records.rs')
+          original = source.read_text()
+          old = '    fn drop(&mut self) { self.budget.release(self.bytes); }'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'pending_event_wait_returns_its_shared_record_budget', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, '    fn drop(&mut self) {}'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'completed wait leaked its budget reservation' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=300)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove retained-record byte bounds
+        run: python3 tools/check_web_resource_mutations.py --records
+
+      - name: Check wrapper resource lifecycle
+        run: node --test crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs
+
+      - name: Prove synthetic download saving cannot use native file custody
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/js/playwright.mjs')
+          original = source.read_text()
+          old = 'downloadId: rec.bodyBase64 == null ? rec.requestId : undefined,'
+          assert original.count(old) == 1
+          command = ['node', '--test', '--test-name-pattern=download saveAs keeps synthetic',
+                     'crates/web-runtime/runtime/tests/playwright-resource-lifecycle.cjs']
+          try:
+              source.write_text(original.replace(old, 'downloadId: rec.requestId,'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'synthetic download was sent to native file custody' in result.stdout + result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=30)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove closed-page retention is detected
+        run: python3 tools/check_web_resource_mutations.py
+
+      - name: Check payload-free record accounting
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features record_usage -- --test-threads=1
+
+      - name: Prove record accounting regression detects an omitted counter
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/record_usage.rs')
+          original = source.read_text()
+          old = 'console.iter().fold(0u64'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'record_usage_crosses_a_real_frame', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'console.iter().take(0).fold(0u64'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'assertion' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+      - name: Check cancellation and absolute deadline during aborted-script drain
+        run: >-
+          cargo test --locked --manifest-path crates/web-runtime/Cargo.toml
+          -p web-runtime --lib --no-default-features aborted_script -- --test-threads=1
+
+      - name: Prove silent-controller cancellation detects a full-budget receive
+        shell: python
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/runtime/src/supervisor.rs')
+          original = source.read_text()
+          old = 'receive(remaining.min(Duration::from_millis(50)))'
+          assert original.count(old) == 1
+          command = ['cargo', 'test', '--locked', '--manifest-path', 'crates/web-runtime/Cargo.toml',
+                     '-p', 'web-runtime', '--lib', '--no-default-features',
+                     'aborted_script_receives_cancellation_while_protocol_is_silent', '--', '--test-threads=1']
+          try:
+              source.write_text(original.replace(old, 'receive(remaining)'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 101 and 'cancellation waited for the script deadline' in result.stdout
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Measure accounting IPC on one CPU
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+          print('MEASUREMENT_PROVENANCE cpu_affinity=' + str(sorted(os.sched_getaffinity(0))), flush=True)
+          subprocess.run(['/usr/bin/time', '-v', 'cargo', 'test', '--locked', '--manifest-path',
+                          'crates/web-runtime/Cargo.toml', '-p', 'web-runtime', '--lib',
+                          '--no-default-features', 'record_usage_transport_comparison', '--',
+                          '--ignored', '--test-threads=1', '--nocapture'], check=True)
+          PY
+
+      - name: Prove workload measurement includes its real process family
+        shell: python
+        run: |
+          import pathlib, subprocess, tempfile
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = 'memory = ProcessTreeMemorySampler(child.pid)'
+          refresh = 'memory.register_root(pid, expected_starttime=birth)'
+          assert original.count(old) == 1 and original.count(refresh) == 1
+          def run_case(capture=False):
+              with tempfile.TemporaryDirectory(prefix='greppy-memory-integration-pycache-') as cache:
+                  return subprocess.run(['python3', '-X', 'pycache_prefix=' + cache,
+                      'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                      'ProcessContract.test_execute_receipt_accounts_for_a_real_parent_and_child'],
+                      capture_output=capture, text=True, timeout=30, check=not capture)
+          try:
+              mutated = original.replace(old, old + '; memory.identities.clear()')
+              source.write_text(mutated.replace(refresh, 'pass # deliberately omit adopted-root enrollment'))
+              result = run_case(capture=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'owned parent/child mappings were not sampled' in result.stderr
+          finally:
+              source.write_text(original)
+          run_case()
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove CLI measurement rejects a changed runtime despite valid POST effects
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = "valid, reason = False, 'CLI runtime executable changed during measurement'"
+          assert original.count(old) == 1
+          command = ['python3', 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'CliBoundaryContract']
+          try:
+              source.write_text(original.replace(old, 'pass # deliberately accept changed runtime'))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'changed_runtime=True' in result.stderr and 'changed runtime must fail even with verified POST effects' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=60)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove an unregistered CLI runtime owner cannot claim complete RAM coverage
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = "'complete_for_execution_surface': False,"
+          assert original.count(old) == 1
+          command = ['python3', 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'CliBoundaryContract']
+          try:
+              source.write_text(original.replace(old, "'complete_for_execution_surface': True,"))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'unregistered CLI runtime owner cannot establish whole-worker memory' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=60)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Check complete-workflow measurement contracts without launching browsers
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 crates/web-runtime/scripts/test-measure-web-efficiency.py
+          node --check crates/web-runtime/runtime/fixtures/efficiency-workload.mjs
+          node --check crates/web-runtime/runtime/fixtures/efficiency-native.mjs
+          node --check crates/web-runtime/scripts/efficiency-reference.mjs
+          node --check crates/web-runtime/scripts/check-efficiency-native-entry.mjs
+
+      - name: Prove detached CLI lifetime cannot disappear before the first sample
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys, tempfile
+          source = pathlib.Path('bench/process_memory.py')
+          original = source.read_text()
+          old = 'self._prctl(36, ctypes.c_ulong(1))'
+          assert original.count(old) == 1
+          def run_case(capture=False):
+              with tempfile.TemporaryDirectory(prefix='greppy-custody-pycache-') as cache:
+                  return subprocess.run(
+                      [sys.executable, '-X', 'pycache_prefix=' + cache,
+                       'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                       'ProcessContract.test_detached_family_cost_and_exit_are_not_lost_after_cli_exit'],
+                      capture_output=capture, text=True, timeout=30, check=not capture)
+          try:
+              source.write_text(original.replace(old, 'self._prctl(36, ctypes.c_ulong(0))'))
+              result = run_case(capture=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'detached child lifetime was omitted after original CLI exit' in result.stderr
+          finally:
+              source.write_text(original)
+          run_case()
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove a leaf cgroup cannot hide tighter ancestor ceilings
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = '            if group == mount:\n                break\n            group = group.parent'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'HostEnvelopeContract.test_visible_ancestor_ceilings_cannot_be_relaxed_by_leaf']
+          try:
+              source.write_text(original.replace(old, old.replace('if group == mount:', 'if True:')))
+              result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'leaf-only CPU observation loses the tighter ancestor ceiling' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True, timeout=30)
+          subprocess.run(['git', 'diff', '--exit-code', '--', str(source)], check=True)
+
+      - name: Prove outcome verifier rejects invented successful work
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = 'effect_verified = self.token(*identity) in self.effects'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'OutcomeContract.test_claimed_success_without_post_effect_never_counts']
+          try:
+              source.write_text(original.replace(old, 'effect_verified = True'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'AssertionError: 1 != 0' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+      - name: Prove native entry rejects a restored relative module import
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/scripts/measure-web-efficiency.py')
+          original = source.read_text()
+          old = 'source = adapter.replace(import_line, workload, 1)'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'NativeEntryContract.test_entry_parses_with_only_the_native_playwright_import']
+          try:
+              source.write_text(original.replace(old, 'source = adapter'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and "'./efficiency-workload.mjs'" in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)
+
+      - name: Prove native adapter cannot forward unsupported launch options
+        shell: python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          import pathlib, subprocess, sys
+          source = pathlib.Path('crates/web-runtime/runtime/fixtures/efficiency-native.mjs')
+          original = source.read_text()
+          old = 'return browserType.launch();'
+          assert original.count(old) == 1
+          command = [sys.executable, 'crates/web-runtime/scripts/test-measure-web-efficiency.py',
+                     'NativeEntryContract.test_entry_parses_with_only_the_native_playwright_import']
+          try:
+              source.write_text(original.replace(old, 'return browserType.launch(options);'))
+              result = subprocess.run(command, capture_output=True, text=True)
+              print(result.stdout, result.stderr)
+              assert result.returncode == 1 and 'BrowserType.launch.options' in result.stderr
+          finally:
+              source.write_text(original)
+          subprocess.run(command, check=True)

@@ -375,9 +375,34 @@ fn fixture_url_grants_project_loopback(fixture_url: &str) -> bool {
     )
 }
 
+fn strip_controller_download_authority(method: &str, params: &mut serde_json::Value) {
+    if method == "session.setProfile" {
+        if let Some(object) = params.as_object_mut() {
+            object.remove("__download_session");
+            object.remove("max_download_bytes");
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn controller_cannot_replace_download_session_authority() {
+    let mut params = serde_json::json!({
+        "profile": "project", "__download_session": "foreign-session",
+        "max_download_bytes": u64::MAX,
+    });
+    strip_controller_download_authority("session.setProfile", &mut params);
+    assert!(params.get("__download_session").is_none(), "controller replaced download session authority");
+    assert!(params.get("max_download_bytes").is_none(), "controller replaced download byte authority");
+    assert_eq!(params["profile"], "project");
+}
+
 pub(crate) trait EngineGate {
     fn before_call(&mut self, method: &str, params: &serde_json::Value) -> Result<(), String>;
-    fn after_records(&mut self, records: &serde_json::Value) -> Result<(), String> {
+    fn after_call(&mut self, _method: &str, _params: &serde_json::Value, _ok: bool, _result: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
+    fn after_records(&mut self, records: &crate::record_usage::RecordUsage) -> Result<(), String> {
         let _ = records;
         Ok(())
     }
@@ -453,10 +478,12 @@ pub(crate) fn route_until_script_complete_gated(
                     Ok(Ok(crate::protocol::Message::EngineResult {
                         request_id,
                         ok,
+                        result,
                         error,
                         ..
                     })) => {
-                        if pending.remove(&request_id).is_some() {
+                        if let Some((method, params)) = pending.remove(&request_id) {
+                            let _ = gate.after_call(&method, &params, ok, &result);
                             gate.note_discarded_engine_result(request_id, ok, error);
                         }
                         if pending.is_empty() {
@@ -512,12 +539,18 @@ pub(crate) fn route_until_script_complete_gated(
                     ..
                 }) => {
                     if let Err(message) = gate.before_call(&method, &params) {
+                        settle_aborted_script(
+                            controller, content, request_id, &mut pending, &mut parked,
+                            deadline, &message, &mut gate,
+                        );
                         return Err(io::Error::other(format!("resource_limit: {message}")));
                     }
                     wait_point = format!("content:{method}");
                     phase!("web-runtime: phase run-wait point={wait_point}");
                     let mut params = params;
+                    strip_controller_download_authority(&method, &mut params);
                     if let Err(error) = content.prepare_engine_params(&method, &mut params) {
+                        let _ = gate.after_call(&method, &params, false, &serde_json::Value::Null);
                         controller.send_timeout(
                             &Message::engine_result(
                                 request_id,
@@ -549,6 +582,13 @@ pub(crate) fn route_until_script_complete_gated(
                         ); }
                         continue;
                     };
+                    if let Err(message) = gate.after_call(&method, &params, ok, &result) {
+                        settle_aborted_script(
+                            controller, content, request_id, &mut pending, &mut parked,
+                            deadline, &message, &mut gate,
+                        );
+                        return Err(io::Error::other(format!("resource_limit: {message}")));
+                    }
                     if ok && tally_after(&method) {
                         if let Err(message) = poll_session_records(
                             content,
@@ -558,12 +598,10 @@ pub(crate) fn route_until_script_complete_gated(
                             &mut gate,
                             &mut parked,
                         ) {
-                            let _ = controller.send(&Message::engine_result(
-                                request_id,
-                                false,
-                                serde_json::json!({}),
-                                Some(format!("resource_limit: {message}")),
-                            ));
+                            settle_aborted_script(
+                                controller, content, request_id, &mut pending, &mut parked,
+                                deadline, &message, &mut gate,
+                            );
                             return Err(io::Error::other(format!("resource_limit: {message}")));
                         }
                     }
@@ -606,6 +644,93 @@ pub(crate) fn route_until_script_complete_gated(
     }
 }
 
+/// A failed engine gate returns before the controller's awaiting JavaScript
+/// has completed. Finish that script before reusing its protocol stream, or
+/// its late ScriptComplete can be mistaken for the next web.run's result.
+/// No further page actions are dispatched and the original deadline is kept.
+fn settle_aborted_script(
+    controller: &mut WorkerProcess,
+    content: &mut WorkerProcess,
+    rejected_id: u64,
+    pending: &mut HashMap<u64, (String, serde_json::Value)>,
+    parked: &mut VecDeque<Message>,
+    deadline: Instant,
+    reason: &str,
+    gate: &mut impl EngineGate,
+) {
+    let failure = |id| Message::engine_result(
+        id, false, serde_json::Value::Null, Some(format!("resource_limit: {reason}")),
+    );
+    let retire = |controller: &mut WorkerProcess, content: &mut WorkerProcess, inflight: bool| {
+        controller.kill_tree_now();
+        if inflight {
+            content.kill_tree_now();
+        }
+    };
+    for id in std::iter::once(rejected_id).chain(pending.keys().copied()) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || controller.send_timeout(&failure(id), remaining).is_err() {
+            retire(controller, content, !pending.is_empty());
+            return;
+        }
+    }
+    let mut completed = false;
+    while !completed || !pending.is_empty() {
+        let incoming = recv_aborted_script(gate, deadline, |slice| {
+            if let Some(message) = parked.pop_front() {
+                Ok(Incoming::Content(message))
+            } else {
+                recv_any(controller, content, slice)
+            }
+        });
+        match incoming {
+            Ok(Incoming::Controller(Message::ScriptComplete { .. })) => completed = true,
+            Ok(Incoming::Controller(Message::EngineCall { request_id, .. })) => {
+                // A script can catch the rejection; it still cannot resume
+                // page actions after this operation's resource gate failed.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || controller.send_timeout(&failure(request_id), remaining).is_err() {
+                    retire(controller, content, !pending.is_empty());
+                    return;
+                }
+            }
+            Ok(Incoming::Content(Message::EngineResult { request_id, ok, result, error, .. })) => {
+                if let Some((method, params)) = pending.remove(&request_id) {
+                    let _ = gate.after_call(&method, &params, ok, &result);
+                }
+                gate.note_discarded_engine_result(request_id, ok, error);
+            }
+            _ => {
+                retire(controller, content, !pending.is_empty());
+                return;
+            }
+        }
+    }
+}
+
+fn recv_aborted_script(
+    gate: &mut impl EngineGate,
+    deadline: Instant,
+    mut receive: impl FnMut(Duration) -> io::Result<Incoming>,
+) -> io::Result<Incoming> {
+    loop {
+        gate.poll_control();
+        if gate.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled aborted script"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "aborted script deadline exhausted"));
+        }
+        // As in the normal router, silence is only a poll timeout. Observe
+        // control again without extending the operation's absolute deadline.
+        match receive(remaining.min(Duration::from_millis(50))) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            incoming => return incoming,
+        }
+    }
+}
+
 fn tally_after(method: &str) -> bool {
     matches!(
         method,
@@ -640,36 +765,16 @@ fn poll_session_records(
     let Some(page) = params.get("page").and_then(|value| value.as_str()) else {
         return Ok(());
     };
-    let console = sidecar_engine_call(
+    let usage = sidecar_engine_call(
         content,
         sidecar,
-        "page.consoleMessages",
+        "page.recordUsage",
         serde_json::json!({ "page": page }),
         timeout,
         parked,
     )?;
-    let downloads = sidecar_engine_call(
-        content,
-        sidecar,
-        "page.downloads",
-        serde_json::json!({ "page": page }),
-        timeout,
-        parked,
-    )?;
-    let responses = sidecar_engine_call(
-        content,
-        sidecar,
-        "page.responses",
-        serde_json::json!({ "page": page }),
-        timeout,
-        parked,
-    )?;
-    let records = serde_json::json!({
-        "messages": console.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "downloads": downloads.get("downloads").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "responses": responses.get("responses").cloned().unwrap_or_else(|| serde_json::json!([])),
-    });
-    gate.after_records(&records)
+    let usage = serde_json::from_value(usage).map_err(|error| format!("invalid record usage: {error}"))?;
+    gate.after_records(&usage)
 }
 
 fn sidecar_engine_call(
@@ -1030,12 +1135,40 @@ fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::Owned
 }
 
 #[cfg(unix)]
+fn trace_worker_spawn(worker: &WorkerKind, stage: &str) {
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+        eprintln!(
+            "web-runtime: spawn supervisor={} worker={worker:?} stage={stage}",
+            std::process::id()
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_WORKER_IMAGE_PREPARATION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(unix)]
 fn spawn_unix(
     worker: WorkerKind,
     capability: String,
     persistent_profiles: Option<PathBuf>,
 ) -> io::Result<WorkerProcess> {
-        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    crate::fork_exec_window::exclusive(|| {
+        spawn_unix_in_window(worker, capability, persistent_profiles)
+    })
+}
+
+#[cfg(unix)]
+fn spawn_unix_in_window(
+    worker: WorkerKind,
+    capability: String,
+    persistent_profiles: Option<PathBuf>,
+) -> io::Result<WorkerProcess> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
         let path = std::env::current_exe().map_err(|error| {
@@ -1073,12 +1206,11 @@ fn spawn_unix(
         let proto_parent = unsafe { OwnedFd::from_raw_fd(proto[1]) };
         let proto_child = duplicate_above_worker_protocol_fds(proto_child_source.as_raw_fd())?;
         drop(proto_child_source);
-        let cap_read_fd = cap_read.into_raw_fd();
-        let proto_child_fd = proto_child.into_raw_fd();
+        let cap_read_fd = cap_read.as_raw_fd();
+        let proto_child_fd = proto_child.as_raw_fd();
         unsafe {
             libc::fcntl(proto_parent.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let proto_parent_fd = proto_parent.into_raw_fd();
 
         let mut command = Command::new(&path);
         command
@@ -1118,15 +1250,22 @@ fn spawn_unix(
                 Ok(())
             });
         }
+        // Keep all descriptor owners alive across every fallible preparation step.
+        // Raw fd numbers above are borrowed only for the child pre_exec closure.
+        #[cfg(all(test, target_os = "linux"))]
+        if FAIL_WORKER_IMAGE_PREPARATION.with(|fail| fail.replace(false)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected worker image preparation failure",
+            ));
+        }
+        trace_worker_spawn(&worker, "image-prepare");
         let image = crate::worker::apply_same_image_reexec(&mut command)?;
         // Cache parent identity before exec so the first child cannot race the digest.
+        trace_worker_spawn(&worker, "parent-image");
         let _ = parent_image()?;
+        trace_worker_spawn(&worker, "spawn");
         let mut child = command.spawn().map_err(|error| {
-            unsafe {
-                libc::close(cap_read_fd);
-                libc::close(proto_child_fd);
-                libc::close(proto_parent_fd);
-            }
             io::Error::new(
                 error.kind(),
                 format!(
@@ -1135,35 +1274,28 @@ fn spawn_unix(
                 ),
             )
         })?;
-        unsafe {
-            libc::close(cap_read_fd);
-            libc::close(proto_child_fd);
-        }
+        drop(cap_read);
+        drop(proto_child);
+        trace_worker_spawn(&worker, "image-prove");
         image.prove_child_or_kill(&mut child)?;
+        trace_worker_spawn(&worker, "executable-prove");
         if let Err(error) = prove_same_executable(child.id()) {
-            unsafe {
-                libc::close(proto_parent_fd);
-            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
 
-        let proto_read_fd = unsafe { libc::dup(proto_parent_fd) };
-        if proto_read_fd < 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                libc::close(proto_parent_fd);
+        trace_worker_spawn(&worker, "protocol-clone");
+        let proto_read = match proto_parent.try_clone() {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        unsafe {
-            libc::fcntl(proto_read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        let protocol_write = File::from(unsafe { OwnedFd::from_raw_fd(proto_parent_fd) });
-        let protocol_read = File::from(unsafe { OwnedFd::from_raw_fd(proto_read_fd) });
+        };
+        let protocol_write = File::from(proto_parent);
+        let protocol_read = File::from(proto_read);
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "worker stdout was not piped")
         })?;
@@ -1214,6 +1346,7 @@ fn spawn_unix(
         };
 
         register_owned_worker(child.id());
+        trace_worker_spawn(&worker, "spawn-complete");
         Ok(WorkerProcess {
             worker,
             capability,
@@ -2191,6 +2324,34 @@ fn stage_input_files(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_worker_image_preparation_releases_kernel_descriptors() {
+        fn fail_after_descriptors_are_allocated() {
+            FAIL_WORKER_IMAGE_PREPARATION.with(|fail| fail.set(true));
+            let result = spawn_unix(WorkerKind::Controller, "fd-lifetime-contract".into(), None);
+            FAIL_WORKER_IMAGE_PREPARATION.with(|fail| fail.set(false));
+            let error = result.err().expect("worker preparation must fail before exec");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "injected worker image preparation failure");
+        }
+        fn descriptor_count() -> usize {
+            fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        // Warm one-time process setup before measuring repeated failed starts.
+        fail_after_descriptors_are_allocated();
+        let before = descriptor_count();
+        for _ in 0..4 {
+            fail_after_descriptors_are_allocated();
+            assert_eq!(
+                descriptor_count(),
+                before,
+                "failed worker image preparation leaked kernel descriptors"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn upload_ancestor_swap_after_canonicalization_cannot_escape_grant() {
@@ -2401,6 +2562,62 @@ mod tests {
         assert!(future.exists(), "clock skew is not proof of staleness");
         assert!(fs::symlink_metadata(linked).unwrap().file_type().is_symlink());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn aborted_script_receives_cancellation_while_protocol_is_silent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Gate(Arc<AtomicBool>);
+        impl EngineGate for Gate {
+            fn before_call(&mut self, _: &str, _: &serde_json::Value) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut gate = Gate(Arc::clone(&cancelled));
+        let (entered, first_receive) = mpsc::channel();
+        let (sender, silent) = mpsc::channel::<Incoming>();
+        let cancellation = thread::spawn(move || {
+            first_receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = recv_aborted_script(&mut gate, started + Duration::from_secs(2), |budget| {
+            let _ = entered.send(());
+            silent.recv_timeout(budget).map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
+                mpsc::RecvTimeoutError::Disconnected => io::Error::from(io::ErrorKind::BrokenPipe),
+            })
+        });
+        cancellation.join().unwrap();
+        drop(sender);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent controller unexpectedly completed"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(750), "cancellation waited for the script deadline");
+    }
+
+    #[test]
+    fn aborted_script_poll_timeouts_keep_the_original_absolute_deadline() {
+        let mut gate = AllowAllGate;
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(130);
+        let result = recv_aborted_script(&mut gate, deadline, |budget| {
+            thread::sleep(budget);
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent controller unexpectedly completed"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now() >= deadline, "a slice timeout ended cleanup prematurely");
+        assert!(started.elapsed() < Duration::from_millis(750), "cleanup extended its original deadline");
     }
 
     #[test]

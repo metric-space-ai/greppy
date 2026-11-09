@@ -27,6 +27,7 @@ greppy-search = { path = "../search" }
 greppy-store = { path = "../store" }
 greppy-workspace-core = { path = "../workspace-core" }
 greppy-web-client = { path = "../web-client" }
+greppy-desktop = { path = "../desktop" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

@@ -134,7 +134,7 @@ pub use embedding::{
     index_code_embeddings_for_scope_with_progress, CodeEmbeddingProvider,
     EmbeddingGemmaCodeProvider, EmbeddingIndexOptions, EmbeddingIndexProgress,
     EmbeddingIndexProgressContext, EmbeddingIndexReport, EmbeddingProviderCacheStats,
-    EmbeddingWorkload,
+    EmbeddingValidationProgress, EmbeddingWorkload,
 };
 
 /// Fraction of the process RAM budget the indexer initialises
@@ -1510,13 +1510,13 @@ fn apply_file_nodes(
     // files and needs the per-file delete-then-insert for correctness.
     insert_content: bool,
 ) -> Result<()> {
-    // Delete any prior nodes for this file BEFORE inserting
-    // the new ones. The FK cascade on `edges.source_id` /
-    // `edges.target_id` removes orphaned edges in the same
-    // transaction. This per-file deletion is preserved exactly under
-    // the two-phase split — each file is still individually cleaned
-    // before its fresh nodes land.
-    let _removed = store.delete_nodes_for_file(project, rel_path)?;
+    // A revision-only refresh has proven identical source bytes. Preserve
+    // unchanged definition identities and their content-addressed vectors;
+    // ordinary source edits retain the existing delete/reinsert behavior.
+    let revision_only = store.get_file_state(project, rel_path)?.is_some_and(|old| {
+        old.sha256 == file_state::sha256_hex(bytes)
+            && !greppy_parser::extraction_revision_matches(abs_path, &old.extractor_version)
+    });
 
     // Also delete prior file-content rows before the new
     // content is inserted, so a renamed/removed symbol's content
@@ -1558,6 +1558,40 @@ fn apply_file_nodes(
     for n in nodes {
         new_nodes.push(new_node_for(project, rel_path, n.clone()));
     }
+    if revision_only {
+        let expected = new_nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect::<std::collections::HashMap<_, _>>();
+        // Match the old cascade's edge boundary while retaining exact nodes.
+        // Raw rows below are replaced and the existing resolver regenerates
+        // these relations against the new definition set.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.edges WHERE project=?1 AND (
+                source_id IN (SELECT id FROM main.nodes WHERE project=?1 AND file_path=?2)
+                OR target_id IN (SELECT id FROM main.nodes WHERE project=?1 AND file_path=?2))",
+                rusqlite::params![project, rel_path],
+            )
+            .map_err(sqlite_err)?;
+        for old in store.list_nodes_for_file(project, rel_path)? {
+            let unchanged = expected
+                .get(old.qualified_name.as_str())
+                .is_some_and(|new| {
+                    old.label == new.label
+                        && old.name == new.name
+                        && old.start_line == new.start_line
+                        && old.end_line == new.end_line
+                        && old.properties == new.properties
+                });
+            if !unchanged && old.id > 0 {
+                store.delete_node(old.id)?;
+            }
+        }
+    } else {
+        let _removed = store.delete_nodes_for_file(project, rel_path)?;
+    }
     store.insert_nodes(&new_nodes)?;
 
     // Feed indexed file-content rows for `search-code`. We
@@ -1585,7 +1619,10 @@ fn apply_file_nodes(
         mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-        extractor_version: "greppy-extractor-v1".into(),
+        extractor_version: greppy_parser::extraction_revision(greppy_parser::language_for_path(
+            abs_path,
+        ))
+        .into(),
         last_indexed_generation: generation,
     };
     store.upsert_file_state(&fs)?;
@@ -2838,7 +2875,9 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
-pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v4";
+// The established reference-repair namespace also carries Go usages. v5
+// repairs old Go extraction without invalidating unrelated files or Base identity.
+pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v5";
 
 /// JSON `{"count":N,"paths":[...]}` for files skipped by
 /// [`recover_persisted_js_ts_usages`] because extraction still violated the
@@ -2889,7 +2928,7 @@ fn warn_js_ts_usage_repair_skips(paths: &[String]) {
     tracing::warn!(
         count,
         paths = %ordered.join(", "),
-        "JS/TS usage repair skipped files that still violate the provider contract"
+        "Reference usage repair skipped files that still violate the provider contract"
     );
 }
 
@@ -2907,20 +2946,21 @@ fn validated_js_ts_repair_extraction(
         && relative.rsplit(['/', '\\']).next() == Some("contract-invalid.js")
     {
         return Err(greppy_core::Error::Invalid(format!(
-            "JS/TS usage repair extraction incomplete for {relative}: synthetic residual contract violation (0 invalid records removed)"
+            "Reference usage repair extraction incomplete for {relative}: synthetic residual contract violation (0 invalid records removed)"
         )));
     }
     let (validated, dropped, error) = validate_or_degrade(language, relative, extraction);
     if let Some(error) = error {
         return Err(greppy_core::Error::Invalid(format!(
-            "JS/TS usage repair extraction incomplete for {relative}: {error} ({dropped} invalid records removed)"
+            "Reference usage repair extraction incomplete for {relative}: {error} ({dropped} invalid records removed)"
         )));
     }
     Ok(validated)
 }
 
-/// One-shot source-validated usage recovery, separately partitioned from Rust.
-/// Validate all visible source and definition identities before atomic publication.
+/// Source-validated JS/TS and Go reference recovery in the existing compatibility pass.
+/// Reuse v4-certified JS/TS facts per layer; validate Go and uncertified Delta sources.
+/// Validate all affected source and definition identities before atomic publication.
 pub fn recover_persisted_js_ts_usages(
     store: &mut Store,
     project: &str,
@@ -2929,30 +2969,124 @@ pub fn recover_persisted_js_ts_usages(
     if js_ts_usages_repaired(store)? {
         return Ok(false);
     }
+    // v4 already certified JS/TS with this extractor. Reuse that evidence,
+    // including immutable Base facts. Private JS/TS still needs its own evidence.
+    let mut legacy_js_schema = None;
+    for schema in if store.is_overlay() {
+        &["main", "greppy_base"][..]
+    } else {
+        &["main"][..]
+    } {
+        let complete: bool = store.conn().query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {schema}.schema_meta WHERE key='greppy.js_ts_usage_repair_v4' AND value='complete')"),
+            [],
+            |row| row.get(0),
+        ).map_err(sqlite_err)?;
+        if complete {
+            legacy_js_schema = Some(*schema);
+            break;
+        }
+    }
+    let previous_skips = if let Some(schema) = legacy_js_schema {
+        let raw: String = store.conn().query_row(
+            &format!(r#"SELECT COALESCE((SELECT value FROM {schema}.schema_meta WHERE key=?1), '{{"count":0,"paths":[]}}')"#),
+            [JS_TS_USAGE_REPAIR_SKIPS_KEY],
+            |row| row.get(0),
+        ).map_err(sqlite_err)?;
+        Some(
+            serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| {
+                greppy_core::Error::Invalid(format!("reference repair skip metadata: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
     let root = std::fs::canonicalize(root).map_err(|e| {
-        greppy_core::Error::Invalid(format!("JS/TS usage repair root unavailable: {e}"))
+        greppy_core::Error::Invalid(format!("Reference usage repair root unavailable: {e}"))
     })?;
     let states = store.list_file_states(project)?;
-    let indexed = store.list_nodes(project, "", "", 0, i64::MAX as usize)?;
-    let relevant = |path: &str| {
-        matches!(
-            greppy_parser::language_for_path(Path::new(path)),
-            Language::JavaScript | Language::TypeScript { .. }
-        )
+    // Only source identities are needed here, not every node/property payload.
+    let indexed = {
+        let mut statement = store
+            .conn()
+            .prepare("SELECT DISTINCT file_path FROM nodes WHERE project=?1")
+            .map_err(sqlite_err)?;
+        let paths = statement
+            .query_map([project], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+        paths
     };
-    if indexed.iter().any(|node| {
-        relevant(&node.file_path) && !states.iter().any(|state| state.rel_path == node.file_path)
-    }) {
+    let mut uncertified_js_files = std::collections::HashSet::new();
+    if legacy_js_schema == Some("greppy_base") {
+        // A Base certificate says nothing about private Delta facts. Include
+        // owned files, raw/resolved facts and prior reference-override masks.
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT rel_path FROM main.file_state WHERE project=?1
+             UNION SELECT file_path FROM main.nodes WHERE project=?1
+             UNION SELECT file_path FROM main.raw_edges WHERE project=?1
+             UNION SELECT n.file_path FROM main.overlay_edges e JOIN nodes n
+               ON n.project=e.project AND n.qualified_name=e.source_qualified_name
+               WHERE e.project=?1
+             UNION SELECT CAST(f.value AS TEXT) FROM main.schema_meta m, json_each(m.value) f
+               WHERE m.key IN (?2,?3)",
+            )
+            .map_err(sqlite_err)?;
+        let paths = statement
+            .query_map(
+                rusqlite::params![
+                    project,
+                    format!("greppy.js_ts_usage_override_files.{project}"),
+                    format!("greppy.js_ts_caller_override_files.{project}")
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sqlite_err)?;
+        for path in paths {
+            uncertified_js_files.insert(path.map_err(sqlite_err)?);
+        }
+    }
+    let relevant = |path: &str| {
+        let language = greppy_parser::language_for_path(Path::new(path));
+        matches!(language, Language::Go)
+            || ((legacy_js_schema.is_none() || uncertified_js_files.contains(path))
+                && matches!(language, Language::JavaScript | Language::TypeScript { .. }))
+    };
+    let fingerprint_paths: std::collections::HashSet<_> =
+        states.iter().map(|state| state.rel_path.as_str()).collect();
+    if indexed
+        .iter()
+        .any(|path| relevant(path) && !fingerprint_paths.contains(path.as_str()))
+    {
         return Err(greppy_core::Error::Invalid(
-            "JS/TS usage repair requires indexed source fingerprints".into(),
+            "Reference usage repair requires indexed source fingerprints".into(),
         ));
+    }
+    if legacy_js_schema.is_some() && !states.iter().any(|state| relevant(&state.rel_path)) {
+        // No Go or uncertified JS/TS sources: certify without reading their
+        // source or loading node payloads/rebuilding the graph.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete'),(?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![
+                    JS_TS_USAGE_REPAIR_KEY,
+                    JS_TS_USAGE_REPAIR_SKIPS_KEY,
+                    previous_skips.unwrap().to_string()
+                ],
+            )
+            .map_err(sqlite_err)?;
+        return Ok(false);
     }
     // A Store-CoW Delta retains fingerprints for discovery-filtered files,
     // although those files deliberately have no graph definitions. Do not
     // re-extract them as if their absent definitions were cache corruption.
     let discovery_filtered = discovery_filtered_recovery_identities(store, project)?;
-    let indexed_paths: std::collections::BTreeSet<_> =
-        indexed.iter().map(|node| node.file_path.as_str()).collect();
+    let indexed_paths: std::collections::BTreeSet<_> = indexed.iter().map(String::as_str).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
     let mut skipped_contract_files = Vec::new();
@@ -2967,23 +3101,23 @@ pub fn recover_persisted_js_ts_usages(
             .any(|part| !matches!(part, std::path::Component::Normal(_)))
         {
             return Err(greppy_core::Error::Invalid(
-                "unsafe JS/TS usage repair path".into(),
+                "unsafe Reference usage repair path".into(),
             ));
         }
         let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
-            greppy_core::Error::Invalid(format!("JS/TS usage repair source unavailable: {e}"))
+            greppy_core::Error::Invalid(format!("Reference usage repair source unavailable: {e}"))
         })?;
         if !path.starts_with(&root) {
             return Err(greppy_core::Error::Invalid(
-                "JS/TS usage repair source escapes root".into(),
+                "Reference usage repair source escapes root".into(),
             ));
         }
         let (bytes, _) = read_stable_file(&path).map_err(|e| {
-            greppy_core::Error::Invalid(format!("JS/TS usage repair source unreadable: {e}"))
+            greppy_core::Error::Invalid(format!("Reference usage repair source unreadable: {e}"))
         })?;
         if file_state::sha256_hex(&bytes) != state.sha256 {
             return Err(greppy_core::Error::Invalid(format!(
-                "JS/TS usage repair source {} changed since indexing",
+                "Reference usage repair source {} changed since indexing",
                 state.rel_path
             )));
         }
@@ -2995,8 +3129,8 @@ pub fn recover_persisted_js_ts_usages(
         // Marking the repair complete despite the skip is safe: the bytes were
         // just verified against their recorded sha256, so the same extractor
         // fails the same way on every retry. A changed file is re-extracted by
-        // ordinary indexing, and an extractor change bumps INDEXER_VERSION_BASE,
-        // which forces a full re-extraction.
+        // ordinary indexing. Compatibility extractor changes advance this repair
+        // key so affected cached references are revalidated without a global rebuild.
         let extraction =
             match validated_js_ts_repair_extraction(language, &state.rel_path, extraction) {
                 Ok(extraction) => extraction,
@@ -3022,7 +3156,7 @@ pub fn recover_persisted_js_ts_usages(
                     || cached.end_line != i64::from(node.end_line)
             }) {
                 return Err(greppy_core::Error::Invalid(format!(
-                    "JS/TS usage repair definition unavailable: {}",
+                    "Reference usage repair definition unavailable: {}",
                     node.qualified_name
                 )));
             }
@@ -3063,7 +3197,7 @@ pub fn recover_persisted_js_ts_usages(
     {
         let Some(source) = index.by_qname(&edge.source_qualified_name) else {
             return Err(greppy_core::Error::Invalid(format!(
-                "JS/TS usage repair source identity unavailable: {}:{} source={} reference={}",
+                "Reference usage repair source identity unavailable: {}:{} source={} reference={}",
                 edge.file_path,
                 edge.line,
                 edge.source_qualified_name,
@@ -3108,7 +3242,24 @@ pub fn recover_persisted_js_ts_usages(
         .filter(|edge| edge.edge_type == "USAGE")
         .map(|edge| new_raw_edge_for(project, &edge.file_path, edge))
         .collect::<Vec<_>>();
-    let skip_json = js_ts_usage_repair_skip_json(&skipped_contract_files);
+    let skip_json = if let Some(previous) = previous_skips {
+        let mut paths = previous["paths"].as_array().cloned().unwrap_or_default();
+        paths.extend(
+            skipped_contract_files
+                .iter()
+                .map(|path| serde_json::json!(path)),
+        );
+        paths.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        paths.dedup();
+        paths.truncate(20);
+        serde_json::json!({
+            "count": previous["count"].as_u64().unwrap_or(0) + skipped_contract_files.len() as u64,
+            "paths": paths,
+        })
+        .to_string()
+    } else {
+        js_ts_usage_repair_skip_json(&skipped_contract_files)
+    };
     store
         .conn()
         .execute_batch("SAVEPOINT greppy_js_ts_usage_repair")
@@ -6248,6 +6399,20 @@ impl GraphIndex {
             .iter()
             .filter(|node| node.file_path == referrer_file)
             .collect::<Vec<_>>();
+        // Distinct same-name Rust free functions can be conditional siblings.
+        // Their source identities do not prove which cfg is active. Preserve
+        // ambiguity before the historical local label/id preference can pick
+        // one variant merely because it was inserted first.
+        if referrer_file.ends_with(".rs")
+            && local
+                .iter()
+                .filter(|node| node.label == "Function")
+                .take(2)
+                .count()
+                > 1
+        {
+            return UniqueResolution::Ambiguous;
+        }
         if let Some(target) = local
             .iter()
             .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
@@ -7954,7 +8119,10 @@ fn record_unsupported_file_state(
             mtime_ns: metadata.mtime_ns.unwrap_or(0),
             size: md.len() as i64,
             parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-            extractor_version: "greppy-extractor-v1".into(),
+            extractor_version: greppy_parser::extraction_revision(
+                greppy_parser::language_for_path(&entry.abs_path),
+            )
+            .into(),
             last_indexed_generation: generation,
         };
         let _ = store.upsert_file_state(&fs);
@@ -7981,7 +8149,10 @@ fn record_unsupported_file_state(
         mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-        extractor_version: "greppy-extractor-v1".into(),
+        extractor_version: greppy_parser::extraction_revision(greppy_parser::language_for_path(
+            &entry.abs_path,
+        ))
+        .into(),
         last_indexed_generation: generation,
     };
     let _ = store.upsert_file_state(&fs);

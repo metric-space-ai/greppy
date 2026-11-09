@@ -32,6 +32,25 @@ fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
     }
 }
 
+/// Liveness and completed work are distinct during candidate validation.
+/// Legacy counting records have no work timestamp: fresh heartbeats cannot
+/// establish whether any candidate has completed.
+fn index_job_progress_ages(job: &serde_json::Value, now: u64) -> (Option<u64>, Option<u64>) {
+    let timestamp = |key| job.get(key).and_then(serde_json::Value::as_u64);
+    let heartbeat = timestamp("updated_at_unix_secs");
+    let work =
+        if job.get("state").and_then(serde_json::Value::as_str) == Some("counting_embeddings") {
+            timestamp("last_work_progress_at_unix_secs")
+                .or_else(|| timestamp("validation_started_at_unix_secs"))
+        } else {
+            heartbeat
+        };
+    (
+        heartbeat.map(|at| now.saturating_sub(at)),
+        work.map(|at| now.saturating_sub(at)),
+    )
+}
+
 pub(crate) fn dispatch_index_status(
     json: bool,
     diagnostics: bool,
@@ -533,7 +552,7 @@ fn compact_health_keeps_failed_inference_reason() {
 fn published_coverage_warning(
     indexed_files: Option<u64>,
     graph_generation: Option<u64>,
-    git_tracked: Option<u64>,
+    git_tracked: Option<GitTrackedFiles>,
 ) -> Option<String> {
     // An allocated store is not a published graph. In particular, admission
     // can leave an empty store without ever running discovery.
@@ -542,9 +561,10 @@ fn published_coverage_warning(
     else {
         return None;
     };
+    let tracked = tracked.non_skip_worktree();
     (tracked >= 100 && indexed_files.saturating_mul(5) < tracked).then(|| {
         format!(
-            "store indexed {indexed_files} files but git tracks {tracked} — \
+            "store indexed {indexed_files} files but git tracks {tracked} non-skip-worktree files — \
              discovery may be dropping files (nested-repo ignore rules?); \
              re-run `greppy index` with the current binary"
         )
@@ -554,13 +574,35 @@ fn published_coverage_warning(
 #[cfg(test)]
 #[test]
 fn coverage_warning_requires_publication_but_keeps_real_underindexing_visible() {
-    assert!(published_coverage_warning(None, None, Some(1063)).is_none());
-    assert!(published_coverage_warning(Some(0), None, Some(1063)).is_none());
-    assert!(published_coverage_warning(None, Some(1), Some(1063)).is_none());
-    let warning = published_coverage_warning(Some(0), Some(1), Some(1063)).unwrap();
+    let full = |total| {
+        Some(GitTrackedFiles {
+            total,
+            skip_worktree: 0,
+        })
+    };
+    assert!(published_coverage_warning(None, None, full(1063)).is_none());
+    assert!(published_coverage_warning(Some(0), None, full(1063)).is_none());
+    assert!(published_coverage_warning(None, Some(1), full(1063)).is_none());
+    let warning = published_coverage_warning(Some(0), Some(1), full(1063)).unwrap();
     assert!(warning.contains("store indexed 0 files but git tracks 1063"));
-    assert!(published_coverage_warning(Some(100), Some(1), Some(101)).is_none());
-    assert!(published_coverage_warning(Some(0), Some(1), Some(99)).is_none());
+    assert!(published_coverage_warning(Some(100), Some(1), full(101)).is_none());
+    assert!(published_coverage_warning(Some(0), Some(1), full(99)).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn coverage_warning_respects_sparse_scope_without_hiding_real_gaps() {
+    let sparse = Some(GitTrackedFiles {
+        total: 1220,
+        skip_worktree: 1100,
+    });
+    assert!(published_coverage_warning(Some(120), Some(1), sparse).is_none());
+    assert!(published_coverage_warning(Some(0), Some(1), sparse).is_some());
+    let full = Some(GitTrackedFiles {
+        total: 1220,
+        skip_worktree: 0,
+    });
+    assert!(published_coverage_warning(Some(120), Some(1), full).is_some());
 }
 
 fn background_health_state(
@@ -643,10 +685,9 @@ fn background_health_observation(
         "process_alive" => "No writer or startup lease was observed. The recorded PID is alive, but its job identity is unconfirmed; retry the original command rather than waiting for that PID or starting duplicate preparation.",
         _ => "No writer or startup lease and no live recorded process were observed. Inspect the prior job and current store diagnostics before choosing recovery; a stale journal alone does not require rebuilding a healthy graph.",
     };
-    let progress_age_seconds = job
-        .and_then(|job| job.get("updated_at_unix_secs"))
-        .and_then(serde_json::Value::as_u64)
-        .map(|updated| now.saturating_sub(updated));
+    let (heartbeat_age_seconds, progress_age_seconds) = job
+        .map(|job| index_job_progress_ages(job, now))
+        .unwrap_or((None, None));
     let phase = job
         .and_then(|job| job.get("state"))
         .and_then(serde_json::Value::as_str);
@@ -655,6 +696,8 @@ fn background_health_observation(
         "process_identity_confirmed": false,
         "recovery": recovery,
         "progress_age_seconds": progress_age_seconds,
+        "work_progress_age_seconds": progress_age_seconds,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
         "progress_stale": progress_age_seconds.map(|age| age >= progress_stall_threshold_seconds(phase)),
         "note": "PID liveness does not establish admission, writer ownership or current progress; an old progress timestamp alone does not establish process exit",
     }))
@@ -1012,19 +1055,27 @@ fn dispatch_index_health_with_detail(
     // lightweight progress record before touching SQLite or walking Git.
     if writer_active {
         let writer_lock = greppy_freshness::lock_path_for(&store_path);
-        let progress_age_seconds = background_job
+        let (heartbeat_age_seconds, progress_age_seconds) = background_job
             .as_ref()
-            .and_then(|job| job.get("updated_at_unix_secs"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|updated| unix_now_secs_cli().saturating_sub(updated));
+            .map(|job| index_job_progress_ages(job, unix_now_secs_cli()))
+            .unwrap_or((None, None));
         let phase = background_job
             .as_ref()
             .and_then(|job| job.get("state"))
             .and_then(serde_json::Value::as_str);
         let stall_threshold_seconds = progress_stall_threshold_seconds(phase);
-        let progress_stalled =
-            progress_age_seconds.is_some_and(|age| age >= stall_threshold_seconds);
-        let message = if progress_stalled {
+        let progress_stalled = if phase == Some("counting_embeddings") {
+            progress_age_seconds.map(|age| age >= stall_threshold_seconds)
+        } else {
+            Some(progress_age_seconds.is_some_and(|age| age >= stall_threshold_seconds))
+        };
+        let message = if phase == Some("counting_embeddings") && progress_stalled != Some(false) {
+            format!(
+                "candidate validation has no recent completed-work evidence (work_age_seconds={}, heartbeat_age_seconds={}); inspect the owning invocation and its logs; liveness alone does not prove work progress or deadlock; do not signal background_job.pid without separate ownership proof",
+                progress_age_seconds.map(|age| age.to_string()).unwrap_or_else(|| "unknown".into()),
+                heartbeat_age_seconds.map(|age| age.to_string()).unwrap_or_else(|| "unknown".into()),
+            )
+        } else if progress_stalled == Some(true) {
             let phase = phase.unwrap_or("unknown");
             format!(
                 "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the index invocation that owns writer_lock and its logs; background_job.pid is diagnostic only and must not be signaled without separate ownership proof; the OS lock releases when its actual owner exits",
@@ -1053,6 +1104,8 @@ fn dispatch_index_health_with_detail(
             "background_observation": background_observation,
 
             "progress_age_seconds": progress_age_seconds,
+            "work_progress_age_seconds": progress_age_seconds,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
             "progress_stall_threshold_seconds": stall_threshold_seconds,
             "progress_stalled": progress_stalled,
             "fresh": false,
@@ -1074,16 +1127,24 @@ fn dispatch_index_health_with_detail(
             println!("store: {}", store_path.display());
             if let Some(job) = status.get("background_job").filter(|job| !job.is_null()) {
                 println!(
-                    "progress: phase={} completed={}/{} eta_seconds={} workers={}",
+                    "progress: phase={} completed={}/{} unit={} eta_seconds={} workers={}",
                     job.get("state")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("starting"),
-                    job.get("completed_spans")
+                    job.get("validation_completed_candidates")
+                        .filter(|value| !value.is_null())
+                        .or_else(|| job.get("completed_spans"))
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
-                    job.get("total_spans")
+                    job.get("validation_total_candidates")
+                        .filter(|value| !value.is_null())
+                        .or_else(|| job.get("total_spans"))
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    job.get("progress_unit")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("items"),
                     job.get("eta_seconds")
                         .and_then(serde_json::Value::as_u64)
                         .map(|value| value.to_string())
@@ -1386,7 +1447,7 @@ fn dispatch_index_health_with_detail(
     //     O9-class) shows up as a tiny fraction of the tracked files.
     //   * vectors: a configured embedding model with zero stored vectors
     //     means every semantic query silently degrades to lexical.
-    let git_tracked = git_tracked_file_count(&effective_root);
+    let git_tracked = git_tracked_file_counts(&effective_root);
     let coverage_warning = published_coverage_warning(
         project_diag.map(|p| p.stats.file_count as u64),
         graph_generation,
@@ -1422,7 +1483,8 @@ fn dispatch_index_health_with_detail(
     let js_ts_usage_repair_skips = js_ts_usage_repair_skip_diagnostic(&store);
 
     if json {
-        let value = serde_json::json!({
+        let git_tracked_total = git_tracked.map(|counts| counts.total);
+        let mut value = serde_json::json!({
             "command": command,
             "status": status_label,
             "healthy": healthy,
@@ -1456,7 +1518,7 @@ fn dispatch_index_health_with_detail(
             "provider_failure_count": provider_failure_count,
             "providers": provider_states,
             "skip_counts_by_reason": skip_counts,
-            "git_tracked_files": git_tracked,
+            "git_tracked_files": git_tracked_total,
             "coverage_warning": coverage_warning,
             "vectors_missing_with_model": vectors_missing_with_model,
             "inference_healthy": inference_healthy,
@@ -1465,6 +1527,11 @@ fn dispatch_index_health_with_detail(
             "inference": inference_diagnostics,
             "js_ts_usage_repair_skips": js_ts_usage_repair_skips,
         });
+        // Keep supplementary scope evidence outside the large json! expansion.
+        value["git_skip_worktree_files"] =
+            serde_json::json!(git_tracked.map(|counts| counts.skip_worktree));
+        value["git_tracked_non_skip_worktree_files"] =
+            serde_json::json!(git_tracked.map(GitTrackedFiles::non_skip_worktree));
         println!(
             "{}",
             serde_json::to_string_pretty(&index_health_output(value, detailed))
@@ -2292,7 +2359,7 @@ pub(crate) fn index_overlay_snapshot(
     // deliberately skips Base preparation. In that path the command-scoped
     // environment has no pinned commit even though the existing overlay does.
     let base_commit = overlay.base_commit.as_str();
-    crate::store_cow::persist_visibility(&store, &overlay.visibility, base_commit)?;
+    crate::store_cow::persist_visibility(&store, &overlay.visibility, base_commit, project)?;
     crate::store_cow::persist_overlay_binding(&store, &overlay.base_path, base_commit, project)?;
     let embedding = if let Some(config) = embedding_config {
         Some(index_embeddings_into_temp_store(
@@ -2773,12 +2840,22 @@ fn index_embeddings_into_temp_store_scoped(
         let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
         let report = if let Some(job) = background_job {
             let heartbeat_path = job.path.clone();
-            job.begin_counting_embeddings(candidate_nodes);
+            // The SQL count covers private project definitions, not a scoped
+            // composed Base/Delta walk. Do not present it as an exact scope total.
+            job.begin_counting_embeddings(if index_prefixes.is_empty() {
+                candidate_nodes
+            } else {
+                None
+            });
             let _heartbeat = heartbeat_path.map(CountingEmbeddingsHeartbeat::start);
             let (backend, device) = provider.backend_plan();
             job.device = device;
+            let job = std::cell::RefCell::new(job);
+            let mut validation_progress =
+                |value| job.borrow_mut().embedding_validation_progress(value);
             let mut started = false;
             let mut progress = |value: greppy_indexer::EmbeddingIndexProgress| {
+                let mut job = job.borrow_mut();
                 if !started {
                     job.embedding_started(
                         &backend,
@@ -2798,6 +2875,7 @@ fn index_embeddings_into_temp_store_scoped(
                 greppy_indexer::EmbeddingIndexProgressContext {
                     total_documents: 0,
                     callback: &mut progress,
+                    validation_callback: Some(&mut validation_progress),
                 },
                 index_prefixes,
             )?
@@ -2811,6 +2889,7 @@ fn index_embeddings_into_temp_store_scoped(
                 greppy_indexer::EmbeddingIndexProgressContext {
                     total_documents: 0,
                     callback: &mut |_| {},
+                    validation_callback: None,
                 },
                 index_prefixes,
             )?
@@ -2859,6 +2938,36 @@ fn index_embeddings_into_temp_store_scoped(
 #[cfg(test)]
 mod progress_status_tests {
     use super::{index_warm_run_id, progress_stall_threshold_seconds};
+
+    #[test]
+    fn validation_progress_work_age_is_independent_of_liveness() {
+        let mut job = serde_json::json!({
+            "state": "counting_embeddings", "updated_at_unix_secs": 199,
+            "last_work_progress_at_unix_secs": 10, "validation_started_at_unix_secs": 5,
+        });
+        assert_eq!(
+            super::index_job_progress_ages(&job, 200),
+            (Some(1), Some(190)),
+            "fresh heartbeat must not hide old validation work"
+        );
+        let observation =
+            super::background_health_observation(Some(&job), Some("refreshing"), true, 200)
+                .unwrap();
+        assert_eq!(observation["heartbeat_age_seconds"], 1);
+        assert_eq!(observation["work_progress_age_seconds"], 190);
+        assert_eq!(observation["progress_stale"], true);
+        job["last_work_progress_at_unix_secs"] = serde_json::Value::Null;
+        assert_eq!(
+            super::index_job_progress_ages(&job, 200),
+            (Some(1), Some(195))
+        );
+        job["validation_started_at_unix_secs"] = serde_json::Value::Null;
+        assert_eq!(
+            super::index_job_progress_ages(&job, 200),
+            (Some(1), None),
+            "legacy counting heartbeat is not completed-work evidence"
+        );
+    }
 
     #[test]
     fn index_warm_run_ids_are_unique_within_a_process() {

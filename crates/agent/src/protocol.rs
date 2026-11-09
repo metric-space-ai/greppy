@@ -6,6 +6,43 @@
 
 use serde_json::Value;
 
+/// A caller-verified per-response output limit for one model/provider route.
+///
+/// This is neither a context-window size nor a run/turn budget. Callers must
+/// resolve it again when their model or endpoint changes. The unlimited
+/// sentinel is intentionally not representable by this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputTokenLimit(u64);
+
+impl OutputTokenLimit {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for OutputTokenLimit {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 || value == u64::MAX {
+            Err("output token limit must be a finite positive integer (1..18446744073709551614)")
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl std::str::FromStr for OutputTokenLimit {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<u64>()
+            .map_err(|_| "output token limit must be a finite positive integer")?
+            .try_into()
+    }
+}
+
 /// One model turn request assembled by the agent loop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {

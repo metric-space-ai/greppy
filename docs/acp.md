@@ -52,6 +52,45 @@ and append/model writes use the same lease. A restarted host can load the same
 session id. Replayed updates carry `_meta.isReplay` so the host can distinguish restored
 history from a new turn.
 
+## Verified route output metadata
+
+A host may pass a verified per-response limit for the initial route with
+`greppy agent stdio --model MODEL_ID --max-output-tokens N`. The finite positive
+value is not a context-window size or a turn/deadline budget. Greppy does not
+infer global vendor limits from a harness profile. Without caller metadata,
+unknown limits continue to fail explicitly.
+
+For fresh metadata after model selection or resume, `initialize` advertises:
+
+```json
+{"greppyOutputLimit":{"version":1,"method":"_greppy/set_output_limit"}}
+```
+
+This object lives inside `agentCapabilities._meta`. Hosts must check support
+before calling the custom request `_greppy/set_output_limit` with these fields:
+
+| Field | Required value |
+| --- | --- |
+| `sessionId` | An existing idle, open session. |
+| `modelId` | The exact current model ID, including any reasoning suffix. |
+| `endpoint` | The exact gateway endpoint configured for this process. |
+| `maxOutputTokens` | A caller-verified JSON unsigned integer from `1` through `18446744073709551614`, inclusive. Strings, booleans, fractional numbers, zero and the unlimited sentinel are rejected. |
+
+The extension result echoes those four accepted values. Invalid/missing limit
+or route metadata returns JSON-RPC `-32602`; an unknown session returns `-32002`.
+A closed or busy session returns `-32600`. Requests require initialization like
+other session methods. A stale or missing route identity is rejected. Limits are held only in live memory, discarded
+on model change or session load/resume, and never restored from saved history.
+A new process/endpoint requires newly verified route metadata. The limit flows
+through the existing `AgentConfig::with_max_tokens` path to numeric wire
+`max_tokens`, including continuation after a truncated response.
+
+The extension does not add an option or custom root fields to standard
+`session/set_config_option`. Standard `configOptions` selectors and their
+full-state responses remain unchanged. This separation follows ACP v1's
+[configuration option](https://agentclientprotocol.com/protocol/v1/session-config-options)
+and [extension](https://agentclientprotocol.com/protocol/v1/extensibility) contracts.
+
 ## Imported Workjet history
 
 `initialize` advertises `agentCapabilities._meta.workjetImportHistory = {"version":1}`.

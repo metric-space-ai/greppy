@@ -12,6 +12,7 @@ page.context().on("requestfailed", (req) => {
   ctxFailed.push(String(req.url()));
 });
 const waitFailed = page.waitForEvent("requestfailed");
+const pendingRequest = page.waitForRequest("aborted");
 let navigationFailed = false;
 const navigationStarted = Date.now();
 try {
@@ -33,7 +34,7 @@ if (!ctxFailed.some((url) => url.includes("aborted"))) {
 if (!String(failedReq.url()).includes("aborted")) {
   throw new Error("waitForEvent requestfailed " + failedReq.url());
 }
-const request = await page.waitForRequest("aborted");
+const request = await pendingRequest;
 const failure = request.failure();
 if (!failure || !String(failure.errorText || "").includes("ERR_FAILED")) {
   throw new Error(

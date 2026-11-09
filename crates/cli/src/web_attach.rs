@@ -357,6 +357,17 @@ pub fn take_inherited_attach_token() -> Option<String> {
     None
 }
 
-pub fn inherit_attach_for_agent(command: &mut Command) -> io::Result<Box<dyn Send>> {
-    inherit_current_into(command).map(|pass| Box::new(pass) as Box<dyn Send>)
+pub fn inherit_attach_for_agent(
+    command: &mut Command,
+    args: &[String],
+) -> io::Result<Box<dyn Send>> {
+    let pass = inherit_current_into(command)?;
+    let worktree = command.get_current_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent web tool has no worktree",
+        )
+    })?;
+    crate::web::prepare_agent_runtime(args, worktree)?;
+    Ok(Box::new(pass) as Box<dyn Send>)
 }

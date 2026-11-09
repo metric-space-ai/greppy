@@ -12,12 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use greppy_agent::BuiltinPromptMode;
 use greppy_agent::{
     run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
-    GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
-    StreamEvent, Usage, WorkspaceError,
+    GreppyEnv, LoopEvent, LoopStop, OutputTokenLimit, ProbeError, RunOutcome, SandboxError,
+    SandboxMode, StopReason, StreamEvent, Usage, WorkspaceError,
 };
-use greppy_agent::{system_prompt_for_mode, BuiltinPromptMode};
 
 use crate::agent_control::{socket_path_for, ControlServer};
 use crate::agent_tui::{
@@ -40,9 +40,21 @@ pub const EXIT_INCOMPLETE: u8 = 5;
 /// Exit: user cancelled interactive startup.
 pub const EXIT_CANCELLED: u8 = 130;
 
+#[cfg(test)]
+#[path = "agent_output_limit_tests.rs"]
+mod output_limit_tests;
+
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
 const DEFAULT_MAX_TURNS: usize = 0;
 const TOOL_LINE_MAX: usize = 120;
+
+/// Response metadata belongs to one selected model, including reasoning suffixes.
+fn select_session_model(config: &mut AgentConfig, model: String) {
+    if config.model != model {
+        config.max_tokens = u64::MAX;
+    }
+    config.model = model;
+}
 
 const LONG_HELP: &str = "\
 Coding agent with interactive and one-shot modes. Uses an isolated workspace;
@@ -88,6 +100,7 @@ Usage:
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
                    [--continue | --resume ID] [--json]
+                   [--enable web|desktop]
   greppy -p --help
 
 Flags:
@@ -95,6 +108,12 @@ Flags:
                       and persist this through /setup)
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
+  --max-output-tokens N
+                      Verified finite positive per-response limit for --model
+                      at this endpoint; also accepted by agent serve/stdio.
+                      Omit to resolve provider metadata. Unknown limits fail
+                      clearly. Model/endpoint changes discard this value;
+                      it is not persisted, a context size, or a turn budget.
   --max-turns N       Optional cap on action turns, followed by one tool-free
                       report turn (unlimited by default)
   --deadline-secs N   Wall-clock budget in seconds (env GREPPY_DEADLINE_SECS);
@@ -107,6 +126,8 @@ Flags:
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
   --json              Stream newline-delimited JSON events on stdout (`greppy -p` only)
+  --enable CAP        Include web and/or desktop manuals from the first turn
+                      (`--enable web`, `--enable desktop`, or `--enable web,desktop`)
 
 Interactive keys and commands (`greppy agent`):
   Enter               Send the prompt
@@ -155,6 +176,10 @@ pub struct AgentArgs {
     /// Anthropic-Messages gateway base URL.
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
+
+    /// Caller-verified finite positive response limit for this model and endpoint.
+    #[arg(long, value_name = "N", requires = "model")]
+    pub max_output_tokens: Option<OutputTokenLimit>,
 
     /// Maximum assistant turns.
     #[arg(long, default_value_t = DEFAULT_MAX_TURNS, value_name = "N")]
@@ -224,6 +249,14 @@ pub struct AgentArgs {
     /// Stream newline-delimited JSON events on stdout (`greppy -p` only).
     #[arg(long)]
     pub json: bool,
+
+    /// Include a capability manual from the first turn.
+    ///
+    /// Repeat the flag, or pass a comma-separated list: `--enable web,desktop`.
+    /// Without it, the built-in agent sees only the short hint and desktop
+    /// commands stay refused until `greppy capabilities enable`.
+    #[arg(long, value_name = "web|desktop")]
+    pub enable: Vec<String>,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -236,6 +269,9 @@ struct ServeArgs {
     model: Option<String>,
     #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    /// Caller-verified response limit; discarded on model/endpoint changes.
+    #[arg(long, value_name = "N", requires = "model")]
+    max_output_tokens: Option<OutputTokenLimit>,
     #[arg(long = "continue")]
     continue_session: bool,
     #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
@@ -266,6 +302,9 @@ struct ServeArgs {
         require_equals = true,
     )]
     skip_selfcheck: bool,
+    /// Include a capability manual from the first turn (`web`, `desktop`, or both).
+    #[arg(long, value_name = "web|desktop")]
+    enable: Vec<String>,
 }
 
 /// Data root and logical project used by the agent session store for `repo_root`.
@@ -355,6 +394,7 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             task: serve.task,
             model: serve.model,
             endpoint: serve.endpoint,
+            max_output_tokens: serve.max_output_tokens,
             max_turns: serve.max_turns,
             deadline_secs: None,
             apply: false,
@@ -366,6 +406,7 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             continue_session: serve.continue_session,
             resume: serve.resume,
             json: true,
+            enable: serve.enable,
         };
         run_agent(
             args,
@@ -474,6 +515,9 @@ fn apply_interactive_settings(
             .as_ref()
             .filter(|value| !value.trim().is_empty())
         {
+            if args.endpoint != *endpoint {
+                args.max_output_tokens = None;
+            }
             args.endpoint = endpoint.clone();
         }
     }
@@ -997,12 +1041,21 @@ fn run_agent(
     std::env::set_var("TMP", &scratch_dir);
     std::env::set_var("TEMP", &scratch_dir);
 
+    let capabilities = match greppy_agent::CapabilitySet::parse_list(&args.enable) {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            eprintln!("greppy -p: {error}");
+            return EXIT_USAGE;
+        }
+    };
+
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
         Ok(env) => env
             .with_deadline(deadline)
             .with_output_owner(cwd.clone())
             .with_output_storage(output_storage)
             .with_sandbox(sandbox_mode.clone())
+            .with_capabilities(capabilities)
             .with_context_status(
                 workspace.run_id().to_owned(),
                 crate::context_status::agent_notice,
@@ -1052,18 +1105,22 @@ fn run_agent(
         }
     }
 
+    let prompt_mode = if serve {
+        BuiltinPromptMode::Serve
+    } else if interactive {
+        BuiltinPromptMode::Interactive
+    } else {
+        BuiltinPromptMode::OneShot
+    };
     let mut config = AgentConfig {
         max_turns: args.max_turns,
         context_summary: headless_session
             .as_ref()
             .and_then(|(record, _)| record.context_summary.clone()),
-        system: Some(system_prompt_for_mode(if serve {
-            BuiltinPromptMode::Serve
-        } else if interactive {
-            BuiltinPromptMode::Interactive
-        } else {
-            BuiltinPromptMode::OneShot
-        })),
+        system: Some(greppy_agent::system_prompt_with_capabilities(
+            prompt_mode,
+            capabilities,
+        )),
         model: model.clone(),
         deadline,
         deadline_total,
@@ -1075,7 +1132,11 @@ fn run_agent(
             crate::agent_tui::AgentSettings::load().compaction_thresholds()
         },
         ..AgentConfig::default()
-    };
+    }
+    .with_max_tokens(
+        args.max_output_tokens
+            .map_or(u64::MAX, OutputTokenLimit::get),
+    );
     #[cfg(unix)]
     let _headless_signals = if !interactive && !serve {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1150,16 +1211,7 @@ fn run_agent(
             Ok(_) => {
                 let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
                     .set(crate::web_attach::inherit_attach_for_agent);
-                // Start the runtime HERE, while this process is still
-                // unsandboxed. The runtime sandboxes its own workers, and macOS
-                // Seatbelt does not nest: started from a sandboxed tool child it
-                // dies with "worker sandbox: Operation not permitted", and the
-                // agent only ever sees "web-runtime did not create its socket".
-                // Started here, the tool children merely connect.
-                let worktree_root = workspace.worktree_path().to_string_lossy().into_owned();
-                if let Err(error) = crate::web::prestart_unsandboxed(Some(&worktree_root)) {
-                    eprintln!("greppy: browser unavailable to the agent ({error})");
-                }
+                // The web-only attach hook starts the runtime lazily in this parent.
             }
             Err(error) => {
                 eprintln!("greppy: browser unavailable to the agent (no attach token: {error})");
@@ -1170,7 +1222,7 @@ fn run_agent(
         struct ShutdownWebOnDrop;
         impl Drop for ShutdownWebOnDrop {
             fn drop(&mut self) {
-                crate::web::shutdown_if_running();
+                crate::web::shutdown_agent_runtimes();
             }
         }
         let _shutdown_web = ShutdownWebOnDrop;
@@ -1922,7 +1974,11 @@ fn run_headless_session(
                 summary.last_stop = Some(LoopStop::Cancelled);
                 Ok(summary)
             } else {
-                Err(message)
+                eprintln!("greppy -p: agent error: {message}");
+                // The common finish path saves edits, keeps the error exit,
+                // and refuses automatic application of a failed proposal.
+                summary.error = Some(message);
+                Ok(summary)
             }
         }
     }
@@ -1998,7 +2054,7 @@ pub(crate) fn spawn_session_worker(
             let gateway_ready = match client.list_models() {
                 Ok(models) if !models.is_empty() => {
                     if config.model == "auto" {
-                        config.model = models[0].clone();
+                        select_session_model(&mut config, models[0].clone());
                         if let Err(error) = store_for_worker.set_model(&session_id, &config.model) {
                             worker_bridge.send_discrete(SessionEvent::Warning(format!(
                                 "session save failed: {error}"
@@ -2049,7 +2105,7 @@ pub(crate) fn spawn_session_worker(
                         cancel.store(true, Ordering::Relaxed);
                     }
                     SessionCommand::SetModel(model) => {
-                        config.model = model.clone();
+                        select_session_model(&mut config, model.clone());
                         if let Err(error) = store_for_worker.set_model(&session_id, &model) {
                             worker_bridge.send_discrete(SessionEvent::Warning(format!(
                                 "session save failed: {error}"
@@ -2064,11 +2120,14 @@ pub(crate) fn spawn_session_worker(
                         );
                         match candidate.list_models() {
                             Ok(models) if !models.is_empty() => {
+                                if current_endpoint != endpoint {
+                                    config.max_tokens = u64::MAX;
+                                }
                                 current_endpoint = endpoint;
                                 if config.model == "auto"
                                     || !models.iter().any(|model| model == &config.model)
                                 {
-                                    config.model = models[0].clone();
+                                    select_session_model(&mut config, models[0].clone());
                                 }
                                 client = client_for_endpoint(
                                     &current_endpoint,
@@ -2109,7 +2168,9 @@ pub(crate) fn spawn_session_worker(
                                 summary.usage = next.usage;
                                 summary.turns = next.turns;
                                 summary.last_stop = None;
-                                config.model = next.model;
+                                // A resumed session has no caller-verified route metadata.
+                                config.max_tokens = u64::MAX;
+                                select_session_model(&mut config, next.model);
                                 session_id = next.id;
                                 summary.session_id = session_id.clone();
                                 cancel.store(false, Ordering::Relaxed);
@@ -2385,7 +2446,7 @@ fn run_interactive_session(
     struct ShutdownWebOnDrop;
     impl Drop for ShutdownWebOnDrop {
         fn drop(&mut self) {
-            crate::web::shutdown_if_running();
+            crate::web::shutdown_agent_runtimes();
         }
     }
     let _shutdown_web = ShutdownWebOnDrop;
@@ -2404,7 +2465,7 @@ fn run_interactive_session(
 
     let cancel = Arc::new(AtomicBool::new(false));
     config.cancel = Some(Arc::clone(&cancel));
-    config.model = launch.model.clone();
+    select_session_model(&mut config, launch.model.clone());
     let ui_cancel = Arc::clone(&cancel);
     let startup_worktree = PathBuf::from(&launch.worktree);
     // Gateway/model discovery also runs in the visible setup phase, even when
@@ -2899,13 +2960,7 @@ fn resolve_sandbox_mode(
 /// capped near 104 bytes — which is exactly why the default is under `/tmp`
 /// and not the long macOS temp root.
 pub(crate) fn agent_runtime_dir(run_id: &str) -> std::path::PathBuf {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in run_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // "/tmp/greppy-agent-" + 8 hex = 26 bytes, comfortably under the cap.
-    std::path::PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
+    greppy_agent::greppy_env::agent_runtime_dir(run_id)
 }
 
 /// Removes only this invocation's empty browser-runtime directory.
@@ -2952,7 +3007,7 @@ fn writable_roots_for(
     scratch_dir: &Path,
     agent_data: &Path,
 ) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::with_capacity(7);
+    let mut roots = Vec::with_capacity(5);
 
     // Worktree: agent proposal edits and worktree-local builds land here.
     roots.push(worktree_path.to_path_buf());
@@ -2977,14 +3032,10 @@ fn writable_roots_for(
     // lease file without a file-level grant API.
     roots.push(agent_data.to_path_buf());
 
-    // Cargo download caches only — never ~/.cargo/bin, config.toml, credentials*.
-    let cargo = cargo_home_dir();
-    let cargo_registry = cargo.join("registry");
-    let cargo_git = cargo.join("git");
-    let _ = std::fs::create_dir_all(&cargo_registry);
-    let _ = std::fs::create_dir_all(&cargo_git);
-    roots.push(cargo_registry);
-    roots.push(cargo_git);
+    // Confined tool children use CARGO_HOME=<run scratch>/cargo and
+    // CARGO_TARGET_DIR=<run scratch>/target (prepare_tool_cache_env). Those
+    // paths are already below scratch_dir. Do not create or grant the unused
+    // operator caches: existing storage symlinks are not writable run roots.
 
     // This run's own browser-runtime socket directory. Narrow on purpose: NOT
     // the shared /tmp/greppy-daemon-<uid>, so the agent cannot reach the
@@ -3006,24 +3057,6 @@ fn writable_roots_for(
     // Stable-worktree PARENT and the sibling lock file must stay outside every
     // tool-writable root (worktree path itself is root 1; its parent is not).
     roots
-}
-
-fn cargo_home_dir() -> std::path::PathBuf {
-    if let Some(home) = std::env::var_os("CARGO_HOME") {
-        return std::path::PathBuf::from(home);
-    }
-    home_dir().join(".cargo")
-}
-
-fn home_dir() -> std::path::PathBuf {
-    #[cfg(target_os = "windows")]
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        return std::path::PathBuf::from(profile);
-    }
-    if let Some(h) = std::env::var_os("HOME") {
-        return std::path::PathBuf::from(h);
-    }
-    std::env::temp_dir()
 }
 
 /// Ensure the worktree's greppy index is usable before the first agent turn.
@@ -3501,6 +3534,7 @@ mod tests {
             task: Some("hi".into()),
             model: None,
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3512,6 +3546,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
@@ -3522,6 +3557,7 @@ mod tests {
             task: Some("   ".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3533,6 +3569,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
@@ -3688,6 +3725,77 @@ mod tests {
         assert!(line.contains("the result may be incomplete"));
     }
 
+    /// The operator cache is a read-only input, not a run-owned writable root.
+    /// Deliberately exercise a valid storage link, a retargeted link and a
+    /// dangling cache link without changing HOME or touching real user caches.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_cache_roots_preserve_operator_links_and_refuse_run_escape() {
+        use std::os::unix::fs::symlink;
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(fixture.path()).unwrap();
+        let cargo = base.join("operator-cargo");
+        let cache = base.join("storage-cache");
+        let outside = base.join("ungranted");
+        for directory in [&cargo, &cache, &outside] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::write(cache.join("retained"), b"original-cache").unwrap();
+        symlink(&cache, cargo.join("registry")).unwrap();
+        let missing = base.join("missing-cache-volume");
+        symlink(&missing, cargo.join("git")).unwrap();
+        struct CargoEnv(Option<OsString>);
+        impl Drop for CargoEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CARGO_HOME", value),
+                    None => std::env::remove_var("CARGO_HOME"),
+                }
+            }
+        }
+        let previous = CargoEnv(std::env::var_os("CARGO_HOME"));
+        std::env::set_var("CARGO_HOME", &cargo);
+        let operator_home = std::env::var_os("HOME");
+        let wt = base.join("worktree");
+        let git = base.join("git-state");
+        let scratch = base.join("scratch");
+        let data = base.join("agent-data");
+        let run = base.file_name().unwrap().to_string_lossy();
+        let _runtime_cleanup = AgentRuntimeDirCleanup::new(&run);
+        let raw = writable_roots_for(&wt, &git, &run, &scratch, &data);
+        let roots = agent_sandbox::prepare_writable_roots(&raw)
+            .expect("operator cache links must not block private scratch setup");
+        assert_eq!(raw.len(), 5, "only run-owned roots may be granted");
+        assert!(!roots
+            .iter()
+            .any(|root| cargo.starts_with(root) || cache.starts_with(root)));
+        assert_eq!(fs::read_link(cargo.join("registry")).unwrap(), cache);
+        assert_eq!(fs::read_link(cargo.join("git")).unwrap(), missing);
+        assert!(
+            !missing.exists(),
+            "must not create through a dangling operator link"
+        );
+        assert_eq!(fs::read(cache.join("retained")).unwrap(), b"original-cache");
+        // Retargeting the ungranted alias cannot authorize its new destination.
+        fs::remove_file(cargo.join("registry")).unwrap();
+        symlink(&outside, cargo.join("registry")).unwrap();
+        let next = writable_roots_for(&wt, &git, &run, &scratch, &data);
+        assert_eq!(agent_sandbox::prepare_writable_roots(&next).unwrap(), roots);
+        assert!(!roots.iter().any(|root| outside.starts_with(root)));
+        // A symlink supplied as an actual run root is still rejected before any
+        // missing child is created outside. No general canonicalize bypass.
+        symlink(&outside, scratch.join("escape")).unwrap();
+        let forbidden = scratch.join("escape/new-child");
+        let error = agent_sandbox::prepare_writable_roots(&[forbidden]).unwrap_err();
+        assert!(error.to_string().contains("symlink component"), "{error}");
+        assert!(!outside.join("new-child").exists());
+        assert_eq!(std::env::var_os("HOME"), operator_home);
+        drop(previous);
+    }
+
     #[test]
     fn writable_roots_are_narrow_no_global_shared_state() {
         let _env_guard = crate::TEST_ENV_LOCK
@@ -3733,19 +3841,9 @@ mod tests {
             !roots.iter().any(|r| r == &global_temp),
             "global temp must not be a root: {roots:?}"
         );
-        let cargo = cargo_home_dir();
-        assert!(
-            !roots.iter().any(|r| r == &cargo),
-            "whole cargo home must not be granted: {roots:?}"
-        );
-        assert!(
-            roots.iter().any(|r| r == &cargo.join("registry")),
-            "cargo registry missing: {roots:?}"
-        );
-        assert!(
-            roots.iter().any(|r| r == &cargo.join("git")),
-            "cargo git missing: {roots:?}"
-        );
+        // Every root has a run-specific owner; operator package caches are
+        // absent because confined child cache writes already live in scratch.
+        assert_eq!(roots.len(), 5, "unexpected writable root: {roots:?}");
         assert!(
             !roots.iter().any(|r| {
                 let s = r.to_string_lossy();
@@ -3803,6 +3901,7 @@ mod tests {
             task: Some("t".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3814,6 +3913,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
@@ -3839,6 +3939,7 @@ mod tests {
             task: Some("t".into()),
             model: Some("m".into()),
             endpoint: DEFAULT_ENDPOINT.into(),
+            max_output_tokens: None,
             max_turns: 40,
             deadline_secs: None,
             apply: false,
@@ -3850,6 +3951,7 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            enable: Vec::new(),
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();

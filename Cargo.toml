@@ -19,6 +19,7 @@ members = [
     "crates/workspace-provider",
     "crates/workspace-ffi",
     "crates/web-client",
+    "crates/desktop",
 ]
 
 [workspace.package]

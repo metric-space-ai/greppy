@@ -272,8 +272,22 @@ impl WebResourceLoad {
     pub fn continue_with_headers(mut self, headers: http::HeaderMap) {
         if let Err(error) = self
             .responder
-            .send(WebResourceResponseMsg::Continue { headers })
+            .send(WebResourceResponseMsg::Continue { headers, download_budget: None })
         {
+            self.error_sender.raise_response_send_error(error);
+        }
+    }
+
+    /// Continue with the session's shared native download staging authority.
+    pub fn continue_with_download_budget(
+        mut self,
+        headers: http::HeaderMap,
+        budget: std::sync::Arc<embedder_traits::DownloadBudget>,
+    ) {
+        if let Err(error) = self.responder.send(WebResourceResponseMsg::Continue {
+            headers,
+            download_budget: Some(budget),
+        }) {
             self.error_sender.raise_response_send_error(error);
         }
     }
