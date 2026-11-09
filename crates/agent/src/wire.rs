@@ -1099,7 +1099,7 @@ mod tests {
         let facts = sent_request_facts(&body);
         assert_eq!(facts["first_user_message"], "list files");
         assert!(facts["temperature"].is_null());
-        assert!(facts["max_tokens"].is_null());
+        assert_eq!(facts["max_tokens"], 65536);
     }
 
     #[test]
