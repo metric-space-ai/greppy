@@ -1,5 +1,19 @@
 //! Connect-time HTTP/HTTPS proxy that dials only policy-pinned SocketAddrs.
 
+
+#[cfg(test)]
+#[test]
+fn dropping_proxy_releases_its_listener() {
+    let proxy = PolicyProxy::spawn(SharedProfile::new(crate::policy::NetworkProfile::Project)).unwrap();
+    let address = proxy.addr();
+    drop(proxy);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+        assert!(std::time::Instant::now() < deadline,
+            "closed context retained its policy listener");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 use crate::policy::{allowed_connect_addrs, decide_host_literal, SharedProfile, UrlDecision};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
