@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 
 use log::warn;
 use malloc_size_of::MallocSizeOf;
@@ -21,7 +20,7 @@ use profile_traits::mem::{
 use profile_traits::path;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+use servo_base::generic_channel::{self, GenericSender};
 use servo_base::id::WebViewId;
 use servo_base::threadpool::ThreadPool;
 use servo_base::{read_json_from_file, write_json_to_file};
@@ -51,17 +50,26 @@ impl WebStorageThreadFactory for GenericSender<WebStorageThreadMsg> {
     ) -> GenericSender<WebStorageThreadMsg> {
         let (chan, port) = generic_channel::channel().unwrap();
         let chan2 = chan.clone();
-        thread::Builder::new()
-            .name("WebStorageManager".to_owned())
-            .spawn(move || {
-                mem_profiler_chan.run_with_memory_reporting(
-                    || WebStorageManager::new(port, config_dir).start(),
-                    reporter_name,
-                    chan2,
-                    WebStorageThreadMsg::CollectMemoryReport,
-                );
+        let mut manager = None;
+        let mut registration = None;
+        crate::shared_workers::WEB_STORAGE
+            .register(port, move |message| {
+                if let WebStorageThreadMsg::Exit(sender) = message {
+                    let _ = sender.send(());
+                    return false;
+                }
+                manager
+                    .get_or_insert_with(|| {
+                        registration = Some(mem_profiler_chan.prepare_memory_reporting(
+                            reporter_name.clone(),
+                            chan2.clone(),
+                            WebStorageThreadMsg::CollectMemoryReport,
+                        ));
+                        WebStorageManager::new(config_dir.clone())
+                    })
+                    .handle_message(message)
             })
-            .expect("Thread spawning failed");
+            .expect("WebStorage worker spawning failed");
         chan
     }
 }
@@ -91,7 +99,7 @@ impl StorageOrigins {
             Entry::Vacant(entry) => {
                 entry.insert(OriginDescriptor::new(origin));
                 true
-            },
+            }
         }
     }
 
@@ -205,7 +213,6 @@ impl<E: WebStorageEngine> Drop for WebStorageEnvironment<E> {
 }
 
 struct WebStorageManager {
-    port: GenericReceiver<WebStorageThreadMsg>,
     session_storage_origins: StorageOrigins,
     local_storage_origins: StorageOrigins,
     session_data: FxHashMap<WebViewId, FxHashMap<ImmutableOrigin, OriginEntry>>,
@@ -215,16 +222,12 @@ struct WebStorageManager {
 }
 
 impl WebStorageManager {
-    fn new(
-        port: GenericReceiver<WebStorageThreadMsg>,
-        config_dir: Option<PathBuf>,
-    ) -> WebStorageManager {
+    fn new(config_dir: Option<PathBuf>) -> WebStorageManager {
         let mut local_storage_origins = StorageOrigins::new();
         if let Some(ref config_dir) = config_dir {
             read_json_from_file(&mut local_storage_origins, config_dir, "localstorage.json");
         }
         WebStorageManager {
-            port,
             session_storage_origins: StorageOrigins::new(),
             local_storage_origins,
             session_data: FxHashMap::default(),
@@ -236,63 +239,55 @@ impl WebStorageManager {
 }
 
 impl WebStorageManager {
-    fn start(&mut self) {
-        loop {
-            match self.port.recv().unwrap() {
-                WebStorageThreadMsg::Length(sender, storage_type, webview_id, url) => {
-                    self.length(sender, storage_type, webview_id, url)
-                },
-                WebStorageThreadMsg::Key(sender, storage_type, webview_id, url, index) => {
-                    self.key(sender, storage_type, webview_id, url, index)
-                },
-                WebStorageThreadMsg::Keys(sender, storage_type, webview_id, url) => {
-                    self.keys(sender, storage_type, webview_id, url)
-                },
-                WebStorageThreadMsg::SetItem(
-                    sender,
-                    storage_type,
-                    webview_id,
-                    url,
-                    name,
-                    value,
-                ) => {
-                    self.set_item(sender, storage_type, webview_id, url, name, value);
-                },
-                WebStorageThreadMsg::GetItem(sender, storage_type, webview_id, url, name) => {
-                    self.request_item(sender, storage_type, webview_id, url, name)
-                },
-                WebStorageThreadMsg::RemoveItem(sender, storage_type, webview_id, url, name) => {
-                    self.remove_item(sender, storage_type, webview_id, url, name);
-                },
-                WebStorageThreadMsg::Clear(sender, storage_type, webview_id, url) => {
-                    self.clear(sender, storage_type, webview_id, url);
-                },
-                WebStorageThreadMsg::Clone {
-                    sender,
-                    src: src_webview_id,
-                    dest: dest_webview_id,
-                } => {
-                    self.clone(src_webview_id, dest_webview_id);
-                    let _ = sender.send(());
-                },
-                WebStorageThreadMsg::ListOrigins(sender, storage_type) => {
-                    let _ = sender.send(self.origin_descriptors(storage_type));
-                },
-                WebStorageThreadMsg::ClearDataForSites(sender, storage_type, sites) => {
-                    self.clear_data_for_sites(storage_type, &sites);
-                    let _ = sender.send(());
-                },
-                WebStorageThreadMsg::CollectMemoryReport(sender) => {
-                    let reports = self.collect_memory_reports();
-                    sender.send(ProcessReports::new(reports));
-                },
-                WebStorageThreadMsg::Exit(sender) => {
-                    // Nothing to do since we save localstorage set eagerly.
-                    let _ = sender.send(());
-                    break;
-                },
+    fn handle_message(&mut self, message: WebStorageThreadMsg) -> bool {
+        match message {
+            WebStorageThreadMsg::Length(sender, storage_type, webview_id, url) => {
+                self.length(sender, storage_type, webview_id, url)
+            }
+            WebStorageThreadMsg::Key(sender, storage_type, webview_id, url, index) => {
+                self.key(sender, storage_type, webview_id, url, index)
+            }
+            WebStorageThreadMsg::Keys(sender, storage_type, webview_id, url) => {
+                self.keys(sender, storage_type, webview_id, url)
+            }
+            WebStorageThreadMsg::SetItem(sender, storage_type, webview_id, url, name, value) => {
+                self.set_item(sender, storage_type, webview_id, url, name, value);
+            }
+            WebStorageThreadMsg::GetItem(sender, storage_type, webview_id, url, name) => {
+                self.request_item(sender, storage_type, webview_id, url, name)
+            }
+            WebStorageThreadMsg::RemoveItem(sender, storage_type, webview_id, url, name) => {
+                self.remove_item(sender, storage_type, webview_id, url, name);
+            }
+            WebStorageThreadMsg::Clear(sender, storage_type, webview_id, url) => {
+                self.clear(sender, storage_type, webview_id, url);
+            }
+            WebStorageThreadMsg::Clone {
+                sender,
+                src: src_webview_id,
+                dest: dest_webview_id,
+            } => {
+                self.clone(src_webview_id, dest_webview_id);
+                let _ = sender.send(());
+            }
+            WebStorageThreadMsg::ListOrigins(sender, storage_type) => {
+                let _ = sender.send(self.origin_descriptors(storage_type));
+            }
+            WebStorageThreadMsg::ClearDataForSites(sender, storage_type, sites) => {
+                self.clear_data_for_sites(storage_type, &sites);
+                let _ = sender.send(());
+            }
+            WebStorageThreadMsg::CollectMemoryReport(sender) => {
+                let reports = self.collect_memory_reports();
+                sender.send(ProcessReports::new(reports));
+            }
+            WebStorageThreadMsg::Exit(sender) => {
+                // Nothing to do since we save localstorage set eagerly.
+                let _ = sender.send(());
+                return false;
             }
         }
+        true
     }
 
     fn collect_memory_reports(&self) -> Vec<Report> {
@@ -331,7 +326,7 @@ impl WebStorageManager {
                     origin.ascii_serialization().as_bytes(),
                 );
                 Some(config_dir.join("webstorage").join(origin_uuid.to_string()))
-            },
+            }
             None => None,
         }
     }
@@ -407,9 +402,9 @@ impl WebStorageManager {
                     Err(e) => {
                         warn!("Failed to get storage environment: {:?}", e);
                         None
-                    },
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -437,9 +432,9 @@ impl WebStorageManager {
                     Err(e) => {
                         warn!("Failed to get storage environment: {:?}", e);
                         None
-                    },
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -460,7 +455,7 @@ impl WebStorageManager {
                         .entry(origin)
                         .or_default(),
                 )
-            },
+            }
             WebStorageType::Local => {
                 if self.local_storage_origins.ensure_origin_descriptor(&origin) {
                     self.save_local_storage_origins();
@@ -470,9 +465,9 @@ impl WebStorageManager {
                     Err(e) => {
                         warn!("Failed to get storage environment: {:?}", e);
                         None
-                    },
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -556,8 +551,8 @@ impl WebStorageManager {
                             Ok((true, Some(old)))
                         }
                     });
-            if storage_type == WebStorageType::Local &&
-                let Ok(env) = self.get_environment_mut(&origin)
+            if storage_type == WebStorageType::Local
+                && let Ok(env) = self.get_environment_mut(&origin)
             {
                 env.set(&name, &value);
             }
@@ -592,8 +587,8 @@ impl WebStorageManager {
         let data = self.select_data_mut(storage_type, webview_id, origin.clone());
         let old_value = data.and_then(|entry| entry.remove(&name));
         sender.send(old_value).unwrap();
-        if storage_type == WebStorageType::Local &&
-            let Ok(env) = self.get_environment_mut(&origin)
+        if storage_type == WebStorageType::Local
+            && let Ok(env) = self.get_environment_mut(&origin)
         {
             env.delete(&name);
         }
@@ -617,8 +612,8 @@ impl WebStorageManager {
                 }
             }))
             .unwrap();
-        if storage_type == WebStorageType::Local &&
-            let Ok(env) = self.get_environment_mut(&origin)
+        if storage_type == WebStorageType::Local
+            && let Ok(env) = self.get_environment_mut(&origin)
         {
             env.clear();
         }
@@ -652,7 +647,7 @@ impl WebStorageManager {
                     }
                     !origins_map.is_empty()
                 });
-            },
+            }
             WebStorageType::Local => {
                 let origins = self.local_storage_origins.take_origins_for_sites(sites);
 
@@ -676,7 +671,7 @@ impl WebStorageManager {
                         self.environments.remove(&origin);
                     }
                 }
-            },
+            }
         }
     }
 }

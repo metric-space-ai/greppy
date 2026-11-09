@@ -2,13 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use std::fmt::Debug;
+use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{fs, thread};
 
 use log::warn;
 use rusqlite::{Connection, OptionalExtension, Transaction};
-use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+use servo_base::generic_channel::{self, GenericSender};
 use servo_base::id::{BrowsingContextId, WebViewId};
 use servo_url::ImmutableOrigin;
 use storage_traits::client_storage::{
@@ -195,7 +195,7 @@ fn ensure_storage_shed(
                 (storage_type.as_str(), browsing_context.as_str()),
                 |row| row.get(0),
             )
-        },
+        }
         None => {
             tx.execute(
                 "INSERT INTO sheds (storage_type, browsing_context) VALUES (?1, NULL) ON CONFLICT DO NOTHING;",
@@ -207,7 +207,7 @@ fn ensure_storage_shed(
                 [storage_type.as_str()],
                 |row| row.get(0),
             )
-        },
+        }
     }
 }
 
@@ -536,7 +536,7 @@ impl RegistryEngine for SqliteEngine {
             StorageType::Local => {
                 // Step 2. If type is "local", then set shed to the user agent’s storage shed.
                 ensure_storage_shed(&storage_type, None, &tx)?
-            },
+            }
             StorageType::Session => {
                 // Step 3: Otherwise:
                 // Step 3.1: Assert: type is "session".
@@ -553,7 +553,7 @@ impl RegistryEngine for SqliteEngine {
                     Some(Into::<BrowsingContextId>::into(webview).to_string()),
                     &tx,
                 )?
-            },
+            }
         };
 
         // Step 4. Let shelf be the result of running obtain a storage shelf, with shed,
@@ -598,8 +598,8 @@ impl RegistryEngine for SqliteEngine {
         // otherwise false.
         // It will be false when there’s an internal error.
         let persisted = bucket_mode(shelf.default_bucket_id, &tx)
-            .is_ok_and(|mode| mode == Mode::Persistent) &&
-            tx.commit().is_ok();
+            .is_ok_and(|mode| mode == Mode::Persistent)
+            && tx.commit().is_ok();
 
         Ok(persisted)
     }
@@ -687,25 +687,30 @@ impl ClientStorageThreadFactory for ClientStorageThreadHandle {
         std::fs::create_dir_all(&storage_dir)
             .expect("Failed to create ClientStorage storage directory");
         let sender_clone = generic_sender.clone();
-        thread::Builder::new()
-            .name("ClientStorageThread".to_owned())
-            .spawn(move || {
-                // Keep temp_dir alive while the thread runs.
-                let _ = temp_dir;
-                let engine = SqliteEngine::new(storage_dir).unwrap_or_else(|error| {
-                    warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
-                    SqliteEngine::memory().unwrap()
-                });
-                ClientStorageThread::new(sender_clone, generic_receiver, engine).start();
+        let mut manager = None;
+        crate::shared_workers::CLIENT_STORAGE
+            .register(generic_receiver, move |message| {
+                // Each port retains its own directory and registry connection.
+                let _keep_temp_dir = &temp_dir;
+                if let ClientStorageThreadMessage::Exit(sender) = message {
+                    let _ = sender.send(());
+                    return false;
+                }
+                manager.get_or_insert_with(|| {
+                    let engine = SqliteEngine::new(storage_dir.clone()).unwrap_or_else(|error| {
+                        warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
+                        SqliteEngine::memory().unwrap()
+                    });
+                    ClientStorageThread::new(sender_clone.clone(), engine)
+                }).handle_message(message)
             })
-            .expect("Thread spawning failed");
+            .expect("ClientStorage worker spawning failed");
 
         ClientStorageThreadHandle::new(generic_sender)
     }
 }
 
 struct ClientStorageThread<E: RegistryEngine> {
-    receiver: GenericReceiver<ClientStorageThreadMessage>,
     sender: GenericSender<ClientStorageThreadMessage>,
     engine: E,
 }
@@ -716,69 +721,63 @@ where
 {
     pub fn new(
         sender: GenericSender<ClientStorageThreadMessage>,
-        receiver: GenericReceiver<ClientStorageThreadMessage>,
         engine: E,
     ) -> ClientStorageThread<E> {
-        ClientStorageThread {
-            sender,
-            receiver,
-            engine,
-        }
+        ClientStorageThread { sender, engine }
     }
 
-    pub fn start(&mut self) {
-        while let Ok(message) = self.receiver.recv() {
-            match message {
-                ClientStorageThreadMessage::ObtainBottleMap {
+    fn handle_message(&mut self, message: ClientStorageThreadMessage) -> bool {
+        match message {
+            ClientStorageThreadMessage::ObtainBottleMap {
+                storage_type,
+                storage_identifier,
+                webview,
+                origin,
+                sender,
+            } => {
+                let result = self.engine.obtain_a_storage_bottle_map(
                     storage_type,
-                    storage_identifier,
                     webview,
+                    storage_identifier,
                     origin,
-                    sender,
-                } => {
-                    let result = self.engine.obtain_a_storage_bottle_map(
-                        storage_type,
-                        webview,
-                        storage_identifier,
-                        origin,
-                        &self.sender,
-                    );
-                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
-                },
-                ClientStorageThreadMessage::CreateDatabase {
-                    bottle_id,
-                    name,
-                    sender,
-                } => {
-                    let result = self.engine.create_database(bottle_id, name);
-                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
-                },
-                ClientStorageThreadMessage::DeleteDatabase {
-                    bottle_id,
-                    name,
-                    sender,
-                } => {
-                    let result = self.engine.delete_database(bottle_id, name);
-                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
-                },
-                ClientStorageThreadMessage::Persisted { origin, sender } => {
-                    let _ = sender.send(self.engine.persisted(origin));
-                },
-                ClientStorageThreadMessage::Persist {
-                    origin,
-                    permission_granted,
-                    sender,
-                } => {
-                    let _ = sender.send(self.engine.persist(origin, permission_granted));
-                },
-                ClientStorageThreadMessage::Estimate { origin, sender } => {
-                    let _ = sender.send(self.engine.estimate(origin));
-                },
-                ClientStorageThreadMessage::Exit(sender) => {
-                    let _ = sender.send(());
-                    break;
-                },
+                    &self.sender,
+                );
+                let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
+            }
+            ClientStorageThreadMessage::CreateDatabase {
+                bottle_id,
+                name,
+                sender,
+            } => {
+                let result = self.engine.create_database(bottle_id, name);
+                let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
+            }
+            ClientStorageThreadMessage::DeleteDatabase {
+                bottle_id,
+                name,
+                sender,
+            } => {
+                let result = self.engine.delete_database(bottle_id, name);
+                let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
+            }
+            ClientStorageThreadMessage::Persisted { origin, sender } => {
+                let _ = sender.send(self.engine.persisted(origin));
+            }
+            ClientStorageThreadMessage::Persist {
+                origin,
+                permission_granted,
+                sender,
+            } => {
+                let _ = sender.send(self.engine.persist(origin, permission_granted));
+            }
+            ClientStorageThreadMessage::Estimate { origin, sender } => {
+                let _ = sender.send(self.engine.estimate(origin));
+            }
+            ClientStorageThreadMessage::Exit(sender) => {
+                let _ = sender.send(());
+                return false;
             }
         }
+        true
     }
 }

@@ -44,3 +44,5 @@ pub mod supervisor;
 #[cfg(feature = "content-runtime")]
 pub mod web_api_shims;
 pub mod worker;
+#[cfg(unix)]
+mod worker_resource;

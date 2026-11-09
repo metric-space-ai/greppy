@@ -6,6 +6,7 @@ pub mod cache_storage;
 pub mod client_storage;
 mod indexeddb;
 pub(crate) mod shared;
+mod shared_workers;
 mod storage_thread;
 mod webstorage;
 

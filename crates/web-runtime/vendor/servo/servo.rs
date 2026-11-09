@@ -31,9 +31,7 @@ use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
-use net::resource_thread::{
-    new_resource_threads, new_resource_threads_with_shared_async_runtime,
-};
+use net::resource_thread::{new_resource_threads, new_resource_threads_with_shared_async_runtime};
 use net_traits::{FetchThread, ResourceThreads};
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
@@ -119,7 +117,7 @@ mod media_platform {
                 Err(e) => {
                     log::error!("Error initializing GStreamer: {:?}", e);
                     std::process::exit(1);
-                },
+                }
             }
         });
     }
@@ -248,6 +246,7 @@ struct ServoInner {
     /// and deinitialization of the JS Engine. Multiprocess Servo instances have their
     /// own instance that exists in the content process instead.
     _js_engine_setup: Option<JSEngineSetup>,
+    _process_state: Option<Rc<ServoProcessState>>,
     /// [`InputEventId`]s that have been handled, but for which the embedder has
     /// not been notified yet.
     pending_handled_input_events: RefCell<Vec<PendingHandledInputEvent>>,
@@ -277,7 +276,7 @@ impl ServoInner {
                     Ok(message) => messages.push(message),
                     Err(error) => {
                         warn!("Router deserialization error: {error}. Ignoring this PaintMessage.")
-                    },
+                    }
                 }
             }
             paint.handle_messages(messages);
@@ -295,7 +294,7 @@ impl ServoInner {
                 Message::FromNet(message) => self.handle_net_embedder_message(message),
                 Message::FromConstellation(message) => {
                     self.handle_constellation_embedder_message(message)
-                },
+                }
             }
             if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
                 break;
@@ -390,7 +389,7 @@ impl ServoInner {
                         }),
                     );
                 }
-            },
+            }
             NetToEmbedderMsg::WebResourceRequested(
                 webview_id,
                 web_resource_request,
@@ -415,7 +414,7 @@ impl ServoInner {
                     );
                     self.delegate.borrow().load_web_resource(web_resource_load);
                 }
-            },
+            }
             NetToEmbedderMsg::WebResourceResponseCompleted(webview_id, response) => {
                 if let Some(webview) =
                     webview_id.and_then(|webview_id| self.get_webview_handle(webview_id))
@@ -424,7 +423,7 @@ impl ServoInner {
                         .delegate()
                         .web_resource_response_completed(webview, response);
                 }
-            },
+            }
             NetToEmbedderMsg::RequestAuthentication(
                 webview_id,
                 url,
@@ -442,17 +441,17 @@ impl ServoInner {
                         .delegate()
                         .request_authentication(webview, authentication_request);
                 }
-            },
+            }
             NetToEmbedderMsg::EmbedderCookieOperationResponseWithCookies(operation_id, cookies) => {
                 self.site_data_manager.handle_cookie_response(
                     operation_id,
                     CookieOperationResponse::Cookies(cookies),
                 );
-            },
+            }
             NetToEmbedderMsg::EmbedderCookieOperationResponse(operation_id) => {
                 self.site_data_manager
                     .handle_cookie_response(operation_id, CookieOperationResponse::Done);
-            },
+            }
         }
     }
 
@@ -462,24 +461,24 @@ impl ServoInner {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_status_text(status_text);
                 }
-            },
+            }
             EmbedderMsg::ChangePageTitle(webview_id, title) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_page_title(title);
                 }
-            },
+            }
             EmbedderMsg::MoveTo(webview_id, position) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.delegate().request_move_to(webview, position);
                 }
-            },
+            }
             EmbedderMsg::ResizeTo(webview_id, size) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .delegate()
                         .request_resize_to(webview, size.max(MINIMUM_WEBVIEW_SIZE));
                 }
-            },
+            }
             EmbedderMsg::ShowSimpleDialog(webview_id, simple_dialog) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.delegate().show_embedder_control(
@@ -487,7 +486,7 @@ impl ServoInner {
                         EmbedderControl::SimpleDialog(simple_dialog.into()),
                     );
                 }
-            },
+            }
             EmbedderMsg::AllowProtocolHandlerRequest(
                 webview_id,
                 registration_update,
@@ -515,7 +514,7 @@ impl ServoInner {
                         allow_deny_request,
                     );
                 }
-            },
+            }
             EmbedderMsg::AllowUnload(webview_id, response_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let request = AllowOrDenyRequest::new(
@@ -525,7 +524,7 @@ impl ServoInner {
                     );
                     webview.delegate().request_unload(webview, request);
                 }
-            },
+            }
             EmbedderMsg::InputEventsHandled(webview_id, event_outcomes) => {
                 let webview = self.get_webview_handle(webview_id);
                 for InputEventOutcome {
@@ -546,46 +545,46 @@ impl ServoInner {
                         );
                     }
                 }
-            },
+            }
             EmbedderMsg::ClearClipboard(webview_id) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.clipboard_delegate().clear(webview);
                 }
-            },
+            }
             EmbedderMsg::GetClipboardText(webview_id, result_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .clipboard_delegate()
                         .get_text(webview, StringRequest::from(result_sender));
                 }
-            },
+            }
             EmbedderMsg::SetClipboardText(webview_id, string) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.clipboard_delegate().set_text(webview, string);
                 }
-            },
+            }
             EmbedderMsg::SetCursor(webview_id, cursor) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_cursor(cursor);
                 }
-            },
+            }
             EmbedderMsg::NewFavicon(webview_id, image) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_favicon(image);
                 }
-            },
+            }
             EmbedderMsg::NotifyLoadStatusChanged(webview_id, load_status) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_load_status(load_status);
                 }
-            },
+            }
             EmbedderMsg::NotifyFullscreenStateChanged(webview_id, fullscreen) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .delegate()
                         .notify_fullscreen_state_changed(webview, fullscreen);
                 }
-            },
+            }
             EmbedderMsg::GetSelectedBluetoothDevice(webview_id, items, response_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.delegate().show_bluetooth_device_dialog(
@@ -593,7 +592,7 @@ impl ServoInner {
                         BluetoothDeviceSelectionRequest::new(items, response_sender),
                     );
                 }
-            },
+            }
             EmbedderMsg::PromptPermission(webview_id, requested_feature, response_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let permission_request = PermissionRequest {
@@ -608,7 +607,7 @@ impl ServoInner {
                         .delegate()
                         .request_permission(webview, permission_request);
                 }
-            },
+            }
             EmbedderMsg::RequestWakeLockPermission(webview_id, callback, type_) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let permission_request = PermissionRequest {
@@ -623,7 +622,7 @@ impl ServoInner {
                         .delegate()
                         .request_permission(webview, permission_request);
                 }
-            },
+            }
             EmbedderMsg::OnDevtoolsStarted(port, token) => match port {
                 Ok(port) => self
                     .delegate
@@ -642,7 +641,7 @@ impl ServoInner {
                         AllowOrDeny::Deny,
                         self.servo_errors.sender(),
                     ));
-            },
+            }
             #[cfg(feature = "gamepad")]
             EmbedderMsg::PlayGamepadHapticEffect(
                 webview_id,
@@ -664,7 +663,7 @@ impl ServoInner {
                         .gamepad_delegate()
                         .handle_haptic_effect_request(request);
                 }
-            },
+            }
             #[cfg(feature = "gamepad")]
             EmbedderMsg::StopGamepadHapticEffect(webview_id, gamepad_index, callback) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
@@ -681,13 +680,13 @@ impl ServoInner {
                         .gamepad_delegate()
                         .handle_haptic_effect_request(request);
                 }
-            },
+            }
             EmbedderMsg::ShowNotification(webview_id, notification) => {
                 match webview_id.and_then(|webview_id| self.get_webview_handle(webview_id)) {
                     Some(webview) => webview.delegate().show_notification(webview, notification),
                     None => self.delegate.borrow().show_notification(notification),
                 }
-            },
+            }
             EmbedderMsg::ShowConsoleApiMessage(webview_id, level, message) => {
                 match webview_id.and_then(|webview_id| self.get_webview_handle(webview_id)) {
                     Some(webview) => webview
@@ -695,19 +694,19 @@ impl ServoInner {
                         .show_console_message(webview, level, message),
                     None => self.delegate.borrow().show_console_message(level, message),
                 }
-            },
+            }
             EmbedderMsg::ShowEmbedderControl(control_id, position, embedder_control_request) => {
                 if let Some(webview) = self.get_webview_handle(control_id.webview_id) {
                     webview.show_embedder_control(control_id, position, embedder_control_request);
                 }
-            },
+            }
             EmbedderMsg::HideEmbedderControl(control_id) => {
                 if let Some(webview) = self.get_webview_handle(control_id.webview_id) {
                     webview
                         .delegate()
                         .hide_embedder_control(webview, control_id);
                 }
-            },
+            }
             EmbedderMsg::GetWindowRect(webview_id, response_sender) => {
                 let window_rect = || {
                     let Some(webview) = self.get_webview_handle(webview_id) else {
@@ -724,7 +723,7 @@ impl ServoInner {
                 if let Err(error) = response_sender.send(window_rect()) {
                     warn!("Failed to respond to GetWindowRect: {error}");
                 }
-            },
+            }
             EmbedderMsg::GetScreenMetrics(webview_id, response_sender) => {
                 let screen_metrics = || {
                     let Some(webview) = self.get_webview_handle(webview_id) else {
@@ -749,12 +748,12 @@ impl ServoInner {
                 if let Err(error) = response_sender.send(screen_metrics()) {
                     warn!("Failed to respond to GetScreenMetrics: {error}");
                 }
-            },
+            }
             EmbedderMsg::AccessibilityTreeUpdate(webview_id, tree_update, epoch) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.process_accessibility_tree_update(tree_update, epoch);
                 }
-            },
+            }
         }
     }
 
@@ -777,17 +776,17 @@ impl ServoInner {
                     };
                     webview.delegate().request_navigation(webview, request);
                 }
-            },
+            }
             ConstellationToEmbedderMsg::AllowOpeningWebView(webview_id, response_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.request_create_new(response_sender);
                 }
-            },
+            }
             ConstellationToEmbedderMsg::WebViewClosed(webview_id) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.delegate().notify_closed(webview);
                 }
-            },
+            }
             ConstellationToEmbedderMsg::WebViewFocused(webview_id, focus_result) => {
                 if focus_result {
                     for id in self.webviews.borrow().keys() {
@@ -797,19 +796,19 @@ impl ServoInner {
                         }
                     }
                 }
-            },
+            }
             ConstellationToEmbedderMsg::WebViewBlurred => {
                 for id in self.webviews.borrow().keys() {
                     if let Some(webview) = self.get_webview_handle(*id) {
                         webview.set_focused(false);
                     }
                 }
-            },
+            }
             ConstellationToEmbedderMsg::FinishJavaScriptEvaluation(evaluation_id, result) => {
                 self.javascript_evaluator
                     .borrow_mut()
                     .finish_evaluation(evaluation_id, result);
-            },
+            }
             ConstellationToEmbedderMsg::InputEventsHandled(webview_id, event_outcomes) => {
                 let webview = self.get_webview_handle(webview_id);
                 for InputEventOutcome {
@@ -830,14 +829,14 @@ impl ServoInner {
                         );
                     }
                 }
-            },
+            }
             ConstellationToEmbedderMsg::HistoryTraversalComplete(webview_id, traversal_id) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .delegate()
                         .notify_traversal_complete(webview.clone(), traversal_id);
                 }
-            },
+            }
             ConstellationToEmbedderMsg::HistoryChanged(
                 webview_id,
                 new_back_forward_list,
@@ -846,22 +845,22 @@ impl ServoInner {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_history(new_back_forward_list, current_list_index);
                 }
-            },
+            }
             ConstellationToEmbedderMsg::Panic(webview_id, reason, backtrace) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .delegate()
                         .notify_crashed(webview, reason, backtrace);
                 }
-            },
-            ConstellationToEmbedderMsg::ReportProfile(_items) => {},
+            }
+            ConstellationToEmbedderMsg::ReportProfile(_items) => {}
             ConstellationToEmbedderMsg::MediaSessionEvent(webview_id, media_session_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .delegate()
                         .notify_media_session_event(webview, media_session_event);
                 }
-            },
+            }
         }
     }
 }
@@ -894,7 +893,10 @@ impl Servo {
         // Global configuration options, parsed from the command line.
         let mut instance_opts = builder.opts.map(|opts| *opts).unwrap_or_default();
         if cfg!(debug_assertions)
-            && std::env::var("GREPPY_WEB_TEST_IGNORE_CERTS").ok().as_deref() == Some("1")
+            && std::env::var("GREPPY_WEB_TEST_IGNORE_CERTS")
+                .ok()
+                .as_deref()
+                == Some("1")
         {
             instance_opts.ignore_certificate_errors = true;
         }
@@ -1065,6 +1067,7 @@ impl Servo {
             webviews: Default::default(),
             servo_errors: ServoErrorChannel::default(),
             _js_engine_setup: js_engine_setup,
+            _process_state: builder.process_state,
             pending_handled_input_events: Default::default(),
             event_loop_waker,
         }))
@@ -1397,10 +1400,10 @@ pub fn run_content_process(token: String) {
 
             // Shut down the `FetchThread` if it had been started in the course of execution.
             FetchThread::exit();
-        },
+        }
         UnprivilegedContent::ServiceWorker(content) => {
             content.start::<ServiceWorkerManager>();
-        },
+        }
     }
 }
 
@@ -1444,6 +1447,49 @@ impl EventLoopWaker for DefaultEventLoopWaker {
     fn wake(&self) {}
 }
 
+/// Process-wide services for isolated in-process Servo instances.
+///
+/// This owner has no browser, renderer, profile storage, resource manager or
+/// constellation of its own. Every dependent Servo retains an Rc, so its
+/// shutdown completes before the JavaScript engine and shared services stop.
+/// Construct once on the embedder thread, before creating any Servo.
+pub struct ServoProcessState {
+    async_runtime: Box<dyn net_traits::AsyncRuntime>,
+    _js_engine_setup: JSEngineSetup,
+    _embedder_thread: std::marker::PhantomData<Rc<()>>,
+}
+
+impl ServoProcessState {
+    pub fn new(options: Opts, preferences: Preferences) -> Self {
+        assert!(
+            !options.multiprocess,
+            "shared process state requires in-process Servo"
+        );
+        opts::initialize_options(options);
+        prefs::set(preferences);
+        media_platform::init();
+        PipelineNamespace::install(EMBEDDER_PIPELINE_NAMESPACE_ID);
+        let js_engine_setup = script::init();
+        Self {
+            async_runtime: net::async_runtime::init_async_runtime(),
+            _js_engine_setup: js_engine_setup,
+            _embedder_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ServoProcessState {
+    fn drop(&mut self) {
+        // ServoInner::drop has already waited for each dependent constellation's
+        // ShutdownComplete. None of those constellations owns process services.
+        ipc_channel::router::ROUTER.shutdown();
+        self.async_runtime.shutdown();
+        StyleThreadPool::shutdown();
+        FetchThread::exit();
+        // The JSEngineSetup field drops last, after every script has joined.
+    }
+}
+
 /// Builder for [`Servo`].
 pub struct ServoBuilder {
     opts: Option<Box<Opts>>,
@@ -1451,6 +1497,7 @@ pub struct ServoBuilder {
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
     shared_process_state: bool,
+    process_state: Option<Rc<ServoProcessState>>,
 }
 
 impl Default for ServoBuilder {
@@ -1461,6 +1508,7 @@ impl Default for ServoBuilder {
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
             shared_process_state: false,
+            process_state: None,
         }
     }
 }
@@ -1480,6 +1528,14 @@ impl ServoBuilder {
     /// same embedder thread so the installed pipeline namespace remains valid.
     pub unsafe fn build_with_shared_process_state(mut self) -> Servo {
         self.shared_process_state = true;
+        Servo::new(self)
+    }
+
+    /// Build an isolated Servo using an explicitly owned process foundation.
+    /// Rc retains the owner until this Servo and its WebViews have shut down.
+    pub fn build_with_process_state(mut self, owner: Rc<ServoProcessState>) -> Servo {
+        self.shared_process_state = true;
+        self.process_state = Some(owner);
         Servo::new(self)
     }
 
