@@ -234,11 +234,16 @@ fn run_late() -> Result<i32, String> {
     reject_mixed_icu_versions(&overlaps)?;
     let comdat = local_icu_comdat_signatures(private_sm, "__greppy_sm_")?;
     reject_mixed_icu_versions(&comdat)?;
-    redefine_linux_archive_symbols(
-        private_sm,
-        &overlaps.union(&comdat).cloned().collect(),
-        "__greppy_sm_",
-    )?;
+    // Isolate the measured personality reference cells as well. Both classes
+    // use the same private prefix, so rewrite the large archive only once.
+    let personality_refs = globals
+        .intersection(&v8_globals)
+        .filter(|name| name.as_str() == "DW.ref.__gxx_personality_v0")
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut rename_symbols = overlaps.union(&comdat).cloned().collect::<BTreeSet<_>>();
+    rename_symbols.extend(personality_refs.iter().cloned());
+    redefine_linux_archive_symbols(private_sm, &rename_symbols, "__greppy_sm_")?;
     verify_symbols_absent(private_sm, &overlaps, "ICU")?;
     verify_local_icu_comdat_absent(private_sm, "__greppy_sm_")?;
     verify_symbols_renamed(private_sm, &overlaps, "__greppy_sm_", "ICU")?;
@@ -252,15 +257,6 @@ fn run_late() -> Result<i32, String> {
         }
     }
     verify_symbols_absent(&copies[&old_diplomat[0]], &allocators, "diplomat-runtime")?;
-    // The measured ELF archives also share a weak COMDAT reference cell for
-    // __gxx_personality_v0. Isolate the SM cell and its references rather than
-    // permitting another shared global in the strict intersection gate.
-    let personality_refs = globals
-        .intersection(&v8_globals)
-        .filter(|name| name.as_str() == "DW.ref.__gxx_personality_v0")
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    redefine_linux_archive_symbols(private_sm, &personality_refs, "__greppy_sm_")?;
     verify_symbols_absent(private_sm, &personality_refs, "personality reference")?;
     verify_symbols_renamed(
         private_sm,
