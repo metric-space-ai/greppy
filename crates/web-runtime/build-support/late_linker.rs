@@ -263,7 +263,10 @@ fn run_late() -> Result<i32, String> {
     redefine_linux_archive_symbols(private_sm, &personality_refs, "__greppy_sm_")?;
     verify_symbols_absent(private_sm, &personality_refs, "personality reference")?;
     verify_symbols_renamed(
-        private_sm, &personality_refs, "__greppy_sm_", "personality reference",
+        private_sm,
+        &personality_refs,
+        "__greppy_sm_",
+        "personality reference",
     )?;
     if !pending_symbols(&personality_refs, &archive_symbol_names(private_sm)?).is_empty() {
         return Err("old personality reference names remain in the private archive".into());
