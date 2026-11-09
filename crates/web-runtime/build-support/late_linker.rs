@@ -105,6 +105,14 @@ fn run_late() -> Result<i32,String> {
     // GCC supplies the actual subprogram; never guess cc, ld or rust-lld.
     let driver = input.next().ok_or("missing GCC subprogram")?;
     let passed = input.collect::<Vec<_>>();
+    let name = Path::new(&driver).file_name().and_then(OsStr::to_str).unwrap_or("");
+    let is_link = name == "collect2" || name == "ld" || name == "rust-lld"
+        || name.starts_with("ld.") || name.ends_with("-ld") || name.contains("-ld.");
+    if !is_link {
+        // Compiler/assembler/LTO subprocess arguments are not linker syntax.
+        // In particular, do not inspect or expand their @arguments.
+        return delegate(&driver,&passed);
+    }
     let original = expand(passed.clone(),0,&mut (8 * 1024 * 1024))?;
     let sm = selected(&original,"libmozjs_sys-");
     let v8 = selected(&original,"libv8-");
