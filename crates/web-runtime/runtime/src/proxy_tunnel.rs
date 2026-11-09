@@ -2,7 +2,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const BUFFER_BYTES: usize = 16 * 1024;
@@ -94,8 +94,15 @@ fn arm_timeout(wait: &mut Option<Instant>, timeout: Option<Duration>) -> io::Res
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn copy_bidirectional(a: &mut TcpStream, b: &mut TcpStream,
     transferred: &AtomicU64) -> io::Result<()>
+{
+    copy_bidirectional_cancellable(a, b, transferred, None)
+}
+
+pub(crate) fn copy_bidirectional_cancellable(a: &mut TcpStream, b: &mut TcpStream,
+    transferred: &AtomicU64, closing: Option<&AtomicBool>) -> io::Result<()>
 {
     let mut up = Direction::new(a, b)?;
     let mut down = Direction::new(b, a)?;
@@ -103,6 +110,9 @@ pub(crate) fn copy_bidirectional(a: &mut TcpStream, b: &mut TcpStream,
     b.set_nonblocking(true)?;
     let result = (|| {
         loop {
+            if closing.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let progress_up = up.transfer(a, b, transferred)?;
             let progress_down = down.transfer(b, a, transferred)?;
             if up.complete() && down.complete() { return Ok(()); }

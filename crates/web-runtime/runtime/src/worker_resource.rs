@@ -134,6 +134,8 @@ pub(crate) fn install_thread_spawn_failure_hook(protocol: Arc<Mutex<File>>) {
         // A constellation that failed to create its script cannot finish Servo's
         // normal shutdown. Exit the owned content process; its supervisor reaps
         // the worker group and returns the original ResourceLimit to the client.
-        std::process::exit(70);
+        // The worker's JS threads are still live. Skip C++ atexit destructors;
+        // the supervising process owns all process/file cleanup and reaping.
+        unsafe { libc::_exit(70); }
     }));
 }
