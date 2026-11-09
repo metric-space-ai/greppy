@@ -87,6 +87,10 @@ jobs:
           toolchain: '1.95.0'
           components: rustfmt, clippy
 
+      - name: Debug model-size metadata contract
+        if: runner.os == 'Linux'
+        run: python3 tools/check_debug_asset_metadata.py
+
       - name: Cache cargo registry, git, and target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -153,6 +157,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_toolchain_cache_roots_mutation.py
 
+      - name: Coding-only agent must not start a browser
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_web_agent_startup_mutations.py
+
       - name: Partial proposal after gateway error mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_agent_error_proposal_mutation.py
@@ -182,6 +190,10 @@ jobs:
       - name: Anthropic required output-bound mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anthropic_output_limit_mutation.py
+
+      - name: Bash absolute-glob atomic write mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_bash_glob_syntax_mutation.py
 
       - name: Agent HTTP error-body mutation proof
         if: runner.os == 'Linux'

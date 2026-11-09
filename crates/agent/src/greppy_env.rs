@@ -39,11 +39,25 @@ pub const DEFAULT_DEADLINE_GRACE: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
 
 /// Installs the parent-owned attach token onto an authorized `greppy web`
-/// child via inherited FD 4. The returned value must be held until after
+/// child via inherited FD 4. Preparation runs in the trusted parent and
+/// receives the actual tool argv before the child is spawned. The returned
+/// value must be held until after
 /// `spawn` so the CLOEXEC pipe end stays open through fork.
 type AttachHold = Box<dyn Send>;
-type PrepareAttachFd = fn(&mut Command) -> io::Result<AttachHold>;
+type PrepareAttachFd = fn(&mut Command, &[String]) -> io::Result<AttachHold>;
 pub static PREPARE_ATTACH_FD: OnceLock<PrepareAttachFd> = OnceLock::new();
+
+/// Raw namespace input for this agent's browser owner. Retain this path for
+/// later CLI lifecycle operations: its text is part of the endpoint identity.
+pub fn agent_runtime_dir(run_id: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // "/tmp/greppy-agent-" + 8 hex = 26 bytes, under the endpoint path cap.
+    PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
+}
 
 /// Host-provided contextual signal, appended to the captured tool envelope.
 /// The subprocess byte streams and its exit status remain unchanged.
@@ -408,10 +422,10 @@ impl GreppyEnv {
         // sandbox first, then child-local dup2 onto FD 4.
         let attach_hold = if args.first().map(String::as_str) == Some("web") {
             match PREPARE_ATTACH_FD.get() {
-                Some(prepare) => match prepare(&mut cmd) {
+                Some(prepare) => match prepare(&mut cmd, &args) {
                     Ok(hold) => Some(hold),
                     Err(error) => {
-                        return ToolOutcome::err(format!("attach token fd: {error}"));
+                        return ToolOutcome::err(format!("web parent preparation: {error}"));
                     }
                 },
                 None => {

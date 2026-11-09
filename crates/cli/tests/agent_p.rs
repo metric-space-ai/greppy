@@ -16,6 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod portable_provider;
 use portable_provider::{spawn_fake_provider, spawn_fake_provider_with_edits};
 
+#[cfg(unix)]
+#[path = "../../web-runtime/runtime/tests/support/recorded_http_fixture.rs"]
+mod recorded_http_fixture;
+
 fn binary_path() -> PathBuf {
     std::env::var_os("GREPPY_ACCEPTANCE_BINARY")
         .map(PathBuf::from)
@@ -78,18 +82,39 @@ fn spawn_gateway_sequence(
     )
 }
 
-fn spawn_gateway_contract(
-    responses: Vec<&'static str>,
+type GatewayMessages = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+fn spawn_gateway_contract<T: AsRef<str> + Send + 'static>(
+    responses: Vec<T>,
     catalog: &'static str,
     caller_bound: Option<(&'static str, u64)>,
 ) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
-    spawn_gateway_contract_with_error(responses, catalog, caller_bound, None)
+    spawn_gateway_observed(responses, catalog, caller_bound, None)
 }
 
 fn spawn_gateway_contract_with_error(
     responses: Vec<&'static str>,
     catalog: &'static str,
     caller_bound: Option<(&'static str, u64)>,
+    error_after_edit: Option<u16>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway_observed_with_error(responses, catalog, caller_bound, None, error_after_edit)
+}
+
+fn spawn_gateway_observed<T: AsRef<str> + Send + 'static>(
+    responses: Vec<T>,
+    catalog: &'static str,
+    caller_bound: Option<(&'static str, u64)>,
+    messages: Option<GatewayMessages>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway_observed_with_error(responses, catalog, caller_bound, messages, None)
+}
+
+fn spawn_gateway_observed_with_error<T: AsRef<str> + Send + 'static>(
+    responses: Vec<T>,
+    catalog: &'static str,
+    caller_bound: Option<(&'static str, u64)>,
+    messages: Option<GatewayMessages>,
     error_after_edit: Option<u16>,
 ) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     assert!(!responses.is_empty());
@@ -129,6 +154,14 @@ fn spawn_gateway_contract_with_error(
                             + 4;
                         let body: serde_json::Value =
                             serde_json::from_slice(&request[body_start..]).expect("Messages JSON");
+                        if let Some(messages) = messages.as_ref() {
+                            let mut messages = messages.lock().unwrap();
+                            assert!(
+                                messages.len() < 4,
+                                "scripted web gateway request bound exceeded"
+                            );
+                            messages.push(body.clone());
+                        }
                         if let Some((model, limit)) = caller_bound {
                             assert_eq!(body["model"], model, "wire model must remain unchanged");
                             assert_eq!(body["max_tokens"].as_u64(), Some(limit));
@@ -162,7 +195,7 @@ fn spawn_gateway_contract_with_error(
                             let _ = stream.flush();
                             continue;
                         }
-                        let sse = responses[message_index.min(responses.len() - 1)];
+                        let sse = responses[message_index.min(responses.len() - 1)].as_ref();
                         message_index += 1;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -322,6 +355,506 @@ fn edit_gateway_response() -> &'static str {
         "data: {\"type\":\"message_stop\"}\n",
         "\n",
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn coding_task_does_not_start_a_browser() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_temp("no-browser");
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let marker = root.join("browser-was-started");
+    let runtime = root.join("unexpected-runtime");
+    std::fs::write(
+        &runtime,
+        "#!/bin/sh\nprintf started > \"$GREPPY_BROWSER_START_MARKER\"\nexit 91\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (endpoint, stop, handle) = spawn_gateway(stub_gateway_response());
+    let output = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", root.join("store"))
+        .env("GREPPY_WORKSPACE_DIR", root.join("no-provider"))
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_WEB_RUNTIME", &runtime)
+        .env("GREPPY_BROWSER_START_MARKER", &marker)
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .args([
+            "-p",
+            "Answer briefly without tools",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--private-store",
+            "--skip-selfcheck",
+            "--deadline-secs",
+            "20",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    stop.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "coding-only task started a browser runtime"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+fn web_gateway_response(args: serde_json::Value, id: &str) -> String {
+    let events = [
+        (
+            "message_start",
+            serde_json::json!({"type":"message_start","message":{
+            "id":format!("msg_{id}"),"type":"message","role":"assistant","model":"test","content":[],
+            "stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}),
+        ),
+        (
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"tool_use","id":id,"name":"greppy","input":{}}}),
+        ),
+        (
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"input_json_delta","partial_json":serde_json::to_string(&args).unwrap()}}),
+        ),
+        (
+            "content_block_stop",
+            serde_json::json!({"type":"content_block_stop","index":0}),
+        ),
+        (
+            "message_delta",
+            serde_json::json!({"type":"message_delta",
+            "delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":8}}),
+        ),
+        ("message_stop", serde_json::json!({"type":"message_stop"})),
+    ];
+    events
+        .into_iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn collect_runtime_scopes(
+    value: &serde_json::Value,
+    scopes: &mut std::collections::BTreeSet<(String, String)>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(result) = object.get("result") {
+                if object.get("schema").and_then(serde_json::Value::as_str)
+                    == Some("greppy.web-runtime.v1")
+                    && object.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+                    && result["running"] == true
+                    && result["owned"] == true
+                {
+                    if let (Some(socket), Some(run_id)) =
+                        (result["socket"].as_str(), result["run_id"].as_str())
+                    {
+                        scopes.insert((socket.to_owned(), run_id.to_owned()));
+                    }
+                }
+            }
+            for child in object.values() {
+                collect_runtime_scopes(child, scopes);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_runtime_scopes(child, scopes);
+            }
+        }
+        serde_json::Value::String(text) => {
+            // Fenced web-do text contains one JSON document per operation.
+            // Consume each complete document so a preceding session result
+            // cannot hide the later authenticated runtime-status receipt.
+            let mut remaining = text.as_str();
+            while let Some(offset) = remaining.find('{') {
+                let candidate = &remaining[offset..];
+                let mut documents =
+                    serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+                match documents.next() {
+                    Some(Ok(document)) => {
+                        collect_runtime_scopes(&document, scopes);
+                        remaining = &candidate[documents.byte_offset()..];
+                    }
+                    _ => remaining = &candidate[1..],
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Run only as an actual child process of the confinement contract below.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires a task-owned confinement canary"]
+fn sandbox_canary_child_probe() {
+    use std::io::Write;
+    let path = std::env::var_os("GREPPY_TEST_SANDBOX_CANARY").expect("task-owned canary path");
+    let result = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(b"canary-write-attempt\n"));
+    match result {
+        Ok(()) => println!("sandbox-canary-write-allowed"),
+        Err(error) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "canary failed for a reason other than OS write denial: {error}"
+            );
+            println!("sandbox-canary-write-denied");
+        }
+    }
+}
+
+/// Real native startup and DOM read through the confined agent tool. A scripted
+/// gateway selects the tool; the HTTP fixture's opaque title is the oracle.
+/// The compatibility job builds and supplies the actual native runtime.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the native runtime built by the compatibility job"]
+fn confined_web_uses_parent_runtime_and_reads_real_page() {
+    use recorded_http_fixture::{http_response, HttpFixture};
+    let runtime =
+        std::env::var_os("GREPPY_WEB_RUNTIME").expect("actual native runtime is required");
+    assert!(std::path::Path::new(&runtime).is_file());
+    let root = unique_temp("confined-web");
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    // A separate sibling belongs to this test, but to none of the agent's
+    // worktree, Git, private data, per-run scratch or runtime write roots.
+    // The actual denied write also catches any future overly broad root grant.
+    let canary_dir = unique_temp("outside-confined-web");
+    std::fs::create_dir_all(&canary_dir).unwrap();
+    struct CanaryDirectory(std::path::PathBuf);
+    impl Drop for CanaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _canary_owner = CanaryDirectory(canary_dir.clone());
+    let canary = canary_dir.join("outside-write-canary");
+    let original_canary: &[u8] = b"task-owned-canary-must-not-change\n";
+    std::fs::write(&canary, original_canary).unwrap();
+    let canary = std::fs::canonicalize(canary).unwrap();
+    assert!(!canary.starts_with(std::fs::canonicalize(&root).unwrap()));
+    let probe_binary = std::env::current_exe().unwrap();
+    let probe_args = [
+        "--exact",
+        "sandbox_canary_child_probe",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ];
+    // The same executable and file must really be writable before confinement;
+    // a read-only file, nonexistent path or broken probe cannot pass as denial.
+    let control = Command::new(&probe_binary)
+        .env("GREPPY_TEST_SANDBOX_CANARY", &canary)
+        .args(probe_args)
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success()
+            && String::from_utf8_lossy(&control.stdout).contains("sandbox-canary-write-allowed")
+            && std::fs::read(&canary).unwrap() != original_canary,
+        "unconfined canary control did not perform the real write: {control:?}"
+    );
+    std::fs::write(&canary, original_canary).unwrap();
+    let title = format!(
+        "native-proof-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let html = format!("<!doctype html><title>{title}</title><h1>{title}</h1>");
+    let fixture = HttpFixture::start(move |_| http_response(html.as_bytes(), "text/html", ""));
+    let responses = vec![
+        web_gateway_response(
+            serde_json::json!({"args":[
+                "bash-smart", "--", "/usr/bin/env",
+                format!("GREPPY_TEST_SANDBOX_CANARY={}", canary.display()),
+                probe_binary.to_str().unwrap(),
+                "--exact", "sandbox_canary_child_probe",
+                "--ignored", "--nocapture", "--test-threads=1"
+            ]}),
+            "toolu_sandbox_canary",
+        ),
+        web_gateway_response(
+            serde_json::json!({"args":[
+                "web","do","--json","session","new","--profile","project","::",
+                "open",format!("{}proof", fixture.origin),"::","js","document.title",
+                "::","runtime","status","--json"
+            ]}),
+            "toolu_web_first",
+        ),
+        web_gateway_response(
+            serde_json::json!({"args":[
+                "web","do","--json","js","document.title","::","runtime","status","--json"
+            ]}),
+            "toolu_web_reuse",
+        ),
+        stub_gateway_response().to_owned(),
+    ];
+    let messages: GatewayMessages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (endpoint, stop, handle) = spawn_gateway_observed(
+        responses,
+        r#"{"data":[{"id":"test","max_completion_tokens":1024}]}"#,
+        None,
+        Some(Arc::clone(&messages)),
+    );
+    // A test-owned in-memory capability can clean up the deliberate no-shutdown
+    // mutant through the official FD provider; never put it in argv/env/evidence.
+    let cleanup_token = greppy::generate_attach_token().expect("test cleanup capability");
+    let mut agent_command = Command::new(binary_path());
+    agent_command
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", root.join("store"))
+        .env("GREPPY_WORKSPACE_DIR", root.join("no-provider"))
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_WEB_RUNTIME", &runtime)
+        .env_remove("GREPPY_WEB_RUNTIME_DIST")
+        .env_remove("GREPPY_NO_SANDBOX")
+        .args([
+            "-p",
+            "Read the real page title with the browser",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--private-store",
+            "--skip-selfcheck",
+            "--enable",
+            "web",
+            "--max-turns",
+            "4",
+            "--deadline-secs",
+            "30",
+            "--json",
+        ]);
+    let attach = greppy::give_child_attach_token(&mut agent_command, &cleanup_token)
+        .expect("official agent control FD");
+    let output = agent_command.output().unwrap();
+    drop(attach);
+    stop.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        std::fs::read(&canary).unwrap(),
+        original_canary,
+        "confined tool changed outside-write canary"
+    );
+    let events: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    let session = events
+        .iter()
+        .find(|event| event["type"] == "session")
+        .expect("actual agent session event");
+    assert_eq!(
+        session["sandbox"], "confined",
+        "native agent test did not select confined mode: {stdout}\n{stderr}"
+    );
+    let finishes: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_finish")
+        .collect();
+    let wire = messages.lock().unwrap();
+    let mut genuine = std::collections::BTreeSet::new();
+    let mut scopes = std::collections::BTreeSet::new();
+    let mut canary_denied = false;
+    for request in wire.iter() {
+        for message in request["messages"].as_array().into_iter().flatten() {
+            for block in message["content"].as_array().into_iter().flatten() {
+                if block["type"] == "tool_result" && block["is_error"] != true {
+                    if block["tool_use_id"] == "toolu_sandbox_canary"
+                        && block.to_string().contains("sandbox-canary-write-denied")
+                    {
+                        canary_denied = true;
+                    }
+                    if block.to_string().contains(&title) {
+                        genuine.insert(block["tool_use_id"].as_str().unwrap().to_owned());
+                    }
+                    collect_runtime_scopes(block, &mut scopes);
+                }
+            }
+        }
+    }
+    assert!(
+        canary_denied,
+        "confined tool did not report real OS canary write denial: {stdout}\n{stderr}"
+    );
+    assert!(
+        output.status.success()
+            && genuine.contains("toolu_web_first")
+            && genuine.contains("toolu_web_reuse")
+            && finishes.len() == 3
+            && finishes.iter().all(|event| event["failed"] == false),
+        "confined web tool did not read the genuine native page: {stdout}\n{stderr}"
+    );
+    assert_eq!(
+        scopes.len(),
+        1,
+        "web tool calls did not reuse one authenticated runtime: {scopes:?}"
+    );
+    let (socket, run_id) = scopes.into_iter().next().unwrap();
+    drop(wire);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // Close the presence probe before recovery. A match scrutinee would
+        // otherwise keep its empty connection open while public stop waits
+        // behind it in the serial runtime frame reader.
+        let presence = std::os::unix::net::UnixStream::connect(&socket).map(drop);
+        match presence {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                break
+            }
+            Err(error) => panic!("cannot verify agent runtime socket closure: {error}"),
+            Ok(()) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Ok(()) => {
+                // A cleanup mutant must still release its own authenticated test
+                // runtime through the public stop operation before failing.
+                let mut stop_command = Command::new(binary_path());
+                stop_command
+                    .current_dir(&repo)
+                    .env("GREPPY_STORE_DIR", root.join("store"))
+                    .env("GREPPY_WEB_RUNTIME", &runtime)
+                    .env("GREPPY_RUN_ID", &run_id)
+                    .env(
+                        "GREPPY_WEB_RUNTIME_DIR",
+                        greppy_agent::greppy_env::agent_runtime_dir(&run_id),
+                    )
+                    .env_remove("GREPPY_WEB_RUNTIME_DIST")
+                    .args(["web", "runtime", "stop", "--json"]);
+                let attach = greppy::give_child_attach_token(&mut stop_command, &cleanup_token)
+                    .expect("official cleanup control FD");
+                let stopped = stop_command.output().unwrap();
+                drop(attach);
+                let stop_result = serde_json::from_slice::<serde_json::Value>(&stopped.stdout);
+                // Observe only after the public stop has already failed. This
+                // cannot turn its immutable exit status into a successful case.
+                let direct_status = if stopped.status.success() {
+                    None
+                } else {
+                    Some(
+                        match greppy_web_client::probe_runtime_status(
+                            std::path::Path::new(&socket),
+                            &run_id,
+                            &cleanup_token,
+                        ) {
+                            Ok(greppy_web_client::RuntimeStatusProbe::Ready(_)) => {
+                                serde_json::json!({"state": "ready"})
+                            }
+                            Ok(greppy_web_client::RuntimeStatusProbe::Starting) => {
+                                serde_json::json!({"state": "starting"})
+                            }
+                            Err(error) => serde_json::json!({
+                                "state": "error", "code": error.into_error().code,
+                            }),
+                        },
+                    )
+                };
+                let short_text = |value: &serde_json::Value| {
+                    value
+                        .as_str()
+                        .map(|text| text.chars().take(256).collect::<String>())
+                };
+                let stop_diagnostic = serde_json::json!({
+                    "exit_code": stopped.status.code(),
+                    "json_valid": stop_result.is_ok(),
+                    "reply": stop_result.as_ref().ok().map(|reply| serde_json::json!({
+                        "status": short_text(&reply["status"]),
+                        "owned": reply["result"]["owned"].as_bool(),
+                        "running": reply["result"]["running"].as_bool(),
+                        "stop_requested": reply["result"]["stop_requested"].as_bool(),
+                        "stopped": reply["result"]["stopped"].as_bool(),
+                        "socket": short_text(&reply["result"]["socket"]),
+                        "run_id": short_text(&reply["result"]["run_id"]),
+                        "error_code": short_text(&reply["error"]["code"]),
+                        "socket_matches_expected": reply["result"]["socket"].as_str()
+                            .map(|actual| actual == socket.as_str()),
+                        "run_id_matches_expected": reply["result"]["run_id"].as_str()
+                            .map(|actual| actual == run_id.as_str()),
+                    })),
+                    "direct_status_after_failed_stop": direct_status,
+                    "stdout_bytes": stopped.stdout.len(),
+                    "stderr_bytes": stopped.stderr.len(),
+                    "stderr_parent_attach_required": String::from_utf8_lossy(&stopped.stderr)
+                        .contains("requires a parent-owned attach token"),
+                    "stderr_permission_denied": String::from_utf8_lossy(&stopped.stderr)
+                        .contains("Permission denied")
+                        || String::from_utf8_lossy(&stopped.stderr)
+                            .contains("Operation not permitted"),
+                });
+                assert!(
+                    stopped.status.success(),
+                    "error: test could not stop its retained runtime: {stop_diagnostic}"
+                );
+                let stop_result = stop_result.expect("public stop returned JSON");
+                assert_eq!(
+                    stop_result["result"]["socket"].as_str(),
+                    Some(socket.as_str()),
+                    "test recovery selected a different runtime namespace: {stop_result}"
+                );
+                assert_eq!(
+                    stop_result["result"]["run_id"].as_str(),
+                    Some(run_id.as_str()),
+                    "test recovery selected a different run: {stop_result}"
+                );
+                let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                    assert!(
+                        std::time::Instant::now() < cleanup_deadline,
+                        "test runtime stop did not close its socket: {stop_result}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                panic!("agent exit retained its authenticated runtime socket");
+            }
+        }
+    }
+    assert_eq!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.as_str() == "/proof")
+            .count(),
+        1,
+        "browser startup must issue exactly one genuine page request"
+    );
+    assert!(
+        !repo.join(".greppy/web").exists(),
+        "parent route escaped into the source checkout"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
