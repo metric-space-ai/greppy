@@ -333,6 +333,9 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
     if coherent:
         report["schema"] = "greppy.cli-native-paired-audit.v2"
         report["cli_sha256_by_version"] = cli_hashes
+        report["configuration"] = config
+        report["verified_tasks_per_attempt"] = (
+            config["rounds"] * config["tasks"] * config["concurrency"])
         report["owned_kernel_resource_comparison"] = kernel_resource_statistics(
             resource_attempts, control, candidate)
     return report

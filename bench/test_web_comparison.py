@@ -223,6 +223,7 @@ class CoherentComparisonContract(unittest.TestCase):
     def test_coherent_pair_binds_cli_per_version_and_keeps_resource_units(self):
         report = self.audit()
         self.assertEqual(report["schema"], "greppy.cli-native-paired-audit.v2")
+        self.assertEqual(report["verified_tasks_per_attempt"], 2)
         comparisons = report["owned_kernel_resource_comparison"]["comparisons"]
         self.assertEqual(comparisons["cpu_usage_seconds"]["statistics"][
             "paired_median_candidate_over_control"], 0.75)
