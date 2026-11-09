@@ -2545,6 +2545,19 @@ fn c_attribute_cases() -> Vec<(&'static str, String, [bool; 2])> {
             [true, true],
         ),
         (
+            "complete-crlf",
+            format!("{C_ATTRIBUTE_PREFIX}{function}").replace('\n', "\r\n"),
+            [true, true],
+        ),
+        (
+            "comment-lookalike",
+            format!(
+                "/*\n{}*/\n{function}",
+                C_ATTRIBUTE_PREFIX.split_once('\n').unwrap().1
+            ),
+            [true, true],
+        ),
+        (
             "broken-body",
             format!("{C_ATTRIBUTE_PREFIX}int example(int n) {{ return n+; }}\n"),
             [false, false],
@@ -2574,22 +2587,24 @@ fn c_attribute_cases() -> Vec<(&'static str, String, [bool; 2])> {
 }
 
 #[test]
-fn c_conditional_attribute_refusal_explains_parser_scope_without_publishing() {
+fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
     let fixture = Fixture::new("c-conditional-attribute-diagnostic");
     let before = "int example(int n) { return n; }\n";
     for (name, source, expected) in c_attribute_cases() {
-        if expected == [true, true] {
-            continue;
-        }
         let file = format!("{name}.c");
         let path = fixture.repo.join(&file);
-        std::fs::write(&path, before).unwrap();
         for json in [false, true] {
+            std::fs::write(&path, before).unwrap();
             let mut args = vec!["write", file.as_str(), source.as_str()];
             if json {
                 args.push("--json");
             }
             let output = fixture.run(&args);
+            if expected == [true, true] {
+                assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+                assert_file(&path, &source);
+                continue;
+            }
             assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
             let message = if json {
                 let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
