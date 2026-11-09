@@ -232,6 +232,12 @@ impl Store {
         &self.conn
     }
 
+    /// Tests install SQLite hooks, which require an exclusive connection borrow.
+    #[cfg(test)]
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Open a writable private Delta with an immutable Base attached behind
     /// one set of TEMP views. Existing read queries continue to address the
     /// ordinary table names; writes must explicitly target `main.<table>`.

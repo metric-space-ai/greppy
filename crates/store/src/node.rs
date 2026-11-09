@@ -913,7 +913,7 @@ mod tests {
         let expected = s.list_nodes("p", "", "src/lib.rs", 0, usize::MAX).unwrap();
         let steps = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&steps);
-        s.conn().progress_handler(
+        s.conn_mut().progress_handler(
             1,
             Some(move || {
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -921,7 +921,7 @@ mod tests {
             }),
         );
         let actual = s.list_nodes_for_file("p", "src/lib.rs").unwrap();
-        s.conn().progress_handler(0, None::<fn() -> bool>);
+        s.conn_mut().progress_handler(0, None::<fn() -> bool>);
         assert_eq!(actual.len(), 10);
         assert_eq!(actual, expected);
         assert!(
@@ -1397,7 +1397,7 @@ mod tests {
             let mut s = store_with_project("p");
             let count = Arc::new(AtomicUsize::new(0));
             let c2 = count.clone();
-            s.conn().commit_hook(Some(move || {
+            s.conn_mut().commit_hook(Some(move || {
                 c2.fetch_add(1, Ordering::SeqCst);
                 false // allow the commit
             }));
@@ -1405,7 +1405,7 @@ mod tests {
                 s.insert_node(&new_node("p", "Function", &format!("p.f{i}")))
                     .unwrap();
             }
-            s.conn().commit_hook(None::<fn() -> bool>);
+            s.conn_mut().commit_hook(None::<fn() -> bool>);
             count.load(Ordering::SeqCst)
         };
         assert_eq!(
@@ -1418,7 +1418,7 @@ mod tests {
             let mut s = store_with_project("p");
             let count = Arc::new(AtomicUsize::new(0));
             let c2 = count.clone();
-            s.conn().commit_hook(Some(move || {
+            s.conn_mut().commit_hook(Some(move || {
                 c2.fetch_add(1, Ordering::SeqCst);
                 false
             }));
@@ -1426,7 +1426,7 @@ mod tests {
                 .map(|i| new_node("p", "Function", &format!("p.f{i}")))
                 .collect();
             s.insert_nodes(&batch).unwrap();
-            s.conn().commit_hook(None::<fn() -> bool>);
+            s.conn_mut().commit_hook(None::<fn() -> bool>);
             count.load(Ordering::SeqCst)
         };
         assert_eq!(
