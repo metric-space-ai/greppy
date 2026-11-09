@@ -48,7 +48,9 @@ fn check_proxy_tunnel_drop(half_closed: bool) {
     assert!(response.starts_with(b"HTTP/1.1 200"));
     if half_closed {
         client.shutdown(std::net::Shutdown::Write).unwrap();
-        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut request = Vec::new();
         server.read_to_end(&mut request).unwrap();
         assert!(request.is_empty());
@@ -480,7 +482,9 @@ fn handle_connect(
     let (host, port) = split_host_port(target, 80);
     match connect_allowed(profile.get(), &host, port, &resolve) {
         Ok(mut server) => {
-            let Some(_origin_connection) = lifetime.register(&server)? else { return Ok(()); };
+            let Some(_origin_connection) = lifetime.register(&server)? else {
+                return Ok(());
+            };
             if lifetime.closing.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -546,7 +550,9 @@ fn handle_forward(
         }
         Err(error) => return Err(error),
     };
-    let Some(_origin_connection) = lifetime.register(&server)? else { return Ok(false); };
+    let Some(_origin_connection) = lifetime.register(&server)? else {
+        return Ok(false);
+    };
     let mut rewritten = rewrite_request_line(head, &path);
     if !rewritten.contains("\r\nHost:") && !rewritten.to_ascii_lowercase().contains("\r\nhost:") {
         let host_header = if port == 80 {
