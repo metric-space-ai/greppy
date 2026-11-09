@@ -2531,60 +2531,9 @@ fn replace_lines_syntax_error_names_allow_syntax_errors() {
     assert_file(&fixture.repo.join("item.rs"), before);
 }
 
-// These bytes are shared by the real CLI check and the opt-in compiler oracle.
-// GCC selects noipa; Clang selects noinline. Never infer one branch's validity
-// from the other compiler, or erase an unchecked branch to accept the source.
-const C_ATTRIBUTE_PREFIX: &str = "/* stable native observation boundary */\n#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((noipa))\n#elif defined(__clang__)\n__attribute__((noinline))\n#endif\n";
-
-fn c_attribute_cases() -> Vec<(&'static str, String, [bool; 2])> {
-    let function = "int example(int n) { return n+1; }\n";
-    vec![
-        (
-            "complete",
-            format!("{C_ATTRIBUTE_PREFIX}{function}"),
-            [true, true],
-        ),
-        (
-            "complete-crlf",
-            format!("{C_ATTRIBUTE_PREFIX}{function}").replace('\n', "\r\n"),
-            [true, true],
-        ),
-        (
-            "comment-lookalike",
-            format!(
-                "/*\n{}*/\n{function}",
-                C_ATTRIBUTE_PREFIX.split_once('\n').unwrap().1
-            ),
-            [true, true],
-        ),
-        (
-            "broken-body",
-            format!("{C_ATTRIBUTE_PREFIX}int example(int n) {{ return n+; }}\n"),
-            [false, false],
-        ),
-        (
-            "broken-gcc-attribute",
-            format!(
-                "{}{function}",
-                C_ATTRIBUTE_PREFIX.replace("__attribute__((noipa))", "__attribute__((noipa)")
-            ),
-            [false, true],
-        ),
-        (
-            "broken-clang-attribute",
-            format!(
-                "{}{function}",
-                C_ATTRIBUTE_PREFIX.replace("__attribute__((noinline))", "__attribute__((noinline)")
-            ),
-            [true, false],
-        ),
-        (
-            "broken-following-declaration",
-            format!("{C_ATTRIBUTE_PREFIX}{function}int broken = ;\n"),
-            [false, false],
-        ),
-    ]
-}
+#[path = "support/c_conditional_attribute.rs"]
+mod c_conditional_attribute;
+use c_conditional_attribute::c_attribute_cases;
 
 #[test]
 fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
@@ -2649,57 +2598,6 @@ fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
     assert!(next.contains("--allow-syntax-errors"), "{next}");
     assert!(!next.contains("without compiler preprocessing"), "{next}");
     assert_file(&cpp, before);
-}
-
-#[test]
-#[ignore = "requires explicit GCC and Clang paths on the admitted build lane"]
-fn c_conditional_attribute_compiler_controls() {
-    let fixture = Fixture::new("c-conditional-attribute-compilers");
-    for (index, variable) in ["GREPPY_C_ATTRIBUTE_GCC", "GREPPY_C_ATTRIBUTE_CLANG"]
-        .iter()
-        .enumerate()
-    {
-        let compiler = std::env::var_os(variable).expect("set the real compiler path");
-        let version = Command::new(&compiler).arg("--version").output().unwrap();
-        assert!(version.status.success());
-        eprintln!(
-            "{variable}={compiler:?}: {}",
-            String::from_utf8_lossy(&version.stdout)
-        );
-        let macros = Command::new(&compiler)
-            .args(["-dM", "-E", "-x", "c", "-"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(macros.status.success());
-        let macros = String::from_utf8(macros.stdout).unwrap();
-        assert!(macros.contains("#define __GNUC__ "));
-        assert_eq!(macros.contains("#define __clang__ "), index == 1);
-        for (name, source, expected) in c_attribute_cases() {
-            let path = fixture.repo.join(format!("{name}.c"));
-            std::fs::write(&path, &source).unwrap();
-            let mut command = Command::new(&compiler);
-            command
-                .args([
-                    "-std=c11",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    "-pedantic",
-                    "-fsyntax-only",
-                ])
-                .arg(&path)
-                .stdin(Stdio::null());
-            eprintln!("compiler fixture={name} bytes={source:?} argv={command:?}");
-            let output = command.output().unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("exit={:?} stderr={stderr}", output.status.code());
-            assert_eq!(output.status.success(), expected[index], "{name}: {stderr}");
-            if !expected[index] {
-                assert!(stderr.contains("error:"), "{name}: {stderr}");
-            }
-        }
-    }
 }
 
 #[test]
