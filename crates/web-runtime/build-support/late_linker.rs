@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 include!("localize_js_static.rs");
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 
@@ -58,8 +59,14 @@ fn expand(args: Vec<OsString>, depth: usize, remaining: &mut u64) -> Result<Vec<
             if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 || metadata.len() > *remaining {
                 return Err("response file must be a regular file of at most 4 MiB".into());
             }
+            let input = fs::File::open(&file).map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            input.take(metadata.len()+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+            if bytes.len() as u64 != metadata.len() {
+                return Err("response file changed while reading".into());
+            }
             *remaining -= metadata.len();
-            result.extend(expand(response_words(&fs::read(file).map_err(|e| e.to_string())?)?, depth + 1, remaining)?);
+            result.extend(expand(response_words(&bytes)?, depth + 1, remaining)?);
         } else { result.push(arg); }
         if result.len() > 100_000 { return Err("expanded linker argument bound exceeded".into()); }
     }
