@@ -113,7 +113,7 @@ def latency_statistics(ratios):
 
 def validate_tasks(receipt, config):
     audit, workload = receipt["audit"], receipt["workload"]
-    count = config["rounds"] * config["tasks"]
+    count = config["rounds"] * config["tasks"] * config["concurrency"]
     require(audit["all_tasks_verified"] is True and audit["error"] is None
             and integer(audit["scheduled_tasks"], count)
             and integer(audit["reported_attempts"], count)
@@ -124,12 +124,15 @@ def validate_tasks(receipt, config):
     durations = []
     for index, row in enumerate(rounds):
         tasks = row["tasks"]
+        round_count = config["tasks"] * config["concurrency"]
         require(type(row["round"]) is int and row["round"] == index
-                and row["attempted"] == config["tasks"]
-                and row["succeeded"] == config["tasks"]
-                and len(tasks) == config["tasks"], "incomplete workload round")
-        require(sorted(task["task"] for task in tasks) == list(range(config["tasks"])),
-                "duplicate or missing task identity")
+                and row["attempted"] == round_count
+                and row["succeeded"] == round_count
+                and len(tasks) == round_count, "incomplete workload round")
+        require(sorted((task["worker"], task["task"]) for task in tasks)
+                == [(worker, task) for worker in range(config["concurrency"])
+                    for task in range(config["tasks"])],
+                "duplicate or missing worker/task identity")
         for task in tasks:
             require(type(task["round"]) is int and task["round"] == index
                     and type(task["task"]) is int
@@ -144,11 +147,62 @@ def validate_tasks(receipt, config):
             "audit and workload durations disagree")
 
 
+def kernel_resource_statistics(attempts, control, candidate):
+    """Keep kernel charge observations separate from sampled PSS and wall time."""
+    metrics = (
+        ("cpu_usage_seconds", "owned CPU time"),
+        ("memory_peak_bytes", "owned memory charge peak"),
+    )
+    comparisons = {}
+    for metric, description in metrics:
+        errors, values = [], {}
+        for identity, kernel in attempts:
+            reason = None
+            if not isinstance(kernel, dict):
+                reason = "owned kernel accounting missing"
+            elif not (kernel.get("schema") == "greppy.kernel-resource-group.v1"
+                      and kernel.get("fresh_group") is True
+                      and kernel.get("populated") is False
+                      and kernel.get("target_entry_observed") is True
+                      and kernel.get("group_removed") is True
+                      and isinstance(kernel.get("memory_events"), dict)
+                      and type(kernel["memory_events"].get("oom_kill")) is int
+                      and kernel["memory_events"]["oom_kill"] == 0):
+                reason = "fresh completed owned group without OOM not verified"
+            value = kernel.get(metric) if isinstance(kernel, dict) else None
+            if reason is None:
+                valid = (type(value) is int and value > 0 if metric == "memory_peak_bytes"
+                         else type(value) in (int, float) and math.isfinite(value) and value > 0)
+                if not valid:
+                    reason = "positive kernel metric missing or invalid"
+            if reason is not None:
+                errors.append({"pair": identity[0], "position": identity[1],
+                               "label": identity[2], "reason": reason})
+            else:
+                values.setdefault(identity[0], {})[identity[2]] = value
+        comparison = {"qualified": not errors, "unqualified_attempts": errors,
+                      "planned_attempts": len(attempts), "pairs": [], "statistics": None}
+        if not errors:
+            pairs = [{"pair": pair, "control": value[control], "candidate": value[candidate],
+                      "ratio": value[candidate] / value[control]}
+                     for pair, value in values.items()]
+            stats = latency_statistics([pair["ratio"] for pair in pairs])
+            stats["conclusion"] = stats["conclusion"].replace("latency", description)
+            comparison.update(pairs=pairs, statistics=stats)
+        comparisons[metric] = comparison
+    return {"scope": "fresh owned cgroup CPU and memory charges through exit and cleanup; "
+                     "includes charged kernel/cache and descendants; shared or preexisting pages "
+                     "may be charged elsewhere; not sampled PSS or all physical RAM",
+            "comparisons": comparisons}
+
+
 def analyze(protocol_path, results_path, receipt_root, control="old", candidate="current"):
     plan, plan_sha = load_json(protocol_path)
     result, result_sha = load_json(results_path)
-    require(plan["schema"] == "greppy.cli-native-paired-protocol.v1"
+    require(plan["schema"] in ("greppy.cli-native-paired-protocol.v1",
+                               "greppy.cli-native-paired-protocol.v2")
             and plan["status"] == "planned", "unsupported fixed protocol")
+    coherent = plan["schema"] == "greppy.cli-native-paired-protocol.v2"
     require(result["protocol_sha256"] == plan_sha, "protocol hash mismatch")
     require(result["status"] == "fixed_schedule_completed", "comparison did not complete")
     require(plan["primary_metric"] == "complete process_cold_total_ms including explicit owner stop",
@@ -160,6 +214,14 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
     labels = {control, candidate}
     require(len(labels) == 2 and set(plan["runtime_sha256"]) == labels,
             "comparison requires two declared versions")
+    if coherent:
+        cli_hashes = plan["cli_sha256"]
+        require(type(cli_hashes) is dict and set(cli_hashes) == labels
+                and all(type(value) is str and len(value) == 64
+                        and set(value) <= set("0123456789abcdef")
+                        for value in cli_hashes.values()), "invalid version-bound CLI hashes")
+    else:
+        cli_hashes = {label: plan["cli_sha256"] for label in labels}
     schedule = plan["schedule"]
     require(1 <= len(schedule) <= MAX_EXACT_PAIRS, "exact comparison pair count exceeds bound")
     require(all(type(order) is list and len(order) == 2 and set(order) == labels
@@ -173,7 +235,7 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
             "invalid workload configuration")
     root = Path(receipt_root).resolve()
     pairs, states, receipt_names, common = {}, set(), set(), None
-    inputs = []
+    inputs, resource_attempts = [], []
     for row, identity in zip(rows, expected):
         require(type(row["pair"]) is int and type(row["position"]) is int
                 and (row["pair"], row["position"], row["label"]) == identity,
@@ -203,7 +265,7 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
         metrics, provenance = receipt["metrics"], receipt["cli_provenance"]
         require(receipt["configuration"] == row["configuration"] == config,
                 "workload configuration changed")
-        require(receipt["executable_sha256"] == provenance["sha256"] == plan["cli_sha256"]
+        require(receipt["executable_sha256"] == provenance["sha256"] == cli_hashes[identity[2]]
                 and provenance["runtime_sha256"] == plan["runtime_sha256"][identity[2]],
                 "configured executable identity mismatch")
         require(receipt["source_provenance"] == row["source"]
@@ -215,7 +277,8 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
                 and row["wall_ms"] == metrics["process_cold_total_ms"],
                 "invalid or inconsistent complete process time")
         validate_tasks(receipt, config)
-        require(row["independently_verified_tasks"] == config["rounds"] * config["tasks"],
+        require(row["independently_verified_tasks"] == (
+                    config["rounds"] * config["tasks"] * config["concurrency"]),
                 "summary task count disagrees")
         cleanup = json.loads(metrics["cleanup_stdout_tail"])
         require(cleanup["schema"] == "greppy.web-runtime.v1" and cleanup["status"] == "ok"
@@ -240,6 +303,7 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
             common = invariant
         require(common == invariant, "visible host capacity, workload or execution surface changed across versions")
         pairs.setdefault(identity[0], {})[identity[2]] = metrics["process_cold_total_ms"]
+        resource_attempts.append((identity, metrics.get("kernel_resource_accounting")))
         inputs.append({"pair": identity[0], "position": identity[1], "label": identity[2],
                        "receipt_sha256": digest})
     ratios = [pair[candidate] / pair[control] for pair in pairs.values()]
@@ -247,7 +311,7 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
     practical_supported = (practical is not None and stats["paired_median_ratio_interval"] is not None
         and stats["paired_median_ratio_interval"][1] <= 1 - practical / 100
         and stats["exact_randomization_p_two_sided_sharp_zero_effect"] <= 0.05)
-    return {
+    report = {
         "schema": "greppy.cli-native-paired-audit.v1",
         "analyzer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "protocol_sha256": plan_sha, "results_sha256": result_sha,
@@ -266,6 +330,12 @@ def analyze(protocol_path, results_path, receipt_root, control="old", candidate=
         "whole_family_cpu_ram_comparison": None,
         "scope": plan["scope"],
     }
+    if coherent:
+        report["schema"] = "greppy.cli-native-paired-audit.v2"
+        report["cli_sha256_by_version"] = cli_hashes
+        report["owned_kernel_resource_comparison"] = kernel_resource_statistics(
+            resource_attempts, control, candidate)
+    return report
 
 
 def main():

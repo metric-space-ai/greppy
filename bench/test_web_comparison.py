@@ -168,6 +168,95 @@ class ComparisonContract(unittest.TestCase):
         self.assertEqual(digest(self.result_path), before, "analysis overwrote its input evidence")
 
 
+class CoherentComparisonContract(unittest.TestCase):
+    """Version-bound execution identities and independently qualified resources."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="coherent-comparison-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        modeled_records(self.root)
+        self.result_path = self.root / "results.json"
+        self.result = json.loads(self.result_path.read_text())
+        plan_path = self.root / "protocol.json"
+        plan = json.loads(plan_path.read_text())
+        plan["schema"] = "greppy.cli-native-paired-protocol.v2"
+        plan["cli_sha256"] = {"old": "d" * 64, "current": "b" * 64}
+        plan["configuration"]["concurrency"] = 2
+        for row in self.result["runs"]:
+            path = self.root / row["receipt"]
+            receipt = json.loads(path.read_text())
+            receipt["configuration"]["concurrency"] = 2
+            row["configuration"]["concurrency"] = 2
+            cli_hash = plan["cli_sha256"][row["label"]]
+            receipt["executable_sha256"] = cli_hash
+            receipt["cli_provenance"]["sha256"] = cli_hash
+            receipt["metrics"]["kernel_resource_accounting"] = dict(
+                schema="greppy.kernel-resource-group.v1", fresh_group=True,
+                populated=False, target_entry_observed=True, group_removed=True,
+                memory_events={"oom_kill": 0},
+                cpu_usage_seconds=4.0 if row["label"] == "old" else 3.0,
+                memory_peak_bytes=104857600 if row["label"] == "old" else 52428800)
+            receipt["audit"].update(scheduled_tasks=2, reported_attempts=2,
+                independently_verified_completed_tasks=2, verified_task_durations_ms=[1, 1])
+            receipt["workload"]["rounds"] = [dict(round=0, attempted=2, succeeded=2,
+                tasks=[dict(round=0, worker=worker, task=0, duration_ms=1, ok=True, error=None)
+                       for worker in range(2)])]
+            row["independently_verified_tasks"] = 2
+            write_json(path, receipt)
+            row["receipt_sha256"] = digest(path)
+        write_json(plan_path, plan)
+        self.result["protocol_sha256"] = digest(plan_path)
+        write_json(self.result_path, self.result)
+
+    def audit(self):
+        return analyze(self.root / "protocol.json", self.result_path, self.root)
+
+    def alter_first_receipt(self, alter):
+        path = self.root / self.result["runs"][0]["receipt"]
+        receipt = json.loads(path.read_text())
+        alter(receipt)
+        write_json(path, receipt)
+        self.result["runs"][0]["receipt_sha256"] = digest(path)
+        write_json(self.result_path, self.result)
+
+    def test_coherent_pair_binds_cli_per_version_and_keeps_resource_units(self):
+        report = self.audit()
+        self.assertEqual(report["schema"], "greppy.cli-native-paired-audit.v2")
+        comparisons = report["owned_kernel_resource_comparison"]["comparisons"]
+        self.assertEqual(comparisons["cpu_usage_seconds"]["statistics"][
+            "paired_median_candidate_over_control"], 0.75)
+        self.assertEqual(comparisons["memory_peak_bytes"]["statistics"][
+            "paired_median_candidate_over_control"], 0.5)
+        self.assertIn("memory charge", comparisons["memory_peak_bytes"]["statistics"]["conclusion"])
+        self.assertFalse(report["whole_agent_resource_efficiency_proved"])
+        def wrong_cli(receipt):
+            receipt["executable_sha256"] = "b" * 64
+            receipt["cli_provenance"]["sha256"] = "b" * 64
+        self.alter_first_receipt(wrong_cli)
+        with self.assertRaises(InvalidComparison, msg="wrong CLI version was accepted"):
+            self.audit()
+
+    def test_missing_memory_does_not_drop_pairs_or_invalidate_wall_and_cpu(self):
+        self.alter_first_receipt(
+            lambda receipt: receipt["metrics"]["kernel_resource_accounting"].pop("memory_peak_bytes"))
+        report = self.audit()
+        comparisons = report["owned_kernel_resource_comparison"]["comparisons"]
+        memory = comparisons["memory_peak_bytes"]
+        self.assertFalse(memory["qualified"], "incomplete memory was qualified")
+        self.assertEqual(memory["pairs"], [])
+        self.assertIsNone(memory["statistics"])
+        self.assertEqual(memory["unqualified_attempts"][0]["label"], "old")
+        self.assertTrue(comparisons["cpu_usage_seconds"]["qualified"])
+        self.assertEqual(report["paired_median_candidate_over_control"], 0.9)
+
+    def test_duplicate_worker_cannot_replace_a_planned_worker(self):
+        self.alter_first_receipt(
+            lambda receipt: receipt["workload"]["rounds"][0]["tasks"][1].update(worker=0))
+        with self.assertRaises(InvalidComparison, msg="missing concurrent worker was accepted"):
+            self.audit()
+
+
 class StatisticalContract(unittest.TestCase):
     def test_exact_small_sample_inference_keeps_its_actual_coverage(self):
         six = latency_statistics([0.9] * 6)
