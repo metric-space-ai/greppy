@@ -3,6 +3,12 @@
 #[cfg(test)]
 #[test]
 fn dropping_proxy_terminates_an_active_tunnel() {
+    check_proxy_tunnel_drop(false);
+    check_proxy_tunnel_drop(true);
+}
+
+#[cfg(test)]
+fn check_proxy_tunnel_drop(half_closed: bool) {
     let origin = TcpListener::bind("127.0.0.1:0").unwrap();
     origin.set_nonblocking(true).unwrap();
     let proxy =
@@ -40,6 +46,15 @@ fn dropping_proxy_terminates_an_active_tunnel() {
         response.push(byte[0]);
     }
     assert!(response.starts_with(b"HTTP/1.1 200"));
+    if half_closed {
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).unwrap();
+        assert!(request.is_empty());
+        // Origin keeps its write side open with no response/EOF. Only that
+        // descriptor is now readable-interest eligible in the relay poll.
+    }
     assert_eq!(active.load(Ordering::Acquire), 1);
     drop(proxy);
     while active.load(Ordering::Acquire) != 0 {
@@ -390,13 +405,19 @@ fn accept_loop(
         let resolve = Arc::clone(&resolve);
         let transferred = Arc::clone(&transferred);
         let lifetime = Arc::clone(&lifetime);
-        let _ = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("greppy-policy-proxy-conn".into())
             .spawn(move || {
                 let _permit = permit;
                 let _connection = connection;
                 let _ = handle_client(stream, profile, resolve, transferred, lifetime);
             });
+        if let Err(error) = spawned {
+            #[cfg(unix)]
+            crate::worker_resource::report_thread_spawn_failure("policy proxy connection", &error);
+            #[cfg(not(unix))]
+            eprintln!("web-runtime: failed to spawn policy proxy connection: {error}");
+        }
     }
 }
 
@@ -435,6 +456,7 @@ fn handle_client(
             rest,
             &target,
             &transferred,
+            &lifetime,
         )?;
         if !keep {
             return Ok(());
@@ -448,7 +470,7 @@ fn handle_connect(
     resolve: ConnectResolve,
     target: &str,
     transferred: &Arc<AtomicU64>,
-    lifetime: &ProxyLifetime,
+    lifetime: &Arc<ProxyLifetime>,
 ) -> io::Result<()> {
     if crate::supervisor::phase_trace_enabled() {
         if crate::supervisor::phase_trace_enabled() {
@@ -458,6 +480,7 @@ fn handle_connect(
     let (host, port) = split_host_port(target, 80);
     match connect_allowed(profile.get(), &host, port, &resolve) {
         Ok(mut server) => {
+            let Some(_origin_connection) = lifetime.register(&server)? else { return Ok(()); };
             if lifetime.closing.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -496,6 +519,7 @@ fn handle_forward(
     rest: Vec<u8>,
     target: &str,
     transferred: &AtomicU64,
+    lifetime: &Arc<ProxyLifetime>,
 ) -> io::Result<bool> {
     let (host, port, path) = match parse_http_target(target, head) {
         Some(parsed) => parsed,
@@ -522,6 +546,7 @@ fn handle_forward(
         }
         Err(error) => return Err(error),
     };
+    let Some(_origin_connection) = lifetime.register(&server)? else { return Ok(false); };
     let mut rewritten = rewrite_request_line(head, &path);
     if !rewritten.contains("\r\nHost:") && !rewritten.to_ascii_lowercase().contains("\r\nhost:") {
         let host_header = if port == 80 {
