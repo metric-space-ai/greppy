@@ -6,46 +6,6 @@
 //! earlier applications never shift later targets. Overlapping ranges are
 //! rejected before anything is applied.
 
-#[cfg(test)]
-mod conditional_attribute_contract {
-    mod fixtures {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cli/tests/support/c_conditional_attribute.rs"
-        ));
-    }
-
-    #[test]
-    fn c_conditional_attribute_view_retains_both_branches() {
-        for (name, source, expected) in fixtures::c_attribute_cases() {
-            let raw = greppy_parser::parse(super::Language::C, source.as_bytes()).unwrap();
-            let view = super::syntax_validation_content(super::Language::C, source.as_bytes());
-            let counts = super::syntax_counts(super::Language::C, source.as_bytes()).unwrap();
-            eprintln!("C_ATTRIBUTE_RAW {name} {}", raw.root_node().to_sexp());
-            eprintln!("C_ATTRIBUTE_COUNTS {name} {counts:?}");
-            if expected == [true, true] {
-                assert_eq!(counts.errors + counts.missing, 0, "{name}");
-            } else {
-                assert!(counts.errors + counts.missing > 0, "{name}");
-            }
-            if name == "complete" || name == "complete-crlf" {
-                assert!(raw.root_node().has_error(), "original parser fault missing");
-                assert!(matches!(view, std::borrow::Cow::Owned(_)));
-                assert_eq!(view.len(), source.len());
-                for (before, after) in source.bytes().zip(view.iter()) {
-                    if matches!(before, b'\r' | b'\n') {
-                        assert_eq!(before, *after);
-                    }
-                }
-                let view = std::str::from_utf8(&view).unwrap();
-                assert!(view.contains("__attribute__((noipa))"));
-                assert!(view.contains("__attribute__((noinline))"));
-                assert!(view.contains("int example(int n) { return n+1; }"));
-            }
-        }
-    }
-}
-
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -1746,6 +1706,46 @@ mod tests {
                 s.file_sha256,
                 "mutation must change hash"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod conditional_attribute_contract {
+    mod fixtures {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cli/tests/support/c_conditional_attribute.rs"
+        ));
+    }
+
+    #[test]
+    fn c_conditional_attribute_view_retains_both_branches() {
+        for (name, source, expected) in fixtures::c_attribute_cases() {
+            let raw = greppy_parser::parse(super::Language::C, source.as_bytes()).unwrap();
+            let view = super::syntax_validation_content(super::Language::C, source.as_bytes());
+            let counts = super::syntax_counts(super::Language::C, source.as_bytes()).unwrap();
+            eprintln!("C_ATTRIBUTE_RAW {name} {}", raw.root_node().to_sexp());
+            eprintln!("C_ATTRIBUTE_COUNTS {name} {counts:?}");
+            if expected == [true, true] {
+                assert_eq!(counts.errors + counts.missing, 0, "{name}");
+            } else {
+                assert!(counts.errors + counts.missing > 0, "{name}");
+            }
+            if name == "complete" || name == "complete-crlf" {
+                assert!(raw.root_node().has_error(), "original parser fault missing");
+                assert!(matches!(view, std::borrow::Cow::Owned(_)));
+                assert_eq!(view.len(), source.len());
+                for (before, after) in source.bytes().zip(view.iter()) {
+                    if matches!(before, b'\r' | b'\n') {
+                        assert_eq!(before, *after);
+                    }
+                }
+                let view = std::str::from_utf8(&view).unwrap();
+                assert!(view.contains("__attribute__((noipa))"));
+                assert!(view.contains("__attribute__((noinline))"));
+                assert!(view.contains("int example(int n) { return n+1; }"));
+            }
         }
     }
 }
