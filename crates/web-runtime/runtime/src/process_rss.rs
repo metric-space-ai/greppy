@@ -1,7 +1,7 @@
 //! Linux RSS observation without creating a process for each sample.
 //!
-//! /proc/PID/status reports VmRSS in kB (1024 bytes). This remains an
-//! instantaneous, kernel-accounted RSS sample; it is not a PSS or leak check.
+//! /proc/PID/status reports VmRSS in kB (1024 bytes). Kernel RSS accounting
+//! is asynchronous and approximate; values may lag changes in resident memory.
 
 pub(crate) fn sample_rss_bytes(pid: u32) -> u64 {
     std::fs::read(format!("/proc/{pid}/status"))
