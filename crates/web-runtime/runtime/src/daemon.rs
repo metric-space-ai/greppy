@@ -6121,6 +6121,12 @@ fn redirect_chain(
     chain
 }
 
+#[cfg(target_os = "linux")]
+fn sample_rss_bytes(pid: u32) -> u64 {
+    crate::process_rss::sample_rss_bytes(pid)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn sample_rss_bytes(pid: u32) -> u64 {
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "rss="])
