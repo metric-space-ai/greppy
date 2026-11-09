@@ -196,7 +196,12 @@ class ProcessTreeMemorySampler:
                     "errno_name": errno.errorcode.get(number), "message": str(error),
                 })
                 continue
-            measured.append({"pid": pid, "starttime_ticks": table[pid][1]})
+            measured.append({
+                "pid": pid, "starttime_ticks": table[pid][1], "parent_pid": table[pid][0],
+                "pss_bytes": metrics["Pss"], "rss_bytes": metrics["Rss"],
+                "private_bytes": metrics["Private_Clean"] + metrics["Private_Dirty"],
+                "swap_pss_bytes": metrics.get("SwapPss", 0),
+            })
             pss_bytes += metrics["Pss"]
             rss_bytes += metrics["Rss"]
             private_bytes += metrics["Private_Clean"] + metrics["Private_Dirty"]
