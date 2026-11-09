@@ -252,6 +252,22 @@ fn run_late() -> Result<i32, String> {
         }
     }
     verify_symbols_absent(&copies[&old_diplomat[0]], &allocators, "diplomat-runtime")?;
+    // The measured ELF archives also share a weak COMDAT reference cell for
+    // __gxx_personality_v0. Isolate the SM cell and its references rather than
+    // permitting another shared global in the strict intersection gate.
+    let personality_refs = globals
+        .intersection(&v8_globals)
+        .filter(|name| name.as_str() == "DW.ref.__gxx_personality_v0")
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    redefine_linux_archive_symbols(private_sm, &personality_refs, "__greppy_sm_")?;
+    verify_symbols_absent(private_sm, &personality_refs, "personality reference")?;
+    verify_symbols_renamed(
+        private_sm, &personality_refs, "__greppy_sm_", "personality reference",
+    )?;
+    if !pending_symbols(&personality_refs, &archive_symbol_names(private_sm)?).is_empty() {
+        return Err("old personality reference names remain in the private archive".into());
+    }
     assert_symbol_intersection(private_sm, &v8[0])?;
     let final_args = original
         .iter()
