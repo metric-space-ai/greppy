@@ -420,6 +420,57 @@ def failure_cleanup(command, directory, env, cwd, resource_group):
                 process.wait(timeout=2)
 
 
+def qualify_cli_memory(measured):
+    """Keep observed values separate from qualified whole-execution samples."""
+    observed = measured['process_family_memory']
+    observed['scope'] = (
+        'non-atomic sampled Linux CLI/runtime descendant mappings; '
+        'excludes transient peaks, kernel/GPU/unmapped cache, fixture, harness and model providers')
+    measured['observed_process_family_memory'] = observed
+    family = measured['process_custody']
+    reasons = []
+    if not family['supported']:
+        reasons.append('kernel_custody_unavailable')
+    if not family['all_reaped']:
+        reasons.append('owned_processes_not_reaped')
+    if not family['runtime_image_observed']:
+        reasons.append('configured_runtime_image_not_observed')
+    if observed['incomplete_sample_count'] != 0:
+        reasons.append('incomplete_memory_samples')
+    if observed['peak_sampled_pss_bytes'] is None:
+        reasons.append('no_complete_pss_sample')
+    measured['process_family_memory'] = {
+        **observed,
+        'complete_for_execution_surface': not reasons,
+        'qualification_errors': reasons,
+        'peak_sampled_pss_bytes': None if reasons else observed['peak_sampled_pss_bytes'],
+        'peak_sampled_private_bytes': None if reasons else observed['peak_sampled_private_bytes'],
+        'scope': (
+            'unqualified whole CLI/runtime sampled memory: ' + ', '.join(reasons)
+            + '; observed samples remain separate' if reasons else
+            'non-atomic sampled Linux CLI/runtime family under kernel custody through explicit cleanup; '
+            'transient peaks, kernel/GPU/cache and model providers remain excluded'),
+    }
+
+
+def measurement_qualification(measured, execution_verified, cli):
+    """Exit0/quality_verified never implies that every resource metric qualifies."""
+    family = measured['process_custody']
+    custody = family['supported'] and family['all_reaped']
+    wall = execution_verified and custody and (not cli or family['runtime_image_observed'])
+    memory = measured['process_family_memory']
+    sampled = (memory.get('complete_for_execution_surface', False) if cli else
+               custody and memory['supported'] and memory['incomplete_sample_count'] == 0
+               and memory['peak_sampled_pss_bytes'] is not None)
+    return {
+        'execution_quality_verified': execution_verified,
+        'process_wall_time_verified': wall,
+        'sampled_process_family_memory_verified': execution_verified and sampled,
+        'memory_qualification_errors': memory.get('qualification_errors', []),
+        'scope': 'separate qualification; sampled memory is non-atomic and does not prove absence of leaks',
+    }
+
+
 def execute(command, directory, timeout, started=None, memory_log_path=None, *,
             env=None, cwd=None, cleanup_command=None, runtime_identity=None, resource_group=None,
             diagnostic_state=None):
@@ -818,28 +869,7 @@ def main():
                     != (runtime_after.st_dev, runtime_after.st_ino, runtime_after.st_size, runtime_after.st_mtime_ns)
                     or digest(runtime) != runtime_sha256):
                 valid, reason = False, 'CLI runtime executable changed during measurement'
-            measured['process_family_memory']['scope'] = (
-                'observed Linux CLI and runtime descendant mappings; sampled peaks are lower bounds; '
-                'detached roots are adopted when Linux kernel custody is supported; '
-                'excludes kernel/GPU/unmapped cache, fixture, harness and LLM/model providers')
-            observed = measured['process_family_memory']
-            measured['observed_process_family_memory'] = observed
-            measured['process_family_memory'] = {
-                **observed,
-                'peak_sampled_pss_bytes': None,
-                'peak_sampled_private_bytes': None,
-                'complete_for_execution_surface': False,
-                'scope': 'unknown whole CLI/runtime memory: complete kernel custody and the configured runtime image were not verified; observed samples are separate',
-            }
-            family = measured['process_custody']
-            if (family['supported'] and family['all_reaped'] and family['runtime_image_observed']
-                    and observed['incomplete_sample_count'] == 0
-                    and observed['peak_sampled_pss_bytes'] is not None):
-                measured['process_family_memory'] = {
-                    **observed,
-                    'complete_for_execution_surface': True,
-                    'scope': 'sampled Linux CLI/runtime family under kernel custody through explicit cleanup; transient peaks, kernel/GPU/cache and LLM/model providers remain excluded',
-                }
+            qualify_cli_memory(measured)
         measured['verified_completed_tasks_per_second_including_all_process_time'] = (
             audit['independently_verified_completed_tasks'] * 1000 / measured['process_cold_total_ms'])
         boundaries = [fixture.started_at] + [event[0] for event in fixture.round_events]
@@ -886,10 +916,13 @@ def main():
             except (ValueError, KeyError, IndexError, OSError):
                 receipt['quality_verified'] = valid = False
                 receipt['quality_error'] = reason = 'missing actual reference version/executable provenance'
+        receipt['measurement_qualification'] = measurement_qualification(measured, valid, state is not None)
+        receipt['quality_scope'] = 'execution and independently verified task outcomes; resource metrics qualify separately'
         with args.output.open('x') as output:
             json.dump(receipt, output, indent=2)
             output.write('\n')
-        print(json.dumps({'output': str(args.output), 'quality_verified': valid, 'quality_error': reason}))
+        print(json.dumps({'output': str(args.output), 'quality_verified': valid, 'quality_error': reason,
+                          'measurement_qualification': receipt['measurement_qualification']}))
         return 0 if valid else 1
     finally:
         fixture.shutdown()

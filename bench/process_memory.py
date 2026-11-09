@@ -8,6 +8,7 @@ be missed: sampled peaks are lower bounds, never OS-enforced memory ceilings.
 """
 
 import ctypes
+import errno
 import os
 from pathlib import Path
 import secrets
@@ -91,10 +92,14 @@ class ProcessFamilyCustody:
             self._exclusive.release()
 
 
+def _read_stat(pid):
+    fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+    return int(fields[1]), int(fields[19])  # PPID, starttime ticks
+
+
 def _stat(pid):
     try:
-        fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
-        return int(fields[1]), int(fields[19])  # PPID, starttime ticks
+        return _read_stat(pid)
     except (OSError, ValueError, IndexError):
         return None
 
@@ -169,13 +174,27 @@ class ProcessTreeMemorySampler:
         swap_pss_bytes = 0
         measured = []
         unreadable = []
+        failures = []
         for pid in sorted(live):
+            stage = "smaps_rollup"
+            observed_identity = None
             try:
                 metrics = _rollup(pid)
-                if _stat(pid) != table[pid]:
+                stage = "identity_after_rollup"
+                observed_identity = _read_stat(pid)
+                if observed_identity != table[pid]:
                     raise ValueError("process identity changed during sample")
-            except (OSError, ValueError):
+            except (OSError, ValueError, IndexError) as error:
                 unreadable.append(pid)
+                number = getattr(error, "errno", None)
+                failures.append({
+                    "pid": pid, "expected_parent_pid": table[pid][0],
+                    "expected_starttime_ticks": table[pid][1], "stage": stage,
+                    "observed_identity": (None if observed_identity is None else {
+                        "parent_pid": observed_identity[0], "starttime_ticks": observed_identity[1]}),
+                    "error_type": type(error).__name__, "errno": number,
+                    "errno_name": errno.errorcode.get(number), "message": str(error),
+                })
                 continue
             measured.append({"pid": pid, "starttime_ticks": table[pid][1]})
             pss_bytes += metrics["Pss"]
@@ -196,6 +215,7 @@ class ProcessTreeMemorySampler:
             "sample_finished_ns": time.monotonic_ns(),
             "processes": measured,
             "unreadable_pids": unreadable,
+            "read_failures": failures,
             "pss_bytes": pss_bytes if complete else None,
             "private_bytes": private_bytes if complete else None,
             "rss_sum_bytes": rss_bytes if complete else None,
