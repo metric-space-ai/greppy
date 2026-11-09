@@ -136,6 +136,8 @@ pub(crate) fn install_thread_spawn_failure_hook(protocol: Arc<Mutex<File>>) {
         // the worker group and returns the original ResourceLimit to the client.
         // The worker's JS threads are still live. Skip C++ atexit destructors;
         // the supervising process owns all process/file cleanup and reaping.
-        unsafe { libc::_exit(70); }
+        unsafe {
+            libc::_exit(70);
+        }
     }));
 }

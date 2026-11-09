@@ -22,19 +22,34 @@ struct Direction {
 impl Direction {
     fn new(source: &TcpStream, destination: &TcpStream) -> io::Result<Self> {
         Ok(Self {
-            bytes: [0; BUFFER_BYTES], start: 0, end: 0, eof: false, sent_eof: false,
-            read_timeout: source.read_timeout()?, write_timeout: destination.write_timeout()?,
-            read_wait: None, write_wait: None,
+            bytes: [0; BUFFER_BYTES],
+            start: 0,
+            end: 0,
+            eof: false,
+            sent_eof: false,
+            read_timeout: source.read_timeout()?,
+            write_timeout: destination.write_timeout()?,
+            read_wait: None,
+            write_wait: None,
         })
     }
 
-    fn pending(&self) -> bool { self.start < self.end }
-    fn complete(&self) -> bool { self.eof && !self.pending() }
-    fn can_read(&self) -> bool { !self.eof && !self.pending() }
+    fn pending(&self) -> bool {
+        self.start < self.end
+    }
+    fn complete(&self) -> bool {
+        self.eof && !self.pending()
+    }
+    fn can_read(&self) -> bool {
+        !self.eof && !self.pending()
+    }
 
-    fn transfer(&mut self, source: &mut TcpStream, destination: &mut TcpStream,
-        counter: &AtomicU64) -> io::Result<bool>
-    {
+    fn transfer(
+        &mut self,
+        source: &mut TcpStream,
+        destination: &mut TcpStream,
+        counter: &AtomicU64,
+    ) -> io::Result<bool> {
         let mut progress = false;
         if self.pending() {
             match destination.write(&self.bytes[self.start..self.end]) {
@@ -62,7 +77,8 @@ impl Direction {
                     progress = true;
                 }
                 Ok(read) => {
-                    self.start = 0; self.end = read;
+                    self.start = 0;
+                    self.end = read;
                     self.read_wait = None;
                     progress = true;
                 }
@@ -89,59 +105,78 @@ impl Direction {
 fn arm_timeout(wait: &mut Option<Instant>, timeout: Option<Duration>) -> io::Result<()> {
     if let Some(timeout) = timeout {
         let deadline = wait.get_or_insert_with(|| Instant::now() + timeout);
-        if Instant::now() >= *deadline { return Err(io::ErrorKind::TimedOut.into()); }
+        if Instant::now() >= *deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
-pub(crate) fn copy_bidirectional(a: &mut TcpStream, b: &mut TcpStream,
-    transferred: &AtomicU64) -> io::Result<()>
-{
+pub(crate) fn copy_bidirectional(
+    a: &mut TcpStream,
+    b: &mut TcpStream,
+    transferred: &AtomicU64,
+) -> io::Result<()> {
     copy_bidirectional_cancellable(a, b, transferred, None)
 }
 
-pub(crate) fn copy_bidirectional_cancellable(a: &mut TcpStream, b: &mut TcpStream,
-    transferred: &AtomicU64, closing: Option<&AtomicBool>) -> io::Result<()>
-{
+pub(crate) fn copy_bidirectional_cancellable(
+    a: &mut TcpStream,
+    b: &mut TcpStream,
+    transferred: &AtomicU64,
+    closing: Option<&AtomicBool>,
+) -> io::Result<()> {
     let mut up = Direction::new(a, b)?;
     let mut down = Direction::new(b, a)?;
     a.set_nonblocking(true)?;
     b.set_nonblocking(true)?;
-    let result = (|| {
-        loop {
-            if closing.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                return Err(io::ErrorKind::Interrupted.into());
+    let result = (|| loop {
+        if closing.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let progress_up = up.transfer(a, b, transferred)?;
+        let progress_down = down.transfer(b, a, transferred)?;
+        if up.complete() && down.complete() {
+            return Ok(());
+        }
+        if progress_up || progress_down {
+            continue;
+        }
+        let events = |read: bool, write: bool| {
+            (if read { libc::POLLIN } else { 0 }) | (if write { libc::POLLOUT } else { 0 })
+        };
+        let a_events = events(up.can_read(), down.pending());
+        let b_events = events(down.can_read(), up.pending());
+        let mut descriptors = [
+            libc::pollfd {
+                fd: if a_events == 0 { -1 } else { a.as_raw_fd() },
+                events: a_events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if b_events == 0 { -1 } else { b.as_raw_fd() },
+                events: b_events,
+                revents: 0,
+            },
+        ];
+        let remaining = [up.read_wait, up.write_wait, down.read_wait, down.write_wait]
+            .into_iter()
+            .flatten()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .min();
+        let timeout = remaining.map_or(-1, |value| {
+            value.as_millis().saturating_add(1).min(i32::MAX as u128) as i32
+        });
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
             }
-            let progress_up = up.transfer(a, b, transferred)?;
-            let progress_down = down.transfer(b, a, transferred)?;
-            if up.complete() && down.complete() { return Ok(()); }
-            if progress_up || progress_down { continue; }
-            let events = |read: bool, write: bool| {
-                (if read { libc::POLLIN } else { 0 }) |
-                (if write { libc::POLLOUT } else { 0 })
-            };
-            let a_events = events(up.can_read(), down.pending());
-            let b_events = events(down.can_read(), up.pending());
-            let mut descriptors = [
-                libc::pollfd { fd: if a_events == 0 { -1 } else { a.as_raw_fd() },
-                    events: a_events, revents: 0 },
-                libc::pollfd { fd: if b_events == 0 { -1 } else { b.as_raw_fd() },
-                    events: b_events, revents: 0 },
-            ];
-            let remaining = [up.read_wait, up.write_wait, down.read_wait, down.write_wait]
-                .into_iter().flatten().map(|deadline|
-                    deadline.saturating_duration_since(Instant::now())).min();
-            let timeout = remaining.map_or(-1, |value|
-                value.as_millis().saturating_add(1).min(i32::MAX as u128) as i32);
-            let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
-            }
-            if descriptors.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
-                return Err(io::ErrorKind::InvalidInput.into());
-            }
+        }
+        if descriptors.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
+            return Err(io::ErrorKind::InvalidInput.into());
         }
     })();
     if result.is_err() {
@@ -163,8 +198,12 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         for socket in [&client, &server] {
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
         }
         (client, server)
     }
@@ -175,8 +214,9 @@ mod tests {
         let (mut proxy_server, mut origin) = pair();
         let total = ArcCounter::default();
         let actual = total.0.clone();
-        let relay = thread::spawn(move ||
-            copy_bidirectional(&mut proxy_client, &mut proxy_server, &actual));
+        let relay = thread::spawn(move || {
+            copy_bidirectional(&mut proxy_client, &mut proxy_server, &actual)
+        });
         let request: Vec<u8> = (0..2 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
         let reply: Vec<u8> = request.iter().map(|v| 255 - v).collect();
         let upload = request.clone();
@@ -198,12 +238,16 @@ mod tests {
         });
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();
-        writer.join().unwrap(); responder.join().unwrap();
+        writer.join().unwrap();
+        responder.join().unwrap();
         let received = receiver.join().unwrap();
         relay.join().unwrap().unwrap();
         assert_eq!(received, request);
         assert_eq!(response, expected_reply);
-        assert_eq!(total.0.load(Ordering::Relaxed), (request.len() + response.len()) as u64);
+        assert_eq!(
+            total.0.load(Ordering::Relaxed),
+            (request.len() + response.len()) as u64
+        );
     }
 
     #[derive(Default)]
