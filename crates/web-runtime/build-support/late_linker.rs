@@ -88,6 +88,7 @@ fn response_bytes(args: &[OsString]) -> Vec<u8> {
 
 fn selected(args: &[OsString], prefix: &str) -> Vec<PathBuf> {
     args.iter().filter_map(|arg| {
+        if arg.as_bytes().first() == Some(&b'-') { return None; }
         let p = PathBuf::from(arg);
         let name = p.file_name()?.to_str()?;
         (name.starts_with(prefix) && name.ends_with(".rlib")).then_some(p)
