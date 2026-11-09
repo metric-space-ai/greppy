@@ -879,6 +879,94 @@ fn linter_rule_diagnostics_count_and_preserve_child_exit_and_stream_bytes() {
 }
 
 #[test]
+fn lld_diagnostic_headers_preserve_child_exit_counts_and_bytes() {
+    let workspace = fresh_workspace("lld-diagnostics");
+    let cases = [
+        (
+            "ld.lld: error: undefined symbol: diagnostic_test\n",
+            1,
+            "FAILED — exit 1: 1 error, 0 warnings\n",
+        ),
+        (
+            "ld.lld-14: error: undefined symbol: diagnostic_test\n",
+            1,
+            "FAILED — exit 1: 1 error, 0 warnings\n",
+        ),
+        (
+            "ld.lld: warning: unused entry symbol\n",
+            0,
+            "ok — exit 0, 1 warning\n",
+        ),
+        (
+            "ld.lld-14: warning: unused entry symbol\n",
+            0,
+            "ok — exit 0, 1 warning\n",
+        ),
+        (
+            "ld.lld-14x: error: prose lookalike\n",
+            1,
+            "FAILED — exit 1: 0 errors, 0 warnings\n",
+        ),
+        (
+            "ld.lld-: error: prose lookalike\n",
+            1,
+            "FAILED — exit 1: 0 errors, 0 warnings\n",
+        ),
+        (
+            "ld.lld-14: error budget was exceeded\n",
+            1,
+            "FAILED — exit 1: 0 errors, 0 warnings\n",
+        ),
+    ];
+    for (payload, exit, verdict) in cases {
+        let script = format!("printf '%s' \"$1\" >&2; exit {exit}");
+        let output = run(
+            &workspace,
+            &["bash-smart", "--", "sh", "-c", &script, "lld-fixture", payload],
+        );
+        assert_eq!(output.status.code(), Some(exit), "child exit changed");
+        assert_eq!(output.stdout, verdict.as_bytes(), "LLD verdict changed");
+        assert_eq!(output.stderr, payload.as_bytes(), "raw child stderr changed");
+    }
+}
+
+#[test]
+fn lld_diagnostic_blocks_keep_folded_raw_expansion() {
+    let workspace = fresh_workspace("lld-folded-expansion");
+    let diagnostic = "ld.lld-14: error: undefined symbol: diagnostic_test\n    referenced by fixture.o\n";
+    let payload = format!(
+        "{}{diagnostic}{}",
+        "ordinary progress\n".repeat(100),
+        "ordinary progress\n".repeat(100)
+    );
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$1\" >&2; exit 1",
+            "lld-folded-fixture",
+            &payload,
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "child exit changed");
+    let shown = text(&output.stdout);
+    assert!(
+        shown.starts_with("FAILED — exit 1: 1 error, 0 warnings\n"),
+        "{shown}"
+    );
+    for line in diagnostic.lines() {
+        assert!(shown.contains(line), "LLD raw block lost: {shown}");
+    }
+    let expanded = run(&workspace, &["expand", expand_id(&shown)]);
+    assert_eq!(expanded.status.code(), Some(0), "{}", text(&expanded.stderr));
+    assert!(expanded.stderr.is_empty());
+    assert!(text(&expanded.stdout).contains("ordinary progress\n"));
+}
+
+#[test]
 fn compiler_diagnostic_counts_preserve_child_exit_and_raw_bytes() {
     let workspace = fresh_workspace("compiler-diagnostic");
     let diagnostics = "/example/header.h:41:8: error: #error \"incompatible headers\"\n/example/main.c:9: warning: unused variable\n";
