@@ -2619,8 +2619,14 @@ fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
             assert!(message.contains("tree-sitter:"), "{message}");
             assert!(message.contains("nothing written"), "{message}");
             assert!(message.contains("compiler-valid file"), "{message}");
-            assert!(message.contains("without compiler preprocessing"), "{message}");
-            assert!(!message.contains("write this intermediate state"), "{message}");
+            assert!(
+                message.contains("without compiler preprocessing"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("write this intermediate state"),
+                "{message}"
+            );
             assert!(!message.contains("--allow-syntax-errors"), "{message}");
             assert_file(&path, before);
         }
