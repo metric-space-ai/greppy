@@ -2531,6 +2531,156 @@ fn replace_lines_syntax_error_names_allow_syntax_errors() {
     assert_file(&fixture.repo.join("item.rs"), before);
 }
 
+// These bytes are shared by the real CLI check and the opt-in compiler oracle.
+// GCC selects noipa; Clang selects noinline. Never infer one branch's validity
+// from the other compiler, or erase an unchecked branch to accept the source.
+const C_ATTRIBUTE_PREFIX: &str = "/* stable native observation boundary */\n#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((noipa))\n#elif defined(__clang__)\n__attribute__((noinline))\n#endif\n";
+
+fn c_attribute_cases() -> Vec<(&'static str, String, [bool; 2])> {
+    let function = "int example(int n) { return n+1; }\n";
+    vec![
+        (
+            "complete",
+            format!("{C_ATTRIBUTE_PREFIX}{function}"),
+            [true, true],
+        ),
+        (
+            "broken-body",
+            format!("{C_ATTRIBUTE_PREFIX}int example(int n) {{ return n+; }}\n"),
+            [false, false],
+        ),
+        (
+            "broken-gcc-attribute",
+            format!(
+                "{}{function}",
+                C_ATTRIBUTE_PREFIX.replace("__attribute__((noipa))", "__attribute__((noipa)")
+            ),
+            [false, true],
+        ),
+        (
+            "broken-clang-attribute",
+            format!(
+                "{}{function}",
+                C_ATTRIBUTE_PREFIX.replace("__attribute__((noinline))", "__attribute__((noinline)")
+            ),
+            [true, false],
+        ),
+        (
+            "broken-following-declaration",
+            format!("{C_ATTRIBUTE_PREFIX}{function}int broken = ;\n"),
+            [false, false],
+        ),
+    ]
+}
+
+#[test]
+fn c_conditional_attribute_refusal_explains_parser_scope_without_publishing() {
+    let fixture = Fixture::new("c-conditional-attribute-diagnostic");
+    let before = "int example(int n) { return n; }\n";
+    for (name, source, expected) in c_attribute_cases() {
+        if expected == [true, true] {
+            continue;
+        }
+        let file = format!("{name}.c");
+        let path = fixture.repo.join(&file);
+        std::fs::write(&path, before).unwrap();
+        for json in [false, true] {
+            let mut args = vec!["write", file.as_str(), source.as_str()];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+            let message = if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["published"], false);
+                assert_eq!(value["error"]["code"], "invalid_result");
+                let next = value["error"]["next"].as_str().unwrap();
+                assert!(next.contains("without compiler preprocessing"), "{next}");
+                value["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                combined(&output)
+            };
+            assert!(message.contains("tree-sitter:"), "{message}");
+            assert!(message.contains("nothing written"), "{message}");
+            assert!(message.contains("compiler-valid file"), "{message}");
+            assert!(message.contains("without compiler preprocessing"), "{message}");
+            assert!(!message.contains("write this intermediate state"), "{message}");
+            assert!(!message.contains("--allow-syntax-errors"), "{message}");
+            assert_file(&path, before);
+        }
+    }
+
+    // Ordinary supported C still writes. C++ keeps its existing guidance; this
+    // case is only a scope control, not a claimed C++ attribute reproduction.
+    let output = fixture.run(&[
+        "write",
+        "ordinary.c",
+        "__attribute__((noinline))\nint example(int n) { return n+1; }\n",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+    let cpp = fixture.repo.join("scope.cpp");
+    std::fs::write(&cpp, before).unwrap();
+    let output = fixture.run(&["write", "scope.cpp", "int broken = ;\n", "--json"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let next = value["error"]["next"].as_str().unwrap();
+    assert!(next.contains("--allow-syntax-errors"), "{next}");
+    assert!(!next.contains("without compiler preprocessing"), "{next}");
+    assert_file(&cpp, before);
+}
+
+#[test]
+#[ignore = "requires explicit GCC and Clang paths on the admitted build lane"]
+fn c_conditional_attribute_compiler_controls() {
+    let fixture = Fixture::new("c-conditional-attribute-compilers");
+    for (index, variable) in ["GREPPY_C_ATTRIBUTE_GCC", "GREPPY_C_ATTRIBUTE_CLANG"]
+        .iter()
+        .enumerate()
+    {
+        let compiler = std::env::var_os(variable).expect("set the real compiler path");
+        let version = Command::new(&compiler).arg("--version").output().unwrap();
+        assert!(version.status.success());
+        eprintln!(
+            "{variable}={compiler:?}: {}",
+            String::from_utf8_lossy(&version.stdout)
+        );
+        let macros = Command::new(&compiler)
+            .args(["-dM", "-E", "-x", "c", "-"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(macros.status.success());
+        let macros = String::from_utf8(macros.stdout).unwrap();
+        assert!(macros.contains("#define __GNUC__ "));
+        assert_eq!(macros.contains("#define __clang__ "), index == 1);
+        for (name, source, expected) in c_attribute_cases() {
+            let path = fixture.repo.join(format!("{name}.c"));
+            std::fs::write(&path, &source).unwrap();
+            let mut command = Command::new(&compiler);
+            command
+                .args([
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pedantic",
+                    "-fsyntax-only",
+                ])
+                .arg(&path)
+                .stdin(Stdio::null());
+            eprintln!("compiler fixture={name} bytes={source:?} argv={command:?}");
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("exit={:?} stderr={stderr}", output.status.code());
+            assert_eq!(output.status.success(), expected[index], "{name}: {stderr}");
+            if !expected[index] {
+                assert!(stderr.contains("error:"), "{name}: {stderr}");
+            }
+        }
+    }
+}
+
 #[test]
 fn allow_syntax_errors_writes_and_reports_new_diagnostics() {
     let fixture = Fixture::new("syntax-allow");
