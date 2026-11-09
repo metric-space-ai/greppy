@@ -41,6 +41,28 @@ CASES = [
 ]
 
 
+CASES += [
+    [
+        "receipt[\"executable_sha256\"] == provenance[\"sha256\"] == cli_hashes[identity[2]]",
+        "receipt[\"executable_sha256\"] == provenance[\"sha256\"] == provenance[\"sha256\"]",
+        "CoherentComparisonContract.test_coherent_pair_binds_cli_per_version_and_keeps_resource_units",
+        "wrong CLI version was accepted"
+    ],
+    [
+        "\"qualified\": not errors",
+        "\"qualified\": True",
+        "CoherentComparisonContract.test_missing_memory_does_not_drop_pairs_or_invalidate_wall_and_cpu",
+        "incomplete memory was qualified"
+    ],
+    [
+        "require(sorted((task[\"worker\"], task[\"task\"]) for task in tasks)\n                == [(worker, task) for worker in range(config[\"concurrency\"])\n                    for task in range(config[\"tasks\"])],\n                \"duplicate or missing worker/task identity\")",
+        "require(True, \"duplicate or missing worker/task identity\")",
+        "CoherentComparisonContract.test_duplicate_worker_cannot_replace_a_planned_worker",
+        "missing concurrent worker was accepted"
+    ]
+]
+
+
 def run(case=None):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     # Same-length source faults cannot be masked by bytecode from another case.
@@ -48,7 +70,7 @@ def run(case=None):
         env["PYTHONPYCACHEPREFIX"] = cache
         command = [sys.executable, "-B", "-X", "pycache_prefix=" + cache, TEST]
         if case:
-            command.append("ComparisonContract." + case)
+            command.append(case if "." in case else "ComparisonContract." + case)
         return subprocess.run(command, cwd=ROOT, env=env, text=True,
                               capture_output=True, timeout=30)
 
