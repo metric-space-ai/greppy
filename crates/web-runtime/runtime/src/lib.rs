@@ -5,6 +5,8 @@ mod shared_render_workers_contract;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/navigation_fixture_stream.rs"]
 mod navigation_fixture_stream_contract;
+#[cfg(target_os = "linux")]
+mod process_rss;
 pub mod artifacts;
 #[cfg(test)]
 mod download_staging;
