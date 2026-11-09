@@ -1141,6 +1141,7 @@ fn run_prompt(
         )),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
+        compact_at_tokens: crate::agent_tui::AgentSettings::load().compaction_thresholds(),
         ..AgentConfig::default()
     }
     .with_max_tokens(

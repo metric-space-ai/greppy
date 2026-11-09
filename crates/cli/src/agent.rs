@@ -82,6 +82,14 @@ usually does), set GREPPY_API_KEY; it is sent as x-api-key and
 Authorization: Bearer. There is no key flag on purpose — keys do not belong
 on the command line.
 
+Context limits: history is checkpointed once it reaches about 256 KiB. For a
+model whose real window is larger, set its limits in agent-settings.json
+(greppy agent /setup writes it; macOS ~/Library/Application Support/greppy,
+Linux ~/.config/greppy, or GREPPY_CONFIG_DIR), keyed by the exact model id:
+  \"models\": {\"M\": {\"context_window\": 1000000, \"compact_at_tokens\": 800000}}
+The checkpoint then starts when the prompt size the gateway reports reaches
+compact_at_tokens (default 80 % of context_window).
+
 Leading `-p` is reserved for the agent; to grep for the literal pattern `-p`,
 use `greppy -e -p …` (or place `-p` later in the invocation).
 
@@ -1116,6 +1124,13 @@ fn run_agent(
         model: model.clone(),
         deadline,
         deadline_total,
+        // Model limits apply to `greppy -p` too; the rest of the interactive
+        // settings does not.
+        compact_at_tokens: if interactive {
+            settings.compaction_thresholds()
+        } else {
+            crate::agent_tui::AgentSettings::load().compaction_thresholds()
+        },
         ..AgentConfig::default()
     }
     .with_max_tokens(

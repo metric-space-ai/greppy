@@ -26,6 +26,7 @@ use crate::model::ModelStream;
 use crate::protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, Usage,
 };
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,6 +64,11 @@ pub struct AgentConfig {
     /// after a tool returns. A running tool is never interrupted, so an
     /// in-flight edit cannot be left half-applied. Default: `None`.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Per-model compaction thresholds in prompt tokens, keyed by the exact
+    /// model id. A model listed here is compacted when its provider-reported
+    /// prompt reaches the threshold; any other model keeps the history byte
+    /// budget. Looked up by [`Self::model`] on every turn. Default: empty.
+    pub compact_at_tokens: BTreeMap<String, u64>,
 }
 
 impl PartialEq for AgentConfig {
@@ -77,6 +83,7 @@ impl PartialEq for AgentConfig {
             && self.consecutive_failure_stop == other.consecutive_failure_stop
             && self.deadline == other.deadline
             && self.deadline_total == other.deadline_total
+            && self.compact_at_tokens == other.compact_at_tokens
     }
 }
 
@@ -96,6 +103,7 @@ impl Default for AgentConfig {
             deadline: None,
             deadline_total: None,
             cancel: None,
+            compact_at_tokens: BTreeMap::new(),
         }
     }
 }
@@ -306,7 +314,8 @@ pub fn run_agent_loop_with_history(
 
     let mut total_usage = Usage::default();
     let mut turns: usize = 0;
-    let mut compaction_threshold = COMPACTION_BYTES;
+    let mut compaction =
+        CompactionTrigger::new(config.compact_at_tokens.get(&config.model).copied());
     // Every exit from the loop below sets this before `break`.
     let mut last_stop: LoopStop;
     let mut final_text = String::new();
@@ -331,7 +340,7 @@ pub fn run_agent_loop_with_history(
 
         // Snapshot the pre-compaction window only when a checkpoint is due,
         // not on every turn.
-        if crate::context::compaction_due(&messages, compaction_threshold) {
+        if let Some(max_bytes) = compaction.due(&messages, system.as_deref()) {
             let template = ModelRequest {
                 model: config.model.clone(),
                 system: system.clone(),
@@ -351,7 +360,7 @@ pub fn run_agent_loop_with_history(
                 &mut messages,
                 &mut system,
                 &template,
-                COMPACTION_BYTES,
+                max_bytes,
             );
             if let Err(first) = &outcome {
                 if !matches!(first.source, Some(ClientError::Cancelled)) {
@@ -363,14 +372,14 @@ pub fn run_agent_loop_with_history(
                         &mut messages,
                         &mut system,
                         &template,
-                        COMPACTION_BYTES,
+                        max_bytes,
                     );
                 }
             }
             match outcome {
                 Ok(Some(usage)) => {
                     total_usage = sum_usage(total_usage, usage);
-                    compaction_threshold = COMPACTION_BYTES;
+                    compaction.compacted();
                     on_event(LoopEvent::ContextCompacted {
                         archive,
                         messages: messages.clone(),
@@ -387,8 +396,7 @@ pub fn run_agent_loop_with_history(
                     if let Some(usage) = error.usage {
                         total_usage = sum_usage(total_usage, usage);
                     }
-                    compaction_threshold = crate::context::history_bytes(&messages)
-                        .saturating_add(COMPACTION_RETRY_GROWTH_BYTES);
+                    compaction.deferred(&messages, system.as_deref());
                 }
             }
         }
@@ -449,6 +457,7 @@ pub fn run_agent_loop_with_history(
         });
 
         messages.push(turn.message.clone());
+        compaction.observe(turn.usage, messages.len());
         final_text = extract_text(&turn.message);
 
         // A model request is not interrupted mid-frame, but its completion is
@@ -827,11 +836,103 @@ fn extract_text(message: &Message) -> String {
     out
 }
 
-/// History size that triggers a context checkpoint.
+/// History size that triggers a context checkpoint for a model without a
+/// configured token threshold. It counts history bytes only — not the system
+/// prompt, the rolling checkpoint inside it, or tool schemas — and bytes per
+/// token vary by tokenizer and language (prose in a language the tokenizer saw
+/// less of, e.g. German for an English/Chinese vocabulary, splits into more
+/// tokens per byte), so the prompt size at which it fires is not fixed.
 const COMPACTION_BYTES: usize = 256 * 1024;
 /// After a failed checkpoint, wait for this much more history before retrying,
 /// instead of re-asking on every turn.
 const COMPACTION_RETRY_GROWTH_BYTES: usize = 64 * 1024;
+const COMPACTION_RETRY_GROWTH_TOKENS: u64 = 16 * 1024;
+/// Bytes per token assumed for history appended since the last measured
+/// request (tool results). Low on purpose: it overestimates tokens.
+const UNMEASURED_BYTES_PER_TOKEN: usize = 2;
+/// Bytes per token above any real tokenizer's average. The prompt estimate is
+/// never below `bytes / this`, so a provider that reports only uncached input
+/// tokens cannot postpone compaction past the window.
+const FLOOR_BYTES_PER_TOKEN: usize = 6;
+
+/// Decides when the loop checkpoints history.
+///
+/// Without a configured threshold this is the history byte budget. With one,
+/// the decision follows the prompt size the provider reported for the latest
+/// request (input + cache read + cache creation + the answer), plus an
+/// overestimate of tool results appended since.
+struct CompactionTrigger {
+    configured_tokens: Option<u64>,
+    threshold_tokens: u64,
+    threshold_bytes: usize,
+    /// Reported prompt tokens of the last turn and the history length after it.
+    measured: Option<(u64, usize)>,
+}
+
+impl CompactionTrigger {
+    fn new(configured_tokens: Option<u64>) -> Self {
+        let configured_tokens = configured_tokens.filter(|tokens| *tokens > 0);
+        Self {
+            configured_tokens,
+            threshold_tokens: configured_tokens.unwrap_or(u64::MAX),
+            threshold_bytes: COMPACTION_BYTES,
+            measured: None,
+        }
+    }
+
+    fn observe(&mut self, usage: Usage, history_len: usize) {
+        let tokens = usage
+            .input_tokens
+            .saturating_add(usage.cache_read_input_tokens)
+            .saturating_add(usage.cache_creation_input_tokens)
+            .saturating_add(usage.output_tokens);
+        self.measured = Some((tokens, history_len));
+    }
+
+    fn estimated_tokens(&self, messages: &[Message], system: Option<&str>) -> u64 {
+        let bytes =
+            crate::context::history_bytes(messages).saturating_add(system.map_or(0, str::len));
+        let floor = (bytes / FLOOR_BYTES_PER_TOKEN) as u64;
+        let measured = match self.measured {
+            Some((tokens, len)) if len <= messages.len() => tokens.saturating_add(
+                (crate::context::history_bytes(&messages[len..]) / UNMEASURED_BYTES_PER_TOKEN)
+                    as u64,
+            ),
+            _ => 0,
+        };
+        floor.max(measured)
+    }
+
+    /// The byte budget to plan the checkpoint with, when one is due.
+    fn due(&self, messages: &[Message], system: Option<&str>) -> Option<usize> {
+        if self.configured_tokens.is_none() {
+            return crate::context::compaction_due(messages, self.threshold_bytes)
+                .then_some(COMPACTION_BYTES);
+        }
+        if self.estimated_tokens(messages, system) < self.threshold_tokens {
+            return None;
+        }
+        // Keep about half of the current history, like the byte budget does.
+        let budget = crate::context::history_bytes(messages).saturating_sub(1);
+        crate::context::compaction_due(messages, budget).then_some(budget)
+    }
+
+    fn compacted(&mut self) {
+        self.threshold_tokens = self.configured_tokens.unwrap_or(u64::MAX);
+        self.threshold_bytes = COMPACTION_BYTES;
+        self.measured = None;
+    }
+
+    fn deferred(&mut self, messages: &[Message], system: Option<&str>) {
+        self.threshold_bytes =
+            crate::context::history_bytes(messages).saturating_add(COMPACTION_RETRY_GROWTH_BYTES);
+        if self.configured_tokens.is_some() {
+            self.threshold_tokens = self
+                .estimated_tokens(messages, system)
+                .saturating_add(COMPACTION_RETRY_GROWTH_TOKENS);
+        }
+    }
+}
 
 fn sum_usage(a: Usage, b: Usage) -> Usage {
     Usage {
@@ -1329,6 +1430,139 @@ mod tests {
             .any(|event| matches!(event, LoopEvent::ContextCompacted { .. })));
         // Usage of the rejected checkpoint answers is still counted.
         assert!(result.usage.input_tokens >= 40 + 20 * model.checkpoints as u64);
+    }
+
+    /// Reports a scripted prompt size per action turn; records the action
+    /// turn before which each checkpoint was requested.
+    struct ReportedPromptModel {
+        prompt_tokens: Vec<u64>,
+        actions: usize,
+        checkpoints_before_action: Vec<usize>,
+    }
+
+    impl ModelStream for ReportedPromptModel {
+        fn stream_turn(
+            &mut self,
+            req: &ModelRequest,
+            _: &mut dyn FnMut(StreamEvent),
+        ) -> Result<TurnResult, ClientError> {
+            if req
+                .system
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Create an accurate continuation checkpoint"))
+            {
+                self.checkpoints_before_action.push(self.actions);
+                let state = json!({"task":"Fix clamp", "constraints":[], "decisions":[],
+                    "changed_files":[], "tests_results":[], "open_work":["continue"],
+                    "recovery_ids":[]});
+                return text_turn(&state.to_string(), usage(20, 5)).result;
+            }
+            if self.actions == self.prompt_tokens.len() {
+                return text_turn("done", usage(1, 1)).result;
+            }
+            let reported = self.prompt_tokens[self.actions];
+            self.actions += 1;
+            tool_turn(
+                None,
+                vec![(&format!("call-{}", self.actions), "echo", json!({}))],
+                usage(reported, 1),
+            )
+            .result
+        }
+    }
+
+    #[test]
+    fn configured_token_window_compacts_near_its_threshold_not_at_the_byte_budget() {
+        // gpu4 DeepSeek (1M window, threshold 800k) compacted at 76k/90k prompt
+        // tokens: the byte budget fired long before the configured window.
+        // 20 actions of 16 KiB tool output exceed the 256 KiB byte budget while
+        // the provider reports a 128k prompt; then the prompt reaches 805k and,
+        // after the checkpoint, drops to 420k.
+        let mut prompt_tokens = vec![128_000; 20];
+        prompt_tokens.extend([790_000, 805_000, 420_000]);
+        let output = ToolOutcome::ok("Prüfung der Grenzwerte ergab: ".repeat(512));
+        assert!(20 * output.content.len() > COMPACTION_BYTES);
+        let model_id = "DeepSeek-V4.1-Flash\u{ff20}gpu4-a4500";
+        let configured = AgentConfig {
+            compact_at_tokens: BTreeMap::from([(model_id.to_string(), 800_000)]),
+            ..AgentConfig::default().with_model(model_id)
+        };
+
+        let mut model = ReportedPromptModel {
+            prompt_tokens: prompt_tokens.clone(),
+            actions: 0,
+            checkpoints_before_action: Vec::new(),
+        };
+        let mut env = FakeEnv::new(vec![echo_tool()]).with_outcome("echo", output.clone());
+        let (result, events) = run(&mut model, &mut env, &configured, "Fix clamp").unwrap();
+        assert_eq!(result.stop, LoopStop::EndTurn);
+        // Nothing at a reported 128k or 790k; one checkpoint right after the
+        // turn that reported 805k (action 22), none after that.
+        assert_eq!(model.checkpoints_before_action, vec![22]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LoopEvent::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+
+        // The same history under a model without a configured window still
+        // compacts on the byte budget, i.e. well before 800k.
+        for unconfigured in [
+            AgentConfig::default().with_model("other-model"),
+            AgentConfig {
+                compact_at_tokens: BTreeMap::from([("other-model".to_string(), 800_000)]),
+                ..AgentConfig::default().with_model(model_id)
+            },
+        ] {
+            let mut model = ReportedPromptModel {
+                prompt_tokens: prompt_tokens.clone(),
+                actions: 0,
+                checkpoints_before_action: Vec::new(),
+            };
+            let mut env = FakeEnv::new(vec![echo_tool()]).with_outcome("echo", output.clone());
+            run(&mut model, &mut env, &unconfigured, "Fix clamp").unwrap();
+            assert!(
+                model
+                    .checkpoints_before_action
+                    .first()
+                    .is_some_and(|n| *n < 20),
+                "{:?}",
+                model.checkpoints_before_action
+            );
+        }
+    }
+
+    #[test]
+    fn token_trigger_counts_unmeasured_tool_output_and_underreported_prompts() {
+        let at = 100_000;
+        let mut trigger = CompactionTrigger::new(Some(at));
+        let text = |role, text: String| Message {
+            role,
+            content: vec![ContentPart::Text { text }],
+        };
+        let mut messages: Vec<Message> = (0..8)
+            .flat_map(|i| {
+                [
+                    text(Role::User, format!("step {i}")),
+                    text(Role::Assistant, "ok ".repeat(100)),
+                ]
+            })
+            .collect();
+        trigger.observe(usage(90_000, 10), messages.len());
+        assert_eq!(trigger.due(&messages, None), None);
+        // A 40 KB tool result appended after the measurement counts as ≥20k tokens.
+        messages.push(text(Role::User, "x".repeat(40_000)));
+        assert!(trigger.due(&messages, None).is_some());
+
+        // A provider that reports only the uncached tail cannot hide a prompt
+        // whose bytes alone exceed the threshold.
+        let mut trigger = CompactionTrigger::new(Some(at));
+        trigger.observe(usage(24, 1), messages.len());
+        let system = "s".repeat(at as usize * FLOOR_BYTES_PER_TOKEN);
+        assert!(trigger.due(&messages, Some(&system)).is_some());
+        assert_eq!(trigger.due(&messages, None), None);
     }
 
     #[test]
