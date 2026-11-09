@@ -1510,13 +1510,13 @@ fn apply_file_nodes(
     // files and needs the per-file delete-then-insert for correctness.
     insert_content: bool,
 ) -> Result<()> {
-    // Delete any prior nodes for this file BEFORE inserting
-    // the new ones. The FK cascade on `edges.source_id` /
-    // `edges.target_id` removes orphaned edges in the same
-    // transaction. This per-file deletion is preserved exactly under
-    // the two-phase split — each file is still individually cleaned
-    // before its fresh nodes land.
-    let _removed = store.delete_nodes_for_file(project, rel_path)?;
+    // A revision-only refresh has proven identical source bytes. Preserve
+    // unchanged definition identities and their content-addressed vectors;
+    // ordinary source edits retain the existing delete/reinsert behavior.
+    let revision_only = store.get_file_state(project, rel_path)?.is_some_and(|old| {
+        old.sha256 == file_state::sha256_hex(bytes)
+            && !greppy_parser::extraction_revision_matches(abs_path, &old.extractor_version)
+    });
 
     // Also delete prior file-content rows before the new
     // content is inserted, so a renamed/removed symbol's content
@@ -1558,6 +1558,40 @@ fn apply_file_nodes(
     for n in nodes {
         new_nodes.push(new_node_for(project, rel_path, n.clone()));
     }
+    if revision_only {
+        let expected = new_nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect::<std::collections::HashMap<_, _>>();
+        // Match the old cascade's edge boundary while retaining exact nodes.
+        // Raw rows below are replaced and the existing resolver regenerates
+        // these relations against the new definition set.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.edges WHERE project=?1 AND (
+                source_id IN (SELECT id FROM main.nodes WHERE project=?1 AND file_path=?2)
+                OR target_id IN (SELECT id FROM main.nodes WHERE project=?1 AND file_path=?2))",
+                rusqlite::params![project, rel_path],
+            )
+            .map_err(sqlite_err)?;
+        for old in store.list_nodes_for_file(project, rel_path)? {
+            let unchanged = expected
+                .get(old.qualified_name.as_str())
+                .is_some_and(|new| {
+                    old.label == new.label
+                        && old.name == new.name
+                        && old.start_line == new.start_line
+                        && old.end_line == new.end_line
+                        && old.properties == new.properties
+                });
+            if !unchanged && old.id > 0 {
+                store.delete_node(old.id)?;
+            }
+        }
+    } else {
+        let _removed = store.delete_nodes_for_file(project, rel_path)?;
+    }
     store.insert_nodes(&new_nodes)?;
 
     // Feed indexed file-content rows for `search-code`. We
@@ -1585,7 +1619,10 @@ fn apply_file_nodes(
         mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-        extractor_version: "greppy-extractor-v1".into(),
+        extractor_version: greppy_parser::extraction_revision(greppy_parser::language_for_path(
+            abs_path,
+        ))
+        .into(),
         last_indexed_generation: generation,
     };
     store.upsert_file_state(&fs)?;
@@ -6362,6 +6399,20 @@ impl GraphIndex {
             .iter()
             .filter(|node| node.file_path == referrer_file)
             .collect::<Vec<_>>();
+        // Distinct same-name Rust free functions can be conditional siblings.
+        // Their source identities do not prove which cfg is active. Preserve
+        // ambiguity before the historical local label/id preference can pick
+        // one variant merely because it was inserted first.
+        if referrer_file.ends_with(".rs")
+            && local
+                .iter()
+                .filter(|node| node.label == "Function")
+                .take(2)
+                .count()
+                > 1
+        {
+            return UniqueResolution::Ambiguous;
+        }
         if let Some(target) = local
             .iter()
             .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
@@ -6606,6 +6657,9 @@ impl GraphIndex {
         {
             if let Some(fact) = edge.properties.get("receiver_provenance") {
                 let kind = fact.get("kind").and_then(|value| value.as_str());
+                if kind == Some("cpp_direct_member") {
+                    return self.resolve_cpp_member_receiver(fact, name);
+                }
                 if kind == Some("direct_self_field") || kind == Some("typed_field_chain") {
                     return self.resolve_direct_self_field_receiver(src_id, fact, name);
                 }
@@ -6912,6 +6966,37 @@ impl GraphIndex {
             [id] => Some(*id),
             _ => None,
         }
+    }
+
+    /// Both the field owner and its payload must identify one C/C++ class.
+    /// No inheritance, wrapper inference or bare method-name fallback.
+    fn resolve_cpp_member_receiver(&self, fact: &serde_json::Value, name: &str) -> Option<i64> {
+        let unique_class = |name: &str| {
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return None;
+            }
+            let owners = self
+                .defs_named(&["Class"], name)
+                .into_iter()
+                .filter(|n| resolution_language_family(&n.file_path) == "c")
+                .collect::<Vec<_>>();
+            match owners.as_slice() {
+                [owner] => Some(owner.id),
+                _ => None,
+            }
+        };
+        let owner = unique_class(fact.get("base_type")?.as_str()?)?;
+        let field = self.by_qname(&format!(
+            "{}::{}",
+            self.qname_for_id(owner)?,
+            fact.get("field")?.as_str()?
+        ))?;
+        if field.label != "Field" {
+            return None;
+        }
+        let payload = unique_class(field.declared_type.as_deref()?.trim())?;
+        let payload_name = self.qname_for_id(payload)?.rsplit("::").next()?;
+        self.resolve_receiver_method(self.file_of(payload)?, payload_name, name)
     }
 
     fn resolve_direct_self_field_receiver(
@@ -8068,7 +8153,10 @@ fn record_unsupported_file_state(
             mtime_ns: metadata.mtime_ns.unwrap_or(0),
             size: md.len() as i64,
             parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-            extractor_version: "greppy-extractor-v1".into(),
+            extractor_version: greppy_parser::extraction_revision(
+                greppy_parser::language_for_path(&entry.abs_path),
+            )
+            .into(),
             last_indexed_generation: generation,
         };
         let _ = store.upsert_file_state(&fs);
@@ -8095,7 +8183,10 @@ fn record_unsupported_file_state(
         mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
-        extractor_version: "greppy-extractor-v1".into(),
+        extractor_version: greppy_parser::extraction_revision(greppy_parser::language_for_path(
+            &entry.abs_path,
+        ))
+        .into(),
         last_indexed_generation: generation,
     };
     let _ = store.upsert_file_state(&fs);
