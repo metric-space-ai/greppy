@@ -1,8 +1,10 @@
 //! Turn unrecoverable thread creation failures into a bounded worker failure.
 //! Ordinary page/decoder panics keep Servo's existing handling. Only an actual
 //! OS thread-allocation error takes this path; this is not a retry/timeout gate.
+#[cfg(feature = "content-runtime")]
 use std::fs::File;
 use std::io;
+#[cfg(feature = "content-runtime")]
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn spawn_error(context: &str, error: &io::Error) -> String {

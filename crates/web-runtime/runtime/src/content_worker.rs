@@ -2,7 +2,7 @@ use crate::history_receipt::HistoryReceipt;
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
 use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
-    read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
+    read_message, timeout_ms_from_json, Message, WorkerKind, MAX_FRAME_BYTES,
 };
 use crate::selector_runtime::SELECTOR_RUNTIME;
 use crate::web_api_shims::shim_source;
@@ -29,6 +29,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
+
+#[cfg(test)]
+use crate::protocol::write_message;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";

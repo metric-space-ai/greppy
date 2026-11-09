@@ -33,6 +33,8 @@ mod history_receipt;
 pub mod policy;
 pub mod profile_lock;
 pub mod policy_proxy;
+#[cfg(unix)]
+mod proxy_tunnel;
 pub mod playwright_trace;
 pub mod protocol;
 pub mod record_usage;

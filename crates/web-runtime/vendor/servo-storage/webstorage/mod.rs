@@ -4,7 +4,6 @@
 
 mod engines;
 
-use std::borrow::ToOwned;
 use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;

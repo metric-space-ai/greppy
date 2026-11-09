@@ -465,6 +465,14 @@ fn read_headers(stream: &mut TcpStream) -> io::Result<(String, Vec<u8>)> {
     ))
 }
 
+#[cfg(unix)]
+fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io::Result<()> {
+    let _ = a.set_nodelay(true);
+    let _ = b.set_nodelay(true);
+    crate::proxy_tunnel::copy_bidirectional(&mut a, &mut b, &transferred)
+}
+
+#[cfg(not(unix))]
 fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io::Result<()> {
     let _ = a.set_nodelay(true);
     let _ = b.set_nodelay(true);
