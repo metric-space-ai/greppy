@@ -133,6 +133,7 @@ fn project_path(root: &Path, text: &str, report: &serde_json::Value) -> EditResu
     Ok(path)
 }
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    if !std::fs::metadata(path)?.is_file() { return Err(std::io::Error::other("input is not a regular file")); }
     let file = std::fs::File::open(path)?;
     if !file.metadata()?.is_file() { return Err(std::io::Error::other("input is not a regular file")); }
     let mut bytes = Vec::new();
