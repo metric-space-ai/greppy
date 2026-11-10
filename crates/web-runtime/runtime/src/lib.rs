@@ -2,6 +2,10 @@
 #[allow(dead_code)]
 #[path = "../../vendor/servo-paint/shared_render_workers.rs"]
 mod shared_render_workers_contract;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../vendor/servo-storage/shared_workers.rs"]
+mod shared_storage_workers_contract;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/navigation_fixture_stream.rs"]
 mod navigation_fixture_stream_contract;

@@ -33,6 +33,9 @@ http = { version = "1", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+crossbeam-channel = "=0.5.16"
+servo-base = "=0.5.0"
+servo-config = "=0.5.0"
 fst = "0.4"
 rayon = "=1.12.0"
 
