@@ -973,9 +973,28 @@ fn lld_diagnostic_blocks_survive_folded_output() {
     for line in diagnostic.lines() {
         assert!(shown.contains(line), "LLD raw block lost: {shown}");
     }
+    let folded_stderr = text(&output.stderr);
     assert!(
-        shown.lines().count() < 100,
+        shown.lines().count() + folded_stderr.lines().count() < 100,
         "ordinary output wall was not compacted"
+    );
+    let expanded = run(&workspace, &["expand", expand_id(&folded_stderr)]);
+    assert_eq!(
+        expanded.status.code(),
+        Some(0),
+        "{}",
+        text(&expanded.stderr)
+    );
+    assert!(expanded.stderr.is_empty());
+    let expected_raw = format!(
+        "{}{diagnostic}{}",
+        "ordinary progress\n".repeat(79),
+        "ordinary progress\n".repeat(39)
+    );
+    assert_eq!(
+        expanded.stdout,
+        expected_raw.as_bytes(),
+        "focused LLD raw expansion changed"
     );
 }
 
