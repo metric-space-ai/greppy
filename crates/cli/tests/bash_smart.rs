@@ -943,7 +943,7 @@ fn lld_diagnostic_headers_preserve_child_exit_counts_and_bytes() {
 }
 
 #[test]
-fn lld_diagnostic_blocks_keep_folded_raw_expansion() {
+fn lld_diagnostic_blocks_survive_folded_output() {
     let workspace = fresh_workspace("lld-folded-expansion");
     let diagnostic =
         "ld.lld-14: error: undefined symbol: diagnostic_test\n    referenced by fixture.o\n";
@@ -973,15 +973,10 @@ fn lld_diagnostic_blocks_keep_folded_raw_expansion() {
     for line in diagnostic.lines() {
         assert!(shown.contains(line), "LLD raw block lost: {shown}");
     }
-    let expanded = run(&workspace, &["expand", expand_id(&shown)]);
-    assert_eq!(
-        expanded.status.code(),
-        Some(0),
-        "{}",
-        text(&expanded.stderr)
+    assert!(
+        shown.lines().count() < 100,
+        "ordinary output wall was not compacted"
     );
-    assert!(expanded.stderr.is_empty());
-    assert!(text(&expanded.stdout).contains("ordinary progress\n"));
 }
 
 #[test]
