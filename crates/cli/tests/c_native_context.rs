@@ -30,6 +30,15 @@ fn value(out:&Output)->serde_json::Value {serde_json::from_slice(&out.stdout).un
 fn code(out:&Output,expected:i32) {assert_eq!(out.status.code(),Some(expected),"stdout={} stderr={}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));}
 fn add_patch(file:&str,source:&str)->String {format!("*** Begin Patch\n*** Add File: {file}\n{}*** End Patch\n",source.lines().map(|l|format!("+{l}\n")).collect::<String>())}
 #[test]
+fn native_c_rejected_patch_never_publishes() {
+    let f=Fixture::new();f.context("source.c",None,20);
+    let invalid=format!("{SOURCE}\nint broken(void) {{ return +; }}\n");
+    let patch=add_patch("source.c",&invalid);
+    let refused=f.run(&["patch","--c-context","context.json","--json"],patch.as_bytes(),None);
+    code(&refused,14);assert_eq!(value(&refused)["error"]["c_validation"]["status"],"rejected");
+    assert!(!f.root.join("source.c").exists(),"compiler-rejected transaction must not publish");
+}
+#[test]
 fn native_c_transaction_requires_real_compiler_success() {
     let f=Fixture::new();f.context("source.c",None,20);
     for source in [SOURCE.to_string(),SOURCE.replace('\n',"\r\n")] {
@@ -40,11 +49,6 @@ fn native_c_transaction_requires_real_compiler_success() {
         assert!(record["c_validation"]["raw_parser_observations"][0]["errors"].as_u64().unwrap()>0);
         fs::remove_file(f.root.join("source.c")).unwrap();
     }
-    let invalid=format!("{SOURCE}\nint broken(void) {{ return +; }}\n");
-    let patch=add_patch("source.c",&invalid);
-    let refused=f.run(&["patch","--c-context","context.json","--json"],patch.as_bytes(),None);
-    code(&refused,14);assert_eq!(value(&refused)["error"]["c_validation"]["status"],"rejected");
-    assert!(!f.root.join("source.c").exists(),"compiler-rejected transaction must not publish");
     // A header and its consumer are checked together in the staged proposal.
     let patch=format!("*** Begin Patch\n*** Update File: config.h\n@@\n-#define VALUE 7\n+#define VALUE 9\n*** Add File: source.c\n{}*** End Patch\n",SOURCE.lines().map(|l|format!("+{l}\n")).collect::<String>());
     let accepted=f.run(&["patch","--c-context","context.json","--json"],patch.as_bytes(),None);code(&accepted,0);
