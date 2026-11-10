@@ -5863,17 +5863,17 @@ mod serialize_tests {
 
     #[test]
     fn bounded_network_retention_reports_dropped_and_retained_counts() {
-        let dropped = Cell::new(0);
-        let mut records = vec![json!(1), json!(2), json!(3)];
-        retain_bounded(&mut records, &dropped, 2);
-        assert_eq!(records, vec![json!(2), json!(3)]);
-        assert_eq!(dropped.get(), 1);
+        let mut records = RetainedRecords::new(2, 1024);
+        for value in [json!(1), json!(2), json!(3)] {
+            records.push(value);
+        }
+        assert_eq!(records.snapshot().unwrap(), &[json!(2), json!(3)]);
+        assert_eq!(records.dropped(), 1);
         records.push(json!(4));
-        retain_bounded(&mut records, &dropped, 2);
-        assert_eq!(records, vec![json!(3), json!(4)]);
-        assert_eq!(dropped.get(), 2);
+        assert_eq!(records.snapshot().unwrap(), &[json!(3), json!(4)]);
+        assert_eq!(records.dropped(), 2);
         assert_eq!(
-            network_retention_metadata(records.len(), dropped.get()),
+            network_retention_metadata(records.len(), records.dropped()),
             json!({
                 "limit": MAX_NETWORK_RECORDS_PER_PAGE,
                 "retained": 2,
