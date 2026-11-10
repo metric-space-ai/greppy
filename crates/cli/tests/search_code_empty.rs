@@ -185,7 +185,8 @@ fn scoped_pattern_miss_discloses_excluded_tracked_source() {
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     println!("excluded tracked source scoped result:\n{stdout}");
     assert!(
-        stdout.contains("scope: live Greppy-discovered source files under path filter tests/target"),
+        stdout
+            .contains("scope: live Greppy-discovered source files under path filter tests/target"),
         "{stdout}"
     );
     assert!(stdout.contains("excluded files"), "{stdout}");
