@@ -343,13 +343,16 @@ fn search_pattern_no_match_status(query: &str, fixed: bool, path_filters: &Query
         println!("scope: live Greppy-discovered source files in the repository");
         println!("message: no matches");
     } else {
-        println!("scope: path filter {}", path_filters.shown());
+        println!(
+            "scope: live Greppy-discovered source files under path filter {}",
+            path_filters.shown()
+        );
         println!(
             "message: no matches under path filter: {}",
             path_filters.shown()
         );
         println!(
-            "reason: no source match exists inside this scope; paths outside it were not scanned"
+            "reason: no match in the discovered source inside this scope; excluded files and paths outside it were not scanned"
         );
         let mode = if fixed { " --fixed" } else { "" };
         println!(
