@@ -484,12 +484,13 @@ fn execution(
 // Only primary GCC/Clang diagnostics with a staged source location can prove
 // rejection. Quoted source/caret lines and stdout are not diagnostic records.
 fn staged_diagnostic<'a>(line: &'a str, staged: &Path) -> Option<(bool, &'a str)> {
-    let (location, message, fatal) = if let Some((location, message)) = line.split_once(": fatal error: ") {
-        (location, message, true)
-    } else {
-        let (location, message) = line.split_once(": error: ")?;
-        (location, message, false)
-    };
+    let (location, message, fatal) =
+        if let Some((location, message)) = line.split_once(": fatal error: ") {
+            (location, message, true)
+        } else {
+            let (location, message) = line.split_once(": error: ")?;
+            (location, message, false)
+        };
     let (prefix, number) = location.rsplit_once(':')?;
     if number.parse::<u32>().ok()? == 0 {
         return None;
@@ -508,23 +509,32 @@ fn compiler_failure(
     staged: Option<&Path>,
 ) -> EditRefusal {
     let text = format!("{}\n{}", exec.stderr, exec.stdout);
-    let compiler_name = report["compiler"]["resolved_path"].as_str()
-        .and_then(|p| Path::new(p).file_name()).and_then(|p| p.to_str());
+    let compiler_name = report["compiler"]["resolved_path"]
+        .as_str()
+        .and_then(|p| Path::new(p).file_name())
+        .and_then(|p| p.to_str());
     let driver_failed = exec.stderr.lines().any(|line| {
         if line.starts_with("error: ") || line.starts_with("fatal error: ") {
             return true;
         }
-        let Some((prefix, message)) = line.split_once(": ") else { return false; };
+        let Some((prefix, message)) = line.split_once(": ") else {
+            return false;
+        };
         (Some(prefix) == compiler_name || matches!(prefix, "gcc" | "clang" | "cc1" | "cc1plus"))
-            && (message.starts_with("error: ") || message.starts_with("fatal error: ")
+            && (message.starts_with("error: ")
+                || message.starts_with("fatal error: ")
                 || message.starts_with("internal compiler error: "))
     });
-    let diagnostics = exec.stderr.lines().filter_map(|line| {
-        staged.and_then(|stage| staged_diagnostic(line, stage))
-    }).collect::<Vec<_>>();
-    let missing = diagnostics.iter().any(|(fatal, message)| *fatal && (
-        message.ends_with(": No such file or directory") || message.ends_with(" file not found")
-    ));
+    let diagnostics = exec
+        .stderr
+        .lines()
+        .filter_map(|line| staged.and_then(|stage| staged_diagnostic(line, stage)))
+        .collect::<Vec<_>>();
+    let missing = diagnostics.iter().any(|(fatal, message)| {
+        *fatal
+            && (message.ends_with(": No such file or directory")
+                || message.ends_with(" file not found"))
+    });
     let (status, reason) = if exec.exit_code.is_none() {
         ("unavailable", "compiler_terminated")
     } else if missing {
@@ -1001,13 +1011,18 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
             }
             if !path.starts_with(&staged) {
                 let observed = Snapshot::Present(hash.clone());
-                let first = bindings.entry(path.clone()).or_insert_with(|| observed.clone());
+                let first = bindings
+                    .entry(path.clone())
+                    .or_insert_with(|| observed.clone());
                 if *first != observed {
                     return Err(fail(
                         &report,
                         "stale",
                         "input_changed",
-                        format!("compiler input changed between translation units: {}", path.display()),
+                        format!(
+                            "compiler input changed between translation units: {}",
+                            path.display()
+                        ),
                         12,
                     ));
                 }
