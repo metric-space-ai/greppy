@@ -146,7 +146,7 @@ fn native_c_shared_external_header_requires_one_snapshot_across_units() {
         value(&out)["error"]["c_validation"]["reason"],
         "input_changed"
     );
-    assert_eq!(fs::read_to_string(header).unwrap(), "#define VALUE 11\n");
+    assert_eq!(fs::read_to_string(&header).unwrap(), "#define VALUE 11\n");
     assert!(!f.root.join("one.c").exists());
     assert!(!f.root.join("two.c").exists());
     // The same two units with one stable shared header are still accepted.
