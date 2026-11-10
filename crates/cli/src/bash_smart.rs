@@ -175,6 +175,12 @@ static TYPESCRIPT_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|
     )
     .expect("bash-smart TypeScript diagnostic regex")
 });
+// LLD executable names may carry a distribution version suffix. Require the
+// complete linker/severity header, not prose that merely mentions a failure.
+static LLD_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?-u)^[\t ]*ld\.lld(?:-[0-9]+)?:[\t ]+(error|warning):(?:[\t ]|$)")
+        .expect("bash-smart LLD diagnostic regex")
+});
 // CMake headers end in a colon, optionally with an at/in source location.
 // Requiring the terminator avoids counting prose mentioning CMake warnings.
 static CMAKE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
@@ -888,6 +894,7 @@ fn diagnostic_kind(content: &[u8]) -> Option<BlockKind> {
         TYPESCRIPT_DIAGNOSTIC_RE
             .captures(content)
             .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(content))
+            .or_else(|| LLD_DIAGNOSTIC_RE.captures(content))
             .or_else(|| CMAKE_DIAGNOSTIC_RE.captures(content))
             .map(|captures| {
                 if captures[1].eq_ignore_ascii_case(b"warning") {
