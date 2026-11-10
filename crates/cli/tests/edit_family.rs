@@ -2158,6 +2158,41 @@ fn verify_failure_and_unavailable_are_nonzero_in_cli_and_json() {
 }
 
 #[test]
+fn python_write_parser_error_does_not_claim_empty_body() {
+    let fixture = Fixture::new("python-write-parser-diagnostic");
+    let path = "tests/oracle/_greppy_diagnostic_repro.py";
+    let target = fixture.repo.join(path);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let before = "sentinel = True\n";
+    std::fs::write(&target, before).unwrap();
+    let invalid = "for scenario in [0]:\n    offset = 1 if scenario == 0 else3\n";
+    for json in [false, true] {
+        let mut args = vec!["write", path, invalid];
+        if json {
+            args.push("--json");
+        }
+        let refused = fixture.run(&args);
+        assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+        let diagnostic = combined(&refused);
+        assert!(diagnostic.contains("tree-sitter:"), "{diagnostic}");
+        for misleading in ["suite requires a statement", "--body", "use pass"] {
+            assert!(!diagnostic.contains(misleading), "{diagnostic}");
+        }
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+            assert_eq!(value["published"], false);
+        } else {
+            assert!(diagnostic.contains("nothing written"), "{diagnostic}");
+        }
+        assert_file(&target, before);
+    }
+    let corrected = "for scenario in [0]:\n    offset = 1 if scenario == 0 else 3\n";
+    let applied = fixture.run(&["write", path, corrected]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    assert_file(&target, corrected);
+}
+
+#[test]
 fn python_body_indentation_is_checked_before_publication() {
     let fixture = Fixture::new("python-body-indentation");
     let before = "def clamp(value, lower, upper):\n    return min(lower, max(upper, value))\n";
