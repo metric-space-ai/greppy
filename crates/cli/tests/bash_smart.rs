@@ -922,18 +922,31 @@ fn lld_diagnostic_headers_preserve_child_exit_counts_and_bytes() {
         let script = format!("printf '%s' \"$1\" >&2; exit {exit}");
         let output = run(
             &workspace,
-            &["bash-smart", "--", "sh", "-c", &script, "lld-fixture", payload],
+            &[
+                "bash-smart",
+                "--",
+                "sh",
+                "-c",
+                &script,
+                "lld-fixture",
+                payload,
+            ],
         );
         assert_eq!(output.status.code(), Some(exit), "child exit changed");
         assert_eq!(output.stdout, verdict.as_bytes(), "LLD verdict changed");
-        assert_eq!(output.stderr, payload.as_bytes(), "raw child stderr changed");
+        assert_eq!(
+            output.stderr,
+            payload.as_bytes(),
+            "raw child stderr changed"
+        );
     }
 }
 
 #[test]
 fn lld_diagnostic_blocks_keep_folded_raw_expansion() {
     let workspace = fresh_workspace("lld-folded-expansion");
-    let diagnostic = "ld.lld-14: error: undefined symbol: diagnostic_test\n    referenced by fixture.o\n";
+    let diagnostic =
+        "ld.lld-14: error: undefined symbol: diagnostic_test\n    referenced by fixture.o\n";
     let payload = format!(
         "{}{diagnostic}{}",
         "ordinary progress\n".repeat(100),
@@ -961,7 +974,12 @@ fn lld_diagnostic_blocks_keep_folded_raw_expansion() {
         assert!(shown.contains(line), "LLD raw block lost: {shown}");
     }
     let expanded = run(&workspace, &["expand", expand_id(&shown)]);
-    assert_eq!(expanded.status.code(), Some(0), "{}", text(&expanded.stderr));
+    assert_eq!(
+        expanded.status.code(),
+        Some(0),
+        "{}",
+        text(&expanded.stderr)
+    );
     assert!(expanded.stderr.is_empty());
     assert!(text(&expanded.stdout).contains("ordinary progress\n"));
 }

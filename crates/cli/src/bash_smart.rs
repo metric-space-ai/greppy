@@ -178,10 +178,8 @@ static TYPESCRIPT_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|
 // LLD executable names may carry a distribution version suffix. Require the
 // complete linker/severity header, not prose that merely mentions a failure.
 static LLD_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-    regex::bytes::Regex::new(
-        r"(?-u)^[\t ]*ld\.lld(?:-[0-9]+)?:[\t ]+(error|warning):(?:[\t ]|$)",
-    )
-    .expect("bash-smart LLD diagnostic regex")
+    regex::bytes::Regex::new(r"(?-u)^[\t ]*ld\.lld(?:-[0-9]+)?:[\t ]+(error|warning):(?:[\t ]|$)")
+        .expect("bash-smart LLD diagnostic regex")
 });
 // CMake headers end in a colon, optionally with an at/in source location.
 // Requiring the terminator avoids counting prose mentioning CMake warnings.
