@@ -239,7 +239,10 @@ fn native_c_source_excerpt_cannot_impersonate_driver_failure() {
     } else {
         vec!["-fno-color-diagnostics", "-fno-caret-diagnostics"]
     };
-    assert_eq!(native["compiler"]["diagnostic_arguments"], serde_json::json!(expected));
+    assert_eq!(
+        native["compiler"]["diagnostic_arguments"],
+        serde_json::json!(expected)
+    );
     assert!(!native["process"]["stderr"]
         .as_str()
         .unwrap()
