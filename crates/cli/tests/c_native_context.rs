@@ -106,6 +106,78 @@ fn add_patch(file: &str, source: &str) -> String {
     )
 }
 #[test]
+fn native_c_shared_external_header_requires_one_snapshot_across_units() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let header = f._temp.path().join("shared.h");
+    fs::write(&header, "#define VALUE 7\n").unwrap();
+    let wrapper = f.root.join("compiler-between-units.py");
+    // Both actual compilations succeed, but only under mutually inconsistent
+    // header versions. Change it at TU2 discovery, after TU1's post-check hash.
+    let script = format!(
+        "#!/usr/bin/python3\nimport os,sys\nfrom pathlib import Path\ncompiler={}\nif '-M' in sys.argv and any(a.endswith('/two.c') for a in sys.argv): Path({}).write_text('#define VALUE 11\\n')\nos.execv(compiler,[compiler,*sys.argv[1:]])\n",
+        serde_json::to_string(&f.compiler).unwrap(),
+        serde_json::to_string(&header.display().to_string()).unwrap()
+    );
+    fs::write(&wrapper, script).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let context = serde_json::json!({"schema_version":"greppy.c-validation-context.v1","configuration":"two-unit-snapshot","compiler":{"family":f.family,"executable":wrapper},"translation_units":[{"file":"one.c","directory":".","arguments":["-std=c11","-fsyntax-only","{source}"]},{"file":"two.c","directory":".","arguments":["-std=c11","-fsyntax-only","{source}"]}],"input_files":[],"timeout_seconds":20});
+    fs::write(f.root.join("context.json"), serde_json::to_vec(&context).unwrap()).unwrap();
+    let mut patch = String::from("*** Begin Patch\n");
+    for (name, expected) in [("one.c", 7), ("two.c", 11)] {
+        patch.push_str(&format!(
+            "*** Add File: {name}\n+#include \"{}\"\n+_Static_assert(VALUE == {expected}, \"snapshot value\");\n",
+            header.display()
+        ));
+    }
+    patch.push_str("*** End Patch\n");
+    let out = f.run(&["patch", "--c-context", "context.json", "--json"], patch.as_bytes(), None);
+    code(&out, 12);
+    assert_eq!(value(&out)["error"]["c_validation"]["status"], "stale");
+    assert_eq!(value(&out)["error"]["c_validation"]["reason"], "input_changed");
+    assert_eq!(fs::read_to_string(header).unwrap(), "#define VALUE 11\n");
+    assert!(!f.root.join("one.c").exists());
+    assert!(!f.root.join("two.c").exists());
+    // The same two units with one stable shared header are still accepted.
+    fs::write(&header, "#define VALUE 7\n").unwrap();
+    let path = f.root.join("context.json");
+    let mut context: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    context["compiler"]["executable"] = f.compiler.clone().into();
+    fs::write(path, serde_json::to_vec(&context).unwrap()).unwrap();
+    let stable = patch.replace("VALUE == 11", "VALUE == 7");
+    let out = f.run(&["patch", "--c-context", "context.json", "--json"], stable.as_bytes(), None);
+    code(&out, 0);
+    assert_eq!(value(&out)["c_validation"]["status"], "passed");
+    assert!(fs::read_to_string(f.root.join("one.c")).unwrap().contains("VALUE == 7"));
+    assert!(fs::read_to_string(f.root.join("two.c")).unwrap().contains("VALUE == 7"));
+}
+
+#[test]
+fn native_c_failure_classification_uses_primary_source_diagnostics() {
+    let f = Fixture::new();
+    f.context("source.c", None, 20);
+    // These are source diagnostics, including their quoted source excerpts;
+    // their words must not impersonate tool/environment failures.
+    for message in ["no such file or directory", "unknown argument", "internal compiler error"] {
+        let source = format!("#error \"{message}\"\nint value(void) {{ return 1; }}\n");
+        let out = f.run(&["write", "source.c", "--c-context", "context.json", "--json"], source.as_bytes(), None);
+        code(&out, 14);
+        assert_eq!(value(&out)["error"]["c_validation"]["status"], "rejected");
+        assert!(!f.root.join("source.c").exists());
+    }
+    // An actual driver/target error has no staged source-error record. Its
+    // nonzero status cannot become proof that the proposed source is invalid.
+    let path = f.root.join("context.json");
+    let mut context: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    context["translation_units"][0]["arguments"].as_array_mut().unwrap().push("-march=greppy-no-such-cpu".into());
+    fs::write(path, serde_json::to_vec(&context).unwrap()).unwrap();
+    let out = f.run(&["write", "source.c", "--c-context", "context.json", "--json"], SOURCE.as_bytes(), None);
+    code(&out, 14);
+    assert_eq!(value(&out)["error"]["c_validation"]["status"], "unavailable");
+    assert!(!f.root.join("source.c").exists());
+}
+
+#[test]
 fn native_c_rejected_patch_never_publishes() {
     let f = Fixture::new();
     f.context("source.c", None, 20);

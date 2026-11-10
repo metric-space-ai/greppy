@@ -481,31 +481,63 @@ fn execution(
         )
     })
 }
-fn compiler_failure(report: &serde_json::Value, exec: &VerifierExecution) -> EditRefusal {
+// Only primary GCC/Clang diagnostics with a staged source location can prove
+// rejection. Quoted source/caret lines and stdout are not diagnostic records.
+fn staged_diagnostic<'a>(line: &'a str, staged: &Path) -> Option<(bool, &'a str)> {
+    let (location, message, fatal) = if let Some((location, message)) = line.split_once(": fatal error: ") {
+        (location, message, true)
+    } else {
+        let (location, message) = line.split_once(": error: ")?;
+        (location, message, false)
+    };
+    let (prefix, number) = location.rsplit_once(':')?;
+    if number.parse::<u32>().ok()? == 0 {
+        return None;
+    }
+    let path = match prefix.rsplit_once(':') {
+        Some((path, line)) if line.parse::<u32>().is_ok_and(|n| n > 0) => path,
+        _ => prefix,
+    };
+    let path = Path::new(path);
+    (path.is_absolute() && path.canonicalize().is_ok_and(|p| p.starts_with(staged)))
+        .then_some((fatal, message))
+}
+fn compiler_failure(
+    report: &serde_json::Value,
+    exec: &VerifierExecution,
+    staged: Option<&Path>,
+) -> EditRefusal {
     let text = format!("{}\n{}", exec.stderr, exec.stdout);
-    let lower = text.to_ascii_lowercase();
-    let (status, reason) =
-        if lower.contains("no such file or directory") || lower.contains("file not found") {
-            ("unavailable", "missing_input")
-        } else if lower.contains("unknown argument")
-            || lower.contains("unrecognized command-line")
-            || lower.contains("unsupported option")
-            || lower.contains("unknown target")
-            || lower.contains("unknown cpu")
-        {
-            ("unavailable", "unsupported_configuration")
-        } else if matches!(exec.exit_code, Some(126 | 127))
-            || lower.contains("internal compiler error")
-            || lower.contains("unable to execute")
-            || lower.contains("cannot execute")
-            || lower.contains("error trying to exec")
-        {
-            ("unavailable", "compiler_execution_failed")
-        } else if exec.exit_code.is_none() {
-            ("unavailable", "compiler_terminated")
-        } else {
-            ("rejected", "compiler_rejected")
-        };
+    let compiler_name = report["compiler"]["resolved_path"].as_str()
+        .and_then(|p| Path::new(p).file_name()).and_then(|p| p.to_str());
+    let driver_failed = exec.stderr.lines().any(|line| {
+        if line.starts_with("error: ") || line.starts_with("fatal error: ") {
+            return true;
+        }
+        let Some((prefix, message)) = line.split_once(": ") else { return false; };
+        (Some(prefix) == compiler_name || matches!(prefix, "gcc" | "clang" | "cc1" | "cc1plus"))
+            && (message.starts_with("error: ") || message.starts_with("fatal error: ")
+                || message.starts_with("internal compiler error: "))
+    });
+    let diagnostics = exec.stderr.lines().filter_map(|line| {
+        staged.and_then(|stage| staged_diagnostic(line, stage))
+    }).collect::<Vec<_>>();
+    let missing = diagnostics.iter().any(|(fatal, message)| *fatal && (
+        message.ends_with(": No such file or directory") || message.ends_with(" file not found")
+    ));
+    let (status, reason) = if exec.exit_code.is_none() {
+        ("unavailable", "compiler_terminated")
+    } else if missing {
+        ("unavailable", "missing_input")
+    } else if exec.exit_code == Some(1)
+        && !driver_failed
+        && !diagnostics.is_empty()
+        && diagnostics.iter().all(|(fatal, _)| !fatal)
+    {
+        ("rejected", "compiler_rejected")
+    } else {
+        ("unavailable", "compiler_execution_failed")
+    };
     let mut evidence = report.clone();
     evidence["process"] = serde_json::json!({"exit_code":exec.exit_code,"timed_out":false,"stderr":exec.stderr,"stdout":exec.stdout});
     fail(&evidence, status, reason, text, 14)
@@ -627,7 +659,7 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
         Instant::now() + Duration::from_secs(context.timeout_seconds).min(edit_verify_timeout());
     let version = execution(&resolved, &["--version".into()], &root, deadline, &report)?;
     if version.exit_code != Some(0) {
-        return Err(compiler_failure(&report, &version));
+        return Err(compiler_failure(&report, &version, None));
     }
     let lower = version.stdout.to_ascii_lowercase();
     if !(if context.compiler.family == "clang" {
@@ -897,7 +929,7 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
         ]);
         let result = execution(&resolved, &scan, &cwd, deadline, &report)?;
         if result.exit_code != Some(0) {
-            return Err(compiler_failure(&report, &result));
+            return Err(compiler_failure(&report, &result, Some(&staged)));
         }
         let deps = dependencies(&dep, &cwd, &report)?;
         let mut dependency_hashes = BTreeMap::new();
@@ -946,7 +978,7 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
         ]);
         let checked = execution(&resolved, &check, &cwd, deadline, &report)?;
         if checked.exit_code != Some(0) {
-            return Err(compiler_failure(&report, &checked));
+            return Err(compiler_failure(&report, &checked, Some(&staged)));
         }
         if dependencies(&post, &cwd, &report)? != deps {
             return Err(fail(
@@ -968,7 +1000,17 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
                 ));
             }
             if !path.starts_with(&staged) {
-                bindings.insert(path.clone(), Snapshot::Present(hash.clone()));
+                let observed = Snapshot::Present(hash.clone());
+                let first = bindings.entry(path.clone()).or_insert_with(|| observed.clone());
+                if *first != observed {
+                    return Err(fail(
+                        &report,
+                        "stale",
+                        "input_changed",
+                        format!("compiler input changed between translation units: {}", path.display()),
+                        12,
+                    ));
+                }
             }
         }
         units.push(serde_json::json!({"file":unit.file,"source_sha256":edit_sha256_hex(&files[&unit.file]),"directory":unit.directory,"arguments":check,"process":{"exit_code":checked.exit_code,"timed_out":false},"dependency_hashes":dependency_hashes}));
