@@ -32,6 +32,10 @@ def main():
         no_match_marker = "unobserved actionability deadline fabricated NO_MATCH"
     if not args.native:
         cases.append((POLICY,
+            '        "stable"\n    }\n}',
+            '        "unobserved"\n    }\n}',
+            'observed DOM sample lost pending stability check'))
+        cases.append((POLICY,
             '(received <= deadline).then_some(value)',
             '(received <= deadline || received > deadline).then_some(value)',
             'late DOM reply exceeded the original deadline'))

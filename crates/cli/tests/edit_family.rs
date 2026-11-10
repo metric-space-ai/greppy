@@ -2158,6 +2158,41 @@ fn verify_failure_and_unavailable_are_nonzero_in_cli_and_json() {
 }
 
 #[test]
+fn python_write_parser_error_does_not_claim_empty_body() {
+    let fixture = Fixture::new("python-write-parser-diagnostic");
+    let path = "tests/oracle/_greppy_diagnostic_repro.py";
+    let target = fixture.repo.join(path);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let before = "sentinel = True\n";
+    std::fs::write(&target, before).unwrap();
+    let invalid = "for scenario in [0]:\n    offset = 1 if scenario == 0 else3\n";
+    for json in [false, true] {
+        let mut args = vec!["write", path, invalid];
+        if json {
+            args.push("--json");
+        }
+        let refused = fixture.run(&args);
+        assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+        let diagnostic = combined(&refused);
+        assert!(diagnostic.contains("tree-sitter:"), "{diagnostic}");
+        for misleading in ["suite requires a statement", "--body", "use pass"] {
+            assert!(!diagnostic.contains(misleading), "{diagnostic}");
+        }
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+            assert_eq!(value["published"], false);
+        } else {
+            assert!(diagnostic.contains("nothing written"), "{diagnostic}");
+        }
+        assert_file(&target, before);
+    }
+    let corrected = "for scenario in [0]:\n    offset = 1 if scenario == 0 else 3\n";
+    let applied = fixture.run(&["write", path, corrected]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    assert_file(&target, corrected);
+}
+
+#[test]
 fn python_body_indentation_is_checked_before_publication() {
     let fixture = Fixture::new("python-body-indentation");
     let before = "def clamp(value, lower, upper):\n    return min(lower, max(upper, value))\n";
@@ -2529,6 +2564,75 @@ fn replace_lines_syntax_error_names_allow_syntax_errors() {
         combined(&output)
     );
     assert_file(&fixture.repo.join("item.rs"), before);
+}
+
+#[path = "support/c_conditional_attribute.rs"]
+mod c_conditional_attribute;
+use c_conditional_attribute::c_attribute_cases;
+
+#[test]
+fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
+    let fixture = Fixture::new("c-conditional-attribute-diagnostic");
+    let before = "int example(int n) { return n; }\n";
+    for (name, source, expected) in c_attribute_cases() {
+        let file = format!("{name}.c");
+        let path = fixture.repo.join(&file);
+        for json in [false, true] {
+            std::fs::write(&path, before).unwrap();
+            let mut args = vec!["write", file.as_str(), source.as_str()];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            if expected == [true, true] {
+                assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+                assert_file(&path, &source);
+                continue;
+            }
+            assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+            let message = if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["published"], false);
+                assert_eq!(value["error"]["code"], "invalid_result");
+                let next = value["error"]["next"].as_str().unwrap();
+                assert!(next.contains("without compiler preprocessing"), "{next}");
+                value["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                combined(&output)
+            };
+            assert!(message.contains("tree-sitter:"), "{message}");
+            assert!(message.contains("nothing written"), "{message}");
+            assert!(message.contains("compiler-valid file"), "{message}");
+            assert!(
+                message.contains("without compiler preprocessing"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("write this intermediate state"),
+                "{message}"
+            );
+            assert!(!message.contains("--allow-syntax-errors"), "{message}");
+            assert_file(&path, before);
+        }
+    }
+
+    // Ordinary supported C still writes. C++ keeps its existing guidance; this
+    // case is only a scope control, not a claimed C++ attribute reproduction.
+    let output = fixture.run(&[
+        "write",
+        "ordinary.c",
+        "__attribute__((noinline))\nint example(int n) { return n+1; }\n",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+    let cpp = fixture.repo.join("scope.cpp");
+    std::fs::write(&cpp, before).unwrap();
+    let output = fixture.run(&["write", "scope.cpp", "int broken = ;\n", "--json"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let next = value["error"]["next"].as_str().unwrap();
+    assert!(next.contains("--allow-syntax-errors"), "{next}");
+    assert!(!next.contains("without compiler preprocessing"), "{next}");
+    assert_file(&cpp, before);
 }
 
 #[test]

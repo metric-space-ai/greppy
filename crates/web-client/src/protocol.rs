@@ -12,8 +12,25 @@ pub const SCHEMA: &str = "greppy.web-runtime.v1";
 #[cfg(unix)]
 pub fn runtime_image_id(path: &Path) -> io::Result<String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)?;
-    let digest = format!("{:x}", Sha256::digest(bytes));
+    use std::io::Read;
+
+    // Runtime images can be hundreds of MiB. Hash the same complete byte stream
+    // without materializing a second image-sized anonymous allocation.
+    let mut image = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = match image.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    let digest = format!("{:x}", hash.finalize());
     Ok(format!("sha256:{digest}"))
 }
 
@@ -252,6 +269,23 @@ mod tests {
         let copy = root.join("copy");
         std::fs::copy(&executable, &copy).unwrap();
         assert_eq!(new, runtime_image_id(&copy).unwrap());
+
+        // The identity must cover every byte, including partial and exact
+        // streaming-buffer boundaries; retain the original whole-input oracle.
+        use sha2::{Digest, Sha256};
+        for length in [0, 1, 65_535, 65_536, 65_537, 131_089] {
+            let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            std::fs::write(&executable, &bytes).unwrap();
+            assert_eq!(
+                runtime_image_id(&executable).unwrap(),
+                format!("sha256:{:x}", Sha256::digest(&bytes)),
+                "complete content identity at {length} bytes",
+            );
+        }
+        assert_eq!(
+            runtime_image_id(&root.join("absent")).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

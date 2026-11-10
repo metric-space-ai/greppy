@@ -9,8 +9,34 @@ await page.setContent(`<!DOCTYPE html><html><body>
 <button id="hid" style="display:none">Hid</button>
 <button id="invis" style="visibility:hidden">Invis</button>
 <input id="ro" readonly value="no">
+<input id="query">
 </body></html>`);
+await page.evaluate(() => {
+  const ownNames = Object.getOwnPropertyNames;
+  window.__windowPropertyWalks = 0;
+  window.__goClicks = 0;
+  Object.getOwnPropertyNames = function (target) {
+    if (target === window) window.__windowPropertyWalks += 1;
+    return ownNames(target);
+  };
+  document.getElementById("go").addEventListener("click", () => {
+    window.__goClicks += 1;
+  });
+});
 await page.locator("#go").click();
+await page.locator("#query").fill("ready");
+await page.waitForFunction(() => document.getElementById("query").value === "ready");
+const readyState = await page.evaluate(() => ({
+  clicks: window.__goClicks,
+  value: document.getElementById("query").value,
+  walks: window.__windowPropertyWalks,
+}));
+if (readyState.clicks !== 1 || readyState.value !== "ready") {
+  throw new Error("actionability work changed its result: " + JSON.stringify(readyState));
+}
+if (readyState.walks !== 0) {
+  throw new Error("empty pump ledger performed a redundant window property walk: " + JSON.stringify(readyState));
+}
 if (await page.locator("#hid").isVisible()) throw new Error("display:none isVisible");
 if (await page.locator("#invis").isVisible()) throw new Error("visibility:hidden isVisible");
 

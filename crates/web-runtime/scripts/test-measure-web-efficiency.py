@@ -20,6 +20,36 @@ measurement = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(measurement)
 
 
+class MemoryQualificationContract(unittest.TestCase):
+    def test_vps_incident_counts_do_not_blame_verified_custody_or_qualify_partial_pss(self):
+        # Actual VPS shapes:4/50 and18/209 incomplete, versus53 complete samples.
+        for samples, incomplete in ((50, 4), (209, 18), (53, 0)):
+            with self.subTest(samples=samples, incomplete=incomplete):
+                peak = 472257536
+                measured = {
+                    'process_custody': {'supported': True, 'all_reaped': True,
+                                        'runtime_image_observed': True},
+                    'process_family_memory': {
+                        'supported': True, 'sample_count': samples,
+                        'incomplete_sample_count': incomplete,
+                        'peak_sampled_pss_bytes': peak, 'peak_sampled_private_bytes': 410910720},
+                }
+                measurement.qualify_cli_memory(measured)
+                memory = measured['process_family_memory']
+                qualified = measurement.measurement_qualification(measured, True, True)
+                self.assertEqual(memory['complete_for_execution_surface'], incomplete == 0)
+                self.assertEqual(memory['qualification_errors'],
+                                 ['incomplete_memory_samples'] if incomplete else [])
+                self.assertEqual(memory['peak_sampled_pss_bytes'], None if incomplete else peak)
+                self.assertEqual(measured['observed_process_family_memory']['peak_sampled_pss_bytes'], peak)
+                self.assertTrue(qualified['process_wall_time_verified'])
+                self.assertEqual(qualified['sampled_process_family_memory_verified'], incomplete == 0)
+                self.assertNotIn('not verified', memory['scope'])
+                rejected = measurement.measurement_qualification(measured, False, True)
+                self.assertFalse(rejected['process_wall_time_verified'])
+                self.assertFalse(rejected['sampled_process_family_memory_verified'])
+
+
 class HostEnvelopeContract(unittest.TestCase):
     def fixture(self, directory):
         proc_self = directory / 'proc-self'

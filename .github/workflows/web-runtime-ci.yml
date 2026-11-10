@@ -166,6 +166,9 @@ jobs:
       - name: Prove fill focuses without dispatching pointer events
         run: python3 tools/check_web_fill_pointer_mutation.py
 
+      - name: Prove confirmed timer cleanup avoids redundant window scans
+        run: python3 tools/check_web_action_cleanup_mutation.py
+
       - name: Check native history waits for its matching traversal
         run: >-
           cargo test --locked --manifest-path crates/web-runtime/Cargo.toml

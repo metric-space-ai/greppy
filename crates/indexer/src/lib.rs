@@ -6657,6 +6657,9 @@ impl GraphIndex {
         {
             if let Some(fact) = edge.properties.get("receiver_provenance") {
                 let kind = fact.get("kind").and_then(|value| value.as_str());
+                if kind == Some("cpp_direct_member") {
+                    return self.resolve_cpp_member_receiver(fact, name);
+                }
                 if kind == Some("direct_self_field") || kind == Some("typed_field_chain") {
                     return self.resolve_direct_self_field_receiver(src_id, fact, name);
                 }
@@ -6963,6 +6966,37 @@ impl GraphIndex {
             [id] => Some(*id),
             _ => None,
         }
+    }
+
+    /// Both the field owner and its payload must identify one C/C++ class.
+    /// No inheritance, wrapper inference or bare method-name fallback.
+    fn resolve_cpp_member_receiver(&self, fact: &serde_json::Value, name: &str) -> Option<i64> {
+        let unique_class = |name: &str| {
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return None;
+            }
+            let owners = self
+                .defs_named(&["Class"], name)
+                .into_iter()
+                .filter(|n| resolution_language_family(&n.file_path) == "c")
+                .collect::<Vec<_>>();
+            match owners.as_slice() {
+                [owner] => Some(owner.id),
+                _ => None,
+            }
+        };
+        let owner = unique_class(fact.get("base_type")?.as_str()?)?;
+        let field = self.by_qname(&format!(
+            "{}::{}",
+            self.qname_for_id(owner)?,
+            fact.get("field")?.as_str()?
+        ))?;
+        if field.label != "Field" {
+            return None;
+        }
+        let payload = unique_class(field.declared_type.as_deref()?.trim())?;
+        let payload_name = self.qname_for_id(payload)?.rsplit("::").next()?;
+        self.resolve_receiver_method(self.file_of(payload)?, payload_name, name)
     }
 
     fn resolve_direct_self_field_receiver(

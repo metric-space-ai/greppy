@@ -1756,6 +1756,12 @@ impl ContentEngine {
     }
 
     fn settle_pump_tokens(&self, webview: &WebView) {
+        // Each confirmed per-token cleanup advances the floor and removes its
+        // ledger entry. Avoid another JS roundtrip and two whole-window walks
+        // when nothing remains; unconfirmed cleanup still requires the sweep.
+        if self.pump_pending.borrow().is_empty() {
+            return;
+        }
         if self.sweep_pump_namespace(webview) {
             reclaim_all_tracked_tokens(&self.pump_pending);
         }
@@ -5028,8 +5034,15 @@ impl ContentEngine {
                         .unwrap_or(false);
                     let offset_left = number_field(&values, "offsetLeft").unwrap_or(0.0);
                     let offset_top = number_field(&values, "offsetTop").unwrap_or(0.0);
+                    let failed_check = crate::locator_diagnostics::observed_actionability_check(
+                        count,
+                        visible,
+                        hit,
+                        disabled,
+                        need_editable && readonly,
+                    );
                     last = format!(
-                        "count={count} width={width} height={height} offsetLeft={offset_left} offsetTop={offset_top} disabled={disabled} readonly={readonly} visible={visible} hit={hit}"
+                        "failed_check={failed_check}; count={count} width={width} height={height} offsetLeft={offset_left} offsetTop={offset_top} disabled={disabled} readonly={readonly} visible={visible} hit={hit}"
                     );
                     if count == 1 && visible && hit && !disabled && (!need_editable || !readonly) {
                         let node = ResolvedNode {
@@ -5059,7 +5072,6 @@ impl ContentEngine {
                                 }
                             } else {
                                 stable_since = Some(Instant::now());
-                                last = format!("failed_check=stable; {last}");
                             }
                         } else {
                             stable_since = Some(Instant::now());
@@ -5073,15 +5085,6 @@ impl ContentEngine {
                                 "strict mode: selector matched {count} nodes"
                             )));
                         }
-                        last = if count == 0 {
-                            format!("failed_check=attached; {last}")
-                        } else if !visible {
-                            format!("failed_check=visible; {last}")
-                        } else if !hit {
-                            format!("failed_check=hit; {last}")
-                        } else {
-                            format!("failed_check=enabled; {last}")
-                        };
                     }
                 }
                 _ => {
@@ -5860,17 +5863,17 @@ mod serialize_tests {
 
     #[test]
     fn bounded_network_retention_reports_dropped_and_retained_counts() {
-        let dropped = Cell::new(0);
-        let mut records = vec![json!(1), json!(2), json!(3)];
-        retain_bounded(&mut records, &dropped, 2);
-        assert_eq!(records, vec![json!(2), json!(3)]);
-        assert_eq!(dropped.get(), 1);
+        let mut records = RetainedRecords::new(2, 1024);
+        for value in [json!(1), json!(2), json!(3)] {
+            records.push(value);
+        }
+        assert_eq!(records.snapshot().unwrap(), &[json!(2), json!(3)]);
+        assert_eq!(records.dropped(), 1);
         records.push(json!(4));
-        retain_bounded(&mut records, &dropped, 2);
-        assert_eq!(records, vec![json!(3), json!(4)]);
-        assert_eq!(dropped.get(), 2);
+        assert_eq!(records.snapshot().unwrap(), &[json!(3), json!(4)]);
+        assert_eq!(records.dropped(), 2);
         assert_eq!(
-            network_retention_metadata(records.len(), dropped.get()),
+            network_retention_metadata(records.len(), records.dropped()),
             json!({
                 "limit": MAX_NETWORK_RECORDS_PER_PAGE,
                 "retained": 2,

@@ -22,3 +22,7 @@ servo-net-traits = { path = "vendor/servo-net-traits" }
 servo-paint = { path = "vendor/servo-paint" }
 servo-script = { path = "vendor/servo-script" }
 servo-script-traits = { path = "vendor/servo-script-traits" }
+
+# Preserve the pinned Servo API while using patched bundled SQLite.
+servo-storage = { path = "vendor/servo-storage" }
+sea-query-rusqlite = { path = "vendor/sea-query-rusqlite" }

@@ -1,4 +1,5 @@
 """Real Linux process-family/PSS contract, including a shared file mapping."""
+import errno
 import json
 import mmap
 import os
@@ -15,6 +16,29 @@ from process_memory import ProcessTreeMemorySampler
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc PSS contract")
 class ProcessMemoryContract(unittest.TestCase):
+    def test_unreaped_exit_preserves_actual_rollup_error_and_disqualifies_sample(self):
+        # A real unreaped child still has a stat identity but no readable mappings.
+        child = subprocess.Popen([sys.executable, '-c', 'pass'])
+        try:
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            sampler = ProcessTreeMemorySampler(child.pid)
+            birth = sampler.identities[child.pid]
+            measured = sampler.sample()
+            self.assertFalse(measured['complete_for_observed_processes'])
+            self.assertIsNone(measured['pss_bytes'])
+            self.assertEqual(measured['unreadable_pids'], [child.pid])
+            self.assertEqual(len(measured['read_failures']), 1)
+            failure = measured['read_failures'][0]
+            self.assertEqual(failure['pid'], child.pid)
+            self.assertEqual(failure['expected_starttime_ticks'], birth)
+            self.assertEqual(failure['expected_parent_pid'], os.getpid())
+            self.assertEqual(failure['stage'], 'smaps_rollup')
+            self.assertIn(failure['errno'], (errno.ESRCH, errno.ENOENT))
+            self.assertEqual(failure['errno_name'], errno.errorcode[failure['errno']])
+            self.assertIn(str(child.pid), failure['message'])
+        finally:
+            child.wait(timeout=5)
+
     def test_private_family_and_shared_mapping_are_accounted_without_rss_double_count(self):
         child = r"""
 import mmap, sys
@@ -61,6 +85,10 @@ with open(sys.argv[1], "r+b") as f:
                 self.assertTrue(measured["supported"])
                 self.assertTrue(measured["complete_for_observed_processes"], measured)
                 self.assertEqual({p["pid"] for p in measured["processes"]}, {root.pid, child_pid})
+                self.assertEqual(sum(p["pss_bytes"] for p in measured["processes"]), measured["pss_bytes"])
+                self.assertEqual(sum(p["private_bytes"] for p in measured["processes"]), measured["private_bytes"])
+                self.assertEqual(sum(p["rss_bytes"] for p in measured["processes"]), measured["rss_sum_bytes"])
+                self.assertEqual(next(p for p in measured["processes"] if p["pid"] == child_pid)["parent_pid"], root.pid)
                 self.assertGreaterEqual(measured["private_bytes"], 48 * 1024 * 1024)
                 self.assertGreaterEqual(measured["pss_bytes"], 48 * 1024 * 1024)
                 self.assertLess(measured["pss_bytes"], measured["rss_sum_bytes"] - 16 * 1024 * 1024)

@@ -93,6 +93,16 @@ Rust crate licenses are declared by their packages and resolved in
 packaged source and attach it to the release. A tag is not publishable when the
 SBOM, model notices, checksums, signatures, or build provenance are missing.
 
+## SQLite storage compatibility patches
+
+The native web runtime retains Servo 0.5.0 and vendors its `servo-storage`
+0.5.0 (MPL-2.0) plus `sea-query-rusqlite` 0.8.0 (MIT OR Apache-2.0) to update
+their rusqlite requirement to 0.41. The source archive checksums, upstream
+revisions, retained license texts, exact manifest changes, and removal condition
+are in `crates/web-runtime/vendor/sqlite-security-patches.md`. No upstream Rust
+source is modified. Both resolved workspaces use the patched bundled SQLite
+3.54.1 through libsqlite3-sys 0.39.1; SQLCipher is not enabled.
+
 ## Native filesystem adapters
 
 ### WinFsp 2.1 (Windows filesystem transport)

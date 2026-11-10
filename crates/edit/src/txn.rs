@@ -193,10 +193,73 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     let Ok(tree) = greppy_parser::parse(Language::Bash, content) else {
         return Cow::Borrowed(content);
     };
+    // Restrict the Bash-only glob recovery to an explicit Bash dialect.
+    // This is metadata, never a command to resolve or execute.
+    let shebang = content
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let explicit_bash = [
+        b"#!/bin/bash".as_slice(),
+        b"#!/usr/bin/bash",
+        b"#!/usr/bin/env bash",
+    ]
+    .contains(&shebang);
     let mut normalized: Option<Vec<u8>> = None;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
+        // The bundled grammar tokenizes the exact bare `/*` equality
+        // operand as regex and prematurely inserts `]]` before a boolean
+        // continuation. A fixed two-byte word validates the surrounding
+        // syntax without changing offsets or the proposed/published source.
+        if explicit_bash && node.kind() == "regex" && content.get(node.byte_range()) == Some(b"/*")
+        {
+            if let Some(binary) = node
+                .parent()
+                .filter(|parent| parent.kind() == "binary_expression")
+            {
+                let right = binary.child_by_field_name("right");
+                let left = binary.child_by_field_name("left");
+                let test = binary
+                    .parent()
+                    .filter(|parent| parent.kind() == "test_command");
+                if right == Some(node)
+                    && left.is_some_and(|left| !left.has_error())
+                    && test.is_some_and(|test| {
+                        (0..test.child_count())
+                            .filter_map(|i| test.child(i))
+                            .any(|child| {
+                                child.is_missing()
+                                    && child.kind() == "]]"
+                                    && child.start_byte() == node.end_byte()
+                            })
+                    })
+                {
+                    let operator =
+                        content[left.unwrap().end_byte()..node.start_byte()].trim_ascii();
+                    let separated = content
+                        .get(left.unwrap().end_byte())
+                        .is_some_and(u8::is_ascii_whitespace)
+                        && node
+                            .start_byte()
+                            .checked_sub(1)
+                            .and_then(|at| content.get(at))
+                            .is_some_and(u8::is_ascii_whitespace)
+                        && content
+                            .get(node.end_byte())
+                            .is_some_and(u8::is_ascii_whitespace);
+                    let suffix = content[node.end_byte()..].trim_ascii_start();
+                    if separated
+                        && (suffix.starts_with(b"&&") || suffix.starts_with(b"||"))
+                        && (operator == b"=" || operator == b"==" || operator == b"!=")
+                    {
+                        let output = normalized.get_or_insert_with(|| content.to_vec());
+                        output[node.start_byte()..node.end_byte()].copy_from_slice(b"xx");
+                    }
+                }
+            }
+        }
         if node.is_error() && content.get(node.start_byte()..node.end_byte()) == Some(b">") {
             if let Some(redirect) = node.parent().filter(|p| p.kind() == "file_redirect") {
                 let start = node.start_byte();
@@ -247,13 +310,16 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if matches!(language, Language::C | Language::Cpp) {
-        let linkage = guarded_linkage_validation_content(language, content);
+        let mut view = guarded_linkage_validation_content(language, content);
         if language == Language::C {
-            if let Cow::Owned(normalized) = c_atomic_validation_content(&linkage) {
-                return Cow::Owned(normalized);
+            if let Cow::Owned(normalized) = c_conditional_attribute_validation_content(&view) {
+                view = Cow::Owned(normalized);
+            }
+            if let Cow::Owned(normalized) = c_atomic_validation_content(&view) {
+                view = Cow::Owned(normalized);
             }
         }
-        return linkage;
+        return view;
     }
     if language.name() == "json" {
         return json_validation_content(content);
@@ -544,8 +610,119 @@ fn json_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     normalized.map_or(Cow::Borrowed(content), Cow::Owned)
 }
 
-/// Validate only a complete unique conventional linkage pair. The body and
-/// other directives stay parsed; spaces preserve diagnostic coordinates.
+/// Validate the exact GCC/Clang observation prefix without choosing a compiler
+/// branch. Both attribute spellings remain in the view and must parse together
+/// on one complete top-level function. Only the three directive lines become
+/// spaces; original bytes, line widths and newline coordinates stay unchanged.
+/// This is not a general C preprocessor or an attribute-name substitution.
+fn c_conditional_attribute_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    const LF: &[u8] = b"#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((noipa))\n#elif defined(__clang__)\n__attribute__((noinline))\n#endif\n";
+    const CRLF: &[u8] = b"#if defined(__GNUC__) && !defined(__clang__)\r\n__attribute__((noipa))\r\n#elif defined(__clang__)\r\n__attribute__((noinline))\r\n#endif\r\n";
+    let mut candidate = None;
+    for prefix in [LF, CRLF] {
+        for (start, bytes) in content.windows(prefix.len()).enumerate() {
+            if bytes != prefix || (start != 0 && content[start - 1] != b'\n') {
+                continue;
+            }
+            // Multiple prefixes remain on the ordinary fail-closed path until
+            // that distinct shape has its own compiler and parser coverage.
+            if candidate.is_some() {
+                return Cow::Borrowed(content);
+            }
+            candidate = Some((start, prefix));
+        }
+    }
+    let Some((start, prefix)) = candidate else {
+        return Cow::Borrowed(content);
+    };
+    let Ok(raw) = greppy_parser::parse(Language::C, content) else {
+        return Cow::Borrowed(content);
+    };
+    if !raw.root_node().has_error() {
+        return Cow::Borrowed(content);
+    }
+
+    let mut proposed = content.to_vec();
+    let mut attributes = Vec::with_capacity(2);
+    let mut offset = start;
+    for line in prefix.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"#") {
+            let Some(mut node) = raw
+                .root_node()
+                .descendant_for_byte_range(offset, offset + 1)
+            else {
+                return Cow::Borrowed(content);
+            };
+            loop {
+                if matches!(
+                    node.kind(),
+                    "comment"
+                        | "string_literal"
+                        | "char_literal"
+                        | "preproc_arg"
+                        | "preproc_def"
+                        | "preproc_function_def"
+                ) {
+                    return Cow::Borrowed(content);
+                }
+                let Some(parent) = node.parent() else { break };
+                node = parent;
+            }
+            for byte in &mut proposed[offset..offset + line.len()] {
+                if !matches!(*byte, b'\r' | b'\n') {
+                    *byte = b' ';
+                }
+            }
+        } else {
+            let length = line
+                .iter()
+                .position(|byte| matches!(*byte, b'\r' | b'\n'))
+                .unwrap_or(line.len());
+            attributes.push(offset..offset + length);
+        }
+        offset += line.len();
+    }
+    let Ok(tree) = greppy_parser::parse(Language::C, &proposed) else {
+        return Cow::Borrowed(content);
+    };
+    let mut function = None;
+    for range in attributes {
+        let Some(attribute) = tree
+            .root_node()
+            .descendant_for_byte_range(range.start, range.end)
+        else {
+            return Cow::Borrowed(content);
+        };
+        if attribute.kind() != "attribute_specifier" || attribute.byte_range() != range {
+            return Cow::Borrowed(content);
+        }
+        let Some(parent) = attribute
+            .parent()
+            .filter(|node| node.kind() == "function_definition" && !node.has_error())
+        else {
+            return Cow::Borrowed(content);
+        };
+        if function.is_some_and(|node| node != parent) {
+            return Cow::Borrowed(content);
+        }
+        function = Some(parent);
+    }
+    let Some(function) = function else {
+        return Cow::Borrowed(content);
+    };
+    let mut ancestor = function.parent();
+    while let Some(node) = ancestor {
+        if !matches!(
+            node.kind(),
+            "translation_unit" | "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif"
+        ) {
+            return Cow::Borrowed(content);
+        }
+        ancestor = node.parent();
+    }
+    Cow::Owned(proposed)
+}
+
 /// The C grammar reserves `_Atomic` as a qualifier, preventing its
 /// macro-type rule from recognizing standard C11 `_Atomic(type-name)`.
 /// Substitute an equal-length identifier only for actual qualifier tokens,
@@ -617,6 +794,8 @@ fn c_atomic_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     normalized.map_or(Cow::Borrowed(content), Cow::Owned)
 }
 
+/// Validate only a complete unique conventional linkage pair. The body and
+/// other directives stay parsed; spaces preserve diagnostic coordinates.
 fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     const OPEN: &[u8] = b"#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
     const CLOSE: &[u8] = b"#ifdef __cplusplus\n}\n#endif\n";
@@ -801,15 +980,18 @@ fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)
 }
 
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
-    if language == Language::Python {
+    let validation_content = syntax_validation_content(language, content);
+    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
+    // Parser recovery can leave an empty block after a malformed statement.
+    // Prefer the explicit parser failure over treating that recovered block as
+    // proof that the user omitted or unindented a suite.
+    if language == Language::Python && !tree.root_node().has_error() {
         if let Some((row, column, reason)) = python_syntax_diagnostics(content).first() {
             return Some(format!(
                 "{row}:{column} ({reason}; column is a byte offset)"
             ));
         }
     }
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -1590,6 +1772,46 @@ mod tests {
                 s.file_sha256,
                 "mutation must change hash"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod conditional_attribute_contract {
+    mod fixtures {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cli/tests/support/c_conditional_attribute.rs"
+        ));
+    }
+
+    #[test]
+    fn c_conditional_attribute_view_retains_both_branches() {
+        for (name, source, expected) in fixtures::c_attribute_cases() {
+            let raw = greppy_parser::parse(super::Language::C, source.as_bytes()).unwrap();
+            let view = super::syntax_validation_content(super::Language::C, source.as_bytes());
+            let counts = super::syntax_counts(super::Language::C, source.as_bytes()).unwrap();
+            eprintln!("C_ATTRIBUTE_RAW {name} {}", raw.root_node().to_sexp());
+            eprintln!("C_ATTRIBUTE_COUNTS {name} {counts:?}");
+            if expected == [true, true] {
+                assert_eq!(counts.errors + counts.missing, 0, "{name}");
+            } else {
+                assert!(counts.errors + counts.missing > 0, "{name}");
+            }
+            if name == "complete" || name == "complete-crlf" {
+                assert!(raw.root_node().has_error(), "original parser fault missing");
+                assert!(matches!(view, std::borrow::Cow::Owned(_)));
+                assert_eq!(view.len(), source.len());
+                for (before, after) in source.bytes().zip(view.iter()) {
+                    if matches!(before, b'\r' | b'\n') {
+                        assert_eq!(before, *after);
+                    }
+                }
+                let view = std::str::from_utf8(&view).unwrap();
+                assert!(view.contains("__attribute__((noipa))"));
+                assert!(view.contains("__attribute__((noinline))"));
+                assert!(view.contains("int example(int n) { return n+1; }"));
+            }
         }
     }
 }

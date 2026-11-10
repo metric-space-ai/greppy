@@ -116,6 +116,89 @@ fn empty_search_pattern_names_the_path_filter_and_next_actions() {
     );
 }
 
+#[test]
+fn scoped_pattern_miss_discloses_excluded_tracked_source() {
+    let (repo, store) = fresh_workspace("excluded-tracked-target");
+    std::fs::create_dir_all(repo.join("tests/target")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let target_path = "tests/target/adapter.c";
+    let definition = "int board_target_initialize(void) { return 7; }\n";
+    std::fs::write(repo.join(target_path), definition).unwrap();
+    std::fs::write(
+        repo.join("src/control.c"),
+        "int board_host_initialize(void) { return 3; }\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", target_path, "src/control.c"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@invalid",
+            "commit",
+            "-qm",
+            "tracked C source fixture",
+        ],
+        vec!["ls-files", "--error-unmatch", target_path],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let ignored = Command::new("git")
+        .current_dir(&repo)
+        .args(["check-ignore", target_path])
+        .output()
+        .unwrap();
+    assert_eq!(ignored.status.code(), Some(1), "{ignored:?}");
+    assert_indexed(&repo, &store);
+
+    let control = run(&repo, &store, &["read", "board_host_initialize"]);
+    assert_eq!(control.0, 0, "{control:?}");
+    assert!(control.1.contains("return 3;"), "{control:?}");
+    let graph_miss = run(&repo, &store, &["read", "board_target_initialize"]);
+    assert_eq!(graph_miss.0, 1, "{graph_miss:?}");
+    let direct = run(
+        &repo,
+        &store,
+        &["rg", "-n", "board_target_initialize", target_path],
+    );
+    assert_eq!(direct.0, 0, "{direct:?}");
+    assert!(direct.1.contains(definition.trim()), "{direct:?}");
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &[
+            "search-pattern",
+            "board_target_initialize",
+            "--path",
+            "tests/target",
+            "--limit",
+            "8",
+        ],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    println!("excluded tracked source scoped result:\n{stdout}");
+    assert!(
+        stdout
+            .contains("scope: live Greppy-discovered source files under path filter tests/target"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("excluded files"), "{stdout}");
+    assert!(!stdout.contains("no source match exists"), "{stdout}");
+    assert!(
+        stdout.contains("next: search excluded source directly: greppy rg"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("greppy index ."), "{stdout}");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 /// A repository-wide miss must not claim that excluded vendor/ignored files
 /// were searched. It names the graph discovery boundary and gives the exact
 /// direct-source recovery instead of sending the caller into a futile reindex.

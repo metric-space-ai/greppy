@@ -145,6 +145,10 @@ jobs:
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anonymous_compound_typedef_mutation.py
 
+      - name: C++ typed member caller and warm-store mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_cpp_typed_member_mutation.py
+
       - name: Unix request absolute-deadline mutation proof
         if: runner.os == 'Linux'
         run: python3 tools/check_unix_deadline_mutation.py
@@ -186,6 +190,10 @@ jobs:
       - name: Anthropic required output-bound mutation proof
         if: runner.os == 'Linux'
         run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_anthropic_output_limit_mutation.py
+
+      - name: Bash absolute-glob atomic write mutation proof
+        if: runner.os == 'Linux'
+        run: target/debug/greppy bash-smart -e '^mutation:' -- python3 tools/check_bash_glob_syntax_mutation.py
 
       - name: Agent HTTP error-body mutation proof
         if: runner.os == 'Linux'
