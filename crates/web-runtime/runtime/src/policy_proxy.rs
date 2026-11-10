@@ -1,10 +1,99 @@
 //! Connect-time HTTP/HTTPS proxy that dials only policy-pinned SocketAddrs.
 
+#[cfg(test)]
+#[test]
+fn dropping_proxy_terminates_an_active_tunnel() {
+    check_proxy_tunnel_drop(false);
+    check_proxy_tunnel_drop(true);
+}
+
+#[cfg(test)]
+fn check_proxy_tunnel_drop(half_closed: bool) {
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let proxy =
+        PolicyProxy::spawn(SharedProfile::new(crate::policy::NetworkProfile::Project)).unwrap();
+    let active = Arc::clone(&proxy.active_connections);
+    let mut client = TcpStream::connect(proxy.addr()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        client,
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+        origin.local_addr().unwrap(),
+        origin.local_addr().unwrap()
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let (mut server, _) = loop {
+        match origin.accept() {
+            Ok(pair) => break pair,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "proxy did not connect"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        client.read_exact(&mut byte).unwrap();
+        response.push(byte[0]);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    if half_closed {
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).unwrap();
+        assert!(request.is_empty());
+        // Origin keeps its write side open with no response/EOF. Only that
+        // descriptor is now readable-interest eligible in the relay poll.
+    }
+    assert_eq!(active.load(Ordering::Acquire), 1);
+    drop(proxy);
+    while active.load(Ordering::Acquire) != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "closed context retained an active tunnel"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(server.read(&mut [0]).unwrap(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn dropping_proxy_releases_its_listener() {
+    let proxy =
+        PolicyProxy::spawn(SharedProfile::new(crate::policy::NetworkProfile::Project)).unwrap();
+    let address = proxy.addr();
+    drop(proxy);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "closed context retained its policy listener"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 use crate::policy::{allowed_connect_addrs, decide_host_literal, SharedProfile, UrlDecision};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -70,14 +159,26 @@ fn connect_allowed(
     addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
     let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no allowed address");
     for addr in addrs {
-        if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy dial {host}:{port} -> {addr}"); } }
+        if crate::supervisor::phase_trace_enabled() {
+            if crate::supervisor::phase_trace_enabled() {
+                eprintln!("web-runtime: policy-proxy dial {host}:{port} -> {addr}");
+            }
+        }
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(stream) => {
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy connected {addr}"); } }
+                if crate::supervisor::phase_trace_enabled() {
+                    if crate::supervisor::phase_trace_enabled() {
+                        eprintln!("web-runtime: policy-proxy connected {addr}");
+                    }
+                }
                 return Ok(stream);
             }
             Err(error) => {
-                if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy dial {addr} failed: {error}"); } }
+                if crate::supervisor::phase_trace_enabled() {
+                    if crate::supervisor::phase_trace_enabled() {
+                        eprintln!("web-runtime: policy-proxy dial {addr} failed: {error}");
+                    }
+                }
                 last_error = error;
             }
         }
@@ -88,11 +189,78 @@ fn connect_allowed(
 pub(crate) type ConnectResolve =
     Arc<dyn Fn(&str, u16) -> Result<Vec<SocketAddr>, &'static str> + Send + Sync>;
 
+struct ProxyLifetime {
+    closing: AtomicBool,
+    next_connection: AtomicU64,
+    clients: Mutex<HashMap<u64, TcpStream>>,
+}
+
+struct LiveConnection {
+    lifetime: Arc<ProxyLifetime>,
+    id: u64,
+}
+
+impl ProxyLifetime {
+    fn register(self: &Arc<Self>, client: &TcpStream) -> io::Result<Option<LiveConnection>> {
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.closing.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let duplicate = client.try_clone()?;
+        let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        clients.insert(id, duplicate);
+        Ok(Some(LiveConnection {
+            lifetime: Arc::clone(self),
+            id,
+        }))
+    }
+
+    fn close(&self) {
+        self.closing.store(true, Ordering::Release);
+        let clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for client in clients.values() {
+            // Wake blocked header reads and the tunnel poll without a timer or
+            // another thread. The relay then closes both directions.
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.lifetime
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
 pub struct PolicyProxy {
     addr: SocketAddr,
     _profile: SharedProfile,
     transferred: Arc<AtomicU64>,
     active_connections: Arc<AtomicUsize>,
+    lifetime: Arc<ProxyLifetime>,
+    listener_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PolicyProxy {
+    fn drop(&mut self) {
+        self.lifetime.close();
+        // Wake the listener's poll. No request/connection worker is started
+        // after the closing flag, including this local wake connection.
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(20));
+        if let Some(worker) = self.listener_thread.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl PolicyProxy {
@@ -106,12 +274,19 @@ impl PolicyProxy {
     ) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let lifetime = Arc::new(ProxyLifetime {
+            closing: AtomicBool::new(false),
+            next_connection: AtomicU64::new(0),
+            clients: Mutex::new(HashMap::new()),
+        });
+        let thread_lifetime = Arc::clone(&lifetime);
         let thread_profile = profile.clone();
         let transferred = Arc::new(AtomicU64::new(0));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let thread_transferred = Arc::clone(&transferred);
         let thread_active_connections = Arc::clone(&active_connections);
-        thread::Builder::new()
+        let listener_thread = thread::Builder::new()
             .name("greppy-policy-proxy".into())
             .spawn(move || {
                 accept_loop(
@@ -120,6 +295,7 @@ impl PolicyProxy {
                     resolve,
                     thread_transferred,
                     thread_active_connections,
+                    thread_lifetime,
                 )
             })?;
         Ok(Self {
@@ -127,6 +303,8 @@ impl PolicyProxy {
             _profile: profile,
             transferred,
             active_connections,
+            lifetime,
+            listener_thread: Some(listener_thread),
         })
     }
 
@@ -180,9 +358,38 @@ fn accept_loop(
     resolve: ConnectResolve,
     transferred: Arc<AtomicU64>,
     active_connections: Arc<AtomicUsize>,
+    lifetime: Arc<ProxyLifetime>,
 ) {
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
+    while !lifetime.closing.load(Ordering::Acquire) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut ready = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut ready, 1, 50) };
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+            if result <= 0 {
+                continue;
+            }
+        }
+        if lifetime.closing.load(Ordering::Acquire) {
+            break;
+        }
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                #[cfg(not(unix))]
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
         let Some(permit) = ConnectionPermit::acquire(&active_connections) else {
             // Reject before allocating an OS thread. A hostile page can open
             // arbitrary subresource/WebSocket connections, so queueing here
@@ -192,15 +399,27 @@ fn accept_loop(
             );
             continue;
         };
+        let connection = match lifetime.register(&stream) {
+            Ok(Some(connection)) => connection,
+            _ => continue,
+        };
         let profile = profile.clone();
         let resolve = Arc::clone(&resolve);
         let transferred = Arc::clone(&transferred);
-        let _ = thread::Builder::new()
+        let lifetime = Arc::clone(&lifetime);
+        let spawned = thread::Builder::new()
             .name("greppy-policy-proxy-conn".into())
             .spawn(move || {
                 let _permit = permit;
-                let _ = handle_client(stream, profile, resolve, transferred);
+                let _connection = connection;
+                let _ = handle_client(stream, profile, resolve, transferred, lifetime);
             });
+        if let Err(error) = spawned {
+            #[cfg(unix)]
+            crate::worker_resource::report_thread_spawn_failure("policy proxy connection", &error);
+            #[cfg(not(unix))]
+            eprintln!("web-runtime: failed to spawn policy proxy connection: {error}");
+        }
     }
 }
 
@@ -209,10 +428,14 @@ fn handle_client(
     profile: SharedProfile,
     resolve: ConnectResolve,
     transferred: Arc<AtomicU64>,
+    lifetime: Arc<ProxyLifetime>,
 ) -> io::Result<()> {
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(30)));
     loop {
+        if lifetime.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let (head, rest) = match read_headers(&mut client) {
             Ok(pair) => pair,
             Err(_) => return Ok(()),
@@ -225,10 +448,18 @@ fn handle_client(
         let method = parts.next().unwrap_or("").to_ascii_uppercase();
         let target = parts.next().unwrap_or("").to_owned();
         if method == "CONNECT" {
-            return handle_connect(client, profile, resolve, &target, &transferred);
+            return handle_connect(client, profile, resolve, &target, &transferred, &lifetime);
         }
-        let keep =
-            handle_forward(&mut client, &profile, &resolve, &head, rest, &target, &transferred)?;
+        let keep = handle_forward(
+            &mut client,
+            &profile,
+            &resolve,
+            &head,
+            rest,
+            &target,
+            &transferred,
+            &lifetime,
+        )?;
         if !keep {
             return Ok(());
         }
@@ -241,13 +472,38 @@ fn handle_connect(
     resolve: ConnectResolve,
     target: &str,
     transferred: &Arc<AtomicU64>,
+    lifetime: &Arc<ProxyLifetime>,
 ) -> io::Result<()> {
-    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: policy-proxy CONNECT target={target}"); } }
+    if crate::supervisor::phase_trace_enabled() {
+        if crate::supervisor::phase_trace_enabled() {
+            eprintln!("web-runtime: policy-proxy CONNECT target={target}");
+        }
+    }
     let (host, port) = split_host_port(target, 80);
     match connect_allowed(profile.get(), &host, port, &resolve) {
-        Ok(server) => {
+        Ok(mut server) => {
+            let Some(_origin_connection) = lifetime.register(&server)? else {
+                return Ok(());
+            };
+            if lifetime.closing.load(Ordering::Acquire) {
+                return Ok(());
+            }
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-            splice(client, server, Arc::clone(transferred))
+            #[cfg(unix)]
+            {
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
+                crate::proxy_tunnel::copy_bidirectional_cancellable(
+                    &mut client,
+                    &mut server,
+                    transferred,
+                    Some(&lifetime.closing),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                splice(client, server, Arc::clone(transferred))
+            }
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             client.write_all(
@@ -267,6 +523,7 @@ fn handle_forward(
     rest: Vec<u8>,
     target: &str,
     transferred: &AtomicU64,
+    lifetime: &Arc<ProxyLifetime>,
 ) -> io::Result<bool> {
     let (host, port, path) = match parse_http_target(target, head) {
         Some(parsed) => parsed,
@@ -292,6 +549,9 @@ fn handle_forward(
             return Ok(false);
         }
         Err(error) => return Err(error),
+    };
+    let Some(_origin_connection) = lifetime.register(&server)? else {
+        return Ok(false);
     };
     let mut rewritten = rewrite_request_line(head, &path);
     if !rewritten.contains("\r\nHost:") && !rewritten.to_ascii_lowercase().contains("\r\nhost:") {
@@ -465,6 +725,14 @@ fn read_headers(stream: &mut TcpStream) -> io::Result<(String, Vec<u8>)> {
     ))
 }
 
+#[cfg(all(unix, test))]
+fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io::Result<()> {
+    let _ = a.set_nodelay(true);
+    let _ = b.set_nodelay(true);
+    crate::proxy_tunnel::copy_bidirectional(&mut a, &mut b, &transferred)
+}
+
+#[cfg(not(unix))]
 fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io::Result<()> {
     let _ = a.set_nodelay(true);
     let _ = b.set_nodelay(true);
@@ -638,10 +906,7 @@ mod tests {
 
     #[test]
     fn header_batches_reject_oversize_and_truncated_headers() {
-        for input in [
-            b"GET / HTTP/1.1\r\n".to_vec(),
-            vec![b'x'; HEADER_LIMIT + 1],
-        ] {
+        for input in [b"GET / HTTP/1.1\r\n".to_vec(), vec![b'x'; HEADER_LIMIT + 1]] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (mut server, _) = listener.accept().unwrap();
@@ -773,8 +1038,7 @@ mod tests {
         let (status, body) = proxy_get(&proxy, &format!("http://{addr}/jump"));
         assert_eq!(status, 302, "{body}");
         assert!(
-            body.to_ascii_lowercase().contains("location:")
-                && body.contains("169.254.169.254"),
+            body.to_ascii_lowercase().contains("location:") && body.contains("169.254.169.254"),
             "proxy must surface the hop, not fetch it: {body:?}"
         );
         let (status, hop) = proxy_get(&proxy, "http://169.254.169.254/latest/meta-data/");
@@ -800,17 +1064,18 @@ mod tests {
                 }
                 let n = lookups.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    Ok(vec![std::net::SocketAddr::new(fixture.ip(), fixture.port())])
+                    Ok(vec![std::net::SocketAddr::new(
+                        fixture.ip(),
+                        fixture.port(),
+                    )])
                 } else {
                     Ok(vec!["169.254.169.254:80".parse().unwrap()])
                 }
             }) as ConnectResolve
         };
-        let proxy = PolicyProxy::spawn_with_resolve(
-            SharedProfile::new(NetworkProfile::Project),
-            resolve,
-        )
-        .unwrap();
+        let proxy =
+            PolicyProxy::spawn_with_resolve(SharedProfile::new(NetworkProfile::Project), resolve)
+                .unwrap();
         let (status, body) = proxy_get(&proxy, "http://flip.test/pin");
         assert_eq!(status, 200, "first lookup must pin the fixture: {body}");
         assert!(body.contains("first-hop"), "{body}");
@@ -825,11 +1090,9 @@ mod tests {
         let resolve: ConnectResolve = Arc::new(|host, _| {
             panic!("must not resolve metadata hostname {host}");
         });
-        let proxy = PolicyProxy::spawn_with_resolve(
-            SharedProfile::new(NetworkProfile::Project),
-            resolve,
-        )
-        .unwrap();
+        let proxy =
+            PolicyProxy::spawn_with_resolve(SharedProfile::new(NetworkProfile::Project), resolve)
+                .unwrap();
         let status = proxy_connect(&proxy, "metadata.google.internal:80");
         assert_eq!(status, 403, "metadata hostname CONNECT must fail closed");
     }
@@ -857,11 +1120,9 @@ mod tests {
                 }
             }) as ConnectResolve
         };
-        let proxy = PolicyProxy::spawn_with_resolve(
-            SharedProfile::new(NetworkProfile::Project),
-            resolve,
-        )
-        .unwrap();
+        let proxy =
+            PolicyProxy::spawn_with_resolve(SharedProfile::new(NetworkProfile::Project), resolve)
+                .unwrap();
         let first = proxy_connect(&proxy, "flip.test:443");
         assert_eq!(first, 200, "first CONNECT must pin the fixture");
         let second = proxy_connect(&proxy, "flip.test:443");
@@ -874,11 +1135,9 @@ mod tests {
         let resolve: ConnectResolve = Arc::new(|host, _| {
             panic!("must not resolve when Host header is metadata: {host}");
         });
-        let proxy = PolicyProxy::spawn_with_resolve(
-            SharedProfile::new(NetworkProfile::Project),
-            resolve,
-        )
-        .unwrap();
+        let proxy =
+            PolicyProxy::spawn_with_resolve(SharedProfile::new(NetworkProfile::Project), resolve)
+                .unwrap();
         let mut stream = TcpStream::connect(proxy.addr()).unwrap();
         stream
             .write_all(
@@ -914,17 +1173,18 @@ mod tests {
                 }
                 let n = lookups.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    Ok(vec![std::net::SocketAddr::new(fixture.ip(), fixture.port())])
+                    Ok(vec![std::net::SocketAddr::new(
+                        fixture.ip(),
+                        fixture.port(),
+                    )])
                 } else {
                     Ok(vec!["169.254.169.254:80".parse().unwrap()])
                 }
             }) as ConnectResolve
         };
-        let proxy = PolicyProxy::spawn_with_resolve(
-            SharedProfile::new(NetworkProfile::Project),
-            resolve,
-        )
-        .unwrap();
+        let proxy =
+            PolicyProxy::spawn_with_resolve(SharedProfile::new(NetworkProfile::Project), resolve)
+                .unwrap();
         let mut stream = TcpStream::connect(proxy.addr()).unwrap();
         stream
             .write_all(b"GET http://flip.test/pin HTTP/1.1\r\nHost: flip.test\r\nConnection: keep-alive\r\n\r\n")
@@ -1035,9 +1295,8 @@ mod tests {
     fn splice_client_half_close_preserves_complete_server_reply() {
         let (mut client, proxy_client) = connected_pair();
         let (proxy_server, mut origin) = connected_pair();
-        let worker = thread::spawn(move || {
-            splice(proxy_client, proxy_server, Arc::new(AtomicU64::new(0)))
-        });
+        let worker =
+            thread::spawn(move || splice(proxy_client, proxy_server, Arc::new(AtomicU64::new(0))));
 
         client.write_all(b"request").unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();

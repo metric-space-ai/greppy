@@ -2,7 +2,7 @@ use crate::history_receipt::HistoryReceipt;
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
 use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
-    read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
+    read_message, timeout_ms_from_json, Message, WorkerKind, MAX_FRAME_BYTES,
 };
 use crate::selector_runtime::SELECTOR_RUNTIME;
 use crate::web_api_shims::shim_source;
@@ -29,6 +29,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
+
+#[cfg(test)]
+use crate::protocol::write_message;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
@@ -1242,8 +1245,8 @@ fn wait_for_function_waiter_script(
 }
 
 struct ContentEngine {
-    servo: Servo,
-    rendering_context: Rc<dyn RenderingContext>,
+    process_state: Rc<servo::ServoProcessState>,
+    default_bundle: Option<Rc<EngineBundle>>,
     pages: HashMap<String, PageSlot>,
     browsers: HashMap<String, ObjectLife>,
     contexts: HashMap<String, ObjectLife>,
@@ -1260,21 +1263,19 @@ struct ContentEngine {
     parent_alive: Arc<AtomicBool>,
     wake: WakeFlag,
     profile: SharedProfile,
-    /// Carries the Web API shims. Shared by every page, so a shim reaches
-    /// frames and popups too, not just the tab the agent drove.
-    user_content: Rc<UserContentManager>,
+
     transfer_capability: String,
     transfer_root: PathBuf,
-    _proxy: PolicyProxy,
 }
 
 impl Drop for ContentEngine {
     fn drop(&mut self) {
-        // Additional Servo instances borrow the process-global JS engine and
-        // embedder namespace owned by `self.servo`; drop every dependent page
-        // and bundle before Rust reaches the owner's field drop.
+        // Each Servo also retains process_state. Drop the pages and isolated
+        // bundles before our final foundation reference; there is no spare
+        // bootstrap constellation or profile to keep alive.
         self.pages.clear();
         self.context_bundles.clear();
+        self.default_bundle.take();
     }
 }
 
@@ -1326,20 +1327,7 @@ fn create_software_rendering_context(
 
 impl ContentEngine {
     fn new(parent_alive: Arc<AtomicBool>, transfer_capability: String) -> io::Result<Self> {
-        trace_startup("renderer-create");
-        let rendering_context = Rc::new(create_software_rendering_context(PhysicalSize {
-            width: 1280,
-            height: 720,
-        })?);
-        trace_startup("renderer-make-current");
-        rendering_context.make_current().map_err(|error| {
-            io::Error::other(format!("renderer make_current failed: {error:?}"))
-        })?;
-
         let profile = SharedProfile::new(NetworkProfile::Research);
-        trace_startup("policy-proxy-spawn");
-        let proxy = PolicyProxy::spawn(profile.clone())?;
-        let preferences = engine_preferences(&proxy.uri());
         let wake = WakeFlag::new();
         let mut opts = Opts::default();
         if let Some(path) = std::env::var_os(CONTENT_CONFIG_DIR_ENV) {
@@ -1347,18 +1335,11 @@ impl ContentEngine {
             std::fs::create_dir_all(&path)?;
             opts.config_dir = Some(path);
         }
-        trace_startup("servo-build");
-        let servo = ServoBuilder::default()
-            .opts(opts)
-            .preferences(preferences)
-            .event_loop_waker(Box::new(wake.clone()))
-            .build();
-        trace_startup("user-content-init");
-        let user_content = Rc::new(UserContentManager::new(&servo));
-        user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
+        trace_startup("process-state-init");
+        let process_state = Rc::new(servo::ServoProcessState::new(opts, engine_preferences("")));
         Ok(Self {
-            servo,
-            rendering_context,
+            process_state,
+            default_bundle: None,
             pages: HashMap::new(),
             browsers: HashMap::new(),
             contexts: HashMap::new(),
@@ -1379,10 +1360,8 @@ impl ContentEngine {
             parent_alive,
             wake,
             profile,
-            user_content,
             transfer_capability,
             transfer_root: std::env::temp_dir().join("transfers"),
-            _proxy: proxy,
         })
     }
 
@@ -1440,15 +1419,11 @@ impl ContentEngine {
             std::fs::create_dir_all(&path)?;
             opts.config_dir = Some(path);
         }
-        // `self.servo` owns Servo's process-global SpiderMonkey setup and the
-        // embedder thread's pipeline namespace for the lifetime of this engine.
-        let servo = unsafe {
-            ServoBuilder::default()
-                .opts(opts)
-                .preferences(preferences)
-                .event_loop_waker(Box::new(wake.clone()))
-                .build_with_shared_process_state()
-        };
+        let servo = ServoBuilder::default()
+            .opts(opts)
+            .preferences(preferences)
+            .event_loop_waker(Box::new(wake.clone()))
+            .build_with_process_state(Rc::clone(&self.process_state));
         let user_content = Rc::new(UserContentManager::new(&servo));
         user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
         Ok(Rc::new(EngineBundle {
@@ -1464,14 +1439,7 @@ impl ContentEngine {
     }
 
     fn spin_all_event_loops(&self) {
-        if let Err(error) = self.rendering_context.make_current() {
-            self.renderer_error
-                .borrow_mut()
-                .get_or_insert_with(|| format!("root renderer make_current failed: {error:?}"));
-            return;
-        }
-        self.servo.spin_event_loop();
-        for bundle in self.context_bundles.values() {
+        for bundle in self.default_bundle.iter().chain(self.context_bundles.values()) {
             if let Err(error) = bundle.rendering_context.make_current() {
                 self.renderer_error.borrow_mut().get_or_insert_with(|| {
                     format!("context renderer make_current failed: {error:?}")
@@ -1518,7 +1486,8 @@ impl ContentEngine {
                     bundle: Some(bundle),
                     ..
                 }) => bundle._proxy.bytes_transferred(),
-                Some(PageSlot::Live { .. }) => self._proxy.bytes_transferred(),
+                Some(PageSlot::Live { .. }) => self.default_bundle.as_ref()
+                    .map_or(0, |bundle| bundle._proxy.bytes_transferred()),
                 _ => 0,
             };
         }
@@ -1540,7 +1509,8 @@ impl ContentEngine {
             .map(|bundle| bundle._proxy.bytes_transferred())
             .sum::<u64>()
             .saturating_add(self.retired_network_bytes)
-            .saturating_add(self._proxy.bytes_transferred())
+            .saturating_add(self.default_bundle.as_ref()
+                .map_or(0, |bundle| bundle._proxy.bytes_transferred()))
     }
 
     fn retire_bundle(&mut self, context_id: &str) {
@@ -2819,11 +2789,15 @@ impl ContentEngine {
                         _ => return Err(object_disposed("BrowserContext")),
                     }
                 }
+                if context_id.is_none() && self.default_bundle.is_none() {
+                    self.default_bundle = Some(self.build_bundle("default-context")?);
+                }
                 let page = self.alloc_id("page");
                 let bundle = context_id
                     .as_deref()
                     .and_then(|context| self.context_bundles.get(context))
-                    .cloned();
+                    .cloned()
+                    .or_else(|| self.default_bundle.clone());
                 let (servo, rendering_context, profile, wake, user_content) = match bundle.as_ref() {
                     Some(bundle) => (
                         &bundle.servo,
@@ -2832,13 +2806,7 @@ impl ContentEngine {
                         bundle.wake.clone(),
                         Rc::clone(&bundle.user_content),
                     ),
-                    None => (
-                        &self.servo,
-                        Rc::clone(&self.rendering_context),
-                        self.profile.clone(),
-                        self.wake.clone(),
-                        Rc::clone(&self.user_content),
-                    ),
+                    None => return Err(io::Error::other("context has no engine bundle")),
                 };
                 let record_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.record_budget)).unwrap_or_else(|| Rc::new(RecordBudget::new(self.record_memory_limit)));
                 let download_budget = bundle.as_ref().map(|bundle| Rc::clone(&bundle.download_budget))
@@ -5863,17 +5831,17 @@ mod serialize_tests {
 
     #[test]
     fn bounded_network_retention_reports_dropped_and_retained_counts() {
-        let dropped = Cell::new(0);
-        let mut records = vec![json!(1), json!(2), json!(3)];
-        retain_bounded(&mut records, &dropped, 2);
-        assert_eq!(records, vec![json!(2), json!(3)]);
-        assert_eq!(dropped.get(), 1);
+        let mut records = RetainedRecords::new(2, 1024);
+        for value in [json!(1), json!(2), json!(3)] {
+            records.push(value);
+        }
+        assert_eq!(records.snapshot().unwrap(), &[json!(2), json!(3)]);
+        assert_eq!(records.dropped(), 1);
         records.push(json!(4));
-        retain_bounded(&mut records, &dropped, 2);
-        assert_eq!(records, vec![json!(3), json!(4)]);
-        assert_eq!(dropped.get(), 2);
+        assert_eq!(records.snapshot().unwrap(), &[json!(3), json!(4)]);
+        assert_eq!(records.dropped(), 2);
         assert_eq!(
-            network_retention_metadata(records.len(), dropped.get()),
+            network_retention_metadata(records.len(), records.dropped()),
             json!({
                 "limit": MAX_NETWORK_RECORDS_PER_PAGE,
                 "retained": 2,
@@ -6870,7 +6838,13 @@ pub fn run() -> io::Result<()> {
             .map(std::path::Path::new),
     )?;
     trace_startup("protocol-channel");
-    let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
+    let (mut protocol_in, protocol_out) = crate::worker::take_protocol_channel()?;
+    let mut protocol_out = Arc::new(Mutex::new(protocol_out));
+    crate::worker_resource::install_thread_spawn_failure_hook(Arc::clone(&protocol_out));
+    let write_message = |writer: &mut Arc<Mutex<std::fs::File>>, message: &Message| {
+        let mut output = writer.lock().unwrap_or_else(|error| error.into_inner());
+        crate::protocol::write_message(&mut *output, message)
+    };
     let parent_alive = Arc::new(AtomicBool::new(true));
     let mut engine = ContentEngine::new(Arc::clone(&parent_alive), capability.clone())?;
     trace_startup("read-hello");
@@ -7076,7 +7050,7 @@ pub fn run() -> io::Result<()> {
                 if !engine.pages.is_empty() {
                     let started = Instant::now();
                     if recorded_waiters.is_empty() {
-                        engine.servo.spin_event_loop();
+                        engine.spin_all_event_loops();
                     } else {
                         // The awaiting page may belong to an isolated bundle;
                         // its network completion does not arrive on root Servo.

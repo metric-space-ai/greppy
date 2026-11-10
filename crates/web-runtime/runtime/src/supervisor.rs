@@ -837,6 +837,9 @@ fn recv_any(
     // to 1ms so an idle 50ms slice stays cheap.
     let mut idle_polls: u32 = 0;
     loop {
+        if let Some(failure) = content.resource_failure().or_else(|| controller.resource_failure()) {
+            return Err(io::Error::other(failure));
+        }
         match controller.messages.try_recv() {
             Ok(message) => return Ok(Incoming::Controller(message?)),
             Err(mpsc::TryRecvError::Empty) => {}
@@ -867,10 +870,11 @@ fn recv_any(
             ));
         }
         if !content.is_running() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "content worker exited",
-            ));
+            // The process can exit immediately after writing ResourceLimit.
+            // Let its already-running protocol reader deliver that final frame
+            // within the original deadline before reporting a generic death.
+            return content.recv(deadline.saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50))).map(Incoming::Content);
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -940,6 +944,7 @@ pub(crate) struct WorkerProcess {
     child: Child,
     input: Option<BufWriter<File>>,
     messages: Receiver<io::Result<Message>>,
+    resource_failure: Arc<Mutex<Option<String>>>,
     reader_thread: Option<JoinHandle<()>>,
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
@@ -1268,10 +1273,8 @@ fn spawn_unix_in_window(
         let mut child = command.spawn().map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!(
-                    "failed to spawn {worker:?} worker at {}: {error}",
-                    path.display()
-                ),
+                crate::worker_resource::spawn_error(
+                    &format!("failed to spawn {worker:?} worker at {}", path.display()), &error),
             )
         })?;
         drop(cap_read);
@@ -1311,17 +1314,28 @@ fn spawn_unix_in_window(
                 let _ = child.wait();
                 return Err(io::Error::new(
                     error.kind(),
-                    format!("failed to spawn {worker:?} stdout drain: {error}"),
+                    crate::worker_resource::spawn_error(
+                        &format!("failed to spawn {worker:?} stdout drain"), &error),
                 ));
             }
         };
         let (message_sender, messages) = mpsc::channel();
+        let resource_failure = Arc::new(Mutex::new(None));
+        let failure_for_reader = Arc::clone(&resource_failure);
         let reader_thread = match thread::Builder::new()
             .name(format!("web-runtime-{worker:?}-protocol-reader"))
             .spawn(move || {
                 let mut output = BufReader::new(protocol_read);
                 loop {
                     match read_message(&mut output) {
+                        Ok(Message::ResourceLimit { reason, .. }) => {
+                            let message = format!("resource_limit: {reason}; {}",
+                                crate::worker_resource::pid_budget());
+                            *failure_for_reader.lock().unwrap_or_else(|error| error.into_inner()) =
+                                Some(message.clone());
+                            let _ = message_sender.send(Err(io::Error::other(message)));
+                            return;
+                        }
                         Ok(message) => {
                             if message_sender.send(Ok(message)).is_err() {
                                 return;
@@ -1340,7 +1354,8 @@ fn spawn_unix_in_window(
                 let _ = child.wait();
                 return Err(io::Error::new(
                     error.kind(),
-                    format!("failed to spawn {worker:?} protocol reader: {error}"),
+                    crate::worker_resource::spawn_error(
+                        &format!("failed to spawn {worker:?} protocol reader"), &error),
                 ));
             }
         };
@@ -1353,6 +1368,7 @@ fn spawn_unix_in_window(
             child,
             input: Some(BufWriter::new(protocol_write)),
             messages,
+            resource_failure,
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
@@ -1862,7 +1878,16 @@ impl WorkerProcess {
         Ok(())
     }
 
+    pub(crate) fn resource_failure(&self) -> Option<String> {
+        self.resource_failure.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+
+    pub(crate) fn clear_resource_failure(&mut self) {
+        self.resource_failure.lock().unwrap_or_else(|error| error.into_inner()).take();
+    }
+
     pub(crate) fn recv(&mut self, timeout: Duration) -> io::Result<Message> {
+        if let Some(failure) = self.resource_failure() { return Err(io::Error::other(failure)); }
         match self.messages.recv_timeout(timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => Err(io::Error::new(

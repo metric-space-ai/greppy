@@ -2,6 +2,10 @@
 #[allow(dead_code)]
 #[path = "../../vendor/servo-paint/shared_render_workers.rs"]
 mod shared_render_workers_contract;
+#[cfg(all(test, feature = "content-runtime"))]
+#[allow(dead_code)]
+#[path = "../../vendor/servo-storage/shared_workers.rs"]
+mod shared_storage_workers_contract;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/navigation_fixture_stream.rs"]
 mod navigation_fixture_stream_contract;
@@ -33,6 +37,8 @@ mod history_receipt;
 pub mod policy;
 pub mod profile_lock;
 pub mod policy_proxy;
+#[cfg(unix)]
+mod proxy_tunnel;
 pub mod playwright_trace;
 pub mod protocol;
 pub mod record_usage;
@@ -44,3 +50,5 @@ pub mod supervisor;
 #[cfg(feature = "content-runtime")]
 pub mod web_api_shims;
 pub mod worker;
+#[cfg(unix)]
+mod worker_resource;

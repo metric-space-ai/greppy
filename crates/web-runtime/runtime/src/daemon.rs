@@ -2551,6 +2551,16 @@ impl Daemon {
                     return response;
                 }
                 if let Some(limit) = message.strip_prefix("resource_limit: ") {
+                    let content_cpu_ms = cpu_ms_since(content_pid, content_cpu_baseline_ns);
+                    let controller_cpu_ms = cpu_ms_since(controller_pid, controller_cpu_baseline_ns);
+                    if self.content.resource_failure().is_some() {
+                        // The failed constellation cannot finish normal shutdown.
+                        // Return the original limit and reap both workers; do not
+                        // spawn replacements inside this failed request budget.
+                        self.controller.kill_tree_now();
+                        self.content.kill_tree_now();
+                        self.content.clear_resource_failure();
+                    }
                     let mut response = limit_error(request, limit);
                     response.artifacts = failure_trace_artifacts;
                     append_optional_warning(&mut response, failure_trace_warning.as_deref());
@@ -2560,10 +2570,8 @@ impl Daemon {
                     response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                     response.metrics.network_bytes = network_bytes;
                     response.metrics.peak_rss_bytes = peak_rss;
-                    response.metrics.content_cpu_ms =
-                        cpu_ms_since(content_pid, content_cpu_baseline_ns);
-                    response.metrics.controller_cpu_ms =
-                        cpu_ms_since(controller_pid, controller_cpu_baseline_ns);
+                    response.metrics.content_cpu_ms = content_cpu_ms;
+                    response.metrics.controller_cpu_ms = controller_cpu_ms;
                     return response;
                 }
                 let safe: String = redact_secrets(&message).chars().take(512).collect();
@@ -5094,6 +5102,12 @@ impl Daemon {
                 object.insert("timeout".into(), json!(operation_ms.min(budget_ms)));
             }
         }
+        if let Some(failure) = self.content.resource_failure() {
+            self.controller.kill_tree_now();
+            self.content.kill_tree_now();
+            self.content.clear_resource_failure();
+            return Err(failure);
+        }
         if !self.content.is_running() {
             if !recover_worker {
                 return Err("content worker is unavailable; observation did not restart it".into());
@@ -5183,7 +5197,11 @@ impl Daemon {
                         continue;
                     }
                     let message = error.to_string();
-                    if recover_worker {
+                    if self.content.resource_failure().is_some() {
+                        self.controller.kill_tree_now();
+                        self.content.kill_tree_now();
+                        self.content.clear_resource_failure();
+                    } else if recover_worker {
                         let _ = self.recover_content(&format!("content worker: {message}"));
                     }
                     return Err(message);

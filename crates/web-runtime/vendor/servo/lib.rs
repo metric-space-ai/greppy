@@ -110,7 +110,7 @@ pub use crate::gamepad_delegate::{
     GamepadDelegate, GamepadHapticEffectRequest, GamepadHapticEffectRequestType,
 };
 pub use crate::network_manager::{CacheEntry, NetworkManager};
-pub use crate::servo::{Servo, ServoBuilder, run_content_process};
+pub use crate::servo::{Servo, ServoBuilder, ServoProcessState, run_content_process};
 pub use crate::servo_delegate::{ServoDelegate, ServoError};
 pub use crate::site_data_manager::{SiteData, SiteDataManager, StorageType};
 pub use crate::user_content_manager::UserContentManager;
@@ -121,8 +121,8 @@ pub use crate::webview_delegate::{
     InputMethodControl, NavigationRequest, PermissionRequest, PromptDialog, SelectElement,
     SimpleDialog, WebResourceLoad, WebViewDelegate,
 };
-pub use embedder_traits::WebResourceResponseCompleted;
 pub use embedder_traits::CapturedWebResourceDownload;
+pub use embedder_traits::WebResourceResponseCompleted;
 
 #[cfg(feature = "webxr")]
 pub mod webxr {

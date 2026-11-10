@@ -4,10 +4,9 @@
 
 use std::fmt::Debug;
 use std::path::PathBuf;
-use std::thread;
 
 use log::error;
-use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+use servo_base::generic_channel::{self, GenericSender};
 use storage_traits::cache_storage::{
     CacheStorageError, CacheStorageThreadHandle, CacheStorageThreadMessage,
     CacheStorageThreadResponse,
@@ -62,22 +61,27 @@ impl CacheStorageThreadFactory for CacheStorageThreadHandle {
         std::fs::create_dir_all(&storage_dir)
             .expect("Failed to create CacheStorage storage directory");
         let sender_clone = generic_sender.clone();
-        thread::Builder::new()
-            .name("CacheStorageThread".to_owned())
-            .spawn(move || {
-                // Keep temp_dir alive while the thread runs.
-                let _ = temp_dir;
-                let engine = DummyCacheStorageEngine;
-                CacheStorageThread::new(sender_clone, generic_receiver, engine).start();
+        let mut manager = None;
+        crate::shared_workers::CACHE_STORAGE
+            .register(generic_receiver, move |message| {
+                let _keep_temp_dir = &temp_dir;
+                if let CacheStorageThreadMessage::Exit(sender) = message {
+                    let _ = sender.send(());
+                    return false;
+                }
+                manager
+                    .get_or_insert_with(|| {
+                        CacheStorageThread::new(sender_clone.clone(), DummyCacheStorageEngine)
+                    })
+                    .handle_message(message)
             })
-            .expect("Thread spawning failed");
+            .expect("CacheStorage worker spawning failed");
 
         CacheStorageThreadHandle::new(generic_sender)
     }
 }
 
 struct CacheStorageThread<E: CacheStorageEngine> {
-    receiver: GenericReceiver<CacheStorageThreadMessage>,
     // Note: a sender to self might be required later for the storage engine.
     _sender: GenericSender<CacheStorageThreadMessage>,
     engine: E,
@@ -89,40 +93,35 @@ where
 {
     pub fn new(
         _sender: GenericSender<CacheStorageThreadMessage>,
-        receiver: GenericReceiver<CacheStorageThreadMessage>,
+
         engine: E,
     ) -> CacheStorageThread<E> {
-        CacheStorageThread {
-            _sender,
-            receiver,
-            engine,
-        }
+        CacheStorageThread { _sender, engine }
     }
 
-    pub fn start(&mut self) {
-        while let Ok(message) = self.receiver.recv() {
-            match message {
-                CacheStorageThreadMessage::HasCache {
-                    cache_name,
-                    callback,
-                    proxy: _,
-                    origin: _,
-                } => {
-                    let result = self.engine.has_cache(&cache_name);
-                    if callback
-                        .send(CacheStorageThreadResponse::HasCacheResult(
-                            result.map(|_| false).map_err(|e| format!("{:?}", e)),
-                        ))
-                        .is_err()
-                    {
-                        error!("Failed to send response to script for HasCache message.");
-                    }
-                },
-                CacheStorageThreadMessage::Exit(sender) => {
-                    let _ = sender.send(());
-                    break;
-                },
+    fn handle_message(&mut self, message: CacheStorageThreadMessage) -> bool {
+        match message {
+            CacheStorageThreadMessage::HasCache {
+                cache_name,
+                callback,
+                proxy: _,
+                origin: _,
+            } => {
+                let result = self.engine.has_cache(&cache_name);
+                if callback
+                    .send(CacheStorageThreadResponse::HasCacheResult(
+                        result.map(|_| false).map_err(|e| format!("{:?}", e)),
+                    ))
+                    .is_err()
+                {
+                    error!("Failed to send response to script for HasCache message.");
+                }
+            }
+            CacheStorageThreadMessage::Exit(sender) => {
+                let _ = sender.send(());
+                return false;
             }
         }
+        true
     }
 }

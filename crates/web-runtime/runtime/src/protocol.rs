@@ -61,6 +61,12 @@ pub enum Message {
         method: String,
         params: serde_json::Value,
     },
+    ResourceLimit {
+        schema: ProtocolSchema,
+        version: u32,
+        worker: WorkerKind,
+        reason: String,
+    },
     EngineResult {
         schema: ProtocolSchema,
         version: u32,
@@ -134,6 +140,15 @@ impl Message {
         }
     }
 
+    pub fn resource_limit(worker: WorkerKind, reason: String) -> Self {
+        Self::ResourceLimit {
+            schema: ProtocolSchema::WorkerV1,
+            version: PROTOCOL_VERSION,
+            worker,
+            reason,
+        }
+    }
+
     pub fn engine_result(
         request_id: u64,
         ok: bool,
@@ -159,6 +174,7 @@ impl Message {
             | Self::RunScript { version, .. }
             | Self::ScriptComplete { version, .. }
             | Self::EngineCall { version, .. }
+            | Self::ResourceLimit { version, .. }
             | Self::EngineResult { version, .. } => version,
         };
         if version != PROTOCOL_VERSION {
@@ -279,6 +295,7 @@ fn validate_fields(value: &serde_json::Value) -> io::Result<()> {
             "method",
             "params",
         ],
+        "ResourceLimit" => &["type", "schema", "version", "worker", "reason"],
         "EngineResult" => &[
             "type",
             "schema",
@@ -352,6 +369,7 @@ mod tests {
             Message::script_complete(true, serde_json::json!({"ok": true}), None),
             Message::engine_call(7, "page.goto".to_owned(), serde_json::json!({"url": "x"})),
             Message::engine_result(7, true, serde_json::json!({"url": "x"}), None),
+            Message::resource_limit(WorkerKind::Content, "thread creation failed: EAGAIN".into()),
         ];
         for expected in messages {
             let mut bytes = Vec::new();
