@@ -80,6 +80,8 @@ fn project_path(root: &Path, text: &str, report: &serde_json::Value) -> EditResu
 }
 fn digest_file(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest,Sha256};
+    let meta=std::fs::metadata(path)?;
+    if !meta.is_file() { return Err(std::io::Error::other("compiler input is not a regular file")); }
     let mut file=std::fs::File::open(path)?;
     let mut hash=Sha256::new(); let mut buffer=[0u8;65536];
     loop { let count=file.read(&mut buffer)?; if count==0 {break;} hash.update(&buffer[..count]); }
@@ -104,6 +106,7 @@ fn validate_args(unit: &Unit, report: &serde_json::Value) -> EditResult<Vec<Stri
     let mut i=0;
     while i<unit.arguments.len() {
         let arg=&unit.arguments[i];
+        if arg.starts_with("-std=") && !matches!(arg.as_str(),"-std=c89"|"-std=c90"|"-std=iso9899:1990"|"-std=iso9899:199409"|"-std=c99"|"-std=iso9899:1999"|"-std=c11"|"-std=iso9899:2011"|"-std=c17"|"-std=c18"|"-std=iso9899:2017"|"-std=c2x"|"-std=c23"|"-std=gnu89"|"-std=gnu90"|"-std=gnu99"|"-std=gnu11"|"-std=gnu17"|"-std=gnu18"|"-std=gnu2x"|"-std=gnu23") { return Err(fail(report,"unavailable","unsupported_arguments","only declared C language standards are supported",14)); }
         if arg.contains(['\0','\n','\r']) { return Err(fail(report,"unavailable","unsupported_arguments","control characters in compiler arguments",14)); }
         if matches!(arg.as_str(),"-I"|"-iquote"|"-isystem") {
             i+=1;
@@ -121,6 +124,7 @@ fn validate_args(unit: &Unit, report: &serde_json::Value) -> EditResult<Vec<Stri
     Ok(unit.arguments.clone())
 }
 fn dependencies(path: &Path, cwd: &Path, report: &serde_json::Value) -> EditResult<BTreeSet<PathBuf>> {
+    if std::fs::metadata(path).map_err(|e|fail(report,"unavailable","dependency_manifest_missing",e.to_string(),14))?.len()>1024*1024 {return Err(fail(report,"unavailable","dependency_manifest_limit","dependency manifest exceeds 1MiB",14));}
     let text=std::fs::read_to_string(path).map_err(|e|fail(report,"unavailable","dependency_manifest_missing",e.to_string(),14))?;
     if text.len()>1024*1024 {return Err(fail(report,"unavailable","dependency_manifest_limit","dependency manifest exceeds 1MiB",14));}
     let text=text.replace("\\\r\n","").replace("\\\n","");

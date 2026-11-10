@@ -69,12 +69,18 @@ fn native_c_context_unavailable_and_stale_inputs_never_publish() {
     f.context("source.c",Some(wrapper.to_str().unwrap()),20);
     let out=f.run(&["write","source.c","--c-context","context.json","--json"],SOURCE.as_bytes(),None);code(&out,12);
     assert_eq!(value(&out)["error"]["c_validation"]["status"],"stale");assert!(!f.root.join("source.c").exists());
+    let slow=f.root.join("slow-compiler.py");
+    let script=format!("#!/usr/bin/python3\nimport os,sys,time\ncompiler={}\nif '--version' in sys.argv: os.execv(compiler,[compiler,*sys.argv[1:]])\ntime.sleep(10)\n",serde_json::to_string(&f.compiler).unwrap());
+    fs::write(&slow,script).unwrap();fs::set_permissions(&slow,fs::Permissions::from_mode(0o700)).unwrap();
+    f.context("source.c",Some(slow.to_str().unwrap()),1);
+    let out=f.run(&["write","source.c","--c-context","context.json","--json"],SOURCE.as_bytes(),None);code(&out,14);
+    assert_eq!(value(&out)["error"]["c_validation"]["status"],"timed_out");assert!(!f.root.join("source.c").exists());
 }
 #[test]
 fn native_c_mode_preserves_default_and_post_publication_verify() {
     let f=Fixture::new();f.context("source.c",None,20);
     let out=f.run(&["replace-lines","source.c","1:1","unused","--c-context","context.json"],b"",None);
-    assert_eq!(out.status.code(),Some(64));assert!(!f.root.join("source.c").exists());
+    code(&out,64);assert!(!f.root.join("source.c").exists());
     let broken=b"int broken(void) { return undeclared_name; }\n";
     let selected=format!("{} -std=c11 -fsyntax-only source.c",f.compiler);
     let out=f.run(&["write","source.c","--verify","--json"],broken,Some(&selected));code(&out,17);
