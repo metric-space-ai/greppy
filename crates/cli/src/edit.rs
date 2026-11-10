@@ -3591,13 +3591,9 @@ fn run_trained_patch_with_context_and_publish_hook(
     edit_journal_crash_hook()?;
     for (published_count, file) in planned.iter().enumerate() {
         before_publish(published_count);
-        if let Err(error) = publish_patch_transition(
-            root_path,
-            &file.abs,
-            file.before.as_deref(),
-            file.after.as_deref(),
-            None,
-        ) {
+        let stale = native.as_ref().and_then(|checked| checked.recheck_progress(&proposed,published_count).err());
+        let transition = if stale.is_some() { Err("configured C validation became stale".to_string()) } else { publish_patch_transition(root_path,&file.abs,file.before.as_deref(),file.after.as_deref(),None) };
+        if let Err(error) = transition {
             let mut conflicts = Vec::new();
             for file in planned[..published_count].iter().rev() {
                 // Reverse only a transition we actually published; CAS/absence
@@ -3633,6 +3629,7 @@ fn run_trained_patch_with_context_and_publish_hook(
                     edit_journal_abort(root_path, transaction.as_deref());
                 }
             }
+            if conflicts.is_empty() { if let Some(refusal)=stale { return Err(refusal); } }
             let recovery = if conflicts.is_empty() {
                 "earlier files written by this patch were rolled back; the failed target was left unchanged. Re-read the affected files before retrying".to_string()
             } else {

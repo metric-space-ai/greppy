@@ -38,6 +38,7 @@ pub(super) struct Proposed<'a> {
 enum Snapshot { Absent, Present(String) }
 pub(super) struct Validated {
     _stage: tempfile::TempDir,
+    root: PathBuf,
     bindings: BTreeMap<PathBuf, Snapshot>,
     proposals: BTreeMap<String, Snapshot>,
     executable: PathBuf,
@@ -296,16 +297,21 @@ fn validate(root:&Path,file:&str,proposed:&[Proposed<'_>])->EditResult<Validated
     }
     if !changed_c.is_subset(&covered){return Err(fail(&report,"unavailable","uncovered_proposal","a changed C/header input was not consumed by any declared translation unit",14));}
     report["translation_units"]=units.into(); report["status"]="passed".into();
-    let validated=Validated{_stage:stage,bindings,proposals:proposal_states,executable,resolved_executable:resolved,report};
+    let validated=Validated{_stage:stage,root,bindings,proposals:proposal_states,executable,resolved_executable:resolved,report};
     validated.recheck(proposed)?;
     Ok(validated)
 }
 impl Validated {
     pub(super) fn recheck(&self,proposed:&[Proposed<'_>])->EditResult<()> {
+        self.recheck_progress(proposed,0)
+    }
+    pub(super) fn recheck_progress(&self,proposed:&[Proposed<'_>],published_count:usize)->EditResult<()> {
+        let published=proposed.iter().take(published_count).map(|p|(self.root.join(p.path),state(p.after))).collect::<BTreeMap<_,_>>();
         if self.executable.canonicalize().ok().as_ref()!=Some(&self.resolved_executable) {
             return Err(fail(&self.report,"stale","compiler_changed","compiler selection changed",12));
         }
-        for (path,expected) in &self.bindings {
+        for (path,before) in &self.bindings {
+            let expected=published.get(path).unwrap_or(before);
             if snapshot(path).ok().as_ref()!=Some(expected){return Err(fail(&self.report,"stale","input_changed",format!("validated input changed: {}",path.display()),12));}
         }
         let current=proposed.iter().map(|p|(p.path.to_string(),state(p.after))).collect::<BTreeMap<_,_>>();

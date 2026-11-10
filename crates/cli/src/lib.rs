@@ -1147,6 +1147,11 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // list, yet clap rejects, was retired there -- also a refusal.
             // Both fall through to the usage path below, which names the
             // corrected invocation.
+            // A requested validation authority must never be dropped by guessed-flag recovery.
+            if unknown_flag_name(first) == Some("--c-context") {
+                println!("--c-context is supported only by write and patch; select one of those commands or omit the option; nothing written");
+                return 64;
+            }
             let flag_kind = classify_unknown_flag(&argv, sub, first);
             if !matches!(
                 flag_kind,
