@@ -221,6 +221,34 @@ fn native_c_failure_classification_keeps_unknown_driver_unavailable() {
 }
 
 #[test]
+fn native_c_source_excerpt_cannot_impersonate_driver_failure() {
+    let f = Fixture::new();
+    f.context("source.c", None, 20);
+    let source = b"int value(void) {\n    goto error;\nerror: return missing_identifier;\n}\n";
+    let out = f.run(
+        &["write", "source.c", "--c-context", "context.json", "--json"],
+        source,
+        None,
+    );
+    code(&out, 14);
+    let record = value(&out);
+    let native = &record["error"]["c_validation"];
+    assert_eq!(native["status"], "rejected");
+    let expected = if f.family == "gcc" {
+        vec!["-fdiagnostics-color=never", "-fno-diagnostics-show-caret"]
+    } else {
+        vec!["-fno-color-diagnostics", "-fno-caret-diagnostics"]
+    };
+    assert_eq!(native["compiler"]["diagnostic_arguments"], serde_json::json!(expected));
+    assert!(!native["process"]["stderr"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .any(|line| line == "error: return missing_identifier;"));
+    assert!(!f.root.join("source.c").exists());
+}
+
+#[test]
 fn native_c_rejected_patch_never_publishes() {
     let f = Fixture::new();
     f.context("source.c", None, 20);

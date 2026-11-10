@@ -65,6 +65,13 @@
         },
         "version": {
           "type": "string"
+        },
+        "diagnostic_arguments": {
+          "description": "Effective frontend-controlled flags suppressing diagnostic color and source excerpts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [

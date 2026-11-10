@@ -664,7 +664,12 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
             14,
         )
     })?;
-    report["compiler"] = serde_json::json!({"family":context.compiler.family,"path":executable,"resolved_path":resolved,"sha256":compiler_hash});
+    let diagnostic_arguments = if context.compiler.family == "gcc" {
+        ["-fdiagnostics-color=never", "-fno-diagnostics-show-caret"]
+    } else {
+        ["-fno-color-diagnostics", "-fno-caret-diagnostics"]
+    };
+    report["compiler"] = serde_json::json!({"family":context.compiler.family,"path":executable,"resolved_path":resolved,"sha256":compiler_hash,"diagnostic_arguments":diagnostic_arguments});
     let deadline =
         Instant::now() + Duration::from_secs(context.timeout_seconds).min(edit_verify_timeout());
     let version = execution(&resolved, &["--version".into()], &root, deadline, &report)?;
@@ -914,7 +919,7 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
                 14,
             )
         })?;
-        let args = validate_args(unit, &report)?
+        let mut args = validate_args(unit, &report)?
             .into_iter()
             .map(|a| {
                 if a == "{source}" {
@@ -924,6 +929,7 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
                 }
             })
             .collect::<Vec<_>>();
+        args.extend(diagnostic_arguments.iter().map(|arg| (*arg).to_string()));
         let dep = stage.path().join(format!("before-{index}.d"));
         let mut scan = args
             .iter()
