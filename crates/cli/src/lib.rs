@@ -544,6 +544,7 @@ pub enum EditCommand {
         verify: bool,
     },
     Write {
+        c_context: Option<String>,
         path: String,
         new: Option<String>,
         dry_run: bool,
@@ -582,6 +583,7 @@ pub enum EditCommand {
         verify: bool,
     },
     Patch {
+        c_context: Option<String>,
         diff: Option<String>,
         dry_run: bool,
         verify: bool,
@@ -2840,6 +2842,7 @@ fn dispatch_subcommand(
             )
         }
         Command::Write {
+            c_context,
             path,
             new,
             dry_run,
@@ -2848,6 +2851,7 @@ fn dispatch_subcommand(
             json,
         } => dispatch_edit(
             EditCommand::Write {
+                c_context,
                 path,
                 new,
                 dry_run,
@@ -2940,6 +2944,7 @@ fn dispatch_subcommand(
             root,
         ),
         Command::Patch {
+            c_context,
             diff,
             dry_run,
             verify,
@@ -2947,6 +2952,7 @@ fn dispatch_subcommand(
             json,
         } => dispatch_edit(
             EditCommand::Patch {
+                c_context,
                 diff,
                 dry_run,
                 verify,
