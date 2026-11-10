@@ -1265,6 +1265,11 @@ pub(crate) fn edit_positional_payload(
 
 const SYNTAX_ALLOW_NEXT: &str = "next: make the whole change in one `greppy patch` so the file is valid at the end, or re-run with --allow-syntax-errors to write this intermediate state";
 
+// A complete compiler-valid C file can exceed the preprocessor coverage of the
+// tree-sitter grammar. Do not describe every refusal as an intermediate edit or
+// suggest that submitting identical bytes through patch repairs that limitation.
+const C_SYNTAX_REFUSAL_NEXT: &str = "next: this C check uses tree-sitter without compiler preprocessing; conditional compiler attributes may exceed parser coverage. Check the complete proposed file with your project's C compiler configuration. A compiler-valid file can still require a Greppy parser fix; rewriting the same bytes as one patch does not resolve a parser limitation";
+
 fn syntax_allowance_message(path: &str, new_errors: usize, diagnostic: Option<&str>) -> String {
     match diagnostic.and_then(|diagnostic| diagnostic.split(" (").next()) {
         Some(point) => format!(
@@ -1323,18 +1328,23 @@ fn edit_validate_syntax(
         .as_ref()
         .map(|item| format!("{path}:{item}"))
         .unwrap_or_else(|| path.to_string());
+    let next = if language == greppy_edit::Language::C {
+        C_SYNTAX_REFUSAL_NEXT
+    } else {
+        SYNTAX_ALLOW_NEXT
+    };
     Err(EditRefusal::new(
         "invalid_result",
         format!(
             "refused: syntax validation failed in proposed {location}; \
              errors {} -> {}, missing nodes {} -> {} — nothing written. \
              Location refers to the proposed result, not the unchanged file\n\
-             {SYNTAX_ALLOW_NEXT}",
+             {next}",
             before_counts.errors, counts.errors, before_counts.missing, counts.missing
         ),
         13,
     )
-    .with("next", serde_json::json!(SYNTAX_ALLOW_NEXT)))
+    .with("next", serde_json::json!(next)))
 }
 
 /// The text receipt's first line. Names the symbol body that was replaced and

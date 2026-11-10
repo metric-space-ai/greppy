@@ -2531,6 +2531,75 @@ fn replace_lines_syntax_error_names_allow_syntax_errors() {
     assert_file(&fixture.repo.join("item.rs"), before);
 }
 
+#[path = "support/c_conditional_attribute.rs"]
+mod c_conditional_attribute;
+use c_conditional_attribute::c_attribute_cases;
+
+#[test]
+fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
+    let fixture = Fixture::new("c-conditional-attribute-diagnostic");
+    let before = "int example(int n) { return n; }\n";
+    for (name, source, expected) in c_attribute_cases() {
+        let file = format!("{name}.c");
+        let path = fixture.repo.join(&file);
+        for json in [false, true] {
+            std::fs::write(&path, before).unwrap();
+            let mut args = vec!["write", file.as_str(), source.as_str()];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            if expected == [true, true] {
+                assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+                assert_file(&path, &source);
+                continue;
+            }
+            assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+            let message = if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["published"], false);
+                assert_eq!(value["error"]["code"], "invalid_result");
+                let next = value["error"]["next"].as_str().unwrap();
+                assert!(next.contains("without compiler preprocessing"), "{next}");
+                value["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                combined(&output)
+            };
+            assert!(message.contains("tree-sitter:"), "{message}");
+            assert!(message.contains("nothing written"), "{message}");
+            assert!(message.contains("compiler-valid file"), "{message}");
+            assert!(
+                message.contains("without compiler preprocessing"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("write this intermediate state"),
+                "{message}"
+            );
+            assert!(!message.contains("--allow-syntax-errors"), "{message}");
+            assert_file(&path, before);
+        }
+    }
+
+    // Ordinary supported C still writes. C++ keeps its existing guidance; this
+    // case is only a scope control, not a claimed C++ attribute reproduction.
+    let output = fixture.run(&[
+        "write",
+        "ordinary.c",
+        "__attribute__((noinline))\nint example(int n) { return n+1; }\n",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+    let cpp = fixture.repo.join("scope.cpp");
+    std::fs::write(&cpp, before).unwrap();
+    let output = fixture.run(&["write", "scope.cpp", "int broken = ;\n", "--json"]);
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let next = value["error"]["next"].as_str().unwrap();
+    assert!(next.contains("--allow-syntax-errors"), "{next}");
+    assert!(!next.contains("without compiler preprocessing"), "{next}");
+    assert_file(&cpp, before);
+}
+
 #[test]
 fn allow_syntax_errors_writes_and_reports_new_diagnostics() {
     let fixture = Fixture::new("syntax-allow");
