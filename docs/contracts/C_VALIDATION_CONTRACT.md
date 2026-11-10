@@ -6,7 +6,7 @@ This is the proposed versioned extension to the registered edit contract. The ra
 
 ## Surface and default
 
-`greppy write PATH [NEW] --c-context FILE` and `greppy patch [DIFF] --c-context FILE` select this authority. FILE is relative to the selected workspace root. The context schema is `c-validation-context.v1.schema.json`. Other verbs do not accept this option. Missing/unsupported coverage is a refusal, never an ignored option. This first version does not certify C-input deletion or C++.
+`greppy write PATH [NEW] --c-context FILE` and `greppy patch [DIFF] --c-context FILE` select this authority. FILE is relative to the selected workspace root. The context schema is `c-validation-context.v1.schema.json`. Other verbs do not accept this option. Missing/unsupported coverage is a refusal, never an ignored option. This first version supports Unix GCC/Clang; other platforms refuse validation. It does not certify C-input deletion or C++.
 
 Without the option, existing edit validation is unchanged. The existing `--allow-syntax-errors` route is unchanged and cannot be combined with native authority. `--verify` remains a separate **post-publication** check: its failure returns17 while the edit remains applied. A native pre-publication failure never reaches that phase.
 

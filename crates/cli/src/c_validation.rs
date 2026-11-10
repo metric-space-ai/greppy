@@ -530,14 +530,15 @@ pub(super) fn prepare(
 }
 fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Validated> {
     let mut report = base();
-    #[cfg(not(unix))]
-    return Err(fail(
-        &report,
-        "unavailable",
-        "unsupported_platform",
-        "native C contexts currently require Unix GCC/Clang",
-        14,
-    ));
+    if !cfg!(unix) {
+        return Err(fail(
+            &report,
+            "unavailable",
+            "unsupported_platform",
+            "native C contexts currently require Unix GCC/Clang",
+            14,
+        ));
+    }
     let root = root.canonicalize().map_err(|e| {
         fail(
             &report,
