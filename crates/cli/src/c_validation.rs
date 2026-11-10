@@ -134,12 +134,18 @@ fn project_path(root: &Path, text: &str, report: &serde_json::Value) -> EditResu
     Ok(path)
 }
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    if !std::fs::metadata(path)?.is_file() { return Err(std::io::Error::other("input is not a regular file")); }
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::other("input is not a regular file"));
+    }
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() { return Err(std::io::Error::other("input is not a regular file")); }
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("input is not a regular file"));
+    }
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit { return Err(std::io::Error::other("input exceeds configured byte limit")); }
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other("input exceeds configured byte limit"));
+    }
     Ok(bytes)
 }
 fn digest_file(path: &Path) -> std::io::Result<String> {
@@ -488,7 +494,12 @@ fn compiler_failure(report: &serde_json::Value, exec: &VerifierExecution) -> Edi
             || lower.contains("unknown cpu")
         {
             ("unavailable", "unsupported_configuration")
-        } else if matches!(exec.exit_code, Some(126 | 127)) || lower.contains("internal compiler error") || lower.contains("unable to execute") || lower.contains("cannot execute") || lower.contains("error trying to exec") {
+        } else if matches!(exec.exit_code, Some(126 | 127))
+            || lower.contains("internal compiler error")
+            || lower.contains("unable to execute")
+            || lower.contains("cannot execute")
+            || lower.contains("error trying to exec")
+        {
             ("unavailable", "compiler_execution_failed")
         } else if exec.exit_code.is_none() {
             ("unavailable", "compiler_terminated")
@@ -735,8 +746,17 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
             }
             changed_c.insert(item.path.to_string());
             let bytes = item.after.unwrap_or_default();
-            let tree = greppy_parser::parse_for_syntax_validation(greppy_parser::Language::C, bytes)
-                .map_err(|e| fail(&report, "unavailable", "parser_observation_unavailable", e.to_string(), 14))?;
+            let tree =
+                greppy_parser::parse_for_syntax_validation(greppy_parser::Language::C, bytes)
+                    .map_err(|e| {
+                        fail(
+                            &report,
+                            "unavailable",
+                            "parser_observation_unavailable",
+                            e.to_string(),
+                            14,
+                        )
+                    })?;
             {
                 let mut nodes = vec![tree.root_node()];
                 let (mut errors, mut missing) = (0, 0);

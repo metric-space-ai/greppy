@@ -245,8 +245,16 @@ fn native_c_mode_preserves_default_and_post_publication_verify() {
     f.context("source.c", None, 20);
     let original = b"int original(void) { return 7; }\n";
     fs::write(f.root.join("source.c"), original).unwrap();
-    for option in [vec!["--c-context", "context.json"], vec!["--c-context=context.json"]] {
-        let mut args = vec!["replace-lines", "source.c", "1:1", "int changed(void) { return 9; }"];
+    for option in [
+        vec!["--c-context", "context.json"],
+        vec!["--c-context=context.json"],
+    ] {
+        let mut args = vec![
+            "replace-lines",
+            "source.c",
+            "1:1",
+            "int changed(void) { return 9; }",
+        ];
         args.extend(option);
         let out = f.run(&args, b"", None);
         code(&out, 64);
