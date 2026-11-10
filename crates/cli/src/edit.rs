@@ -32,12 +32,25 @@ pub(crate) fn dispatch_edit_inner(
     let root_path = resolve_root(root)?;
     let file_base = resolve_file_operand_base(root, &root_path);
     if let EditCommand::Write {
-        path, new, dry_run, c_context, ..
+        path,
+        new,
+        dry_run,
+        c_context,
+        ..
     } = &command
     {
         if let Some(target) = scratch_write_target(&root_path, &file_base, path) {
             if c_context.is_some() {
-                return emit_edit_outcome(Err(EditRefusal::new("validation_unavailable", "--c-context requires a project-relative C transaction; nothing written", 14)), json, None, &root_path);
+                return emit_edit_outcome(
+                    Err(EditRefusal::new(
+                        "validation_unavailable",
+                        "--c-context requires a project-relative C transaction; nothing written",
+                        14,
+                    )),
+                    json,
+                    None,
+                    &root_path,
+                );
             }
             return write_scratch_file(&target, new.clone(), *dry_run, json);
         }
@@ -1941,7 +1954,23 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
     if verifier.scope == "c_validation" {
-        for key in ["CC", "CFLAGS", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH", "SDKROOT", "INCLUDE", "CCC_OVERRIDE_OPTIONS", "CLANG_CONFIG_FILE_SYSTEM_DIR", "CLANG_CONFIG_FILE_USER_DIR"] { process.env_remove(key); }
+        for key in [
+            "CC",
+            "CFLAGS",
+            "CPATH",
+            "C_INCLUDE_PATH",
+            "CPLUS_INCLUDE_PATH",
+            "OBJC_INCLUDE_PATH",
+            "GCC_EXEC_PREFIX",
+            "COMPILER_PATH",
+            "SDKROOT",
+            "INCLUDE",
+            "CCC_OVERRIDE_OPTIONS",
+            "CLANG_CONFIG_FILE_SYSTEM_DIR",
+            "CLANG_CONFIG_FILE_USER_DIR",
+        ] {
+            process.env_remove(key);
+        }
         process.env("LC_ALL", "C");
     }
     if verifier.scope == "tests" {
@@ -1975,10 +2004,18 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     let (status, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(status)) => break (Some(status), false),
-            Ok(None) if native && [&stdout_path, &stderr_path].iter().any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1024 * 1024)) => {
+            Ok(None)
+                if native
+                    && [&stdout_path, &stderr_path]
+                        .iter()
+                        .any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1024 * 1024)) =>
+            {
                 edit_kill_verifier_tree(&mut child, false);
                 let _ = child.wait();
-                return EditVerification::new(EditVerificationStatus::Unavailable, vec!["C validation output exceeded 1MiB; nothing written".into()]);
+                return EditVerification::new(
+                    EditVerificationStatus::Unavailable,
+                    vec!["C validation output exceeded 1MiB; nothing written".into()],
+                );
             }
             Ok(None) if started.elapsed() >= timeout => {
                 edit_kill_verifier_tree(&mut child, verifier.scope == "tests");
@@ -2004,8 +2041,15 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
             }
         }
     };
-    if native && [&stdout_path, &stderr_path].iter().any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1024 * 1024)) {
-        return EditVerification::new(EditVerificationStatus::Unavailable, vec!["C validation output exceeded 1MiB; nothing written".into()]);
+    if native
+        && [&stdout_path, &stderr_path]
+            .iter()
+            .any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1024 * 1024))
+    {
+        return EditVerification::new(
+            EditVerificationStatus::Unavailable,
+            vec!["C validation output exceeded 1MiB; nothing written".into()],
+        );
     }
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -2037,7 +2081,10 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     };
     if timed_out || runner_timed_out {
         let message = if native {
-            format!("C validation timed out after {}s; nothing written", timeout.as_secs())
+            format!(
+                "C validation timed out after {}s; nothing written",
+                timeout.as_secs()
+            )
         } else if runner_timed_out {
             format!("verify: timed out after {}ms — edit remains applied; run `{command}` directly to continue",
                 runner_status.as_ref().and_then(|value| value["elapsed_ms"].as_u64()).unwrap_or_default())
@@ -2788,8 +2835,25 @@ pub(crate) fn edit_refusal_json(
 }
 
 #[cfg(test)]
-pub(crate) fn run_trained_write(root_path: &std::path::Path, file_base: &std::path::Path, path: &str, bytes: Vec<u8>, dry_run: bool, verify: bool, allow_syntax_errors: bool) -> EditResult<EditRecord> {
-    run_trained_write_with_context(root_path, file_base, path, bytes, dry_run, verify, allow_syntax_errors, None)
+pub(crate) fn run_trained_write(
+    root_path: &std::path::Path,
+    file_base: &std::path::Path,
+    path: &str,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+    allow_syntax_errors: bool,
+) -> EditResult<EditRecord> {
+    run_trained_write_with_context(
+        root_path,
+        file_base,
+        path,
+        bytes,
+        dry_run,
+        verify,
+        allow_syntax_errors,
+        None,
+    )
 }
 
 fn run_trained_write_with_context(
@@ -2858,11 +2922,23 @@ fn run_trained_write_with_context(
         }
     }
     let old = before.as_deref().unwrap_or_default();
-    let proposed = [c_validation::Proposed { path: &rel, before: before.as_deref(), after: Some(&bytes) }];
+    let proposed = [c_validation::Proposed {
+        path: &rel,
+        before: before.as_deref(),
+        after: Some(&bytes),
+    }];
     let native = c_validation::prepare(root_path, c_context, &proposed, allow_syntax_errors)?;
-    let allowance = if native.is_some() { None } else { edit_validate_syntax(&rel, old, &bytes, allow_syntax_errors)? };
+    let allowance = if native.is_some() {
+        None
+    } else {
+        edit_validate_syntax(&rel, old, &bytes, allow_syntax_errors)?
+    };
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
-    if let Some(checked) = &native { record.extra.push(("c_validation", checked.receipt(record.published))); }
+    if let Some(checked) = &native {
+        record
+            .extra
+            .push(("c_validation", checked.receipt(record.published)));
+    }
     if before.as_deref() == Some(bytes.as_slice()) {
         record.already_as_sent = !dry_run;
         if verify && !dry_run {
@@ -2884,7 +2960,9 @@ fn run_trained_write_with_context(
             )
         })?;
     }
-    if let Some(checked) = &native { checked.recheck(&proposed)?; }
+    if let Some(checked) = &native {
+        checked.recheck(&proposed)?;
+    }
     let transaction = edit_journal_open(
         root_path,
         &[UndoBefore {
@@ -3443,8 +3521,25 @@ fn publish_patch_transition(
 }
 
 #[cfg(test)]
-fn run_trained_patch_with_publish_hook(root_path: &std::path::Path, file_base: &std::path::Path, diff: Vec<u8>, dry_run: bool, verify: bool, allow_syntax_errors: bool, before_publish: impl FnMut(usize)) -> EditResult<EditRecord> {
-    run_trained_patch_with_context_and_publish_hook(root_path, file_base, diff, dry_run, verify, allow_syntax_errors, None, before_publish)
+fn run_trained_patch_with_publish_hook(
+    root_path: &std::path::Path,
+    file_base: &std::path::Path,
+    diff: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+    allow_syntax_errors: bool,
+    before_publish: impl FnMut(usize),
+) -> EditResult<EditRecord> {
+    run_trained_patch_with_context_and_publish_hook(
+        root_path,
+        file_base,
+        diff,
+        dry_run,
+        verify,
+        allow_syntax_errors,
+        None,
+        before_publish,
+    )
 }
 
 fn run_trained_patch_with_context_and_publish_hook(
@@ -3473,7 +3568,11 @@ fn run_trained_patch_with_context_and_publish_hook(
                             20,
                         )
                     })?;
-                if let Some(message) = if c_context.is_some() && c_validation::is_c(&rel) { None } else { edit_validate_syntax(&rel, &[], &bytes, allow_syntax_errors)? } {
+                if let Some(message) = if c_context.is_some() && c_validation::is_c(&rel) {
+                    None
+                } else {
+                    edit_validate_syntax(&rel, &[], &bytes, allow_syntax_errors)?
+                } {
                     allowances.push(message);
                 }
                 let changed = vec![(0, bytes.len())];
@@ -3485,9 +3584,11 @@ fn run_trained_patch_with_context_and_publish_hook(
                     TrainedPatchOperation::Update => {
                         let (after, changed) =
                             apply_trained_patch_file(&rel, &content, &file.hunks)?;
-                        if let Some(message) =
-                            if c_context.is_some() && c_validation::is_c(&rel) { None } else { edit_validate_syntax(&rel, &content, &after, allow_syntax_errors)? }
-                        {
+                        if let Some(message) = if c_context.is_some() && c_validation::is_c(&rel) {
+                            None
+                        } else {
+                            edit_validate_syntax(&rel, &content, &after, allow_syntax_errors)?
+                        } {
                             allowances.push(message);
                         }
                         (rel, abs, Some(content), Some(after), changed)
@@ -3525,7 +3626,14 @@ fn run_trained_patch_with_context_and_publish_hook(
             changed,
         });
     }
-    let proposed = planned.iter().map(|p| c_validation::Proposed { path: &p.rel, before: p.before.as_deref(), after: p.after.as_deref() }).collect::<Vec<_>>();
+    let proposed = planned
+        .iter()
+        .map(|p| c_validation::Proposed {
+            path: &p.rel,
+            before: p.before.as_deref(),
+            after: p.after.as_deref(),
+        })
+        .collect::<Vec<_>>();
     let native = c_validation::prepare(root_path, c_context, &proposed, allow_syntax_errors)?;
     let already = planned.iter().all(|file| file.before == file.after);
     let exact_required = planned.len() > 1
@@ -3560,7 +3668,11 @@ fn run_trained_patch_with_context_and_publish_hook(
         already_as_sent: already && !dry_run,
         ..EditRecord::default()
     };
-    if let Some(checked) = &native { record.extra.push(("c_validation", checked.receipt(record.published))); }
+    if let Some(checked) = &native {
+        record
+            .extra
+            .push(("c_validation", checked.receipt(record.published)));
+    }
     for file in &planned {
         record.operations.push(EditOperation {
             file: file.rel.clone(),
@@ -3586,13 +3698,27 @@ fn run_trained_patch_with_context_and_publish_hook(
             content: file.before.clone(),
         })
         .collect::<Vec<_>>();
-    if let Some(checked) = &native { checked.recheck(&proposed)?; }
+    if let Some(checked) = &native {
+        checked.recheck(&proposed)?;
+    }
     let transaction = edit_journal_open(root_path, &before)?;
     edit_journal_crash_hook()?;
     for (published_count, file) in planned.iter().enumerate() {
         before_publish(published_count);
-        let stale = native.as_ref().and_then(|checked| checked.recheck_progress(&proposed,published_count).err());
-        let transition = if stale.is_some() { Err("configured C validation became stale".to_string()) } else { publish_patch_transition(root_path,&file.abs,file.before.as_deref(),file.after.as_deref(),None) };
+        let stale = native
+            .as_ref()
+            .and_then(|checked| checked.recheck_progress(&proposed, published_count).err());
+        let transition = if stale.is_some() {
+            Err("configured C validation became stale".to_string())
+        } else {
+            publish_patch_transition(
+                root_path,
+                &file.abs,
+                file.before.as_deref(),
+                file.after.as_deref(),
+                None,
+            )
+        };
         if let Err(error) = transition {
             let mut conflicts = Vec::new();
             for file in planned[..published_count].iter().rev() {
@@ -3629,7 +3755,11 @@ fn run_trained_patch_with_context_and_publish_hook(
                     edit_journal_abort(root_path, transaction.as_deref());
                 }
             }
-            if conflicts.is_empty() { if let Some(refusal)=stale { return Err(refusal); } }
+            if conflicts.is_empty() {
+                if let Some(refusal) = stale {
+                    return Err(refusal);
+                }
+            }
             let recovery = if conflicts.is_empty() {
                 "earlier files written by this patch were rolled back; the failed target was left unchanged. Re-read the affected files before retrying".to_string()
             } else {
