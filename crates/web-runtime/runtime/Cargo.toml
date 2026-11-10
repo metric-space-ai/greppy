@@ -7,7 +7,7 @@ publish = false
 [features]
 default = ["controller-runtime", "content-runtime"]
 controller-runtime = ["dep:deno_core", "dep:deno_error", "dep:tokio"]
-content-runtime = ["dep:servo", "dep:dpi", "dep:png", "dep:http", "dep:surfman"]
+content-runtime = ["dep:servo", "dep:dpi", "dep:png", "dep:http", "dep:surfman", "dep:crossbeam-channel", "dep:servo-base", "dep:servo-config"]
 
 [dependencies]
 greppy-web-client = { path = "../../web-client" }
@@ -19,6 +19,9 @@ dpi = { version = "0.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 servo = { version = "=0.5.0", optional = true }
+crossbeam-channel = { version = "=0.5.16", optional = true }
+servo-base = { version = "=0.5.0", optional = true }
+servo-config = { version = "=0.5.0", optional = true }
 # Direct dependency so Cargo unifies surfman with `sm-x11`. That switches the
 # Linux default connection from Wayland-only to the Unix multi backend
 # (Wayland, then X11, then Mesa surfaceless). SoftwareRenderingContext::new
@@ -33,9 +36,6 @@ http = { version = "1", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
-crossbeam-channel = "=0.5.16"
-servo-base = "=0.5.0"
-servo-config = "=0.5.0"
 fst = "0.4"
 rayon = "=1.12.0"
 

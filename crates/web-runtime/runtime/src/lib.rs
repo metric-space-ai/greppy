@@ -2,7 +2,7 @@
 #[allow(dead_code)]
 #[path = "../../vendor/servo-paint/shared_render_workers.rs"]
 mod shared_render_workers_contract;
-#[cfg(test)]
+#[cfg(all(test, feature = "content-runtime"))]
 #[allow(dead_code)]
 #[path = "../../vendor/servo-storage/shared_workers.rs"]
 mod shared_storage_workers_contract;
