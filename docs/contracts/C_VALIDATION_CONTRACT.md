@@ -35,13 +35,13 @@ A successful native receipt means the validation passed, **not** that publicatio
 | stale | Validated proposal/input/identity binding changed |12 |No |
 | invalid context specification | Malformed/ambiguous context or invalid request |20 |No |
 
-Clap rejects unsupported verbs/options and conflicting native/bypass flags using its existing exit64 convention. A compiler rejection is not advertised as proof that every emitted diagnostic is a source-syntax error.
+Unsupported verbs with either `--c-context FILE` or `--c-context=FILE`, and conflicting native/bypass flags, refuse with exit64. The requested authority is never removed by guessed-option recovery. A compiler rejection is not advertised as proof that every emitted diagnostic is a source-syntax error.
 
 ## First-version supported boundary
 
 - The configuration is explicitly named. Translation-unit entries are unique, project-relative `.c` paths with represented project-relative working directories.
 - Every changed `.c`/`.h` input must actually occur in a declared unit's compiler dependency manifest. Unlisted units and unconsumed changed headers refuse validation.
-- Project inputs are explicit regular, nonsymlink files. Proposals may provide new headers in the same patch. Parent traversal, unrepresented live-workspace escapes and source/configuration self-editing are refused.
+- Project inputs are explicit regular, nonsymlink files. Proposals may provide new headers in the same patch. Noncanonical path aliases, parent traversal, unrepresented live-workspace escapes and source/configuration self-editing are refused.
 - The stage is bounded to2048 files/64MiB. The context and dependency manifest are each at most1MiB. Compiler capture is bounded to1MiB per stream. The transaction uses the existing verifier timeout with a context cap of60s; context settings cannot silently raise it.
 - Argument support is explicit: one `{source}`, one `-fsyntax-only`, C-standard/diagnostic/freestanding/target/CPU options and represented relative include paths. Shell commands, response files, additional source operands, output/link/preprocess-only driver modes and unsupported options refuse validation.
 - Dependency hashes for the selected execution are retained; this does not assert hermetic reproducibility of all toolchain/platform state.

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "greppy.c-validation-context.v1",
+  "$id": "urn:greppy:c-validation-context:v1",
   "title": "DRAFT configured C frontend context v1; Owner sign-off outstanding",
   "type": "object",
   "additionalProperties": false,

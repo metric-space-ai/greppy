@@ -90,6 +90,7 @@ fn fail(
 }
 fn relative(text: &str) -> bool {
     !text.is_empty()
+        && (text == "." || !text.split('/').any(|part| part.is_empty() || part == "."))
         && !text.contains(['\0', '\n', '\r'])
         && Path::new(text)
             .components()
@@ -487,6 +488,8 @@ fn compiler_failure(report: &serde_json::Value, exec: &VerifierExecution) -> Edi
             || lower.contains("unknown cpu")
         {
             ("unavailable", "unsupported_configuration")
+        } else if matches!(exec.exit_code, Some(126 | 127)) || lower.contains("internal compiler error") || lower.contains("unable to execute") || lower.contains("cannot execute") || lower.contains("error trying to exec") {
+            ("unavailable", "compiler_execution_failed")
         } else if exec.exit_code.is_none() {
             ("unavailable", "compiler_terminated")
         } else {
@@ -732,8 +735,8 @@ fn validate(root: &Path, file: &str, proposed: &[Proposed<'_>]) -> EditResult<Va
             }
             changed_c.insert(item.path.to_string());
             let bytes = item.after.unwrap_or_default();
-            if let Ok(tree) =
-                greppy_parser::parse_for_syntax_validation(greppy_parser::Language::C, bytes)
+            let tree = greppy_parser::parse_for_syntax_validation(greppy_parser::Language::C, bytes)
+                .map_err(|e| fail(&report, "unavailable", "parser_observation_unavailable", e.to_string(), 14))?;
             {
                 let mut nodes = vec![tree.root_node()];
                 let (mut errors, mut missing) = (0, 0);

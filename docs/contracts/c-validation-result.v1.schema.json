@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "greppy.c-validation-result.v1",
+  "$id": "urn:greppy:c-validation-result:v1",
   "title": "DRAFT configuration-scoped C validation result; Owner sign-off outstanding",
   "type": "object",
   "required": [
@@ -8,7 +8,8 @@
     "backend",
     "coverage",
     "inactive_variants_checked",
-    "status"
+    "status",
+    "published"
   ],
   "properties": {
     "schema_version": {
@@ -71,7 +72,8 @@
         "path",
         "resolved_path",
         "sha256"
-      ]
+      ],
+      "additionalProperties": false
     },
     "input_hashes": {
       "type": "object",
@@ -104,7 +106,8 @@
             "type": "integer",
             "minimum": 0
           }
-        }
+        },
+        "additionalProperties": false
       }
     },
     "translation_units": {
@@ -144,7 +147,8 @@
               "$ref": "#/$defs/sha"
             }
           }
-        }
+        },
+        "additionalProperties": false
       }
     },
     "process": {
@@ -169,7 +173,47 @@
           "raw_parser_observations",
           "translation_units",
           "published"
-        ]
+        ],
+        "properties": {
+          "compiler": {
+            "required": [
+              "version"
+            ]
+          },
+          "input_hashes": {
+            "minProperties": 1
+          },
+          "raw_parser_observations": {
+            "minItems": 1
+          },
+          "translation_units": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "process": {
+                  "properties": {
+                    "exit_code": {
+                      "const": 0
+                    },
+                    "timed_out": {
+                      "const": false
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "published": {
+            "const": false
+          }
+        }
       }
     }
   ],
@@ -200,7 +244,9 @@
       "required": [
         "exit_code",
         "timed_out"
-      ]
+      ],
+      "additionalProperties": false
     }
-  }
+  },
+  "additionalProperties": false
 }
