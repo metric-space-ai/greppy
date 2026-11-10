@@ -801,15 +801,18 @@ fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)
 }
 
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
-    if language == Language::Python {
+    let validation_content = syntax_validation_content(language, content);
+    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
+    // Parser recovery can leave an empty block after a malformed statement.
+    // Prefer the explicit parser failure over treating that recovered block as
+    // proof that the user omitted or unindented a suite.
+    if language == Language::Python && !tree.root_node().has_error() {
         if let Some((row, column, reason)) = python_syntax_diagnostics(content).first() {
             return Some(format!(
                 "{row}:{column} ({reason}; column is a byte offset)"
             ));
         }
     }
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
