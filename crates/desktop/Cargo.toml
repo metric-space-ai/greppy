@@ -7,34 +7,33 @@ license.workspace = true
 publish.workspace = true
 description = "Thin greppy adapter over agent-desktop. Upstream types stay inside this crate."
 
-# The only agent-desktop version pin. Every git dependency below must use this
-# tag, and package.metadata.greppy records the commit the tag resolved to.
-# Contract test `upstream_pin_is_single_tag` fails if they diverge.
+# One immutable agent-desktop revision for the shared core and all OS adapters.
+# Keep every git dependency below on the revision in package.metadata.greppy.
+# Contract test `upstream_pin_is_single_revision` refuses source drift.
 # Update steps: THIRD_PARTY.md, section "agent-desktop".
 [package.metadata.greppy]
 agent-desktop-repo = "https://github.com/vercel-labs/agent-desktop"
-agent-desktop-tag = "v1.1.0"
-agent-desktop-commit = "d3dc190afbf34cd2377252398ddd5c30efbd093a"
+agent-desktop-revision = "947b051fb7a03a797ad12b9bb942d4ffc6f91735"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 # Shared command core. It does not link a platform accessibility bus.
-agent-desktop-core = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+agent-desktop-core = { git = "https://github.com/vercel-labs/agent-desktop", rev = "947b051fb7a03a797ad12b9bb942d4ffc6f91735" }
 
 # One adapter per target OS. Cargo activates only the matching table, so a
 # macOS build does not compile agent-desktop-linux or its zbus/x11rb stack,
 # and a Linux build does not compile the macOS or Windows adapters.
 [target.'cfg(target_os = "linux")'.dependencies]
-agent-desktop-linux = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+agent-desktop-linux = { git = "https://github.com/vercel-labs/agent-desktop", rev = "947b051fb7a03a797ad12b9bb942d4ffc6f91735" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Calls libc::proc_bsdshortinfo. Cargo.lock must keep libc >= 0.2.189
 # (the version agent-desktop v1.1.0 locks). See THIRD_PARTY.md.
-agent-desktop-macos = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+agent-desktop-macos = { git = "https://github.com/vercel-labs/agent-desktop", rev = "947b051fb7a03a797ad12b9bb942d4ffc6f91735" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-agent-desktop-windows = { git = "https://github.com/vercel-labs/agent-desktop", tag = "v1.1.0" }
+agent-desktop-windows = { git = "https://github.com/vercel-labs/agent-desktop", rev = "947b051fb7a03a797ad12b9bb942d4ffc6f91735" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -158,11 +158,15 @@ all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
 - Purpose: platform accessibility adapters used by `greppy desktop` (macOS AX,
   Windows UIA, Linux AT-SPI). Greppy links the crates. It does not copy their
   source into greppy files.
-- Upstream: [vercel-labs/agent-desktop](https://github.com/vercel-labs/agent-desktop)
-  tag `v1.1.0`, commit `d3dc190afbf34cd2377252398ddd5c30efbd093a`.
-- Pin: `crates/desktop/Cargo.toml` is the only place that names the tag and
-  commit (`package.metadata.greppy` plus the git dependencies, which must all
-  use that tag). `Cargo.lock` records the resolved commit.
+- Upstream: [vercel-labs/agent-desktop](https://github.com/vercel-labs/agent-desktop),
+  immutable revision `947b051fb7a03a797ad12b9bb942d4ffc6f91735` (v1.3.0 plus
+  its merged Rustix security fix). The old v1.1.0 Linux adapter required
+  Rustix exactly 1.1.5; this revision moves that pin to the patched 1.1.6
+  for [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+- Pin: `crates/desktop/Cargo.toml` is the only place that selects the revision
+  (`package.metadata.greppy` plus four git dependencies, all on the same
+  revision). `Cargo.lock` records that exact source for the core and all
+  three adapters. No local fork or additional audit ignore is used.
 - License: Apache-2.0. The upstream license text is
   `licenses/agent-desktop-LICENSE`. Greppy is also Apache-2.0. Keep that
   license file, this notice, and the pin with any redistribution that includes
@@ -196,14 +200,14 @@ all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
 
 #### Updating the pin
 
-1. Read the upstream changelog between the pinned tag and the new tag.
-2. In `crates/desktop/Cargo.toml`, set `agent-desktop-tag` and
-   `agent-desktop-commit`, and set every `tag = "..."` on an agent-desktop git
-   dependency to that same tag. The test `upstream_pin_is_single_tag` fails if
-   those strings diverge or if `Cargo.lock` does not contain the commit.
-3. Run `cargo update -p greppy-desktop` (or regenerate the lock only if a
-   shared crate such as `rustix` or `futures-util` must move to satisfy an
-   exact upstream pin). Do not bump unrelated crates.
+1. Read the upstream changelog and diff between the pinned and new revisions.
+2. In `crates/desktop/Cargo.toml`, set `agent-desktop-revision` to the full
+   commit and every `rev = "..."` on an agent-desktop git dependency to that
+   revision. `upstream_pin_is_single_revision` checks all four declarations
+   and all four resolved sources in `Cargo.lock`.
+3. Resolve the new sources with `cargo update --workspace`. Keep unrelated
+   locked packages unchanged; shared exact upstream pins such as `rustix`
+   must move when the selected revision requires them.
 4. `cargo test -p greppy-desktop`. A compile error in `crates/desktop/src/upstream.rs`
    means a used `commands::*::execute` signature changed. A `schema_mismatch`
    or a changed fixture in the unit tests means a mapped output field moved.

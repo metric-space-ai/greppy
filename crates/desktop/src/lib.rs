@@ -111,36 +111,55 @@ mod tests {
     }
 
     #[test]
-    fn upstream_pin_is_single_tag() {
+    fn upstream_pin_is_single_revision() {
         let manifest = include_str!("../Cargo.toml");
-        let tag = metadata(manifest, "agent-desktop-tag");
-        let commit = metadata(manifest, "agent-desktop-commit");
-        assert_eq!(tag, "v1.1.0");
-        assert_eq!(commit.len(), 40);
-        let mut tags = Vec::new();
+        let revision = metadata(manifest, "agent-desktop-revision");
+        assert_eq!(revision, "947b051fb7a03a797ad12b9bb942d4ffc6f91735");
+        assert_eq!(revision.len(), 40);
+        assert!(revision.chars().all(|value| value.is_ascii_hexdigit()));
+        let mut revisions = Vec::new();
         for line in manifest.lines() {
-            if !line.contains("github.com/vercel-labs/agent-desktop") {
+            if !line.contains("github.com/vercel-labs/agent-desktop") || !line.contains("git =") {
                 continue;
             }
-            if let Some(start) = line.find("tag = \"") {
-                let rest = &line[start + "tag = \"".len()..];
-                let tag_value = rest.split('"').next().unwrap_or("");
-                if !tag_value.is_empty() {
-                    tags.push(tag_value.to_owned());
-                }
-            }
+            assert!(
+                !line.contains("tag ="),
+                "desktop dependencies must use the immutable revision"
+            );
+            let marker = "rev = \"";
+            let start = line.find(marker).expect("desktop dependency revision");
+            let value = line[start + marker.len()..].split('"').next().unwrap_or("");
+            revisions.push(value.to_owned());
         }
         assert_eq!(
-            tags.len(),
+            revisions.len(),
             4,
-            "core plus three platform crates, got {tags:?}"
+            "core plus three platform crates, got {revisions:?}"
         );
-        assert!(tags.iter().all(|item| item == &tag), "{tags:?}");
-        let lock = include_str!("../../../Cargo.lock");
         assert!(
-            lock.contains(commit.as_str()),
-            "Cargo.lock does not record the pinned agent-desktop commit"
+            revisions.iter().all(|item| item == &revision),
+            "{revisions:?}"
         );
+        let lock = include_str!("../../../Cargo.lock");
+        let source = format!(
+            "source = \"git+https://github.com/vercel-labs/agent-desktop?rev={revision}#{revision}\""
+        );
+        for package in [
+            "agent-desktop-core",
+            "agent-desktop-linux",
+            "agent-desktop-macos",
+            "agent-desktop-windows",
+        ] {
+            let name = format!("name = \"{package}\"");
+            let entry = lock
+                .split("[[package]]")
+                .find(|entry| entry.lines().any(|line| line == name.as_str()))
+                .expect("desktop package in Cargo.lock");
+            assert!(
+                entry.lines().any(|line| line == source.as_str()),
+                "{package} does not use the pinned desktop revision"
+            );
+        }
     }
 
     #[test]
