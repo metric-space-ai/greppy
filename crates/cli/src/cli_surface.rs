@@ -423,6 +423,9 @@ pub enum Command {
     /// Create or overwrite PATH with NEW.
     #[command(after_help = EDIT_VERIFY_HELP)]
     Write {
+        /// Draft native C authority: validate the complete proposal before writing using this declared context (relative to --root). Only write/patch support this option; --verify remains post-publication.
+        #[arg(long, value_name = "FILE", conflicts_with = "allow_syntax_errors")]
+        c_context: Option<String>,
         #[arg(value_name = "PATH", allow_hyphen_values = true)]
         path: String,
         #[arg(value_name = "NEW", allow_hyphen_values = true)]
@@ -518,6 +521,9 @@ pub enum Command {
     /// not atomic with edits in a patch.
     #[command(after_help = EDIT_VERIFY_HELP)]
     Patch {
+        /// Draft native C authority: validate the staged transaction with this explicit context before any publication.
+        #[arg(long, value_name = "FILE", conflicts_with = "allow_syntax_errors")]
+        c_context: Option<String>,
         #[arg(value_name = "DIFF", allow_hyphen_values = true)]
         diff: Option<String>,
         /// Write even if the result has more syntax errors than the current file.

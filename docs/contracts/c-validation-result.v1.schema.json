@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:greppy:c-validation-result:v1",
+  "title": "DRAFT configuration-scoped C validation result; Owner sign-off outstanding",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "backend",
+    "coverage",
+    "inactive_variants_checked",
+    "status",
+    "published"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "greppy.c-validation-result.v1"
+    },
+    "backend": {
+      "const": "c-compiler"
+    },
+    "coverage": {
+      "const": "selected-configuration"
+    },
+    "inactive_variants_checked": {
+      "const": false
+    },
+    "status": {
+      "enum": [
+        "passed",
+        "rejected",
+        "unavailable",
+        "timed_out",
+        "stale"
+      ]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "configuration": {
+      "type": "string"
+    },
+    "context_sha256": {
+      "$ref": "#/$defs/sha"
+    },
+    "published": {
+      "type": "boolean"
+    },
+    "compiler": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "enum": [
+            "gcc",
+            "clang"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "resolved_path": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "version": {
+          "type": "string"
+        },
+        "diagnostic_arguments": {
+          "description": "Effective frontend-controlled flags suppressing diagnostic color and source excerpts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "family",
+        "path",
+        "resolved_path",
+        "sha256"
+      ],
+      "additionalProperties": false
+    },
+    "input_hashes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/sha"
+      }
+    },
+    "raw_parser_observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "role",
+          "errors",
+          "missing"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "role": {
+            "const": "observation"
+          },
+          "errors": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "missing": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "translation_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "source_sha256",
+          "directory",
+          "arguments",
+          "process",
+          "dependency_hashes"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "source_sha256": {
+            "$ref": "#/$defs/sha"
+          },
+          "directory": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "process": {
+            "$ref": "#/$defs/process"
+          },
+          "dependency_hashes": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/$defs/sha"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "process": {
+      "$ref": "#/$defs/process"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "passed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "configuration",
+          "context_sha256",
+          "compiler",
+          "input_hashes",
+          "raw_parser_observations",
+          "translation_units",
+          "published"
+        ],
+        "properties": {
+          "compiler": {
+            "required": [
+              "version"
+            ]
+          },
+          "input_hashes": {
+            "minProperties": 1
+          },
+          "raw_parser_observations": {
+            "minItems": 1
+          },
+          "translation_units": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "process": {
+                  "properties": {
+                    "exit_code": {
+                      "const": 0
+                    },
+                    "timed_out": {
+                      "const": false
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "published": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "process": {
+      "type": "object",
+      "properties": {
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timed_out": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exit_code",
+        "timed_out"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

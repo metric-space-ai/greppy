@@ -6,6 +6,9 @@
 
 use super::*;
 
+#[path = "c_validation.rs"]
+mod c_validation;
+
 pub(crate) fn dispatch_edit(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
     match dispatch_edit_inner(command, json, root) {
         Err(error @ Error::Invalid(_)) => {
@@ -29,10 +32,26 @@ pub(crate) fn dispatch_edit_inner(
     let root_path = resolve_root(root)?;
     let file_base = resolve_file_operand_base(root, &root_path);
     if let EditCommand::Write {
-        path, new, dry_run, ..
+        path,
+        new,
+        dry_run,
+        c_context,
+        ..
     } = &command
     {
         if let Some(target) = scratch_write_target(&root_path, &file_base, path) {
+            if c_context.is_some() {
+                return emit_edit_outcome(
+                    Err(EditRefusal::new(
+                        "validation_unavailable",
+                        "--c-context requires a project-relative C transaction; nothing written",
+                        14,
+                    )),
+                    json,
+                    None,
+                    &root_path,
+                );
+            }
             return write_scratch_file(&target, new.clone(), *dry_run, json);
         }
     }
@@ -1797,11 +1816,19 @@ impl EditVerificationStatus {
     }
 }
 
+#[derive(Clone)]
+struct VerifierExecution {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
 pub(crate) struct EditVerification {
     pub(crate) status: EditVerificationStatus,
     pub(crate) diagnostics: Vec<String>,
     checks: Vec<serde_json::Value>,
     tests_status: &'static str,
+    execution: Option<VerifierExecution>,
 }
 
 impl EditVerification {
@@ -1811,6 +1838,7 @@ impl EditVerification {
             diagnostics,
             checks: Vec::new(),
             tests_status: "not_run",
+            execution: None,
         }
     }
 }
@@ -1927,6 +1955,26 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         .current_dir(&verifier.cwd)
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
+    if verifier.scope == "c_validation" {
+        for key in [
+            "CC",
+            "CFLAGS",
+            "CPATH",
+            "C_INCLUDE_PATH",
+            "CPLUS_INCLUDE_PATH",
+            "OBJC_INCLUDE_PATH",
+            "GCC_EXEC_PREFIX",
+            "COMPILER_PATH",
+            "SDKROOT",
+            "INCLUDE",
+            "CCC_OVERRIDE_OPTIONS",
+            "CLANG_CONFIG_FILE_SYSTEM_DIR",
+            "CLANG_CONFIG_FILE_USER_DIR",
+        ] {
+            process.env_remove(key);
+        }
+        process.env("LC_ALL", "C");
+    }
     if verifier.scope == "tests" {
         process.env("GREPPY_INTERNAL_VERIFY_STATUS_PATH", &runner_status_path);
         let bound = timeout.as_millis().saturating_sub(250).max(1);
@@ -1954,9 +2002,23 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     };
     let started = std::time::Instant::now();
     let mut next_progress = std::time::Duration::from_secs(10);
+    let native = verifier.scope == "c_validation";
     let (status, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(status)) => break (Some(status), false),
+            Ok(None)
+                if native
+                    && [&stdout_path, &stderr_path]
+                        .iter()
+                        .any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1024 * 1024)) =>
+            {
+                edit_kill_verifier_tree(&mut child, false);
+                let _ = child.wait();
+                return EditVerification::new(
+                    EditVerificationStatus::Unavailable,
+                    vec!["C validation output exceeded 1MiB; nothing written".into()],
+                );
+            }
             Ok(None) if started.elapsed() >= timeout => {
                 edit_kill_verifier_tree(&mut child, verifier.scope == "tests");
                 break (child.wait().ok(), true);
@@ -1981,6 +2043,16 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
             }
         }
     };
+    if native
+        && [&stdout_path, &stderr_path]
+            .iter()
+            .any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1024 * 1024))
+    {
+        return EditVerification::new(
+            EditVerificationStatus::Unavailable,
+            vec!["C validation output exceeded 1MiB; nothing written".into()],
+        );
+    }
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let runner_status = std::fs::read(&runner_status_path)
@@ -1999,8 +2071,23 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         && runner_status
             .as_ref()
             .is_some_and(|value| value["timed_out"] == true);
+    let execution = VerifierExecution {
+        exit_code: status.and_then(|s| s.code()),
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+    };
+    let complete = |state, diagnostics| {
+        let mut result = EditVerification::new(state, diagnostics);
+        result.execution = Some(execution.clone());
+        result
+    };
     if timed_out || runner_timed_out {
-        let message = if runner_timed_out {
+        let message = if native {
+            format!(
+                "C validation timed out after {}s; nothing written",
+                timeout.as_secs()
+            )
+        } else if runner_timed_out {
             format!("verify: timed out after {}ms — edit remains applied; run `{command}` directly to continue",
                 runner_status.as_ref().and_then(|value| value["elapsed_ms"].as_u64()).unwrap_or_default())
         } else {
@@ -2010,22 +2097,22 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         )
         };
         eprintln!("{message}");
-        return EditVerification::new(EditVerificationStatus::TimedOut, vec![message]);
+        return complete(EditVerificationStatus::TimedOut, vec![message]);
     }
     let Some(status) = status else {
-        return EditVerification::new(
+        return complete(
             EditVerificationStatus::Failed,
             vec![format!("verify: failed — no exit status from {command}")],
         );
     };
     if verifier.scope == "tests" && status.success() && runner_status.is_none() {
-        return EditVerification::new(EditVerificationStatus::Unavailable,
+        return complete(EditVerificationStatus::Unavailable,
             vec!["verify: selected test runner returned no valid completion status; tests are not confirmed".into()]);
     }
     if status.success() {
         let message = format!("verify: passed — {}", verifier.label);
         eprintln!("{message}");
-        return EditVerification::new(EditVerificationStatus::Passed, vec![message]);
+        return complete(EditVerificationStatus::Passed, vec![message]);
     }
     let mut diagnostics = vec![format!(
         "verify: failed (exit {}) — {}",
@@ -2046,7 +2133,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
             .map(str::to_string),
     );
     eprintln!("{}", diagnostics[0]);
-    EditVerification::new(EditVerificationStatus::Failed, diagnostics)
+    complete(EditVerificationStatus::Failed, diagnostics)
 }
 
 /// Local syntax/build checks plus an explicitly selected project test command.
@@ -2749,6 +2836,7 @@ pub(crate) fn edit_refusal_json(
     serde_json::Value::Object(value)
 }
 
+#[cfg(test)]
 pub(crate) fn run_trained_write(
     root_path: &std::path::Path,
     file_base: &std::path::Path,
@@ -2757,6 +2845,28 @@ pub(crate) fn run_trained_write(
     dry_run: bool,
     verify: bool,
     allow_syntax_errors: bool,
+) -> EditResult<EditRecord> {
+    run_trained_write_with_context(
+        root_path,
+        file_base,
+        path,
+        bytes,
+        dry_run,
+        verify,
+        allow_syntax_errors,
+        None,
+    )
+}
+
+fn run_trained_write_with_context(
+    root_path: &std::path::Path,
+    file_base: &std::path::Path,
+    path: &str,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+    allow_syntax_errors: bool,
+    c_context: Option<&str>,
 ) -> EditResult<EditRecord> {
     match std::fs::metadata(root_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2814,8 +2924,23 @@ pub(crate) fn run_trained_write(
         }
     }
     let old = before.as_deref().unwrap_or_default();
-    let allowance = edit_validate_syntax(&rel, old, &bytes, allow_syntax_errors)?;
+    let proposed = [c_validation::Proposed {
+        path: &rel,
+        before: before.as_deref(),
+        after: Some(&bytes),
+    }];
+    let native = c_validation::prepare(root_path, c_context, &proposed, allow_syntax_errors)?;
+    let allowance = if native.is_some() {
+        None
+    } else {
+        edit_validate_syntax(&rel, old, &bytes, allow_syntax_errors)?
+    };
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
+    if let Some(checked) = &native {
+        record
+            .extra
+            .push(("c_validation", checked.receipt(record.published)));
+    }
     if before.as_deref() == Some(bytes.as_slice()) {
         record.already_as_sent = !dry_run;
         if verify && !dry_run {
@@ -2836,6 +2961,9 @@ pub(crate) fn run_trained_write(
                 16,
             )
         })?;
+    }
+    if let Some(checked) = &native {
+        checked.recheck(&proposed)?;
     }
     let transaction = edit_journal_open(
         root_path,
@@ -3341,21 +3469,23 @@ fn rollback_patch_file(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn run_trained_patch(
+fn run_trained_patch_with_context(
     root_path: &std::path::Path,
     file_base: &std::path::Path,
     diff: Vec<u8>,
     dry_run: bool,
     verify: bool,
     allow_syntax_errors: bool,
+    c_context: Option<&str>,
 ) -> EditResult<EditRecord> {
-    run_trained_patch_with_publish_hook(
+    run_trained_patch_with_context_and_publish_hook(
         root_path,
         file_base,
         diff,
         dry_run,
         verify,
         allow_syntax_errors,
+        c_context,
         |_| {},
     )
 }
@@ -3392,6 +3522,7 @@ fn publish_patch_transition(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn run_trained_patch_with_publish_hook(
     root_path: &std::path::Path,
     file_base: &std::path::Path,
@@ -3399,6 +3530,28 @@ fn run_trained_patch_with_publish_hook(
     dry_run: bool,
     verify: bool,
     allow_syntax_errors: bool,
+    before_publish: impl FnMut(usize),
+) -> EditResult<EditRecord> {
+    run_trained_patch_with_context_and_publish_hook(
+        root_path,
+        file_base,
+        diff,
+        dry_run,
+        verify,
+        allow_syntax_errors,
+        None,
+        before_publish,
+    )
+}
+
+fn run_trained_patch_with_context_and_publish_hook(
+    root_path: &std::path::Path,
+    file_base: &std::path::Path,
+    diff: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+    allow_syntax_errors: bool,
+    c_context: Option<&str>,
     mut before_publish: impl FnMut(usize),
 ) -> EditResult<EditRecord> {
     let parsed = parse_trained_patch(&diff)?;
@@ -3417,8 +3570,11 @@ fn run_trained_patch_with_publish_hook(
                             20,
                         )
                     })?;
-                if let Some(message) = edit_validate_syntax(&rel, &[], &bytes, allow_syntax_errors)?
-                {
+                if let Some(message) = if c_context.is_some() && c_validation::is_c(&rel) {
+                    None
+                } else {
+                    edit_validate_syntax(&rel, &[], &bytes, allow_syntax_errors)?
+                } {
                     allowances.push(message);
                 }
                 let changed = vec![(0, bytes.len())];
@@ -3430,9 +3586,11 @@ fn run_trained_patch_with_publish_hook(
                     TrainedPatchOperation::Update => {
                         let (after, changed) =
                             apply_trained_patch_file(&rel, &content, &file.hunks)?;
-                        if let Some(message) =
+                        if let Some(message) = if c_context.is_some() && c_validation::is_c(&rel) {
+                            None
+                        } else {
                             edit_validate_syntax(&rel, &content, &after, allow_syntax_errors)?
-                        {
+                        } {
                             allowances.push(message);
                         }
                         (rel, abs, Some(content), Some(after), changed)
@@ -3470,6 +3628,15 @@ fn run_trained_patch_with_publish_hook(
             changed,
         });
     }
+    let proposed = planned
+        .iter()
+        .map(|p| c_validation::Proposed {
+            path: &p.rel,
+            before: p.before.as_deref(),
+            after: p.after.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    let native = c_validation::prepare(root_path, c_context, &proposed, allow_syntax_errors)?;
     let already = planned.iter().all(|file| file.before == file.after);
     let exact_required = planned.len() > 1
         || planned
@@ -3503,6 +3670,11 @@ fn run_trained_patch_with_publish_hook(
         already_as_sent: already && !dry_run,
         ..EditRecord::default()
     };
+    if let Some(checked) = &native {
+        record
+            .extra
+            .push(("c_validation", checked.receipt(record.published)));
+    }
     for file in &planned {
         record.operations.push(EditOperation {
             file: file.rel.clone(),
@@ -3528,17 +3700,28 @@ fn run_trained_patch_with_publish_hook(
             content: file.before.clone(),
         })
         .collect::<Vec<_>>();
+    if let Some(checked) = &native {
+        checked.recheck(&proposed)?;
+    }
     let transaction = edit_journal_open(root_path, &before)?;
     edit_journal_crash_hook()?;
     for (published_count, file) in planned.iter().enumerate() {
         before_publish(published_count);
-        if let Err(error) = publish_patch_transition(
-            root_path,
-            &file.abs,
-            file.before.as_deref(),
-            file.after.as_deref(),
-            None,
-        ) {
+        let stale = native
+            .as_ref()
+            .and_then(|checked| checked.recheck_progress(&proposed, published_count).err());
+        let transition = if stale.is_some() {
+            Err("configured C validation became stale".to_string())
+        } else {
+            publish_patch_transition(
+                root_path,
+                &file.abs,
+                file.before.as_deref(),
+                file.after.as_deref(),
+                None,
+            )
+        };
+        if let Err(error) = transition {
             let mut conflicts = Vec::new();
             for file in planned[..published_count].iter().rev() {
                 // Reverse only a transition we actually published; CAS/absence
@@ -3572,6 +3755,11 @@ fn run_trained_patch_with_publish_hook(
                         );
                     }
                     edit_journal_abort(root_path, transaction.as_deref());
+                }
+            }
+            if conflicts.is_empty() {
+                if let Some(refusal) = stale {
+                    return Err(refusal);
                 }
             }
             let recovery = if conflicts.is_empty() {
@@ -4957,9 +5145,10 @@ pub(crate) fn dispatch_edit_grammar(
             dry_run,
             verify,
             allow_syntax_errors,
+            c_context,
         } => {
             let outcome = edit_positional_payload(new, "NEW").and_then(|bytes| {
-                run_trained_write(
+                run_trained_write_with_context(
                     root_path,
                     file_base,
                     &path,
@@ -4967,6 +5156,7 @@ pub(crate) fn dispatch_edit_grammar(
                     dry_run,
                     verify,
                     allow_syntax_errors,
+                    c_context.as_deref(),
                 )
             });
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -5117,15 +5307,17 @@ pub(crate) fn dispatch_edit_grammar(
             dry_run,
             verify,
             allow_syntax_errors,
+            c_context,
         } => {
             let outcome = edit_positional_payload(diff, "DIFF").and_then(|bytes| {
-                run_trained_patch(
+                run_trained_patch_with_context(
                     root_path,
                     file_base,
                     bytes,
                     dry_run,
                     verify,
                     allow_syntax_errors,
+                    c_context.as_deref(),
                 )
             });
             emit_edit_outcome(outcome, json, None, root_path)?
