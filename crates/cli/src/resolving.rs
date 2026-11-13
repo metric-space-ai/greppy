@@ -431,7 +431,7 @@ fn is_source_file_extension(extension: &str) -> bool {
 /// same-named value. Exact qualified names and file-qualified queries are
 /// already narrowed, so accepting these two resolver definition labels there
 /// preserves emitted forms without broadening bare or owner/member resolution.
-fn is_addressable_definition_label(label: &str) -> bool {
+pub(crate) fn is_addressable_definition_label(label: &str) -> bool {
     is_primary_label(label) || matches!(label, "Variable" | "Field")
 }
 

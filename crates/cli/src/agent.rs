@@ -14,9 +14,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use greppy_agent::BuiltinPromptMode;
 use greppy_agent::{
-    run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
-    GreppyEnv, LoopEvent, LoopStop, OutputTokenLimit, ProbeError, RunOutcome, SandboxError,
-    SandboxMode, StopReason, StreamEvent, Usage, WorkspaceError,
+    clear_sent_request_hook, compose_one_shot_prompt, install_sent_request_hook,
+    resolve_git_identity, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
+    AgentWorkspace, Client, GreppyEnv, InPlaceWorkspace, LoopEvent, LoopStop, OutputTokenLimit,
+    ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason, StreamEvent, Usage,
+    WorkspaceError,
 };
 
 use crate::agent_control::{socket_path_for, ControlServer};
@@ -98,7 +100,9 @@ Usage:
   greppy agent stdio [--model M] [--endpoint URL]
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
-                   [--no-sandbox] [--skip-selfcheck]
+                   [--no-sandbox] [--in-place] [--mode quality|performance]
+                   [--context-tokens N] [--compact-ratio R]
+                   [--skip-selfcheck]
                    [--continue | --resume ID] [--json]
                    [--enable web|desktop]
   greppy -p --help
@@ -126,6 +130,14 @@ Flags:
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
   --json              Stream newline-delimited JSON events on stdout (`greppy -p` only)
+  --in-place          Edit the current checkout instead of an isolated worktree
+                      (env GREPPY_IN_PLACE=1). Disables write confinement, leaves
+                      HOME/GOPATH/TMPDIR unchanged, and keeps /tmp usable.
+                      Default remains an isolated worktree plus sandbox.
+  --mode MODE         quality (default) or performance (env GREPPY_AGENT_MODE).
+                      quality keeps the merge bar and the pull-request report.
+                      performance is that same prompt with the DONE line, the
+                      FINAL ANSWER line, and the verify sentence changed.
   --enable CAP        Include web and/or desktop manuals from the first turn
                       (`--enable web`, `--enable desktop`, or `--enable web,desktop`)
 
@@ -250,6 +262,25 @@ pub struct AgentArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Edit the current checkout instead of an isolated worktree.
+    ///
+    /// Also set by env `GREPPY_IN_PLACE=1`. Implies `--no-sandbox`: the task
+    /// directory and `/tmp` must be writable, and HOME/GOPATH/TMPDIR stay put.
+    /// The default remains an isolated worktree with write confinement.
+    #[arg(
+        long,
+        env = "GREPPY_IN_PLACE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub in_place: bool,
+
+    /// Prompt style for `greppy -p`. `quality` is the default.
+    #[arg(long, env = "GREPPY_AGENT_MODE", value_enum, default_value = "quality")]
+    pub mode: AgentPromptMode,
+
     /// Include a capability manual from the first turn.
     ///
     /// Repeat the flag, or pass a comma-separated list: `--enable web,desktop`.
@@ -257,6 +288,30 @@ pub struct AgentArgs {
     /// commands stay refused until `greppy capabilities enable`.
     #[arg(long, value_name = "web|desktop")]
     pub enable: Vec<String>,
+}
+
+/// `greppy -p` prompt style. Quality keeps the signed contract. Performance is
+/// the short bench prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentPromptMode {
+    Quality,
+    Performance,
+}
+
+impl AgentPromptMode {
+    fn style(self) -> greppy_agent::AgentPromptStyle {
+        match self {
+            Self::Quality => greppy_agent::AgentPromptStyle::Quality,
+            Self::Performance => greppy_agent::AgentPromptStyle::Performance,
+        }
+    }
+}
+
+fn sandbox_session_value(mode: &SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Off => "disabled",
+        SandboxMode::Enforce(_) => "confined",
+    }
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -406,6 +461,8 @@ fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
             continue_session: serve.continue_session,
             resume: serve.resume,
             json: true,
+            in_place: false,
+            mode: AgentPromptMode::Quality,
             enable: serve.enable,
         };
         run_agent(
@@ -564,6 +621,10 @@ fn validate_args(args: &AgentArgs, interactive: bool) -> Result<(), u8> {
         eprintln!("details: greppy -p --help");
         return Err(EXIT_USAGE);
     }
+    if args.in_place && interactive {
+        eprintln!("error: --in-place is only valid with greppy -p");
+        return Err(EXIT_USAGE);
+    }
     Ok(())
 }
 
@@ -607,14 +668,120 @@ fn resolve_headless_session_record(
     }
 }
 
+/// Isolated worktree (default) or the caller's checkout (`--in-place`).
+enum ActiveWorkspace {
+    Isolated(Box<AgentWorkspace>),
+    InPlace(InPlaceWorkspace),
+}
+
+impl ActiveWorkspace {
+    fn worktree_path(&self) -> &Path {
+        match self {
+            Self::Isolated(workspace) => workspace.worktree_path(),
+            Self::InPlace(workspace) => workspace.worktree_path(),
+        }
+    }
+
+    fn repo_root(&self) -> &Path {
+        match self {
+            Self::Isolated(workspace) => workspace.repo_root(),
+            Self::InPlace(workspace) => workspace.repo_root(),
+        }
+    }
+
+    fn linked_git_dir(&self) -> &Path {
+        match self {
+            Self::Isolated(workspace) => workspace.linked_git_dir(),
+            Self::InPlace(workspace) => workspace.linked_git_dir(),
+        }
+    }
+
+    fn run_id(&self) -> &str {
+        match self {
+            Self::Isolated(workspace) => workspace.run_id(),
+            Self::InPlace(workspace) => workspace.run_id(),
+        }
+    }
+
+    fn base_commit(&self) -> &str {
+        match self {
+            Self::Isolated(workspace) => workspace.base_commit(),
+            Self::InPlace(workspace) => workspace.base_commit(),
+        }
+    }
+
+    fn agent_data_root(&self) -> PathBuf {
+        match self {
+            Self::Isolated(workspace) => workspace.agent_data_root(),
+            Self::InPlace(workspace) => workspace.agent_data_root(),
+        }
+    }
+
+    fn agent_scratch_root(&self) -> PathBuf {
+        match self {
+            Self::Isolated(workspace) => workspace.agent_scratch_root(),
+            Self::InPlace(workspace) => workspace.agent_scratch_root(),
+        }
+    }
+
+    fn restore_proposal(&self, ref_name: &str) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Isolated(workspace) => workspace.restore_proposal(ref_name),
+            Self::InPlace(workspace) => workspace.restore_proposal(ref_name),
+        }
+    }
+
+    fn finish(&self, message: &str) -> Result<RunOutcome, WorkspaceError> {
+        match self {
+            Self::Isolated(workspace) => workspace.finish(message),
+            Self::InPlace(workspace) => workspace.finish(message),
+        }
+    }
+
+    fn apply_to(&self, target: &Path, commit: &str) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Isolated(workspace) => workspace.apply_to(target, commit),
+            Self::InPlace(workspace) => workspace.apply_to(target, commit),
+        }
+    }
+
+    fn keep(&self) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Isolated(workspace) => workspace.keep(),
+            Self::InPlace(workspace) => workspace.keep(),
+        }
+    }
+
+    fn cleanup(self) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Isolated(workspace) => workspace.cleanup(),
+            Self::InPlace(workspace) => workspace.cleanup(),
+        }
+    }
+
+    fn isolated(&self) -> &AgentWorkspace {
+        match self {
+            Self::Isolated(workspace) => workspace,
+            Self::InPlace(_) => {
+                panic!("in-place workspace has no isolated AgentWorkspace")
+            }
+        }
+    }
+}
+
 fn run_agent(
-    args: AgentArgs,
+    mut args: AgentArgs,
     interactive: bool,
     serve: bool,
     idle_timeout_secs: Option<u64>,
     mut bootstrap: Option<crate::agent_tui::BootstrapScreen>,
     settings: crate::agent_tui::AgentSettings,
 ) -> u8 {
+    // In-place means the checkout is the workspace. Write confinement would
+    // still hide /tmp and absolute paths the task is allowed to use.
+    if args.in_place {
+        args.no_sandbox = true;
+    }
     let task = args.task.as_deref().unwrap_or("").trim().to_string();
     let mut model = args.model.as_deref().unwrap_or("").trim().to_string();
     let endpoint = args.endpoint.trim().to_string();
@@ -691,7 +858,12 @@ fn run_agent(
             }
         }
     };
-    let workspace = match AgentWorkspace::create(&cwd, &run_id) {
+    let workspace = match if args.in_place {
+        InPlaceWorkspace::create(&cwd, &run_id).map(ActiveWorkspace::InPlace)
+    } else {
+        AgentWorkspace::create(&cwd, &run_id)
+            .map(|workspace| ActiveWorkspace::Isolated(Box::new(workspace)))
+    } {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {
             // Stable user-facing message for the submodule case; fall back to
@@ -877,14 +1049,26 @@ fn run_agent(
         );
     }
 
-    let prepared_base = if args.private_store {
+    let prepared_base = if args.in_place {
+        // The checkout already has the operator's index (same commit, plus
+        // uncommitted files). A private per-run store would hide it and embed
+        // every span again. Keep the caller's store and drop any overlay mode
+        // so `greppy index` updates that plain snapshot incrementally.
+        if !interactive {
+            eprintln!(
+                "workspace: in-place {} (checkout index)",
+                workspace.worktree_path().display()
+            );
+        }
+        None
+    } else if args.private_store {
         crate::store_cow::configure_private_environment("explicit --private-store");
         if !interactive {
             eprintln!("store mode: private (--private-store)");
         }
         None
     } else if interactive {
-        match crate::store_cow::try_reuse_base_store(&workspace, &shared_data_root) {
+        match crate::store_cow::try_reuse_base_store(workspace.isolated(), &shared_data_root) {
             Ok(Some(prepared)) => Some(prepared),
             Ok(None) => {
                 crate::store_cow::configure_private_environment(
@@ -899,7 +1083,7 @@ fn run_agent(
         }
     } else {
         match crate::store_cow::prepare_base_store(
-            &workspace,
+            workspace.isolated(),
             &shared_data_root,
             crate::EmbeddingCliArgs {
                 device: None,
@@ -969,7 +1153,7 @@ fn run_agent(
     if let Some(screen) = bootstrap.as_mut() {
         screen.advance(2, "Starting background services");
     }
-    std::env::set_var("GREPPY_STORE_DIR", &agent_data);
+    configure_index_store(args.in_place, &agent_data);
     if let Some(prepared) = &prepared_base {
         crate::store_cow::configure_overlay_environment(prepared, workspace.base_commit());
     }
@@ -977,7 +1161,7 @@ fn run_agent(
     // Headless runs still prewarm synchronously. Interactive runs launch and
     // monitor the same index job only after the full TUI is visible.
     if !interactive {
-        ensure_semantic_index(workspace.worktree_path(), args.json);
+        ensure_semantic_index(workspace.worktree_path(), args.json, args.in_place);
     }
     if bootstrap
         .as_ref()
@@ -1027,19 +1211,22 @@ fn run_agent(
             );
         }
     };
-    json_session.sandbox = match &sandbox_mode {
-        SandboxMode::Off => "disabled",
-        SandboxMode::Enforce(_) => "confined",
-    }
-    .to_string();
+    json_session.sandbox = sandbox_session_value(&sandbox_mode).to_string();
 
-    // Point tool children at the per-run scratch (also used by temp-file APIs
-    // that honour TMPDIR). Set for the remainder of this process so every
-    // sandboxed spawn inherits it without re-plumbing Command env.
-    std::env::set_var("TMPDIR", &scratch_dir);
-    // Some platforms also honour TMP/TEMP.
-    std::env::set_var("TMP", &scratch_dir);
-    std::env::set_var("TEMP", &scratch_dir);
+    // Point sandboxed tool children at the per-run scratch. `--no-sandbox` and
+    // `--in-place` leave TMPDIR/TMP/TEMP alone so /tmp stays usable.
+    if matches!(sandbox_mode, SandboxMode::Enforce(_)) {
+        std::env::set_var("TMPDIR", &scratch_dir);
+        std::env::set_var("TMP", &scratch_dir);
+        std::env::set_var("TEMP", &scratch_dir);
+    }
+    let git_identity = resolve_git_identity();
+    if git_identity.preset && !interactive {
+        eprintln!(
+            "git identity: {} <{}> (preset for this run; git config was missing)",
+            git_identity.name, git_identity.email
+        );
+    }
 
     let capabilities = match greppy_agent::CapabilitySet::parse_list(&args.enable) {
         Ok(capabilities) => capabilities,
@@ -1055,6 +1242,7 @@ fn run_agent(
             .with_output_owner(cwd.clone())
             .with_output_storage(output_storage)
             .with_sandbox(sandbox_mode.clone())
+            .with_git_identity(git_identity)
             .with_capabilities(capabilities)
             .with_context_status(
                 workspace.run_id().to_owned(),
@@ -1117,10 +1305,11 @@ fn run_agent(
         context_summary: headless_session
             .as_ref()
             .and_then(|(record, _)| record.context_summary.clone()),
-        system: Some(greppy_agent::system_prompt_with_capabilities(
-            prompt_mode,
-            capabilities,
-        )),
+        system: Some(if prompt_mode == BuiltinPromptMode::OneShot {
+            compose_one_shot_prompt(args.mode.style(), capabilities, args.in_place)
+        } else {
+            greppy_agent::system_prompt_with_capabilities(prompt_mode, capabilities)
+        }),
         model: model.clone(),
         deadline,
         deadline_total,
@@ -1266,7 +1455,7 @@ fn run_agent(
                         sandbox: &json_session.sandbox,
                         idle_timeout_secs,
                         json_session: &json_session,
-                        workspace: &workspace,
+                        workspace: workspace.isolated(),
                     },
                 )
                 .map(|session| (session, false))
@@ -1411,7 +1600,24 @@ fn run_agent(
             if args.diff {
                 patch_text = Some(patch.clone());
             }
-            if !json_mode {
+            if args.in_place && !json_mode {
+                let _ = writeln!(stdout);
+                let _ = writeln!(
+                    stdout,
+                    "in-place: changes remain in {}",
+                    workspace.worktree_path().display()
+                );
+                let _ = write!(stdout, "{stat}");
+                if !stat.ends_with('\n') {
+                    let _ = writeln!(stdout);
+                }
+                if args.diff {
+                    let _ = write!(stdout, "{patch}");
+                    if !patch.ends_with('\n') {
+                        let _ = writeln!(stdout);
+                    }
+                }
+            } else if !json_mode {
                 let _ = writeln!(stdout);
                 let _ = write!(stdout, "{stat}");
                 if !stat.ends_with('\n') {
@@ -1426,13 +1632,13 @@ fn run_agent(
                      artifacts from verification — is the repo's .gitignore complete?"
                 );
             }
-            if !json_mode {
+            if !args.in_place && !json_mode {
                 let _ = writeln!(stdout, "proposal saved: {ref_name}");
                 let _ = writeln!(stdout, "inspect: git show {ref_name}");
                 let _ = writeln!(stdout, "apply:   greppy agent apply {ref_name}");
             }
 
-            if args.diff && !json_mode {
+            if args.diff && !args.in_place && !json_mode {
                 let _ = write!(stdout, "{patch}");
                 if !patch.ends_with('\n') {
                     let _ = writeln!(stdout);
@@ -1524,7 +1730,12 @@ fn run_agent(
         }
         let _ = writeln!(
             stderr,
-            "worktree kept (expires in 24 hours; next agent startup reaps it): {path}"
+            "{}",
+            if args.in_place {
+                format!("in-place checkout left at {path}")
+            } else {
+                format!("worktree kept (expires in 24 hours; next agent startup reaps it): {path}")
+            }
         );
         drop(workspace);
     }
@@ -1806,9 +2017,21 @@ fn run_headless_session(
     if let Err(error) = store.append_turn_start(&record.id, "headless", task) {
         eprintln!("greppy -p: session save failed: {error}");
     }
-    if let Some(emitter) = json.as_mut() {
-        emitter.session(json_session);
+    // The session line is written from the first posted request so its user
+    // message, temperature and max_tokens are the values actually sent.
+    if let Some(gate) = json.as_ref().map(|emitter| emitter.session_gate()) {
+        let session = json_session.clone();
+        install_sent_request_hook(Arc::new(move |facts| {
+            crate::agent_json::emit_session_once(&gate, &session, Some(facts));
+        }));
     }
+    struct ClearSentRequestHook;
+    impl Drop for ClearSentRequestHook {
+        fn drop(&mut self) {
+            clear_sent_request_hook();
+        }
+    }
+    let _clear_sent_request_hook = ClearSentRequestHook;
 
     let json_mode = json.is_some();
     let mut stdout = io::stdout();
@@ -1907,6 +2130,9 @@ fn run_headless_session(
         }
         let message = format!("context checkpoint save failed: {error}");
         persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+        if let Some(emitter) = json.as_mut() {
+            emitter.session(json_session);
+        }
         return Err(message);
     }
 
@@ -1961,11 +2187,17 @@ fn run_headless_session(
             );
             summary.final_answer = result.final_text;
             summary.last_stop = Some(result.stop);
+            if let Some(emitter) = json.as_mut() {
+                emitter.session(json_session);
+            }
             Ok(summary)
         }
         Err(error) => {
             let message = error.to_string();
             persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+            if let Some(emitter) = json.as_mut() {
+                emitter.session(json_session);
+            }
             if config
                 .cancel
                 .as_ref()
@@ -2812,14 +3044,20 @@ fn format_tool_start(name: &str, arguments: &serde_json::Value) -> String {
     truncate_chars(&body, TOOL_LINE_MAX)
 }
 
-fn keep_worktree_on_error(workspace: &AgentWorkspace) {
+fn keep_worktree_on_error(workspace: &ActiveWorkspace) {
     if let Err(error) = workspace.keep() {
         eprintln!("greppy -p: could not mark failed workspace as kept: {error}");
     }
-    eprintln!(
-        "worktree kept for debugging (expires in 24 hours; next agent startup reaps it): {}",
-        workspace.worktree_path().display()
-    );
+    match workspace {
+        ActiveWorkspace::InPlace(_) => eprintln!(
+            "in-place checkout left in place: {}",
+            workspace.worktree_path().display()
+        ),
+        ActiveWorkspace::Isolated(_) => eprintln!(
+            "worktree kept for debugging (expires in 24 hours; next agent startup reaps it): {}",
+            workspace.worktree_path().display()
+        ),
+    }
 }
 
 /// Consistent Tampered diagnostic: name the **worktree directory** (not a
@@ -3066,8 +3304,21 @@ fn writable_roots_for(
 /// `<current_exe> index` (incremental) with credential scrub and no sandbox,
 /// then re-checks doctor. Failure warns with the consequence and continues —
 /// the agent can still work via name/text search while embeddings catch up.
-fn ensure_semantic_index(worktree_path: &Path, json_mode: bool) {
-    if doctor_reports_embedding_complete(worktree_path) {
+/// In-place keeps the process store. Isolated runs point tools at the
+/// private agent data root, which must not see a prewarmed checkout index.
+fn configure_index_store(in_place: bool, agent_data: &Path) {
+    if in_place {
+        crate::store_cow::clear_overlay_environment();
+    } else {
+        std::env::set_var("GREPPY_STORE_DIR", agent_data);
+    }
+}
+
+fn ensure_semantic_index(worktree_path: &Path, json_mode: bool, in_place: bool) {
+    // Isolated runs may skip when their private store is already complete.
+    // In-place always runs `greppy index`: a warm checkout returns "already
+    // current", and a dirty one re-embeds only the changed files.
+    if !in_place && doctor_reports_embedding_complete(worktree_path) {
         return;
     }
 
@@ -3079,7 +3330,11 @@ fn ensure_semantic_index(worktree_path: &Path, json_mode: bool) {
         return;
     };
 
-    eprintln!("indexing the agent worktree (first run for this repository)…");
+    if in_place {
+        eprintln!("indexing the checkout (incremental)…");
+    } else {
+        eprintln!("indexing the agent worktree (first run for this repository)…");
+    }
 
     let mut cmd = Command::new(&bin);
     cmd.arg("index")
@@ -3512,6 +3767,60 @@ mod tests {
     }
 
     #[test]
+    fn in_place_index_environment_keeps_the_prewarmed_store() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_store = std::env::var_os("GREPPY_STORE_DIR");
+        let previous_mode = std::env::var_os(crate::store_cow::ENV_MODE);
+        std::env::set_var("GREPPY_STORE_DIR", "/tmp/prewarmed-checkout-index");
+        std::env::set_var(crate::store_cow::ENV_MODE, crate::store_cow::MODE_PRIVATE);
+        configure_index_store(true, std::path::Path::new("/tmp/fresh-agent-data"));
+        assert_eq!(
+            std::env::var("GREPPY_STORE_DIR").as_deref(),
+            Ok("/tmp/prewarmed-checkout-index")
+        );
+        assert!(std::env::var_os(crate::store_cow::ENV_MODE).is_none());
+        configure_index_store(false, std::path::Path::new("/tmp/fresh-agent-data"));
+        assert_eq!(
+            std::env::var("GREPPY_STORE_DIR").as_deref(),
+            Ok("/tmp/fresh-agent-data")
+        );
+        match previous_store {
+            Some(value) => std::env::set_var("GREPPY_STORE_DIR", value),
+            None => std::env::remove_var("GREPPY_STORE_DIR"),
+        }
+        match previous_mode {
+            Some(value) => std::env::set_var(crate::store_cow::ENV_MODE, value),
+            None => std::env::remove_var(crate::store_cow::ENV_MODE),
+        }
+    }
+
+    #[test]
+    fn parse_in_place_and_mode_flags() {
+        let a = parse(&[
+            "do it",
+            "--model",
+            "kimi-k3",
+            "--in-place",
+            "--mode",
+            "performance",
+        ])
+        .expect("parse");
+        assert!(a.in_place);
+        assert_eq!(a.mode, AgentPromptMode::Performance);
+        let quality = parse(&["do it", "--model", "m"]).expect("parse");
+        assert!(!quality.in_place);
+        assert_eq!(quality.mode, AgentPromptMode::Quality);
+        assert!(parse(&["do it", "--model", "m", "--compact-ratio", "0.7"]).is_err());
+    }
+
+    #[test]
+    fn no_sandbox_session_value_is_disabled() {
+        assert_eq!(sandbox_session_value(&SandboxMode::Off), "disabled");
+    }
+
+    #[test]
     fn parse_skip_selfcheck_flag() {
         let a = parse(&["do it", "--model", "m", "--skip-selfcheck"]).expect("parse");
         assert!(a.skip_selfcheck);
@@ -3546,6 +3855,8 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            in_place: false,
+            mode: AgentPromptMode::Quality,
             enable: Vec::new(),
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
@@ -3569,6 +3880,8 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            in_place: false,
+            mode: AgentPromptMode::Quality,
             enable: Vec::new(),
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
@@ -3913,6 +4226,8 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            in_place: false,
+            mode: AgentPromptMode::Quality,
             enable: Vec::new(),
         };
         let wt = unique("sb-off");
@@ -3951,6 +4266,8 @@ mod tests {
             continue_session: false,
             resume: None,
             json: false,
+            in_place: false,
+            mode: AgentPromptMode::Quality,
             enable: Vec::new(),
         };
         let wt = unique("sb-on");

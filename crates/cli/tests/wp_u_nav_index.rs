@@ -338,6 +338,48 @@ fn read_lines_is_a_file_range_for_a_symbol() {
 }
 
 #[test]
+fn second_index_after_one_edit_reuses_the_other_file() {
+    let root = fresh_dir("reuse");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join("src/a.rs"), "pub fn alpha() { let _ = 1; }\n").unwrap();
+    std::fs::write(repo.join("src/b.rs"), "pub fn beta() { let _ = 2; }\n").unwrap();
+    let store = root.join("store");
+    index(&repo, &store);
+
+    std::fs::write(repo.join("src/a.rs"), "pub fn alpha() { let _ = 3; }\n").unwrap();
+    let (code, stdout, stderr) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "incremental index failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stdout.contains("indexed 1 files"),
+        "one edit must not reindex the whole repo\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("indexed 2 files"),
+        "full reindex\n{stdout}"
+    );
+    if let Some(line) = stdout
+        .lines()
+        .find(|line| line.contains("local-store reused"))
+    {
+        // `embedded N code spans (R local-store reused, ...)`.
+        let reused = line
+            .split('(')
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<usize>().ok());
+        assert!(
+            reused.is_some_and(|count| count > 0),
+            "unchanged spans must be reused, not re-embedded\n{line}"
+        );
+    }
+}
+
+#[test]
 fn second_index_of_an_unchanged_repo_is_already_current() {
     let root = fresh_dir("reindex");
     let repo = root.join("repo");

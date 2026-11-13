@@ -326,14 +326,14 @@ fn read_file_json_keeps_multi_file_errors_and_structured_page_metadata() {
     assert_eq!(code, 1, "{out}\n{err}");
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["files"][0]["start_line"], 1);
-    assert_eq!(value["files"][0]["end_line"], 400);
+    assert_eq!(value["files"][0]["end_line"], 250);
     assert!(value["files"][0].get("rendered").is_none(), "{value}");
     assert!(value["files"][0]["handle"]
         .as_str()
         .unwrap()
         .starts_with("geh2:"));
-    assert_eq!(value["files"][0]["continuation"]["next_line"], 401);
-    assert_eq!(value["files"][0]["continuation"]["remaining_lines"], 1);
+    assert_eq!(value["files"][0]["continuation"]["next_line"], 251);
+    assert_eq!(value["files"][0]["continuation"]["remaining_lines"], 151);
     assert_eq!(value["files"][1]["path"], "missing.txt");
     assert_eq!(value["files"][1]["error"], "no such file");
     assert!(
@@ -766,13 +766,37 @@ fn read_is_symbols_only_whole_and_doc_extended() {
         "{path_out}"
     );
 
-    let long = format!("pub fn target() {{}}\n{}", "// line\n".repeat(60));
+    // Up to the read-file window, `read FILE` is the numbered file.
+    let window = format!("pub fn target() {{}}\n{}", "// line\n".repeat(249));
+    assert_eq!(window.lines().count(), 250);
+    std::fs::write(repo.join("lib.rs"), &window).unwrap();
+    index(&repo, &store);
+    let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
+    assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
+    assert!(path_out.starts_with("lib.rs:1-250\n"), "{path_out}");
+    assert!(path_out.contains("1\tpub fn target() {}\n"), "{path_out}");
+    assert!(path_out.contains("250\t// line\n"), "{path_out}");
+    assert!(
+        !path_out.contains("is a file — read a symbol"),
+        "{path_out}"
+    );
+
+    let long = format!("pub fn target() {{}}\n{}", "// line\n".repeat(250));
+    assert_eq!(long.lines().count(), 251);
     std::fs::write(repo.join("lib.rs"), &long).unwrap();
     index(&repo, &store);
     let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
     assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
     assert!(
         path_out.starts_with("`lib.rs` is a file — read a symbol:\n"),
+        "{path_out}"
+    );
+    assert!(
+        path_out.contains("greppy read-file lib.rs --lines A:B"),
+        "{path_out}"
+    );
+    assert!(
+        path_out.contains("greppy read-file lib.rs --lines 1:250"),
         "{path_out}"
     );
     assert!(!path_out.contains("// line"), "{path_out}");
@@ -789,34 +813,27 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
     index(&repo, &store);
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
+    // Files up to the default window are the source, not an outline.
+    assert!(stdout.contains("731"), "{stdout}");
+    assert!(stdout.contains("private source content"), "{stdout}");
+    assert!(!stdout.contains("Source outline"), "{stdout}");
+
+    let long = format!(
+        "pub fn target() -> i32 {{ 731 }}\n{}",
+        "// private source content, not an outline\n".repeat(400)
+    );
+    std::fs::write(repo.join("lib.rs"), &long).unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("731"), "{stdout}");
+    assert!(!stdout.starts_with("Source outline"), "{stdout}");
     assert!(
-        stdout
-            .starts_with("Source outline for `lib.rs` — fingerprint-verified indexed definitions:"),
-        "{stdout}"
+        stdout.contains("lib.rs:1-250"),
+        "default window should be 250 lines\n{stdout}"
     );
-    assert!(!stdout.contains("731"), "{stdout}");
-    assert!(!stdout.contains("--all"), "{stdout}");
-    assert!(!stdout.contains("private source content"), "{stdout}");
-    assert!(
-        !stdout.lines().any(|line| line.starts_with("handle: ")),
-        "{stdout}"
-    );
-    let selector = stdout
-        .lines()
-        .nth(1)
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap();
-    let (code, stdout, stderr) = run(&repo, &store, &["read", selector]);
-    assert_eq!(
-        code, 0,
-        "outline selector does not resolve: {stdout}\n{stderr}"
-    );
-    assert!(
-        stdout.contains("pub fn target() -> i32 { 731 }"),
-        "{stdout}"
-    );
+    std::fs::write(repo.join("lib.rs"), &source).unwrap();
+    index(&repo, &store);
 
     let (code, stdout, stderr) = run(
         &repo,
@@ -847,6 +864,69 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
         std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
         source
     );
+}
+
+#[test]
+fn read_wrong_file_qualified_name_resolves_the_symbol_elsewhere() {
+    let (repo, store) = fresh_workspace("misqualified");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/env.rs"), "pub struct Env;\n").unwrap();
+    std::fs::write(
+        repo.join("src/env_values.rs"),
+        "impl Env {\n    pub fn define_value() { let _ = 7; }\n}\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "src/env.rs::Env::define_value"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("src/env_values.rs"),
+        "expected the real file\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("define_value"), "{stdout}");
+    assert!(
+        stdout.contains("not an indexed definition in `src/env.rs`"),
+        "{stdout}"
+    );
+    assert!(!stdout.starts_with("no symbol"), "{stdout}");
+}
+
+#[test]
+fn read_wrong_file_qualified_name_lists_several_matches() {
+    let (repo, store) = fresh_workspace("misqualified-many");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/missing.rs"), "pub struct Missing;\n").unwrap();
+    std::fs::write(
+        repo.join("src/a.rs"),
+        "pub fn define_value() { let _ = 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/b.rs"),
+        "pub fn define_value() { let _ = 2; }\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "src/missing.rs::define_value"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("src/a.rs"), "{stdout}");
+    assert!(stdout.contains("src/b.rs"), "{stdout}");
+    assert!(stdout.contains("none are in `src/missing.rs`"), "{stdout}");
+}
+
+#[test]
+fn read_file_qualified_name_falls_back_to_source() {
+    let (repo, store) = fresh_workspace("qualified-fallback");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn target() -> i32 { 1 }\n// needle_token_zz sits in a comment\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "lib.rs::Missing::needle_token_zz"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("needle_token_zz"), "{stdout}");
+    assert!(stdout.contains("no indexed symbol"), "{stdout}\n{stderr}");
 }
 
 #[test]
@@ -1306,10 +1386,18 @@ fn read_accepts_emitted_and_simplified_path_qualified_rust_variables() {
         &store,
         &["read", "missing/gateway.rs::EMAIL_RUNTIME_ENV_KEYS"],
     );
-    assert_ne!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        !stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"),
-        "a missing path must not fall back to the real declaration: {stdout}"
+        stdout.contains("not an indexed definition in `missing/gateway.rs`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("src/core/gateway.rs"),
+        "a mistyped path is resolved by symbol name: {stdout}"
+    );
+    assert!(
+        stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"),
+        "{stdout}"
     );
 }
 
@@ -1504,14 +1592,14 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.starts_with("long.txt:1-400\n  1\tline 1\n"),
+        stdout.starts_with("long.txt:1-250\n  1\tline 1\n"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("400\tline 400\n405 more lines — greppy expand "),
+        stdout.contains("250\tline 250\n555 more lines — greppy expand "),
         "{stdout}"
     );
-    assert!(stdout.ends_with(" continues at 401\n"), "{stdout}");
+    assert!(stdout.ends_with(" continues at 251\n"), "{stdout}");
     let id = stdout
         .lines()
         .last()
@@ -1522,14 +1610,14 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "stdout={expanded}\nstderr={expand_stderr}");
     assert!(
-        expanded.starts_with("long.txt:401-800\n401\tline 401\n"),
+        expanded.starts_with("long.txt:251-500\n251\tline 251\n"),
         "{expanded}"
     );
     assert!(
-        expanded.contains("5 more lines — greppy expand "),
+        expanded.contains("305 more lines — greppy expand "),
         "{expanded}"
     );
-    assert!(expanded.ends_with(" continues at 801\n"), "{expanded}");
+    assert!(expanded.ends_with(" continues at 501\n"), "{expanded}");
 }
 
 #[test]
@@ -1568,11 +1656,11 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with("long.txt:1-400\n  1\tline 1\n"),
+        stdout.starts_with("long.txt:1-250\n  1\tline 1\n"),
         "{stdout}"
     );
-    assert!(stdout.contains("400\tline 400\nhandle: geh2:"), "{stdout}");
-    assert!(!stdout.contains("line 401\n"), "{stdout}");
+    assert!(stdout.contains("250\tline 250\nhandle: geh2:"), "{stdout}");
+    assert!(!stdout.contains("line 251\n"), "{stdout}");
     let id = stdout
         .lines()
         .find_map(|line| line.split("greppy expand ").nth(1))
@@ -1582,11 +1670,11 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
     let (expand_code, expanded, expand_err) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "{expanded}\n{expand_err}");
     assert!(
-        expanded.starts_with("long.txt:401-800\n401\tline 401\n"),
+        expanded.starts_with("long.txt:251-500\n251\tline 251\n"),
         "{expanded}"
     );
-    assert!(!expanded.contains("line 400\n"), "{expanded}");
-    assert!(!expanded.contains("line 801\n"), "{expanded}");
+    assert!(!expanded.contains("line 250\n"), "{expanded}");
+    assert!(!expanded.contains("line 501\n"), "{expanded}");
 
     let (range_code, range_out, range_err) = run(
         &repo,
@@ -1964,10 +2052,10 @@ fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
     );
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with("etc/long.txt:1-400\n  1\tsubdir line 1\n"),
+        stdout.starts_with("etc/long.txt:1-250\n  1\tsubdir line 1\n"),
         "{stdout}"
     );
-    assert!(stdout.contains("subdir line 400\n"), "{stdout}");
+    assert!(stdout.contains("subdir line 250\n"), "{stdout}");
     assert!(!stdout.contains("repo line"), "{stdout}");
     let id = stdout
         .lines()
@@ -1978,7 +2066,7 @@ fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
     let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
     assert_eq!(expand_code, 0, "{expanded}\n{expand_stderr}");
     assert!(
-        expanded.starts_with("etc/long.txt:401-800\n401\tsubdir line 401\n"),
+        expanded.starts_with("etc/long.txt:251-500\n251\tsubdir line 251\n"),
         "{expanded}"
     );
     assert!(!expanded.contains("repo line"), "{expanded}");

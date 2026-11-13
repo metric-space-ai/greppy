@@ -29,6 +29,7 @@ pub mod client;
 pub mod context;
 pub mod env;
 pub mod greppy_env;
+pub mod in_place;
 pub mod model;
 pub mod prompt;
 pub mod protocol;
@@ -44,16 +45,19 @@ pub use agent_loop::{
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};
 pub use greppy_env::{
-    parse_where_am_i_file_count, run_startup_self_check, GreppyEnv, SelfCheckError, SelfCheckOk,
+    parse_where_am_i_file_count, resolve_git_identity, run_startup_self_check, GitIdentity,
+    GreppyEnv, SelfCheckError, SelfCheckOk,
 };
 pub use model::ModelStream;
 #[path = "../../../assets/prompts/contract.rs"]
 pub mod prompt_contract;
+pub use in_place::InPlaceWorkspace;
 pub use prompt::{
-    browser_prompt, capability_manual, capability_sections, capability_source, desktop_prompt,
-    export_prompt, fence_untrusted_desktop, merge_capability_sections,
-    omit_untrusted_desktop_for_log, prompt_metadata, prompt_metadata_for_mode, system_prompt,
-    system_prompt_for_mode, system_prompt_with_capabilities, BuiltinPromptMode, CapabilitySet,
+    browser_prompt, capability_manual, capability_sections, capability_source,
+    compose_one_shot_prompt, desktop_prompt, export_prompt, fence_untrusted_desktop,
+    merge_capability_sections, omit_untrusted_desktop_for_log, prompt_metadata,
+    prompt_metadata_for_mode, system_prompt, system_prompt_for_mode,
+    system_prompt_with_capabilities, AgentPromptStyle, BuiltinPromptMode, CapabilitySet,
     PUBLIC_PROMPT, SYSTEM_PROMPT,
 };
 pub use protocol::{
@@ -61,7 +65,10 @@ pub use protocol::{
     ToolChoice, ToolDefinition, Usage,
 };
 pub use sandbox::{SandboxError, SandboxMode, SandboxSpec};
-pub use wire::{to_messages_request_body, SseItem, SseParser};
+pub use wire::{
+    clear_sent_request_hook, install_sent_request_hook, logged_sent_request_facts,
+    sent_request_facts, to_messages_request_body, SseItem, SseParser,
+};
 pub use workspace::{
     apply_proposal, ensure_ordinary_workspace_available, AgentWorkspace, RunOutcome, WorkspaceError,
 };
