@@ -205,9 +205,11 @@ all namespace, Chunk-CAS, recovery, dirty-baseline and Git logic remains Rust.
    commit and every `rev = "..."` on an agent-desktop git dependency to that
    revision. `upstream_pin_is_single_revision` checks all four declarations
    and all four resolved sources in `Cargo.lock`.
-3. Resolve the new sources with `cargo update --workspace`. Keep unrelated
-   locked packages unchanged; shared exact upstream pins such as `rustix`
-   must move when the selected revision requires them.
+3. Resolve the new sources together with any shared exact upstream pin. For
+   this update, run `cargo update -p rustix@1.1.5 --precise 1.1.6` from the
+   workspace root. `cargo update --workspace` alone retains the old registry
+   version and cannot satisfy the new Linux adapter. Keep unrelated package
+   versions unchanged and review the generated lock diff.
 4. `cargo test -p greppy-desktop`. A compile error in `crates/desktop/src/upstream.rs`
    means a used `commands::*::execute` signature changed. A `schema_mismatch`
    or a changed fixture in the unit tests means a mapped output field moved.
