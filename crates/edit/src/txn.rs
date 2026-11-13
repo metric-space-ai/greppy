@@ -208,12 +208,39 @@ fn cpp_allocation_call_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
         if node.kind() != "call_expression" {
             continue;
         }
-        let Some(callee) = node
-            .child_by_field_name("function")
-            .filter(|callee| callee.kind() == "qualified_identifier")
-        else {
+        let Some(callee) = node.child_by_field_name("function") else {
             continue;
         };
+        let qualified = if callee.kind() == "qualified_identifier" {
+            callee
+        } else if callee.kind() == "subscript_expression" {
+            let Some(indices) = callee.child_by_field_name("indices") else {
+                continue;
+            };
+            if indices.has_error()
+                || indices.named_child_count() != 0
+                || content.get(indices.byte_range()) != Some(b"[]")
+            {
+                continue;
+            }
+            let Some(argument) = callee
+                .child_by_field_name("argument")
+                .filter(|argument| argument.kind() == "qualified_identifier")
+            else {
+                continue;
+            };
+            argument
+        } else {
+            continue;
+        };
+        if !qualified.child_by_field_name("scope").is_some_and(|scope| {
+            scope.kind() == "namespace_identifier"
+                && content.get(scope.byte_range()) == Some(b"operator")
+        }) || !qualified.child_by_field_name("name").is_some_and(|name| {
+            name.kind() == "identifier" && content.get(name.byte_range()) == Some(b"new")
+        }) {
+            continue;
+        }
         let Some(arguments) = node.child_by_field_name("arguments") else {
             continue;
         };
