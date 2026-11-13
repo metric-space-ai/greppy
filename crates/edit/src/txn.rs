@@ -1139,6 +1139,18 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cpp_unqualified_operator_call_keeps_syntax_validation() {
+        let source = b"#include <stddef.h>\nvoid *operator new(size_t);\nvoid *operator new[](size_t n) {return operator new(n);}\n";
+        let tree = greppy_parser::parse(super::Language::Cpp, source).unwrap();
+        assert_eq!(
+            super::syntax_counts(super::Language::Cpp, source),
+            Some(super::SyntaxCounts { errors: 0, missing: 0 }),
+            "complete allocation operator call rejected: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    #[test]
     fn c_atomic_validation_view_never_rewrites_call_expressions_or_literal_text() {
         // The upstream C grammar can accept a reserved spelling as a call
         // identifier. This view must not pretend to repair or validate that
