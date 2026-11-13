@@ -2616,8 +2616,8 @@ fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
         }
     }
 
-    // Ordinary supported C still writes. C++ keeps its existing guidance; this
-    // case is only a scope control, not a claimed C++ attribute reproduction.
+    // Ordinary supported C still writes. C++ names its own parser/compiler
+    // boundary without claiming the C preprocessor recovery applies to it.
     let output = fixture.run(&[
         "write",
         "ordinary.c",
@@ -2630,7 +2630,8 @@ fn c_conditional_attributes_accept_valid_bytes_and_refuse_invalid_syntax() {
     assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let next = value["error"]["next"].as_str().unwrap();
-    assert!(next.contains("--allow-syntax-errors"), "{next}");
+    assert!(next.contains("does not invoke a C++ compiler"), "{next}");
+    assert!(!next.contains("intermediate state"), "{next}");
     assert!(!next.contains("without compiler preprocessing"), "{next}");
     assert_file(&cpp, before);
 }
