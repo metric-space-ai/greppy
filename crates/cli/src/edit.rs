@@ -1270,6 +1270,8 @@ const SYNTAX_ALLOW_NEXT: &str = "next: make the whole change in one `greppy patc
 // suggest that submitting identical bytes through patch repairs that limitation.
 const C_SYNTAX_REFUSAL_NEXT: &str = "next: this C check uses tree-sitter without compiler preprocessing; conditional compiler attributes may exceed parser coverage. Check the complete proposed file with your project's C compiler configuration. A compiler-valid file can still require a Greppy parser fix; rewriting the same bytes as one patch does not resolve a parser limitation";
 
+const CPP_SYNTAX_REFUSAL_NEXT: &str = "next: check the complete proposed C++ file with your project's compiler configuration; this check uses tree-sitter and does not invoke a C++ compiler. If the compiler accepts these bytes, report the parser discrepancy; retrying the same bytes as one patch does not resolve a parser limitation";
+
 fn syntax_allowance_message(path: &str, new_errors: usize, diagnostic: Option<&str>) -> String {
     match diagnostic.and_then(|diagnostic| diagnostic.split(" (").next()) {
         Some(point) => format!(
@@ -1328,10 +1330,10 @@ fn edit_validate_syntax(
         .as_ref()
         .map(|item| format!("{path}:{item}"))
         .unwrap_or_else(|| path.to_string());
-    let next = if language == greppy_edit::Language::C {
-        C_SYNTAX_REFUSAL_NEXT
-    } else {
-        SYNTAX_ALLOW_NEXT
+    let next = match language {
+        greppy_edit::Language::C => C_SYNTAX_REFUSAL_NEXT,
+        greppy_edit::Language::Cpp => CPP_SYNTAX_REFUSAL_NEXT,
+        _ => SYNTAX_ALLOW_NEXT,
     };
     Err(EditRefusal::new(
         "invalid_result",

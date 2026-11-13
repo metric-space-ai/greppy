@@ -188,6 +188,79 @@ pub fn syntax_language_for_edit(path: &Path, before: &[u8], after: &[u8]) -> Lan
     language
 }
 
+/// Validate unqualified allocation operator calls without the C++ grammar's
+/// fabricated scope separator. The view is never used for extraction or edits.
+fn cpp_allocation_call_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    if !content.windows(8).any(|word| word == b"operator") {
+        return Cow::Borrowed(content);
+    }
+    let Ok(tree) = greppy_parser::parse(Language::Cpp, content) else {
+        return Cow::Borrowed(content);
+    };
+    if !tree.root_node().has_error() {
+        return Cow::Borrowed(content);
+    }
+    let mut normalized: Option<Vec<u8>> = None;
+    let mut nodes = vec![tree.root_node()];
+    while let Some(node) = nodes.pop() {
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+        if node.kind() != "call_expression" {
+            continue;
+        }
+        let Some(callee) = node
+            .child_by_field_name("function")
+            .filter(|callee| callee.kind() == "qualified_identifier")
+        else {
+            continue;
+        };
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            continue;
+        };
+        let spelling = &content[callee.byte_range()];
+        let Some(suffix) = spelling.strip_prefix(b"operator") else {
+            continue;
+        };
+        if arguments.has_error()
+            || !suffix.first().is_some_and(u8::is_ascii_whitespace)
+            || !matches!(suffix.trim_ascii(), b"new" | b"new[]")
+        {
+            continue;
+        }
+        let mut missing_scope = 0;
+        let mut other_error = false;
+        let mut children = vec![callee];
+        while let Some(child) = children.pop() {
+            if child.is_error() {
+                other_error = true;
+            }
+            if child.is_missing() {
+                if child.kind() == "::" && child.start_byte() == callee.start_byte() + 8 {
+                    missing_scope += 1;
+                } else {
+                    other_error = true;
+                }
+            }
+            let mut cursor = child.walk();
+            children.extend(child.children(&mut cursor));
+        }
+        if missing_scope != 1 || other_error {
+            continue;
+        }
+        // Only the complete recovered callee becomes an identifier. Arguments
+        // and surrounding syntax are reparsed unchanged. Keep byte/line offsets
+        // intact, including calls whose operator spelling spans lines.
+        let output = normalized.get_or_insert_with(|| content.to_vec());
+        for byte in &mut output[callee.byte_range()] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+        output[callee.start_byte()] = b'x';
+    }
+    normalized.map_or(Cow::Borrowed(content), Cow::Owned)
+}
+
 /// Validation-only recovery for Bash's read/write redirect omitted by the grammar.
 fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     let Ok(tree) = greppy_parser::parse(Language::Bash, content) else {
@@ -311,7 +384,11 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if matches!(language, Language::C | Language::Cpp) {
         let mut view = guarded_linkage_validation_content(language, content);
-        if language == Language::C {
+        if language == Language::Cpp {
+            if let Cow::Owned(normalized) = cpp_allocation_call_validation_content(&view) {
+                view = Cow::Owned(normalized);
+            }
+        } else {
             if let Cow::Owned(normalized) = c_conditional_attribute_validation_content(&view) {
                 view = Cow::Owned(normalized);
             }
@@ -1144,9 +1221,66 @@ mod tests {
         let tree = greppy_parser::parse(super::Language::Cpp, source).unwrap();
         assert_eq!(
             super::syntax_counts(super::Language::Cpp, source),
-            Some(super::SyntaxCounts { errors: 0, missing: 0 }),
+            Some(super::SyntaxCounts {
+                errors: 0,
+                missing: 0
+            }),
             "complete allocation operator call rejected: {}",
             tree.root_node().to_sexp()
+        );
+        let source_text = std::str::from_utf8(source).unwrap();
+        for callee in [
+            "operator  new",
+            "operator\tnew",
+            "operator\nnew",
+            "operator new[]",
+        ] {
+            let candidate = source_text.replace("operator new(n)", &format!("{callee}(n)"));
+            assert_eq!(
+                super::syntax_counts(super::Language::Cpp, candidate.as_bytes()),
+                Some(super::SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                }),
+                "valid allocation call rejected: {candidate}"
+            );
+            let view = super::cpp_allocation_call_validation_content(candidate.as_bytes());
+            assert_eq!(view.len(), candidate.len());
+            for (before, after) in candidate.bytes().zip(view.iter().copied()) {
+                if matches!(before, b'\n' | b'\r') {
+                    assert_eq!(after, before);
+                }
+            }
+        }
+        for invalid in [
+            source_text.replace("operator new(n);", "operator new(n)"),
+            source_text.replace("operator new(n)", "operator new(n +)"),
+            source_text.replace("operator new(n)", "operator new(n"),
+            format!("{source_text}int broken = ;\n"),
+        ] {
+            let counts = super::syntax_counts(super::Language::Cpp, invalid.as_bytes()).unwrap();
+            assert!(
+                counts.errors + counts.missing > 0,
+                "invalid C++ accepted: {invalid}"
+            );
+            assert!(
+                super::first_syntax_diagnostic(super::Language::Cpp, invalid.as_bytes()).is_some()
+            );
+        }
+        for untouched in [
+            "const char *s = \"operator new(n)\"; /* operator new(n) */\n",
+            "const char *s = R\"(operator new(n))\";\n",
+            "int f() { return operator other(1); }\n",
+            "void f() { ::operator new(1); }\n",
+        ] {
+            assert!(matches!(
+                super::cpp_allocation_call_validation_content(untouched.as_bytes()),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+        assert_eq!(
+            super::syntax_validation_content(super::Language::C, source).as_ref(),
+            source
         );
     }
 
