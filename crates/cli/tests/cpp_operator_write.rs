@@ -67,7 +67,13 @@ fn cpp_operator_call_write_preserves_bytes_and_refuses_invalid_transactions() {
     }
     assert_eq!(std::fs::read(repo.join("calls.cpp")).unwrap(), retained);
     assert!(!repo.join("absent.cpp").exists());
-    let patch = format!("*** Begin Patch\n*** Add File: witness.txt\n+must stay absent\n*** Add File: invalid.cpp\n{}*** End Patch\n", invalid.lines().map(|line| format!("+{line}\n")).collect::<String>());
+    std::fs::write(repo.join("witness.txt"), "retained witness\n").unwrap();
+    std::fs::write(repo.join("patch.cpp"), SOURCE).unwrap();
+    let patch = format!(
+        "--- a/witness.txt\n+++ b/witness.txt\n@@ -1 +1 @@\n-retained witness\n+unexpected change\n--- a/patch.cpp\n+++ b/patch.cpp\n@@ -1,3 +1,3 @@\n{}{}",
+        SOURCE.lines().map(|line| format!("-{line}\n")).collect::<String>(),
+        invalid.lines().map(|line| format!("+{line}\n")).collect::<String>()
+    );
     let output = run(&repo, &store, &["patch", "--json"], &patch);
     assert_eq!(
         output.status.code(),
@@ -76,7 +82,13 @@ fn cpp_operator_call_write_preserves_bytes_and_refuses_invalid_transactions() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!repo.join("witness.txt").exists());
-    assert!(!repo.join("invalid.cpp").exists());
+    assert_eq!(
+        std::fs::read(repo.join("witness.txt")).unwrap(),
+        b"retained witness\n"
+    );
+    assert_eq!(
+        std::fs::read(repo.join("patch.cpp")).unwrap(),
+        SOURCE.as_bytes()
+    );
     assert_eq!(std::fs::read(repo.join("calls.cpp")).unwrap(), retained);
 }
