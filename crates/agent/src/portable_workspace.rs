@@ -6288,6 +6288,18 @@ mod tests {
                         let staging = workspaces.join(format!(".{git_id}.publishing"));
                         let destination = workspaces.join(git_id);
                         copy_test_tree(&template.join("payload"), &staging);
+                        // A real FUSE mount also exposes files created directly
+                        // in the core before the first directory lookup. Mirror
+                        // those actual link bytes before publishing Git control.
+                        if cfg!(target_os = "linux") {
+                            let core = WorkspaceCore::open(data_for_git.join("core")).unwrap();
+                            let content = core.open_workspace("test-run").unwrap();
+                            let size = core.metadata(&content, ".git").unwrap().unwrap().size;
+                            let link = core
+                                .read(&content, ".git", 0, usize::try_from(size).unwrap())
+                                .unwrap();
+                            fs::write(workspaces.join("test-run/.git"), link).unwrap();
+                        }
                         fs::rename(staging, destination).unwrap();
                         break;
                     }
