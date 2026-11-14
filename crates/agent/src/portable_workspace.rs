@@ -450,6 +450,14 @@ impl AgentWorkspace {
             }
         };
         trace_workspace_phase(run_id, "content-namespace-created", started);
+        let git_link_seeded =
+            match seed_provider_git_link(&core, &handle, provider.as_ref(), &git_run_id) {
+                Ok(seeded) => seeded,
+                Err(error) => {
+                    let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                    return Err(error);
+                }
+            };
         let worktree = match materialize_content_workspace(
             provider.as_ref(),
             &data_root,
@@ -535,6 +543,7 @@ impl AgentWorkspace {
             &private_git_dir,
             &baseline_tree,
             &baseline_view_commit,
+            git_link_seeded,
         );
         let (baseline_tree, baseline_view_commit, private_index) = match initialized {
             Ok(result) => result,
@@ -4262,11 +4271,42 @@ fn private_git_temporary_path(parent: &Path) -> PathBuf {
     parent.join(format!(".t.{:x}.{:x}", std::process::id(), now_unix_ns()))
 }
 
+fn seed_provider_git_link(
+    core: &WorkspaceCore,
+    workspace: &WorkspaceHandle,
+    provider: Option<&ProviderInstallation>,
+    git_workspace_id: &str,
+) -> Result<bool, WorkspaceError> {
+    if !cfg!(target_os = "linux") {
+        return Ok(false);
+    }
+    let Some(provider) = provider else {
+        return Ok(false);
+    };
+    let private_path = provider.workspace_path(git_workspace_id)?;
+    let parent = private_path
+        .parent()
+        .ok_or_else(|| io::Error::other("private Git namespace has no parent"))?;
+    let parent = canonicalize_trusted_provider_path("workspace container", parent)?;
+    let git_dir = git_compatible_path(&parent.join(git_workspace_id))?;
+    // FUSE caches directory entries until a mounted mutation invalidates them.
+    // Seed before materialization can populate that cache, then validate the
+    // published link through the mount after the private namespace is ready.
+    core.create_file_with_contents(
+        workspace,
+        ".git",
+        0o100600,
+        format!("gitdir: {}\n", git_dir.display()).as_bytes(),
+    )?;
+    Ok(true)
+}
+
 fn initialize_private_git(
     worktree: &Path,
     private_git_dir: &Path,
     baseline_tree: &str,
     expected_baseline_view_commit: &str,
+    git_link_seeded: bool,
 ) -> Result<(String, String, PathBuf), WorkspaceError> {
     if !private_git_dir.is_dir() {
         return Err(WorkspaceError::Tampered {
@@ -4313,19 +4353,34 @@ fn initialize_private_git(
     }
     let worktree_git = worktree.join(".git");
     let linked_git_dir = git_compatible_path(private_git_dir)?;
-    fs::write(
-        &worktree_git,
-        format!("gitdir: {}\n", linked_git_dir.display()),
-    )
-    .map_err(|error| {
-        WorkspaceError::Io(io::Error::new(
-            error.kind(),
-            format!(
-                "cannot write private Git link {}: {error}",
-                worktree_git.display()
-            ),
-        ))
-    })?;
+    let content = format!("gitdir: {}\n", linked_git_dir.display());
+    if git_link_seeded {
+        let actual = fs::read(&worktree_git).map_err(|error| {
+            WorkspaceError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read prepared private Git link {}: {error}",
+                    worktree_git.display()
+                ),
+            ))
+        })?;
+        if actual != content.as_bytes() {
+            return Err(WorkspaceError::Tampered {
+                path: worktree_git,
+                detail: "prepared private Git link does not match its namespace".into(),
+            });
+        }
+    } else {
+        fs::write(&worktree_git, content).map_err(|error| {
+            WorkspaceError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot write private Git link {}: {error}",
+                    worktree_git.display()
+                ),
+            ))
+        })?;
+    }
     Ok((
         baseline_tree.into(),
         baseline_view_commit.into(),
@@ -6017,13 +6072,50 @@ mod tests {
         assert!(path_text(&worktree).unwrap().starts_with(r"\\?\"));
         assert!(path_text(&private_git).unwrap().starts_with(r"\\?\"));
 
-        initialize_private_git(&worktree, &private_git, "baseline-tree", "baseline-commit")
-            .unwrap();
+        initialize_private_git(
+            &worktree,
+            &private_git,
+            "baseline-tree",
+            "baseline-commit",
+            false,
+        )
+        .unwrap();
         let expected = format!(
             "gitdir: {}\n",
             git_compatible_path(&private_git).unwrap().display()
         );
         assert_eq!(fs::read_to_string(worktree.join(".git")).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_changed_prepared_git_link_is_refused_without_rewriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        let private_git = root.path().join("private-git");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(private_git.join("refs/heads")).unwrap();
+        fs::write(private_git.join("index"), b"index").unwrap();
+        fs::write(
+            private_git.join("HEAD"),
+            b"ref: refs/heads/greppy-baseline\n",
+        )
+        .unwrap();
+        fs::write(
+            private_git.join("refs/heads/greppy-baseline"),
+            b"baseline-commit\n",
+        )
+        .unwrap();
+        let unexpected = b"gitdir: /unexpected-namespace\n";
+        fs::write(worktree.join(".git"), unexpected).unwrap();
+        let result = initialize_private_git(
+            &worktree,
+            &private_git,
+            "baseline-tree",
+            "baseline-commit",
+            true,
+        );
+        assert!(matches!(result, Err(WorkspaceError::Tampered { .. })));
+        assert_eq!(fs::read(worktree.join(".git")).unwrap(), unexpected);
     }
 
     #[test]

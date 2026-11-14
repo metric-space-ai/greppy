@@ -1428,6 +1428,18 @@ impl WorkspaceCore {
         self.create_node(workspace, path.as_ref(), NodeKind::File, mode, &[])
     }
 
+    /// Publish a new file and its initial bytes in one namespace transaction.
+    /// An existing entry is refused before allocating or pinning any chunks.
+    pub fn create_file_with_contents(
+        &self,
+        workspace: &WorkspaceHandle,
+        path: impl AsRef<Path>,
+        mode: u32,
+        content: &[u8],
+    ) -> Result<()> {
+        self.create_node(workspace, path.as_ref(), NodeKind::File, mode, content)
+    }
+
     pub fn set_metadata(
         &self,
         workspace: &WorkspaceHandle,
@@ -3521,6 +3533,39 @@ mod tests {
             core.read(&workspace, "large.bin", CHUNK_SIZE as u64, 10)
                 .unwrap(),
             [vec![3_u8; 7], b"x".to_vec(), vec![3_u8; 2]].concat()
+        );
+    }
+
+    #[test]
+    fn initial_file_contents_need_no_empty_placeholder_or_second_publication() {
+        let (_repo, storage, core, workspace) = fixture();
+        let before = core.chunks().stats().unwrap();
+        let content = b"gitdir: /synthetic/private-git\n";
+        core.create_file_with_contents(&workspace, ".git", 0o100600, content)
+            .unwrap();
+        let after = core.chunks().stats().unwrap();
+        assert_eq!(after.chunk_count, before.chunk_count + 1);
+        assert_eq!(after.referenced_chunks, before.referenced_chunks + 1);
+        assert_eq!(
+            after.logical_bytes,
+            before.logical_bytes + content.len() as u64
+        );
+        assert_eq!(core.read(&workspace, ".git", 0, 128).unwrap(), content);
+        assert!(matches!(
+            core.create_file_with_contents(&workspace, ".git", 0o100600, b"replacement"),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert_eq!(
+            core.chunks().stats().unwrap().chunk_count,
+            after.chunk_count
+        );
+        drop(core);
+
+        let reopened = WorkspaceCore::open(storage.path()).unwrap();
+        assert_eq!(reopened.read(&workspace, ".git", 0, 128).unwrap(), content);
+        assert_eq!(
+            reopened.metadata(&workspace, ".git").unwrap().unwrap().mode,
+            0o100600
         );
     }
 
