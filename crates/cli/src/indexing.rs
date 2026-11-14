@@ -1853,6 +1853,21 @@ pub(crate) fn dispatch_index(
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
     let mut background_job = BackgroundJobGuard::from_env();
+    let result = dispatch_index_with_progress(path, root, embedding_args, &mut background_job);
+    if let Err(error) = &result {
+        if !background_job.complete {
+            background_job.fail(error);
+        }
+    }
+    result
+}
+
+fn dispatch_index_with_progress(
+    path: Option<&str>,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+    background_job: &mut BackgroundJobGuard,
+) -> Result<i32> {
     // RV-006: `--root` overrides the indexed target. When both are
     // given we still walk `path` (the user's workspace) but key the
     // store under the canonical `root` so the indexer and the
@@ -2015,7 +2030,7 @@ pub(crate) fn dispatch_index(
             cfg,
             embedding_overlay.as_ref(),
             if background_job.has_progress_sink() {
-                Some(&mut background_job)
+                Some(&mut *background_job)
             } else {
                 None
             },
@@ -2080,7 +2095,7 @@ pub(crate) fn dispatch_index(
             &project,
             &index_options,
             embedding_config.as_ref(),
-            &mut background_job,
+            background_job,
         )? {
             return Ok(code);
         }
@@ -2117,12 +2132,12 @@ pub(crate) fn dispatch_index(
             &index_options,
             true,
             if background_job.has_progress_sink() {
-                Some(&mut background_job)
+                Some(&mut *background_job)
             } else {
                 None
             },
         );
-        record_overlay_job_outcome(&mut background_job, &result);
+        record_overlay_job_outcome(background_job, &result);
         return result.map(|_| 0);
     }
     // Holding the writer lock, build a fresh snapshot in a temp DB, validate
@@ -2146,7 +2161,7 @@ pub(crate) fn dispatch_index(
         &index_options,
         !is_background,
         if background_job.has_progress_sink() {
-            Some(&mut background_job)
+            Some(&mut *background_job)
         } else {
             None
         },

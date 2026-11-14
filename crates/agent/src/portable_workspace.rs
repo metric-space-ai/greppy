@@ -419,6 +419,8 @@ impl AgentWorkspace {
         recover_apply_journals(&core)?;
         reap_expired_agent_workspaces(&data_root)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
+        let git_run_id = git_workspace_id(run_id);
+        let initial_git_link = prepare_provider_git_link(provider.as_ref(), &git_run_id)?;
         let (baseline, captured_snapshot_owns_chunks) = if provider.is_some() {
             capture_tracked_repository(repo_root, &core, run_id, started)?
         } else {
@@ -434,13 +436,19 @@ impl AgentWorkspace {
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
         let baseline_for_git = baseline.clone();
-        let git_run_id = git_workspace_id(run_id);
         let pair_lease = core.begin_workspace_pair(run_id, &git_run_id)?;
         trace_workspace_phase(run_id, "pair-started", started);
-        let handle = if captured_snapshot_owns_chunks {
-            core.create_workspace(run_id, baseline)
-        } else {
-            core.create_workspace_from_shared_baseline(run_id, &baseline)
+        let git_link_seeded = initial_git_link.is_some();
+        let handle = match (captured_snapshot_owns_chunks, initial_git_link.as_deref()) {
+            (true, Some(content)) => {
+                core.create_workspace_with_initial_root_file(run_id, baseline, ".git", content)
+            }
+            (false, Some(content)) => core
+                .create_workspace_from_shared_baseline_with_initial_root_file(
+                    run_id, &baseline, ".git", content,
+                ),
+            (true, None) => core.create_workspace(run_id, baseline),
+            (false, None) => core.create_workspace_from_shared_baseline(run_id, &baseline),
         };
         let handle = match handle {
             Ok(handle) => handle,
@@ -535,6 +543,7 @@ impl AgentWorkspace {
             &private_git_dir,
             &baseline_tree,
             &baseline_view_commit,
+            git_link_seeded,
         );
         let (baseline_tree, baseline_view_commit, private_index) = match initialized {
             Ok(result) => result,
@@ -4262,11 +4271,35 @@ fn private_git_temporary_path(parent: &Path) -> PathBuf {
     parent.join(format!(".t.{:x}.{:x}", std::process::id(), now_unix_ns()))
 }
 
+fn prepare_provider_git_link(
+    provider: Option<&ProviderInstallation>,
+    git_workspace_id: &str,
+) -> Result<Option<Vec<u8>>, WorkspaceError> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    let private_path = provider.workspace_path(git_workspace_id)?;
+    let parent = private_path
+        .parent()
+        .ok_or_else(|| io::Error::other("private Git namespace has no parent"))?;
+    let parent = canonicalize_trusted_provider_path("workspace container", parent)?;
+    let git_dir = git_compatible_path(&parent.join(git_workspace_id))?;
+    // The core commits this entry in the namespace creation transaction. Even
+    // an early external directory reader cannot cache a missing initial link.
+    Ok(Some(
+        format!("gitdir: {}\n", git_dir.display()).into_bytes(),
+    ))
+}
+
 fn initialize_private_git(
     worktree: &Path,
     private_git_dir: &Path,
     baseline_tree: &str,
     expected_baseline_view_commit: &str,
+    git_link_seeded: bool,
 ) -> Result<(String, String, PathBuf), WorkspaceError> {
     if !private_git_dir.is_dir() {
         return Err(WorkspaceError::Tampered {
@@ -4313,19 +4346,34 @@ fn initialize_private_git(
     }
     let worktree_git = worktree.join(".git");
     let linked_git_dir = git_compatible_path(private_git_dir)?;
-    fs::write(
-        &worktree_git,
-        format!("gitdir: {}\n", linked_git_dir.display()),
-    )
-    .map_err(|error| {
-        WorkspaceError::Io(io::Error::new(
-            error.kind(),
-            format!(
-                "cannot write private Git link {}: {error}",
-                worktree_git.display()
-            ),
-        ))
-    })?;
+    let content = format!("gitdir: {}\n", linked_git_dir.display());
+    if git_link_seeded {
+        let actual = fs::read(&worktree_git).map_err(|error| {
+            WorkspaceError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read prepared private Git link {}: {error}",
+                    worktree_git.display()
+                ),
+            ))
+        })?;
+        if actual != content.as_bytes() {
+            return Err(WorkspaceError::Tampered {
+                path: worktree_git,
+                detail: "prepared private Git link does not match its namespace".into(),
+            });
+        }
+    } else {
+        fs::write(&worktree_git, content).map_err(|error| {
+            WorkspaceError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot write private Git link {}: {error}",
+                    worktree_git.display()
+                ),
+            ))
+        })?;
+    }
     Ok((
         baseline_tree.into(),
         baseline_view_commit.into(),
@@ -6017,13 +6065,50 @@ mod tests {
         assert!(path_text(&worktree).unwrap().starts_with(r"\\?\"));
         assert!(path_text(&private_git).unwrap().starts_with(r"\\?\"));
 
-        initialize_private_git(&worktree, &private_git, "baseline-tree", "baseline-commit")
-            .unwrap();
+        initialize_private_git(
+            &worktree,
+            &private_git,
+            "baseline-tree",
+            "baseline-commit",
+            false,
+        )
+        .unwrap();
         let expected = format!(
             "gitdir: {}\n",
             git_compatible_path(&private_git).unwrap().display()
         );
         assert_eq!(fs::read_to_string(worktree.join(".git")).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_changed_prepared_git_link_is_refused_without_rewriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        let private_git = root.path().join("private-git");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(private_git.join("refs/heads")).unwrap();
+        fs::write(private_git.join("index"), b"index").unwrap();
+        fs::write(
+            private_git.join("HEAD"),
+            b"ref: refs/heads/greppy-baseline\n",
+        )
+        .unwrap();
+        fs::write(
+            private_git.join("refs/heads/greppy-baseline"),
+            b"baseline-commit\n",
+        )
+        .unwrap();
+        let unexpected = b"gitdir: /unexpected-namespace\n";
+        fs::write(worktree.join(".git"), unexpected).unwrap();
+        let result = initialize_private_git(
+            &worktree,
+            &private_git,
+            "baseline-tree",
+            "baseline-commit",
+            true,
+        );
+        assert!(matches!(result, Err(WorkspaceError::Tampered { .. })));
+        assert_eq!(fs::read(worktree.join(".git")).unwrap(), unexpected);
     }
 
     #[test]
@@ -6196,6 +6281,18 @@ mod tests {
                         let staging = workspaces.join(format!(".{git_id}.publishing"));
                         let destination = workspaces.join(git_id);
                         copy_test_tree(&template.join("payload"), &staging);
+                        // A real FUSE mount also exposes files created directly
+                        // in the core before the first directory lookup. Mirror
+                        // those actual link bytes before publishing Git control.
+                        if cfg!(target_os = "linux") {
+                            let core = WorkspaceCore::open(data_for_git.join("core")).unwrap();
+                            let content = core.open_workspace("test-run").unwrap();
+                            let size = core.metadata(&content, ".git").unwrap().unwrap().size;
+                            let link = core
+                                .read(&content, ".git", 0, usize::try_from(size).unwrap())
+                                .unwrap();
+                            fs::write(workspaces.join("test-run/.git"), link).unwrap();
+                        }
                         fs::rename(staging, destination).unwrap();
                         break;
                     }

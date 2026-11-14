@@ -6,6 +6,7 @@ use greppy_indexer::embedding::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PROJECT: &str = "extraction-revision-fixture";
 const DEFINITION: &str =
@@ -72,6 +73,12 @@ fn run(
     args: &[&str],
     overlay: Option<(&Path, &str)>,
 ) -> (i32, String, String) {
+    static NEXT_BACKGROUND_LOG: AtomicUsize = AtomicUsize::new(0);
+    let background_output = store.with_extension(format!(
+        "background-{}-{}.log",
+        std::process::id(),
+        NEXT_BACKGROUND_LOG.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut cmd = Command::new(binary);
     cmd.args(args)
         .current_dir(repo)
@@ -79,6 +86,7 @@ fn run(
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env("GREPPY_PROJECT_IDENTITY", PROJECT)
         .env("GREPPY_FRESHNESS_TTL_MS", "60000")
+        .env("GREPPY_TEST_BACKGROUND_OUTPUT", &background_output)
         .env_remove("GREPPY_AUTO_REINDEX")
         .env_remove("GREPPY_DISCOVER_INCLUDE")
         .env_remove("GREPPY_DISCOVER_EXCLUDE")
@@ -91,10 +99,18 @@ fn run(
             .env("GREPPY_AGENT_BASE_COMMIT", commit);
     }
     let out = cmd.output().unwrap();
+    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        if let Ok(log) = std::fs::read_to_string(&background_output) {
+            stderr.push_str("\nbackground index output:\n");
+            stderr.push_str(&log);
+        }
+    }
+    let _ = std::fs::remove_file(background_output);
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        stderr,
     )
 }
 
