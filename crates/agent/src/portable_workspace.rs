@@ -419,6 +419,8 @@ impl AgentWorkspace {
         recover_apply_journals(&core)?;
         reap_expired_agent_workspaces(&data_root)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
+        let git_run_id = git_workspace_id(run_id);
+        let initial_git_link = prepare_provider_git_link(provider.as_ref(), &git_run_id)?;
         let (baseline, captured_snapshot_owns_chunks) = if provider.is_some() {
             capture_tracked_repository(repo_root, &core, run_id, started)?
         } else {
@@ -434,13 +436,19 @@ impl AgentWorkspace {
         let base_commit = baseline.base_commit.clone();
         let baseline_hash = baseline.baseline_hash.clone();
         let baseline_for_git = baseline.clone();
-        let git_run_id = git_workspace_id(run_id);
         let pair_lease = core.begin_workspace_pair(run_id, &git_run_id)?;
         trace_workspace_phase(run_id, "pair-started", started);
-        let handle = if captured_snapshot_owns_chunks {
-            core.create_workspace(run_id, baseline)
-        } else {
-            core.create_workspace_from_shared_baseline(run_id, &baseline)
+        let git_link_seeded = initial_git_link.is_some();
+        let handle = match (captured_snapshot_owns_chunks, initial_git_link.as_deref()) {
+            (true, Some(content)) => {
+                core.create_workspace_with_initial_root_file(run_id, baseline, ".git", content)
+            }
+            (false, Some(content)) => core
+                .create_workspace_from_shared_baseline_with_initial_root_file(
+                    run_id, &baseline, ".git", content,
+                ),
+            (true, None) => core.create_workspace(run_id, baseline),
+            (false, None) => core.create_workspace_from_shared_baseline(run_id, &baseline),
         };
         let handle = match handle {
             Ok(handle) => handle,
@@ -450,14 +458,6 @@ impl AgentWorkspace {
             }
         };
         trace_workspace_phase(run_id, "content-namespace-created", started);
-        let git_link_seeded =
-            match seed_provider_git_link(&core, &handle, provider.as_ref(), &git_run_id) {
-                Ok(seeded) => seeded,
-                Err(error) => {
-                    let _ = core.abort_workspace_pair(run_id, &git_run_id);
-                    return Err(error);
-                }
-            };
         let worktree = match materialize_content_workspace(
             provider.as_ref(),
             &data_root,
@@ -4271,17 +4271,15 @@ fn private_git_temporary_path(parent: &Path) -> PathBuf {
     parent.join(format!(".t.{:x}.{:x}", std::process::id(), now_unix_ns()))
 }
 
-fn seed_provider_git_link(
-    core: &WorkspaceCore,
-    workspace: &WorkspaceHandle,
+fn prepare_provider_git_link(
     provider: Option<&ProviderInstallation>,
     git_workspace_id: &str,
-) -> Result<bool, WorkspaceError> {
+) -> Result<Option<Vec<u8>>, WorkspaceError> {
     if !cfg!(target_os = "linux") {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(provider) = provider else {
-        return Ok(false);
+        return Ok(None);
     };
     let private_path = provider.workspace_path(git_workspace_id)?;
     let parent = private_path
@@ -4289,16 +4287,11 @@ fn seed_provider_git_link(
         .ok_or_else(|| io::Error::other("private Git namespace has no parent"))?;
     let parent = canonicalize_trusted_provider_path("workspace container", parent)?;
     let git_dir = git_compatible_path(&parent.join(git_workspace_id))?;
-    // FUSE caches directory entries until a mounted mutation invalidates them.
-    // Seed before materialization can populate that cache, then validate the
-    // published link through the mount after the private namespace is ready.
-    core.create_file_with_contents(
-        workspace,
-        ".git",
-        0o100600,
-        format!("gitdir: {}\n", git_dir.display()).as_bytes(),
-    )?;
-    Ok(true)
+    // The core commits this entry in the namespace creation transaction. Even
+    // an early external directory reader cannot cache a missing initial link.
+    Ok(Some(
+        format!("gitdir: {}\n", git_dir.display()).into_bytes(),
+    ))
 }
 
 fn initialize_private_git(

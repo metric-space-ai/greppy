@@ -373,7 +373,7 @@ impl WorkspaceCore {
         id: &str,
         baseline: BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        self.create_workspace_internal(id, baseline, true, false)
+        self.create_workspace_internal(id, baseline, true, false, None)
     }
 
     /// Create a provider-managed namespace over a synthetic empty base. Its
@@ -385,7 +385,29 @@ impl WorkspaceCore {
         id: &str,
         baseline: BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        self.create_workspace_internal(id, baseline, true, true)
+        self.create_workspace_internal(id, baseline, true, true, None)
+    }
+
+    /// Publish a captured namespace and one private root file together.
+    pub fn create_workspace_with_initial_root_file(
+        &self,
+        id: &str,
+        baseline: BaselineSnapshot,
+        path: &str,
+        content: &[u8],
+    ) -> Result<WorkspaceHandle> {
+        self.create_workspace_internal(id, baseline, true, false, Some((path, content)))
+    }
+
+    /// Publish a shared-baseline namespace and its private root file together.
+    pub fn create_workspace_from_shared_baseline_with_initial_root_file(
+        &self,
+        id: &str,
+        baseline: &BaselineSnapshot,
+        path: &str,
+        content: &[u8],
+    ) -> Result<WorkspaceHandle> {
+        self.create_workspace_internal(id, baseline.clone(), false, false, Some((path, content)))
     }
 
     fn create_workspace_internal(
@@ -394,8 +416,20 @@ impl WorkspaceCore {
         baseline: BaselineSnapshot,
         captured_snapshot_owns_chunks: bool,
         empty_base: bool,
+        initial_file: Option<(&str, &[u8])>,
     ) -> Result<WorkspaceHandle> {
         validate_workspace_id(id)?;
+        let initial_file = if let Some((path, content)) = initial_file {
+            let path = normalize_path(Path::new(path), false)?;
+            if path.contains('/') {
+                return Err(Error::InvalidPath(
+                    "initial file must be at the namespace root".into(),
+                ));
+            }
+            Some((path, content))
+        } else {
+            None
+        };
         crate::snapshot::validate_snapshot_hardlink_integrity(&baseline)?;
         let repository = baseline
             .repository
@@ -411,29 +445,71 @@ impl WorkspaceCore {
             captured_snapshot_owns_chunks,
             empty_base,
         )?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if empty_base {
-            repository_layers::retain_overlay_template(
-                &transaction,
-                &baseline.baseline_hash,
-                &dirty_layer_id,
+        // Prepare durable bytes before taking the namespace SQLite writer.
+        // Readers must see both the namespace and its initial entry, or neither.
+        let initial_file = if let Some((path, content)) = initial_file {
+            let (chunks, _) = self.chunks.put_stream(content)?;
+            for chunk in &chunks {
+                self.chunks.pin(*chunk)?;
+            }
+            Some((path, content.len() as u64, chunks))
+        } else {
+            None
+        };
+        let result = (|| -> Result<WorkspaceHandle> {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if empty_base {
+                repository_layers::retain_overlay_template(
+                    &transaction,
+                    &baseline.baseline_hash,
+                    &dirty_layer_id,
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO cow_workspaces(
+                     id, repository, base_commit, baseline_hash, baseline_json, state
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'ready')",
+                params![
+                    id,
+                    repository,
+                    baseline.base_commit,
+                    baseline.baseline_hash,
+                    baseline_json
+                ],
             )?;
+            repository_layers::link_workspace(&transaction, id, &base_id, &dirty_layer_id)?;
+            if let Some((path, size, chunks)) = &initial_file {
+                if repository_layers::lookup(&transaction, id, path)?.is_some() {
+                    return Err(Error::AlreadyExists(path.clone()));
+                }
+                let inode = insert_inode(
+                    &transaction,
+                    id,
+                    NodeKind::File,
+                    0o100600,
+                    *size,
+                    now_unix_ns(),
+                    chunks,
+                )?;
+                insert_entry(&transaction, id, path, inode)?;
+            }
+            transaction.commit()?;
+            Ok(WorkspaceHandle { id: id.into() })
+        })();
+        if let Err(error) = result {
+            if let Some((_, _, chunks)) = initial_file {
+                for chunk in chunks {
+                    if let Err(cleanup) = self.chunks.unpin(chunk) {
+                        return Err(Error::Corrupt(format!(
+                            "workspace creation failed: {error}; initial file cleanup failed: {cleanup}"
+                        )));
+                    }
+                }
+            }
+            return Err(error);
         }
-        transaction.execute(
-            "INSERT INTO cow_workspaces(
-                 id, repository, base_commit, baseline_hash, baseline_json, state
-             ) VALUES(?1, ?2, ?3, ?4, ?5, 'ready')",
-            params![
-                id,
-                repository,
-                baseline.base_commit,
-                baseline.baseline_hash,
-                baseline_json
-            ],
-        )?;
-        repository_layers::link_workspace(&transaction, id, &base_id, &dirty_layer_id)?;
-        transaction.commit()?;
-        Ok(WorkspaceHandle { id: id.into() })
+        result
     }
 
     /// Creates another namespace over an already pinned immutable baseline.
@@ -445,7 +521,7 @@ impl WorkspaceCore {
         id: &str,
         baseline: &BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        self.create_workspace_internal(id, baseline.clone(), false, false)
+        self.create_workspace_internal(id, baseline.clone(), false, false, None)
     }
 
     /// Clone a provider-managed control namespace from an already retained
@@ -455,7 +531,7 @@ impl WorkspaceCore {
         id: &str,
         baseline: &BaselineSnapshot,
     ) -> Result<WorkspaceHandle> {
-        self.create_workspace_internal(id, baseline.clone(), false, true)
+        self.create_workspace_internal(id, baseline.clone(), false, true, None)
     }
 
     /// Begin the crash-recoverable creation of the content/Git-state pair.
@@ -1426,18 +1502,6 @@ impl WorkspaceCore {
         mode: u32,
     ) -> Result<()> {
         self.create_node(workspace, path.as_ref(), NodeKind::File, mode, &[])
-    }
-
-    /// Publish a new file and its initial bytes in one namespace transaction.
-    /// An existing entry is refused before allocating or pinning any chunks.
-    pub fn create_file_with_contents(
-        &self,
-        workspace: &WorkspaceHandle,
-        path: impl AsRef<Path>,
-        mode: u32,
-        content: &[u8],
-    ) -> Result<()> {
-        self.create_node(workspace, path.as_ref(), NodeKind::File, mode, content)
     }
 
     pub fn set_metadata(
@@ -3538,10 +3602,13 @@ mod tests {
 
     #[test]
     fn initial_file_contents_need_no_empty_placeholder_or_second_publication() {
-        let (_repo, storage, core, workspace) = fixture();
+        let (repo, storage, core, _) = fixture();
+        let baseline = crate::capture_repository(repo.path(), core.chunks()).unwrap();
+        let shared = baseline.clone();
         let before = core.chunks().stats().unwrap();
         let content = b"gitdir: /synthetic/private-git\n";
-        core.create_file_with_contents(&workspace, ".git", 0o100600, content)
+        let workspace = core
+            .create_workspace_with_initial_root_file("initial-file", baseline, ".git", content)
             .unwrap();
         let after = core.chunks().stats().unwrap();
         assert_eq!(after.chunk_count, before.chunk_count + 1);
@@ -3551,18 +3618,60 @@ mod tests {
             before.logical_bytes + content.len() as u64
         );
         assert_eq!(core.read(&workspace, ".git", 0, 128).unwrap(), content);
-        assert!(matches!(
-            core.create_file_with_contents(&workspace, ".git", 0o100600, b"replacement"),
-            Err(Error::AlreadyExists(_))
-        ));
+        let shared_workspace = core
+            .create_workspace_from_shared_baseline_with_initial_root_file(
+                "shared-initial-file",
+                &shared,
+                ".git",
+                content,
+            )
+            .unwrap();
+        assert_eq!(
+            core.read(&shared_workspace, ".git", 0, 128).unwrap(),
+            content
+        );
         assert_eq!(
             core.chunks().stats().unwrap().chunk_count,
             after.chunk_count
         );
+        assert!(matches!(
+            core.create_workspace_from_shared_baseline_with_initial_root_file(
+                "existing-file",
+                &shared,
+                "README.md",
+                b"replacement",
+            ),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(core.open_workspace("existing-file").is_err());
+        {
+            let connection = core.lock_metadata().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_initial_file_insert
+                 BEFORE INSERT ON cow_inodes
+                 WHEN NEW.workspace_id = 'failed-initial-file'
+                 BEGIN SELECT RAISE(FAIL, 'initial file insert failed'); END;",
+                )
+                .unwrap();
+        }
+        let failure_baseline = crate::capture_repository(repo.path(), core.chunks()).unwrap();
+        assert!(core
+            .create_workspace_with_initial_root_file(
+                "failed-initial-file",
+                failure_baseline,
+                ".git",
+                content,
+            )
+            .is_err());
+        assert!(core.open_workspace("failed-initial-file").is_err());
         drop(core);
-
         let reopened = WorkspaceCore::open(storage.path()).unwrap();
         assert_eq!(reopened.read(&workspace, ".git", 0, 128).unwrap(), content);
+        assert_eq!(
+            reopened.read(&shared_workspace, ".git", 0, 128).unwrap(),
+            content
+        );
         assert_eq!(
             reopened.metadata(&workspace, ".git").unwrap().unwrap().mode,
             0o100600
