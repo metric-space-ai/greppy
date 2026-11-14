@@ -45,6 +45,7 @@ pub fn spawn_fake_provider_with_edits(
     let data = root.join("provider-data");
     let mount = root.join("provider-mount");
     std::fs::create_dir_all(mount.join("doctor")).unwrap();
+    std::fs::create_dir_all(mount.join("workspaces")).unwrap();
     std::fs::create_dir_all(&data).unwrap();
     let manifest = ProviderManifest {
         protocol_version: PROVIDER_PROTOCOL_VERSION,
@@ -79,6 +80,7 @@ pub fn spawn_fake_provider_with_edits(
         let git_dir = tracked_repo.join(".git");
         let mut tracker_fences = HashSet::new();
         let mut mirrored = HashSet::new();
+        let mut mirrored_git_links = HashSet::new();
         let mut edited = HashSet::new();
         let mut last_heartbeat = 0;
         let mut last_tracker_heartbeat = 0;
@@ -159,6 +161,42 @@ pub fn spawn_fake_provider_with_edits(
                     }
                 }
                 if let Ok(workspaces) = core.list_workspaces() {
+                    // Mirror actual core-created link bytes before exposing a
+                    // Git namespace. Ordinary directories cannot observe these
+                    // core commits as a real FUSE mount does. Publish each link
+                    // once so later tampering is never silently repaired.
+                    if cfg!(target_os = "linux") {
+                        for workspace in workspaces.iter().filter(|workspace| {
+                            !workspace.id.starts_with("git-") && mirrored.contains(&workspace.id)
+                        }) {
+                            if mirrored_git_links.contains(&workspace.id) {
+                                continue;
+                            }
+                            let Ok(handle) = core.open_workspace(&workspace.id) else {
+                                continue;
+                            };
+                            let Ok(Some(metadata)) = core.metadata(&handle, ".git") else {
+                                continue;
+                            };
+                            let Ok(link) = core.read(
+                                &handle,
+                                ".git",
+                                0,
+                                usize::try_from(metadata.size).unwrap(),
+                            ) else {
+                                continue;
+                            };
+                            std::fs::write(
+                                mount_thread
+                                    .join("workspaces")
+                                    .join(&workspace.id)
+                                    .join(".git"),
+                                link,
+                            )
+                            .unwrap();
+                            mirrored_git_links.insert(workspace.id.clone());
+                        }
+                    }
                     let active = workspaces
                         .iter()
                         .map(|workspace| workspace.id.clone())
@@ -187,6 +225,7 @@ pub fn spawn_fake_provider_with_edits(
                             mount_thread.join("workspaces").join(&workspace),
                         );
                         mirrored.remove(&workspace);
+                        mirrored_git_links.remove(&workspace);
                     }
                 }
             }
