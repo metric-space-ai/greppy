@@ -405,6 +405,7 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     // A private completion channel belongs to the enclosing edit verifier.
     // Never leak it to the arbitrary project test command or nested greppy calls.
     command.env_remove("GREPPY_INTERNAL_VERIFY_STATUS_PATH");
+    command.env_remove(greppy_agent::LIVE_OUTPUT_ENV);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1615,6 +1616,9 @@ where
             .truncate(true)
             .open(&tail_path)?;
         let mut timestamps = std::fs::File::create(&timestamps_path)?;
+        // A caller that shows the output live gets every chunk as it comes, too.
+        let mut live = std::env::var_os(greppy_agent::LIVE_OUTPUT_ENV)
+            .and_then(|path| std::fs::OpenOptions::new().append(true).open(path).ok());
         let started = std::time::Instant::now();
         let mut byte_len = 0u64;
         let mut overflow_len = 0u64;
@@ -1627,6 +1631,12 @@ where
                 break;
             }
             let chunk = &buffer[..read];
+            if let Some(file) = live.as_mut() {
+                // Best effort: a failing live view never fails the capture.
+                if file.write_all(chunk).and_then(|()| file.flush()).is_err() {
+                    live = None;
+                }
+            }
             let head_remaining = PACK_HEAD_BYTES.saturating_sub(byte_len);
             let head_len = usize::try_from(head_remaining.min(read as u64)).unwrap_or(read);
             if head_len > 0 {

@@ -102,6 +102,21 @@ pub struct GreppyEnv {
     /// Web and desktop manuals enabled for this run. Shared so `&self` tool
     /// calls (including a batch) can record `capabilities enable`.
     capabilities: Arc<std::sync::atomic::AtomicU8>,
+    /// Where a running command's output goes as it comes (`bash-smart` only).
+    live_output: Option<LiveOutput>,
+}
+
+/// What receives a running command's raw output, chunk by chunk.
+pub type LiveSink = dyn Fn(&[u8]) + Send + Sync;
+
+/// A receiver of a running command's raw output, chunk by chunk.
+#[derive(Clone)]
+pub struct LiveOutput(pub Arc<LiveSink>);
+
+impl std::fmt::Debug for LiveOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveOutput")
+    }
 }
 
 impl GreppyEnv {
@@ -134,6 +149,7 @@ impl GreppyEnv {
             sandbox: SandboxMode::Off,
             context_status: None,
             capabilities: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            live_output: None,
         })
     }
 
@@ -187,6 +203,13 @@ impl GreppyEnv {
     /// roots (worktree, private Git state, per-run scratch and agent data).
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
+        self
+    }
+
+    /// Hand a running command's output (`bash-smart`) to `live` as it comes, besides
+    /// the folded result the model gets when it is over.
+    pub fn with_live_output(mut self, live: LiveOutput) -> Self {
+        self.live_output = Some(live);
         self
     }
 
@@ -444,7 +467,30 @@ impl GreppyEnv {
             None
         };
 
-        match run_capture_held(&mut cmd, timeout, attach_hold) {
+        // A running command's output, as it comes: bash-smart appends it to a file of
+        // this run's own, which a reader here hands on until the command is over.
+        let live = match (&self.live_output, args.first().map(String::as_str)) {
+            (Some(live), Some("bash-smart")) => {
+                static LIVE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+                let path = self.run_scratch.join(format!(
+                    "live-{}.out",
+                    LIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::File::create(&path) {
+                    Ok(_) => {
+                        cmd.env(crate::LIVE_OUTPUT_ENV, &path);
+                        Some(LiveReader::start(path, live.clone()))
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let captured = run_capture_held(&mut cmd, timeout, attach_hold);
+        if let Some(live) = live {
+            live.finish();
+        }
+        match captured {
             Ok(captured) => {
                 let actual_success = captured.success && !captured.timed_out;
                 let no_match = captured.exit_code == Some(1)
@@ -540,6 +586,44 @@ impl GreppyEnv {
             }
             Err(msg) => ToolOutcome::err(msg),
         }
+    }
+}
+
+/// Reads a live-output file while its command runs and hands on what was added.
+struct LiveReader {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: thread::JoinHandle<()>,
+    path: PathBuf,
+}
+
+impl LiveReader {
+    fn start(path: PathBuf, live: LiveOutput) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (reading, stopped) = (path.clone(), Arc::clone(&stop));
+        let thread = thread::spawn(move || {
+            let mut offset = 0u64;
+            loop {
+                // Read the flag first: once it is set, one more read takes the rest.
+                let last = stopped.load(Ordering::Relaxed);
+                if let Ok(bytes) = std::fs::read(&reading) {
+                    if bytes.len() as u64 > offset {
+                        live.0(&bytes[offset as usize..]);
+                        offset = bytes.len() as u64;
+                    }
+                }
+                if last {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+        });
+        Self { stop, thread, path }
+    }
+
+    fn finish(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

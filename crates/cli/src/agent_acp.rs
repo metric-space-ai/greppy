@@ -239,6 +239,11 @@ struct Server {
 struct State {
     initialized: bool,
     sessions: HashMap<String, Session>,
+    /// What the client said it can do (`clientCapabilities` of `initialize`).
+    client: Value,
+    /// The session of each `session/prompt` under way, by its request id (for
+    /// `$/cancel_request`).
+    prompts: HashMap<String, String>,
 }
 
 struct Session {
@@ -259,7 +264,43 @@ struct Session {
     usage_out: u64,
     /// The MCP servers the client named for this session, started once.
     mcp: Arc<Mutex<greppy_agent::mcp::McpHub>>,
+    /// The summary of what was compacted away, where the conversation was.
+    context_summary: Option<String>,
+    /// What the client chose for this session (config options and mode).
+    choices: Choices,
+    /// Further folders the client named (`additionalDirectories`): writable like the
+    /// session's folder, and named to the model.
+    extra_dirs: Vec<PathBuf>,
 }
+
+/// What a client chose for a session: how it asks before tools run, how hard the
+/// model is to think, and which of greppy's capabilities are on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Choices {
+    /// `ask` (permission before commands and edits), `auto` (no asking), `read-only`.
+    mode: &'static str,
+    /// Reasoning effort; none: the provider's default.
+    effort: Option<String>,
+    capabilities: greppy_agent::CapabilitySet,
+}
+
+const MODES: [(&str, &str, &str); 3] = [
+    (
+        "ask",
+        "Ask",
+        "Ask before running commands and changing files",
+    ),
+    (
+        "auto",
+        "Auto",
+        "Run commands and change files without asking",
+    ),
+    (
+        "read-only",
+        "Read only",
+        "Read and search only; no commands, no changes",
+    ),
+];
 
 struct PermMemory {
     allow: HashSet<String>,
@@ -306,6 +347,8 @@ impl Server {
             state: Arc::new(Mutex::new(State {
                 initialized: false,
                 sessions: HashMap::new(),
+                client: Value::Null,
+                prompts: HashMap::new(),
             })),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: Arc::new(AtomicU64::new(1)),
@@ -405,6 +448,64 @@ impl Server {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         if let Some(reply) = self.handle_request(&method, &id, &params) {
             let _ = self.out.send(&reply);
+            if matches!(
+                method.as_str(),
+                "session/new" | "session/load" | "session/resume"
+            ) && reply.get("error").is_none()
+            {
+                let session_id = reply
+                    .pointer("/result/sessionId")
+                    .or_else(|| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(session_id) = session_id {
+                    self.after_session_setup(&session_id);
+                }
+            }
+        }
+    }
+
+    /// What a client is told once a session is set up: the slash commands it can send,
+    /// and, where it takes notices, what went wrong while setting up (an MCP server
+    /// left out).
+    fn after_session_setup(&self, session_id: &str) {
+        let _ = send_update(
+            &self.out,
+            session_id,
+            json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": SLASH_COMMANDS.iter().map(|(name, description)| json!({
+                    "name": name, "description": description
+                })).collect::<Vec<_>>()
+            }),
+        );
+        let (notices, hub) = {
+            let state = lock_state(&self.state);
+            (
+                state
+                    .client
+                    .pointer("/session/notices")
+                    .is_some_and(|v| !v.is_null() && v != &json!(false)),
+                state
+                    .sessions
+                    .get(session_id)
+                    .map(|session| Arc::clone(&session.mcp)),
+            )
+        };
+        if let (true, Some(hub)) = (notices, hub) {
+            let notes = hub.lock().map(|hub| hub.notes.clone()).unwrap_or_default();
+            for note in notes {
+                let _ = send_update(
+                    &self.out,
+                    session_id,
+                    json!({
+                        "sessionUpdate": "notice",
+                        "severity": "warning",
+                        "title": "An MCP server is left out",
+                        "description": note
+                    }),
+                );
+            }
         }
     }
 
@@ -426,6 +527,17 @@ impl Server {
         if method == "session/cancel" {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 self.cancel_session(session_id);
+            }
+        }
+        // A request the client no longer wants answered: a prompt under way is
+        // cancelled as with session/cancel (it ends with stopReason cancelled).
+        if method == "$/cancel_request" {
+            let session_id = params
+                .get("requestId")
+                .map(id_key)
+                .and_then(|key| lock_state(&self.state).prompts.get(&key).cloned());
+            if let Some(session_id) = session_id {
+                self.cancel_session(&session_id);
             }
         }
     }
@@ -469,6 +581,8 @@ impl Server {
             "session/list" => Some(self.session_list(id, params)),
             "session/close" => Some(self.session_close(id, params)),
             "session/set_model" => Some(self.session_set_model(id, params)),
+            "session/set_mode" => Some(self.session_set_mode(id, params)),
+            "session/delete" => Some(self.session_delete(id, params)),
             "_workjet/import_history" => Some(self.import_history(id, params)),
             OUTPUT_LIMIT_METHOD => Some(self.set_route_output_limit(id, params)),
 
@@ -486,7 +600,14 @@ impl Server {
         if version.is_none() {
             return rpc_error(id, -32602, "protocolVersion is required");
         }
-        lock_state(&self.state).initialized = true;
+        {
+            let mut state = lock_state(&self.state);
+            state.initialized = true;
+            state.client = params
+                .get("clientCapabilities")
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
         rpc_ok(
             id,
             json!({
@@ -517,7 +638,9 @@ impl Server {
                     "sessionCapabilities": {
                         "list": {},
                         "resume": {},
-                        "close": {}
+                        "close": {},
+                        "delete": {},
+                        "additionalDirectories": {}
                     }
                 },
                 "authMethods": [{
@@ -663,6 +786,10 @@ impl Server {
             Ok(cwd) => cwd,
             Err(message) => return rpc_error(id, -32602, &message),
         };
+        let extra_dirs = match additional_directories(params) {
+            Ok(dirs) => dirs,
+            Err(message) => return rpc_error(id, -32602, &message),
+        };
         let (data_root, project) = self.store_identity(&cwd);
         let model = self.config.model.clone();
         let session_id = unique_session_id();
@@ -699,11 +826,21 @@ impl Server {
             usage_in: 0,
             usage_out: 0,
             mcp,
+            context_summary: None,
+            choices: Choices {
+                mode: "ask",
+                effort: None,
+                capabilities: self.config.capabilities,
+            },
+            extra_dirs: extra_dirs.clone(),
         };
         lock_state(&self.state)
             .sessions
             .insert(session_id.clone(), session);
-        rpc_ok(id, session_setup(&session_id, &model, true))
+        let choices = lock_state(&self.state).sessions[&session_id]
+            .choices
+            .clone();
+        rpc_ok(id, session_setup(&session_id, &model, true, &choices))
     }
 
     fn session_load(&self, id: &Value, params: &Value, method: &str) -> Value {
@@ -714,6 +851,10 @@ impl Server {
         };
         let cwd = match require_cwd(params) {
             Ok(cwd) => cwd,
+            Err(message) => return rpc_error(id, -32602, &message),
+        };
+        let extra_dirs = match additional_directories(params) {
+            Ok(dirs) => dirs,
             Err(message) => return rpc_error(id, -32602, &message),
         };
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
@@ -772,11 +913,19 @@ impl Server {
             usage_in: record.usage.input_tokens,
             usage_out: record.usage.output_tokens,
             mcp,
+            context_summary: record.context_summary.clone(),
+            choices: Choices {
+                mode: "ask",
+                effort: None,
+                capabilities: self.config.capabilities,
+            },
+            extra_dirs: extra_dirs.clone(),
         };
         lock_state(&self.state)
             .sessions
             .insert(session_id.to_string(), session);
-        rpc_ok(id, session_setup(session_id, &model, false))
+        let choices = lock_state(&self.state).sessions[session_id].choices.clone();
+        rpc_ok(id, session_setup(session_id, &model, false, &choices))
     }
 
     fn emit_replay(&self, session_id: &str, messages: &[Message]) {
@@ -935,11 +1084,24 @@ impl Server {
             return rpc_error(id, -32602, "configId is required");
         };
         if config_id != "model" {
-            return rpc_error(
-                id,
-                -32602,
-                &format!("unsupported session config option: {config_id}"),
-            );
+            let Some(value) = params.get("value").and_then(Value::as_str) else {
+                return rpc_error(
+                    id,
+                    -32602,
+                    &format!("config option {config_id} expects a string"),
+                );
+            };
+            return match self.choose(session_id, config_id, value) {
+                Ok(()) => {
+                    let state = lock_state(&self.state);
+                    let session = &state.sessions[session_id];
+                    rpc_ok(
+                        id,
+                        json!({ "configOptions": config_options(&session.model, &session.choices) }),
+                    )
+                }
+                Err((code, message)) => rpc_error(id, code, &message),
+            };
         }
         if params.get("type").and_then(Value::as_str) == Some("boolean") {
             return rpc_error(id, -32602, "model config option expects a string");
@@ -960,6 +1122,109 @@ impl Server {
                     .unwrap_or_else(|| model_id.to_string());
                 rpc_ok(id, json!({ "configOptions": [model_config(&model)] }))
             }
+        }
+    }
+
+    /// Change one of a session's choices (`mode`, `effort`, `web`, `desktop`).
+    fn choose(&self, session_id: &str, config_id: &str, value: &str) -> Result<(), (i64, String)> {
+        let mut state = lock_state(&self.state);
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return Err((-32002, format!("session not found: {session_id}")));
+        };
+        if session.closed {
+            return Err((-32600, "session is closed".to_string()));
+        }
+        let wrong = || {
+            (
+                -32602,
+                format!("{value:?} is no value of config option {config_id}"),
+            )
+        };
+        let switch = |value: &str| match value {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err(wrong()),
+        };
+        match config_id {
+            "mode" => {
+                session.choices.mode = MODES
+                    .iter()
+                    .find(|(id, _, _)| *id == value)
+                    .map(|(id, _, _)| *id)
+                    .ok_or_else(wrong)?;
+            }
+            "effort" => {
+                session.choices.effort = match value {
+                    "default" => None,
+                    "low" | "medium" | "high" => Some(value.to_owned()),
+                    _ => return Err(wrong()),
+                };
+            }
+            "web" => session.choices.capabilities.web = switch(value)?,
+            "desktop" => session.choices.capabilities.desktop = switch(value)?,
+            _ => {
+                return Err((
+                    -32602,
+                    format!("unsupported session config option: {config_id}"),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a session: forgotten here, and its saved conversation removed.
+    fn session_delete(&self, id: &Value, params: &Value) -> Value {
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return rpc_error(id, -32602, "sessionId is required");
+        };
+        if !SessionStore::is_valid_id(session_id) {
+            return rpc_error(id, -32602, "invalid session id");
+        }
+        let removed = {
+            let mut state = lock_state(&self.state);
+            if state
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| session.busy)
+            {
+                return rpc_error(id, -32600, "session is busy");
+            }
+            state.sessions.remove(session_id)
+        };
+        let (data_root, project) = match &removed {
+            Some(session) => (session.data_root.clone(), session.project.clone()),
+            None => match params.get("cwd").and_then(Value::as_str) {
+                Some(cwd) => self.store_identity(Path::new(cwd)),
+                None => return rpc_error(id, -32002, &format!("session not found: {session_id}")),
+            },
+        };
+        let store = SessionStore::new(data_root.as_path(), project.as_str());
+        match store
+            .path_for(session_id)
+            .and_then(|path| match std::fs::remove_file(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound && removed.is_some() => {
+                    Ok(())
+                }
+                other => other,
+            }) {
+            Ok(()) => rpc_ok(id, json!({})),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                rpc_error(id, -32002, &format!("session not found: {session_id}"))
+            }
+            Err(error) => rpc_error(id, -32603, &format!("cannot delete session: {error}")),
+        }
+    }
+
+    fn session_set_mode(&self, id: &Value, params: &Value) -> Value {
+        let (Some(session_id), Some(mode)) = (
+            params.get("sessionId").and_then(Value::as_str),
+            params.get("modeId").and_then(Value::as_str),
+        ) else {
+            return rpc_error(id, -32602, "sessionId and modeId are required");
+        };
+        match self.choose(session_id, "mode", mode) {
+            Ok(()) => rpc_ok(id, json!({})),
+            Err((code, message)) => rpc_error(id, code, &message),
         }
     }
 
@@ -1042,9 +1307,8 @@ impl Server {
                 .pointer(&format!("/_meta/greppy/{name}"))
                 .and_then(Value::as_u64)
         };
-        let compact_at = number("contextWindow")
-            .filter(|window| *window >= SMALLEST_WINDOW)
-            .map(|window| window / 10 * 9);
+        let context_window = number("contextWindow").filter(|window| *window >= SMALLEST_WINDOW);
+        let compact_at = context_window.map(|window| window / 10 * 9);
         let context_tokens = number("contextTokens");
         let client_tools = match client_tools(params) {
             Ok(tools) => tools,
@@ -1085,7 +1349,7 @@ impl Server {
             }
             session.busy = true;
             session.cancel.store(false, Ordering::Relaxed);
-            PreparedPrompt {
+            let prepared = PreparedPrompt {
                 session_id: session.id.clone(),
                 cwd: session.cwd.clone(),
                 data_root: session.data_root.clone(),
@@ -1098,10 +1362,20 @@ impl Server {
                 client_tools,
                 images,
                 mcp: Arc::clone(&session.mcp),
+                context_summary: session.context_summary.clone(),
+                choices: session.choices.clone(),
                 effort,
                 compact_at,
                 context_tokens,
-            }
+                context_window,
+                extra_dirs: session.extra_dirs.clone(),
+                client: Value::Null,
+            };
+            // (Kept so that `$/cancel_request` finds the prompt's session.)
+            let mut prepared = prepared;
+            prepared.client = state.client.clone();
+            state.prompts.insert(id_key(id), session_id.to_owned());
+            prepared
         };
         let request_id = id.clone();
         let out = self.out.clone();
@@ -1153,6 +1427,7 @@ impl Server {
                 Err(_) => rpc_error(&request_id, -32603, "agent prompt failed unexpectedly"),
             };
             drop(busy);
+            lock_state(&state).prompts.remove(&id_key(&request_id));
             let _ = out.send(&reply);
         });
     }
@@ -1199,6 +1474,16 @@ struct PreparedPrompt {
     images: Vec<greppy_agent::ContentPart>,
     /// The session's MCP servers.
     mcp: Arc<Mutex<greppy_agent::mcp::McpHub>>,
+    /// The conversation's checkpoint summary before this prompt.
+    context_summary: Option<String>,
+    /// The session's choices when the prompt began.
+    choices: Choices,
+    /// The model's window as the client named it (`_meta.greppy.contextWindow`).
+    context_window: Option<u64>,
+    /// Further folders the client named for the session (`additionalDirectories`).
+    extra_dirs: Vec<PathBuf>,
+    /// The client's capabilities (`initialize`).
+    client: Value,
     /// The reasoning effort chosen for this prompt (`_meta.greppy.effort`).
     effort: Option<String>,
     /// Prompt tokens at which this prompt's conversation is compacted (90 % of
@@ -1210,6 +1495,8 @@ struct PreparedPrompt {
 
 struct PromptDone {
     messages: Vec<Message>,
+    /// The checkpoint summary after this prompt (a new one where it compacted).
+    context_summary: Option<String>,
     stop_reason: &'static str,
     usage: greppy_agent::Usage,
 }
@@ -1243,7 +1530,11 @@ fn run_prompt(
     for (name, value) in &config.headers {
         client = client.with_header(name, value)?;
     }
-    if let Some(effort) = &prepared.effort {
+    if let Some(effort) = prepared
+        .effort
+        .as_ref()
+        .or(prepared.choices.effort.as_ref())
+    {
         client = client.with_effort(effort)?;
     }
     let mut client = CancelModel {
@@ -1251,14 +1542,16 @@ fn run_prompt(
         cancel: Arc::clone(&prepared.cancel),
     };
 
+    let live = LiveView::new(out.clone(), prepared.session_id.clone());
     let inner: Box<dyn ExecutionEnv + Send> = if let Some(factory) = &config.tool_env {
         factory(&prepared.cwd)
     } else {
         let greppy = GreppyEnv::new(prepared.cwd.clone())
             .map_err(|error| format!("cannot build the tool environment: {error}"))?
-            .with_capabilities(config.capabilities);
+            .with_capabilities(prepared.choices.capabilities)
+            .with_live_output(live.sink());
         if config.sandbox {
-            sandboxed(greppy, &prepared.cwd)
+            sandboxed(greppy, &prepared.cwd, &prepared.extra_dirs)
         } else {
             Box::new(greppy)
         }
@@ -1269,6 +1562,7 @@ fn run_prompt(
         hub: Arc::clone(&prepared.mcp),
     });
     let gated = GatingEnv {
+        mode: prepared.choices.mode,
         inner,
         session_id: prepared.session_id.clone(),
         perms: Arc::clone(&prepared.perms),
@@ -1277,8 +1571,31 @@ fn run_prompt(
         pending: Arc::clone(pending),
         next_request_id: Arc::clone(next_request_id),
     };
+    // greppy's plan, said to the client as an ACP plan (no permission: it changes nothing).
+    let planned = PlanEnv {
+        inner: Box::new(gated),
+        out: out.clone(),
+        session_id: prepared.session_id.clone(),
+    };
+    // Where the client can ask the person (form elicitation), greppy can too.
+    let asking: Box<dyn ExecutionEnv + Send> = if prepared
+        .client
+        .pointer("/elicitation/form")
+        .is_some_and(|form| !form.is_null() && form != &json!(false))
+    {
+        Box::new(AskEnv {
+            inner: Box::new(planned),
+            session_id: prepared.session_id.clone(),
+            cancel: Arc::clone(&prepared.cancel),
+            out: out.clone(),
+            pending: Arc::clone(pending),
+            next_request_id: Arc::clone(next_request_id),
+        })
+    } else {
+        Box::new(planned)
+    };
     let mut env = ClientToolEnv {
-        inner: gated,
+        inner: asking,
         tools: prepared.client_tools.clone(),
         session_id: prepared.session_id.clone(),
         cancel: Arc::clone(&prepared.cancel),
@@ -1290,7 +1607,7 @@ fn run_prompt(
         max_turns: config.max_turns,
         system: Some(greppy_agent::system_prompt_with_capabilities(
             BuiltinPromptMode::Acp,
-            config.capabilities,
+            prepared.choices.capabilities,
         )),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
@@ -1302,6 +1619,7 @@ fn run_prompt(
             thresholds
         },
         measured_prompt_tokens: prepared.context_tokens,
+        context_summary: prepared.context_summary.clone(),
         default_compact_at_tokens: Some(greppy_agent::default_compact_at_tokens()),
         ..AgentConfig::default()
     }
@@ -1311,17 +1629,74 @@ fn run_prompt(
             .map_or(u64::MAX, OutputTokenLimit::get),
     );
     let session_id = prepared.session_id.clone();
+    // A new conversation is named after its first words.
+    if prepared.history.is_empty() && !prompt.trim().is_empty() {
+        let _ = send_update(
+            out,
+            &session_id,
+            json!({"sessionUpdate": "session_info_update", "title": truncate_chars(prompt.trim(), 80)}),
+        );
+    }
+    // A slash command is the client's, not a message for the model.
+    if let Some(done) = slash_command(prompt, prepared, &agent_config, &mut client, &mut env, out)?
+    {
+        return Ok(done);
+    }
+    let window = prepared
+        .context_window
+        .unwrap_or(greppy_agent::DEFAULT_CONTEXT_WINDOW);
+    let compaction_updates = prepared
+        .client
+        .pointer("/session/compaction")
+        .is_some_and(|v| !v.is_null() && v != &json!(false));
+    let mut refused = false;
+    let mut compactions = 0u32;
+    let mut view = ToolView::new(&prepared.cwd);
     let mut on_event = |event: LoopEvent| {
         if let LoopEvent::ToolStart { call_id, .. } = &event {
             let call_id = call_id.clone();
-            ACTIVE_TOOL_CALL.with(|slot| *slot.borrow_mut() = Some(call_id));
+            ACTIVE_TOOL_CALL.with(|slot| *slot.borrow_mut() = Some(call_id.clone()));
+            live.begin(call_id);
         }
-        let _ = emit_loop_event(out, &session_id, &event);
+        if let LoopEvent::TurnComplete { stop_reason, .. } = &event {
+            refused = matches!(stop_reason, greppy_agent::StopReason::Other(reason) if reason == "refusal");
+        }
+        if let (true, LoopEvent::ContextCompacted { summary, .. }) = (compaction_updates, &event) {
+            compactions += 1;
+            let _ = send_update(
+                out,
+                &session_id,
+                json!({
+                    "sessionUpdate": "compaction_update",
+                    "compactionId": format!("{session_id}-{}-{compactions}", now_ms()),
+                    "status": "completed",
+                    "summary": summary
+                }),
+            );
+        }
+        if let Some(mut update) = loop_update(&event) {
+            view.decorate(&event, &mut update);
+            if update["sessionUpdate"] == "usage_update" {
+                update["size"] = json!(window);
+            }
+            let _ = send_update(out, &session_id, update);
+        }
     };
-    let content = (!prompt.is_empty())
-        .then(|| greppy_agent::ContentPart::Text {
-            text: prompt.to_owned(),
-        })
+    // Further folders of the session, named to the model with its first message.
+    let mut text = prompt.to_owned();
+    if prepared.history.is_empty() && !prepared.extra_dirs.is_empty() {
+        let dirs: Vec<String> = prepared
+            .extra_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
+        text = format!(
+            "[Besides the session's folder you may work in: {}]\n{text}",
+            dirs.join(", ")
+        );
+    }
+    let content = (!text.is_empty())
+        .then(|| greppy_agent::ContentPart::Text { text })
         .into_iter()
         .chain(prepared.images.iter().cloned())
         .collect();
@@ -1335,14 +1710,267 @@ fn run_prompt(
     ) {
         Ok(result) => Ok(PromptDone {
             messages: result.messages,
-            stop_reason: stop_reason(&result.stop),
+            context_summary: result.context_summary,
+            stop_reason: if refused && result.stop == LoopStop::EndTurn {
+                "refusal"
+            } else {
+                stop_reason(&result.stop)
+            },
             usage: result.usage,
         }),
         Err(error) => Err(loop_error_message(&error)),
     }
 }
 
+/// The slash commands a client is offered (`available_commands_update`).
+const SLASH_COMMANDS: [(&str, &str); 2] = [
+    (
+        "compact",
+        "Make the conversation shorter now: a checkpoint of what was said",
+    ),
+    ("undo", "Undo greppy's last change to a file"),
+];
+
+/// A prompt that is one of greppy's slash commands, carried out without the model's
+/// turn: `/compact` checkpoints the conversation now, `/undo` takes back greppy's
+/// last edit. None for any other prompt.
+fn slash_command(
+    prompt: &str,
+    prepared: &PreparedPrompt,
+    config: &AgentConfig,
+    client: &mut CancelModel,
+    env: &mut dyn ExecutionEnv,
+    out: &Out,
+) -> Result<Option<PromptDone>, String> {
+    let command = prompt.trim();
+    let say = |text: &str| {
+        let _ = send_update(
+            out,
+            &prepared.session_id,
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}),
+        );
+    };
+    let unchanged = |usage| PromptDone {
+        messages: prepared.history.clone(),
+        context_summary: prepared.context_summary.clone(),
+        stop_reason: "end_turn",
+        usage,
+    };
+    match command {
+        "/compact" => {
+            let mut messages = prepared.history.clone();
+            let mut system = config.system.clone();
+            greppy_agent::context::restore_summary(
+                &mut system,
+                prepared.context_summary.as_deref(),
+            );
+            let template = ModelRequest {
+                model: config.model.clone(),
+                system: system.clone(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: greppy_agent::ToolChoice::None,
+                max_tokens: config.max_tokens,
+            };
+            let before = messages.len();
+            let budget = greppy_agent::context::history_bytes(&messages).saturating_sub(1);
+            match greppy_agent::context::compact_with_model(
+                client,
+                &mut messages,
+                &mut system,
+                &template,
+                budget,
+            ) {
+                Ok(Some(usage)) => {
+                    say(&format!(
+                        "The conversation was compacted: {before} messages are now {} and a summary.",
+                        messages.len()
+                    ));
+                    Ok(Some(PromptDone {
+                        messages,
+                        context_summary: greppy_agent::context::saved_summary(system.as_deref())
+                            .map(str::to_owned),
+                        stop_reason: "end_turn",
+                        usage,
+                    }))
+                }
+                Ok(None) => {
+                    say("There is nothing to compact yet.");
+                    Ok(Some(unchanged(greppy_agent::Usage::default())))
+                }
+                Err(error) => Err(format!("compaction failed: {error}")),
+            }
+        }
+        "/undo" => {
+            let outcome = env.call_tool("greppy", &json!({"args": ["undo"]}));
+            say(&outcome.content);
+            Ok(Some(unchanged(greppy_agent::Usage::default())))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The question tool greppy offers where the client can ask the person (form
+/// elicitation): the questions go to the client as one form; the answers, or that the
+/// person declined, are the tool's result.
+struct AskEnv {
+    inner: Box<dyn ExecutionEnv + Send>,
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+    out: Out,
+    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+const ASK_TOOL: &str = "request_user_input";
+
+impl ExecutionEnv for AskEnv {
+    fn tool_definitions(&self) -> Vec<greppy_agent::ToolDefinition> {
+        let mut tools = self.inner.tool_definitions();
+        tools.push(greppy_agent::ToolDefinition {
+            name: ASK_TOOL.to_owned(),
+            description: "Ask the person one to three short questions, each with two to four choices (they may answer in words of their own). Ask only when you cannot go on without their decision.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"questions": {"type": "array", "minItems": 1, "maxItems": 3, "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "header": {"type": "string"},
+                        "question": {"type": "string"},
+                        "options": {"type": "array", "items": {"type": "object", "properties": {
+                            "label": {"type": "string"}, "description": {"type": "string"}
+                        }, "required": ["label"]}}
+                    },
+                    "required": ["id", "question"]
+                }}},
+                "required": ["questions"]
+            }),
+        });
+        tools
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome {
+        if name != ASK_TOOL {
+            return self.inner.call_tool(name, arguments);
+        }
+        let questions = arguments
+            .get("questions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if questions.is_empty() {
+            return ToolOutcome::err("request_user_input needs `questions`");
+        }
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for (at, question) in questions.iter().enumerate() {
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("q{}", at + 1), str::to_owned);
+            let mut property = json!({
+                "type": "string",
+                "title": question.get("header").and_then(Value::as_str).unwrap_or(&id),
+                "description": question.get("question").and_then(Value::as_str).unwrap_or("")
+            });
+            let labels: Vec<&str> = question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("label").and_then(Value::as_str))
+                .collect();
+            if !labels.is_empty() {
+                property["enum"] = json!(labels);
+            }
+            required.push(id.clone());
+            properties.insert(id, property);
+        }
+        let message = questions
+            .iter()
+            .filter_map(|question| question.get("question").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request_number = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request_id = Value::from(request_number);
+        let (tx, rx) = mpsc::channel();
+        lock_pending(&self.pending).insert(
+            id_key(&request_id),
+            PendingPermission {
+                session_id: self.session_id.clone(),
+                sender: tx,
+            },
+        );
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "elicitation/create",
+            "params": {
+                "sessionId": self.session_id,
+                "mode": "form",
+                "message": message,
+                "requestedSchema": {"type": "object", "properties": properties, "required": required}
+            },
+            "headers": []
+        });
+        let answer = if self.out.send(&request).is_ok() {
+            wait_permission(&rx, &self.cancel)
+        } else {
+            None
+        };
+        lock_pending(&self.pending).remove(&id_key(&request_id));
+        let Some(answer) = answer else {
+            return ToolOutcome::err("The person was not asked: the question was cancelled.");
+        };
+        let result = answer.get("result").cloned().unwrap_or(Value::Null);
+        match result.get("action").and_then(Value::as_str) {
+            Some("accept") => {
+                let content = result.get("content").cloned().unwrap_or(Value::Null);
+                let answers: Vec<String> = content
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(id, value)| {
+                        format!(
+                            "{id}: {}",
+                            value
+                                .as_str()
+                                .map_or_else(|| value.to_string(), str::to_owned)
+                        )
+                    })
+                    .collect();
+                ToolOutcome::ok(format!("The person answered:\n{}", answers.join("\n")))
+            }
+            Some("decline") => ToolOutcome::ok("The person declined to answer."),
+            _ => ToolOutcome::ok("The person did not answer (the question was cancelled)."),
+        }
+    }
+}
+
+#[cfg(test)]
 fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result<()> {
+    match loop_update(event) {
+        Some(update) => send_update(out, session_id, update),
+        None => Ok(()),
+    }
+}
+
+fn send_update(out: &Out, session_id: &str, update: Value) -> io::Result<()> {
+    out.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": update
+        },
+        "id": "",
+        "headers": []
+    }))
+}
+
+/// The ACP update a loop event is said as, where it is said.
+fn loop_update(event: &LoopEvent) -> Option<Value> {
     let update = match event {
         LoopEvent::Stream(StreamEvent::TextDelta { text }) if !text.is_empty() => json!({
             "sessionUpdate": "agent_message_chunk",
@@ -1382,7 +2010,7 @@ fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result
                 .saturating_add(usage.cache_read_input_tokens)
                 .saturating_add(usage.cache_creation_input_tokens);
             if prompt == 0 && usage.output_tokens == 0 {
-                return Ok(());
+                return None;
             }
             json!({
                 "sessionUpdate": "usage_update",
@@ -1395,18 +2023,199 @@ fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result
                 }}
             })
         }
-        _ => return Ok(()),
+        _ => return None,
     };
-    out.send(&json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "sessionId": session_id,
-            "update": update
-        },
-        "id": "",
-        "headers": []
-    }))
+    Some(update)
+}
+
+/// At most this much of a running command's output is shown live (its end).
+const LIVE_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// A running command's output, said to the client as it comes: the tool call's content
+/// while it is `in_progress` (the end of what it printed so far).
+#[derive(Clone)]
+struct LiveView {
+    out: Out,
+    session_id: String,
+    /// The tool call under way, and what it printed so far.
+    current: Arc<Mutex<(Option<String>, Vec<u8>)>>,
+}
+
+impl LiveView {
+    fn new(out: Out, session_id: String) -> Self {
+        Self {
+            out,
+            session_id,
+            current: Arc::default(),
+        }
+    }
+
+    fn begin(&self, call_id: String) {
+        if let Ok(mut current) = self.current.lock() {
+            *current = (Some(call_id), Vec::new());
+        }
+    }
+
+    fn sink(&self) -> greppy_agent::greppy_env::LiveOutput {
+        let view = self.clone();
+        greppy_agent::greppy_env::LiveOutput(Arc::new(move |chunk: &[u8]| view.add(chunk)))
+    }
+
+    fn add(&self, chunk: &[u8]) {
+        let (call_id, text) = {
+            let Ok(mut current) = self.current.lock() else {
+                return;
+            };
+            let Some(call_id) = current.0.clone() else {
+                return;
+            };
+            current.1.extend_from_slice(chunk);
+            let excess = current.1.len().saturating_sub(LIVE_OUTPUT_BYTES);
+            current.1.drain(..excess);
+            (call_id, String::from_utf8_lossy(&current.1).into_owned())
+        };
+        let _ = send_update(
+            &self.out,
+            &self.session_id,
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": call_id,
+                "status": "in_progress",
+                "content": [{"type": "content", "content": {"type": "text", "text": text}}]
+            }),
+        );
+    }
+}
+
+/// greppy's subcommands that change one file named by their first argument.
+const FILE_EDITS: [&str; 5] = [
+    "write",
+    "replace-text",
+    "replace-lines",
+    "insert-lines",
+    "delete-lines",
+];
+/// A file this large is not shown as a diff.
+const DIFF_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What a client is shown of a tool call beyond its title: the places it reads or
+/// changes (`locations`, absolute paths) and, for an edit of a named file, the change
+/// as a `diff` (the file as it was before the call and as it is after).
+struct ToolView {
+    cwd: PathBuf,
+    before: HashMap<String, (PathBuf, Option<String>)>,
+}
+
+impl ToolView {
+    fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            before: HashMap::new(),
+        }
+    }
+
+    fn absolute(&self, path: &str) -> PathBuf {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        }
+    }
+
+    fn read(path: &Path) -> Option<String> {
+        let metadata = std::fs::metadata(path).ok()?;
+        if metadata.len() > DIFF_FILE_BYTES {
+            return None;
+        }
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn decorate(&mut self, event: &LoopEvent, update: &mut Value) {
+        match event {
+            LoopEvent::ToolStart {
+                call_id,
+                name,
+                arguments,
+            } if name == "greppy" => {
+                let words = greppy_words(arguments);
+                let sub = words.first().map(String::as_str).unwrap_or("");
+                let Some(target) = words.get(1).filter(|word| !word.starts_with('-')) else {
+                    return;
+                };
+                if FILE_EDITS.contains(&sub) {
+                    let path = self.absolute(target);
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if size <= DIFF_FILE_BYTES {
+                        self.before
+                            .insert(call_id.clone(), (path.clone(), Self::read(&path)));
+                    }
+                    update["locations"] = json!([{"path": path}]);
+                } else if matches!(sub, "read" | "read-file" | "read-smart") {
+                    let path = self.absolute(target);
+                    if path.is_file() {
+                        let line = words
+                            .iter()
+                            .position(|word| word == "--lines")
+                            .and_then(|at| words.get(at + 1))
+                            .and_then(|range| range.split(':').next()?.parse::<u64>().ok());
+                        let mut location = json!({"path": path});
+                        if let Some(line) = line {
+                            location["line"] = json!(line);
+                        }
+                        update["locations"] = json!([location]);
+                    }
+                }
+            }
+            LoopEvent::ToolFinish {
+                call_id, outcome, ..
+            } => {
+                let mut locations = Vec::new();
+                // greppy says each change as `applied PATH:LINE …`.
+                for line in outcome.content.lines() {
+                    let Some(rest) = line.trim_start().strip_prefix("applied ") else {
+                        continue;
+                    };
+                    let place = rest.split_whitespace().next().unwrap_or("");
+                    if let Some((path, number)) = place.rsplit_once(':') {
+                        if let Ok(number) = number.parse::<u64>() {
+                            locations.push(json!({"path": self.absolute(path), "line": number}));
+                        }
+                    }
+                }
+                if !locations.is_empty() {
+                    update["locations"] = Value::Array(locations);
+                }
+                if let Some((path, old)) = self.before.remove(call_id) {
+                    let new = Self::read(&path);
+                    if new.is_some() && new != old {
+                        update["content"] = json!([{
+                            "type": "diff",
+                            "path": path,
+                            "oldText": old,
+                            "newText": new
+                        }]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The words of a greppy tool call (`{"args":[…]}`, or the first call of a batch).
+fn greppy_words(arguments: &Value) -> Vec<String> {
+    let args = if arguments.get("args").is_some_and(Value::is_array) {
+        &arguments["args"]
+    } else {
+        &arguments["batch"][0]
+    };
+    args.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 struct CancelModel {
@@ -1449,6 +2258,10 @@ fn persist_turn(
                 messages: &messages_from_protocol(&done.messages),
                 usage: &done.usage,
                 stop: done.stop_reason,
+                summary: done
+                    .context_summary
+                    .as_deref()
+                    .filter(|_| done.context_summary != prepared.context_summary),
                 title: title.as_deref(),
             },
             || {
@@ -1472,17 +2285,81 @@ fn finish_prompt(
     let mut state = lock_state(state);
     if let Some(session) = state.sessions.get_mut(&prepared.session_id) {
         session.messages = done.messages.clone();
+        session.context_summary = done.context_summary.clone();
         session.usage_in = session.usage_in.saturating_add(done.usage.input_tokens);
         session.usage_out = session.usage_out.saturating_add(done.usage.output_tokens);
     }
     Ok(())
 }
 
+/// The plan tool greppy offers an ACP client: the model keeps its plan with it, and
+/// every change goes to the client as an ACP `plan` (entries with their status).
+struct PlanEnv {
+    inner: Box<dyn ExecutionEnv + Send>,
+    out: Out,
+    session_id: String,
+}
+
+const PLAN_TOOL: &str = "update_plan";
+
+impl ExecutionEnv for PlanEnv {
+    fn tool_definitions(&self) -> Vec<greppy_agent::ToolDefinition> {
+        let mut tools = self.inner.tool_definitions();
+        tools.push(greppy_agent::ToolDefinition {
+            name: PLAN_TOOL.to_owned(),
+            description: "Keep your plan for this task: its steps, each pending, in_progress or completed (at most one in_progress). Send the whole plan each time; the person sees it as your progress.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "explanation": {"type": "string"},
+                    "plan": {"type": "array", "items": {"type": "object", "properties": {
+                        "step": {"type": "string"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                    }, "required": ["step", "status"]}}
+                },
+                "required": ["plan"]
+            }),
+        });
+        tools
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome {
+        if name != PLAN_TOOL {
+            return self.inner.call_tool(name, arguments);
+        }
+        let Some(steps) = arguments.get("plan").and_then(Value::as_array) else {
+            return ToolOutcome::err("update_plan needs `plan`, a list of steps");
+        };
+        let mut entries = Vec::with_capacity(steps.len());
+        for step in steps {
+            let (Some(content), Some(status)) = (
+                step.get("step").and_then(Value::as_str),
+                step.get("status").and_then(Value::as_str),
+            ) else {
+                return ToolOutcome::err("each step needs `step` and `status`");
+            };
+            if !matches!(status, "pending" | "in_progress" | "completed") {
+                return ToolOutcome::err(format!("{status:?} is no step status"));
+            }
+            entries.push(json!({"content": content, "priority": "medium", "status": status}));
+        }
+        let _ = send_update(
+            &self.out,
+            &self.session_id,
+            json!({"sessionUpdate": "plan", "entries": entries}),
+        );
+        ToolOutcome::ok("The plan is kept.")
+    }
+}
+
 /// greppy's tools confined to `folder` and the run's own temporary folder, without
 /// network; where that sandbox cannot be made, the same tools refusing every call
 /// with the reason.
-fn sandboxed(greppy: GreppyEnv, folder: &Path) -> Box<dyn ExecutionEnv + Send> {
-    let roots = [folder.to_path_buf(), greppy.run_scratch().to_path_buf()];
+fn sandboxed(greppy: GreppyEnv, folder: &Path, extra: &[PathBuf]) -> Box<dyn ExecutionEnv + Send> {
+    let roots: Vec<PathBuf> = [folder.to_path_buf(), greppy.run_scratch().to_path_buf()]
+        .into_iter()
+        .chain(extra.iter().cloned())
+        .collect();
     match greppy_agent::sandbox::resolve_enforce_spec(&roots) {
         Ok(greppy_agent::SandboxMode::Enforce(spec)) => Box::new(
             greppy.with_sandbox(greppy_agent::SandboxMode::Enforce(spec.without_network())),
@@ -1573,7 +2450,7 @@ fn client_tools(params: &Value) -> Result<Vec<greppy_agent::ToolDefinition>, Str
 /// client (`_greppy/client_tool`), whose answer is the tool's result. Client tools need
 /// no permission: the client offered them.
 struct ClientToolEnv {
-    inner: GatingEnv,
+    inner: Box<dyn ExecutionEnv + Send>,
     tools: Vec<greppy_agent::ToolDefinition>,
     session_id: String,
     cancel: Arc<AtomicBool>,
@@ -1676,6 +2553,8 @@ fn lock_pending(
 }
 
 struct GatingEnv {
+    /// The session's mode: `ask`, `auto` or `read-only`.
+    mode: &'static str,
     inner: Box<dyn ExecutionEnv + Send>,
     session_id: String,
     perms: Arc<Mutex<PermMemory>>,
@@ -1694,7 +2573,18 @@ impl ExecutionEnv for GatingEnv {
         if self.cancel.load(Ordering::Relaxed) {
             return ToolOutcome::err("cancelled before execution");
         }
-        match self.authorize(name, arguments) {
+        let kind = tool_kind(name, arguments);
+        if self.mode == "read-only" && matches!(kind, "edit" | "execute" | "other") {
+            return ToolOutcome::err(
+                "The session is read only: no commands, no changes, no outside tools. Read and search only.",
+            );
+        }
+        let authorized = if self.mode == "auto" {
+            Ok(())
+        } else {
+            self.authorize(name, arguments)
+        };
+        match authorized {
             Ok(()) => {
                 if self.cancel.load(Ordering::Relaxed) {
                     return ToolOutcome::err("cancelled before execution");
@@ -1903,6 +2793,29 @@ fn id_key(id: &Value) -> String {
     }
 }
 
+/// The further folders a session request names (`additionalDirectories`): absolute
+/// paths of existing directories.
+fn additional_directories(params: &Value) -> Result<Vec<PathBuf>, String> {
+    let Some(list) = params.get("additionalDirectories") else {
+        return Ok(Vec::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or("additionalDirectories must be an array")?;
+    list.iter()
+        .map(|dir| {
+            let dir = PathBuf::from(dir.as_str().ok_or("additionalDirectories holds paths")?);
+            if !dir.is_absolute() || !dir.is_dir() {
+                return Err(format!(
+                    "additional directory {} is not an absolute path of a directory",
+                    dir.display()
+                ));
+            }
+            Ok(dir)
+        })
+        .collect()
+}
+
 fn require_cwd(params: &Value) -> Result<PathBuf, String> {
     let Some(raw) = params.get("cwd").and_then(Value::as_str) else {
         return Err("cwd is required".to_string());
@@ -2093,10 +3006,16 @@ fn is_picture_type(mime: Option<&str>) -> bool {
     )
 }
 
-fn session_setup(session_id: &str, model: &str, include_id: bool) -> Value {
+fn session_setup(session_id: &str, model: &str, include_id: bool, choices: &Choices) -> Value {
     let mut value = json!({
         "models": model_state(model),
-        "configOptions": [model_config(model)]
+        "configOptions": config_options(model, choices),
+        "modes": {
+            "currentModeId": choices.mode,
+            "availableModes": MODES.iter().map(|(id, name, description)| json!({
+                "id": id, "name": name, "description": description
+            })).collect::<Vec<_>>()
+        }
     });
     if include_id {
         value["sessionId"] = Value::String(session_id.to_string());
@@ -2119,6 +3038,69 @@ fn model_state(model: &str) -> Value {
             "description": "Model id passed through to the local gateway"
         }]
     })
+}
+
+/// All of a session's config options: model, mode, reasoning effort, and greppy's
+/// capabilities (each on or off; on puts its manual in the system prompt and unlocks
+/// its commands, off takes both away again).
+fn config_options(model: &str, choices: &Choices) -> Vec<Value> {
+    let select = |id: &str,
+                  name: &str,
+                  description: &str,
+                  category: Option<&str>,
+                  current: &str,
+                  options: &[(&str, &str)]| {
+        let mut option = json!({
+            "id": id, "name": name, "description": description, "type": "select",
+            "currentValue": current,
+            "options": options.iter().map(|(value, name)| json!({"value": value, "name": name})).collect::<Vec<_>>()
+        });
+        if let Some(category) = category {
+            option["category"] = json!(category);
+        }
+        option
+    };
+    let on = |yes: bool| if yes { "on" } else { "off" };
+    vec![
+        model_config(model),
+        select(
+            "mode",
+            "Mode",
+            "How greppy asks before tools run",
+            Some("mode"),
+            choices.mode,
+            &MODES.map(|(id, name, _)| (id, name)),
+        ),
+        select(
+            "effort",
+            "Reasoning effort",
+            "How hard the model is to think",
+            Some("thought_level"),
+            choices.effort.as_deref().unwrap_or("default"),
+            &[
+                ("default", "Default"),
+                ("low", "Low"),
+                ("medium", "Medium"),
+                ("high", "High"),
+            ],
+        ),
+        select(
+            "web",
+            "Web",
+            "Browse and read web pages (greppy web); needs network",
+            None,
+            on(choices.capabilities.web),
+            &[("on", "On"), ("off", "Off")],
+        ),
+        select(
+            "desktop",
+            "Desktop",
+            "See and operate desktop apps (greppy desktop)",
+            None,
+            on(choices.capabilities.desktop),
+            &[("on", "On"), ("off", "Off")],
+        ),
+    ]
 }
 
 fn model_config(model: &str) -> Value {
@@ -2201,6 +3183,12 @@ fn tool_title(name: &str, arguments: &Value) -> String {
     } else {
         truncate_chars(&format!("{name} {args}"), 160)
     }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {

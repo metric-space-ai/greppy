@@ -323,7 +323,7 @@ pub(crate) fn compaction_due(messages: &[Message], max_bytes: usize) -> bool {
 }
 
 /// Size of the live history in the unit [`compaction_due`] measures.
-pub(crate) fn history_bytes(messages: &[Message]) -> usize {
+pub fn history_bytes(messages: &[Message]) -> usize {
     messages
         .iter()
         .map(message_bytes)

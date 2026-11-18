@@ -205,6 +205,11 @@ fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
             client_tools: Vec::new(),
             images: Vec::new(),
             mcp: Default::default(),
+            context_summary: None,
+            choices: test_choices(),
+            context_window: None,
+            extra_dirs: Vec::new(),
+            client: Value::Null,
             effort: None,
             compact_at: None,
             context_tokens: None,
@@ -214,6 +219,7 @@ fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
     std::fs::remove_dir_all(data_root).unwrap();
     std::fs::write(data_root, b"fixture blocks persistence").unwrap();
     let done = PromptDone {
+        context_summary: None,
         messages: vec![Message {
             role: greppy_agent::Role::User,
             content: vec![greppy_agent::ContentPart::Text {
@@ -299,6 +305,16 @@ fn request(server: &Server, rx: &Receiver<Value>, id: &str, method: &str, params
         eprintln!("import_history RPC failure: {response}");
     }
     assert_eq!(response["id"], id);
+    // A set-up session is told its slash commands right after the answer.
+    if matches!(method, "session/new" | "session/load" | "session/resume")
+        && response.get("error").is_none()
+    {
+        let commands = next(rx);
+        assert_eq!(
+            commands["params"]["update"]["sessionUpdate"], "available_commands_update",
+            "{commands}"
+        );
+    }
     response
 }
 
@@ -438,6 +454,7 @@ fn tool_wait(
     let session = lock_state(&server.state);
     let session = &session.sessions[id];
     let mut env = GatingEnv {
+        mode: "ask",
         inner: Box::new(CountTools(calls)),
         session_id: id.to_owned(),
         perms: Arc::clone(&session.perms),
@@ -533,6 +550,11 @@ fn prepared_for(server: &Server, id: &str) -> PreparedPrompt {
         client_tools: Vec::new(),
         images: Vec::new(),
         mcp: Default::default(),
+        context_summary: session.context_summary.clone(),
+        choices: session.choices.clone(),
+        context_window: None,
+        extra_dirs: session.extra_dirs.clone(),
+        client: Value::Null,
         effort: None,
         compact_at: None,
         context_tokens: None,
@@ -552,6 +574,7 @@ fn completed_fixture(history: &[Message], label: &str) -> PromptDone {
     }
     PromptDone {
         messages,
+        context_summary: None,
         usage: greppy_agent::Usage {
             input_tokens: 7,
             output_tokens: 3,
@@ -996,7 +1019,8 @@ fn a_client_tool_is_run_by_the_client_without_permission_and_its_answer_is_the_r
         let state = lock_state(&server.state);
         let session = &state.sessions[&id];
         ClientToolEnv {
-            inner: GatingEnv {
+            inner: Box::new(GatingEnv {
+                mode: "ask",
                 inner: Box::new(OwnTool(Arc::clone(&calls))),
                 session_id: id.clone(),
                 perms: Arc::clone(&session.perms),
@@ -1004,7 +1028,7 @@ fn a_client_tool_is_run_by_the_client_without_permission_and_its_answer_is_the_r
                 out: server.out.clone(),
                 pending: Arc::clone(&server.pending),
                 next_request_id: Arc::clone(&server.next_request_id),
-            },
+            }),
             tools: client_tools(&json!({"_meta": {"greppy": {"clientTools": [notes_tool()]}}}))
                 .unwrap(),
             session_id: id.clone(),
@@ -1135,4 +1159,342 @@ fn linked_and_embedded_resources_reach_the_model_as_words_or_pictures() {
     assert!(
         prompt_text(&[json!({"type": "audio", "mimeType": "audio/wav", "data": "AAAA"})]).is_err()
     );
+}
+
+#[test]
+fn a_compacted_turn_keeps_its_summary_for_the_next_prompt_and_after_a_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    // A first turn, then one that compacted the conversation to a window and a summary.
+    let prepared = prepared_for(&server, &id);
+    let first = completed_fixture(&prepared.history, "first");
+    finish_prompt(&server.state, &prepared, &server.config, &first).unwrap();
+    let prepared = prepared_for(&server, &id);
+    let mut compacted = completed_fixture(&[], "after compaction");
+    compacted.context_summary = Some("made-up summary of the first turn".into());
+    finish_prompt(&server.state, &prepared, &server.config, &compacted).unwrap();
+    // The next prompt starts from the window and the summary.
+    let next = prepared_for(&server, &id);
+    assert_eq!(next.history, compacted.messages);
+    assert_eq!(
+        next.context_summary.as_deref(),
+        Some("made-up summary of the first turn")
+    );
+    // So does a new server that loads the session.
+    let (restarted, restarted_rx) = fixture(root.path());
+    initialize(&restarted, &restarted_rx);
+    let loaded = restarted.session_load(
+        &json!("reload"),
+        &json!({"sessionId": id, "cwd": root.path(), "mcpServers": []}),
+        "session/load",
+    );
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    let reloaded = prepared_for(&restarted, &id);
+    assert_eq!(reloaded.history, compacted.messages);
+    assert_eq!(
+        reloaded.context_summary.as_deref(),
+        Some("made-up summary of the first turn")
+    );
+}
+
+fn test_choices() -> Choices {
+    Choices {
+        mode: "ask",
+        effort: None,
+        capabilities: greppy_agent::CapabilitySet::default(),
+    }
+}
+
+#[test]
+fn a_session_offers_its_config_options_and_modes_and_takes_the_clients_choices() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let began = request(
+        &server,
+        &rx,
+        "new",
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let id = began["result"]["sessionId"].as_str().unwrap().to_owned();
+    let options: Vec<&str> = began["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|option| option["id"].as_str())
+        .collect();
+    assert_eq!(options, ["model", "mode", "effort", "web", "desktop"]);
+    assert_eq!(began["result"]["modes"]["currentModeId"], "ask");
+    assert_eq!(
+        began["result"]["modes"]["availableModes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let set = |config: &str, value: &str| {
+        request(
+            &server,
+            &rx,
+            "set",
+            "session/set_config_option",
+            json!({"sessionId": id, "configId": config, "value": value}),
+        )
+    };
+    let answer = set("effort", "high");
+    assert!(answer.get("error").is_none(), "{answer}");
+    let effort = answer["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["id"] == "effort")
+        .unwrap()
+        .clone();
+    assert_eq!(effort["currentValue"], "high");
+    assert!(set("web", "on").get("error").is_none());
+    assert_eq!(set("web", "maybe")["error"]["code"], -32602);
+    assert_eq!(set("made-up", "x")["error"]["code"], -32602);
+    let answer = request(
+        &server,
+        &rx,
+        "mode",
+        "session/set_mode",
+        json!({"sessionId": id, "modeId": "read-only"}),
+    );
+    assert!(answer.get("error").is_none(), "{answer}");
+    let choices = prepared_for(&server, &id).choices;
+    assert_eq!(
+        (
+            choices.mode,
+            choices.effort.as_deref(),
+            choices.capabilities.web
+        ),
+        ("read-only", Some("high"), true)
+    );
+}
+
+#[test]
+fn a_read_only_session_refuses_commands_and_an_auto_one_asks_nobody() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = |mode: &'static str| {
+        let state = lock_state(&server.state);
+        let session = &state.sessions[&id];
+        GatingEnv {
+            mode,
+            inner: Box::new(OwnTool(Arc::clone(&calls))),
+            session_id: id.clone(),
+            perms: Arc::clone(&session.perms),
+            cancel: Arc::clone(&session.cancel),
+            out: server.out.clone(),
+            pending: Arc::clone(&server.pending),
+            next_request_id: Arc::clone(&server.next_request_id),
+        }
+    };
+    let command = json!({"args": ["bash-smart", "--", "true"]});
+    let refused = gate("read-only").call_tool("greppy", &command);
+    assert!(
+        refused.is_error && refused.content.contains("read only"),
+        "{refused:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // Auto: run without a permission request.
+    assert_eq!(
+        gate("auto").call_tool("greppy", &command),
+        ToolOutcome::ok("fixture executed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(rx
+        .try_iter()
+        .all(|frame| frame["method"] != "session/request_permission"));
+}
+
+#[test]
+fn the_plan_tool_says_the_plan_to_the_client() {
+    let (tx, rx) = mpsc::channel();
+    let out = Out {
+        inner: Arc::new(Mutex::new(Frames {
+            bytes: Vec::new(),
+            tx,
+        })),
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut env = PlanEnv {
+        inner: Box::new(OwnTool(Arc::clone(&calls))),
+        out,
+        session_id: "fixture-session".into(),
+    };
+    assert!(env
+        .tool_definitions()
+        .iter()
+        .any(|tool| tool.name == PLAN_TOOL));
+    let kept = env.call_tool(
+        PLAN_TOOL,
+        &json!({"plan": [{"step": "Count the made-up buoys", "status": "in_progress"},
+            {"step": "Say what was found", "status": "pending"}]}),
+    );
+    assert_eq!(kept, ToolOutcome::ok("The plan is kept."));
+    let frame = next(&rx);
+    assert_eq!(frame["params"]["update"]["sessionUpdate"], "plan");
+    assert_eq!(
+        frame["params"]["update"]["entries"],
+        json!([{"content": "Count the made-up buoys", "priority": "medium", "status": "in_progress"},
+            {"content": "Say what was found", "priority": "medium", "status": "pending"}])
+    );
+    assert!(
+        env.call_tool(
+            PLAN_TOOL,
+            &json!({"plan": [{"step": "x", "status": "done"}]})
+        )
+        .is_error
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_new_session_is_told_its_slash_commands_and_can_be_deleted() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    server.dispatch_line(
+        &json!({"jsonrpc": "2.0", "id": "new", "method": "session/new",
+            "params": {"cwd": root.path(), "mcpServers": []}})
+        .to_string(),
+    );
+    let began = next(&rx);
+    let id = began["result"]["sessionId"].as_str().unwrap().to_owned();
+    let commands = next(&rx);
+    assert_eq!(
+        commands["params"]["update"]["sessionUpdate"], "available_commands_update",
+        "{commands}"
+    );
+    let names: Vec<&str> = commands["params"]["update"]["availableCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|command| command["name"].as_str())
+        .collect();
+    assert_eq!(names, ["compact", "undo"]);
+
+    let prepared = prepared_for(&server, &id);
+    let store = SessionStore::new(&prepared.data_root, &prepared.project);
+    let path = store.path_for(&id).unwrap();
+    assert!(path.is_file());
+    let deleted = request(
+        &server,
+        &rx,
+        "delete",
+        "session/delete",
+        json!({"sessionId": id}),
+    );
+    assert!(deleted.get("error").is_none(), "{deleted}");
+    assert!(!path.exists() && !lock_state(&server.state).sessions.contains_key(&id));
+    let again = request(
+        &server,
+        &rx,
+        "again",
+        "session/delete",
+        json!({"sessionId": id}),
+    );
+    assert_eq!(again["error"]["code"], -32002, "{again}");
+}
+
+#[test]
+fn a_cancelled_request_cancels_its_prompt_and_further_folders_are_taken() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    lock_state(&server.state)
+        .prompts
+        .insert(id_key(&json!(41)), id.clone());
+    server.dispatch_line(
+        &json!({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": 41}})
+            .to_string(),
+    );
+    assert!(lock_state(&server.state).sessions[&id]
+        .cancel
+        .load(Ordering::SeqCst));
+
+    let extra = tempfile::tempdir().unwrap();
+    assert_eq!(
+        additional_directories(&json!({"additionalDirectories": [extra.path()]})).unwrap(),
+        [extra.path().to_path_buf()]
+    );
+    for broken in [
+        json!(["relative/dir"]),
+        json!(["/nonexistent/made-up"]),
+        json!("x"),
+    ] {
+        assert!(additional_directories(&json!({"additionalDirectories": broken})).is_err());
+    }
+}
+
+#[test]
+fn the_question_tool_asks_the_person_through_the_client_and_hears_the_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let env = {
+        let state = lock_state(&server.state);
+        let session = &state.sessions[&id];
+        AskEnv {
+            inner: Box::new(OwnTool(Arc::clone(&calls))),
+            session_id: id.clone(),
+            cancel: Arc::clone(&session.cancel),
+            out: server.out.clone(),
+            pending: Arc::clone(&server.pending),
+            next_request_id: Arc::clone(&server.next_request_id),
+        }
+    };
+    assert!(env
+        .tool_definitions()
+        .iter()
+        .any(|tool| tool.name == ASK_TOOL));
+    let env = Arc::new(Mutex::new(env));
+    let ask = || {
+        let env = Arc::clone(&env);
+        let (tx, outcome) = mpsc::channel();
+        thread::spawn(move || {
+            let result = env.lock().unwrap().call_tool(
+                ASK_TOOL,
+                &json!({"questions": [{"id": "colour", "header": "Colour", "question": "Which colour?",
+                    "options": [{"label": "Red"}, {"label": "Blue"}]}]}),
+            );
+            tx.send(result).unwrap();
+        });
+        outcome
+    };
+    let outcome = ask();
+    let asked = next(&rx);
+    assert_eq!(asked["method"], "elicitation/create", "{asked}");
+    assert_eq!(
+        asked["params"]["requestedSchema"]["properties"]["colour"]["enum"],
+        json!(["Red", "Blue"])
+    );
+    server.complete_response(&json!({"jsonrpc": "2.0", "id": asked["id"],
+        "result": {"action": "accept", "content": {"colour": "Blue"}}}));
+    assert_eq!(
+        outcome.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ToolOutcome::ok("The person answered:\ncolour: Blue")
+    );
+    let outcome = ask();
+    let asked = next(&rx);
+    server.complete_response(
+        &json!({"jsonrpc": "2.0", "id": asked["id"], "result": {"action": "decline"}}),
+    );
+    assert_eq!(
+        outcome.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ToolOutcome::ok("The person declined to answer.")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

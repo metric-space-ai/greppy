@@ -176,6 +176,9 @@ pub(crate) struct TurnCommit<'a> {
     pub usage: &'a Usage,
     pub stop: &'a str,
     pub title: Option<&'a str>,
+    /// The checkpoint summary, where this turn compacted the conversation: `messages`
+    /// is then the compacted window, published with its summary as one checkpoint.
+    pub summary: Option<&'a str>,
 }
 
 pub(crate) struct ImportHistoryCommit<'a> {
@@ -287,6 +290,7 @@ impl SessionStore {
             usage,
             stop,
             title,
+            summary,
         } = turn;
         let _lease = self.writer_lease(session_id)?;
         let previous = self.load(session_id)?;
@@ -353,7 +357,20 @@ impl SessionStore {
             if needs_newline {
                 target.write_all(b"\n")?;
             }
-            if let Some(added) = messages.strip_prefix(expected) {
+            if let Some(summary) = summary {
+                // A compacted window and its summary, as one record.
+                writeln!(
+                    target,
+                    "{}",
+                    json!({
+                        "v": SESSION_FORMAT,
+                        "type": "context_checkpoint",
+                        "archive": expected.iter().map(redacted_message_line).collect::<Vec<_>>(),
+                        "messages": messages.iter().map(redacted_message_line).collect::<Vec<_>>(),
+                        "system_summary": {"role": "system", "kind": "context_summary", "text": redact_text(summary)},
+                    })
+                )?;
+            } else if let Some(added) = messages.strip_prefix(expected) {
                 for message in added {
                     writeln!(target, "{}", message_line(message))?;
                 }

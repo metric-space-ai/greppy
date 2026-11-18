@@ -24,6 +24,11 @@
 /// a greppy invocation and not through `bash-smart`.
 pub const AGENT_RUN_ENV: &str = "GREPPY_AGENT_RUN";
 
+/// Env marker naming a file `bash-smart` appends the raw output of its command to while
+/// the command runs (besides capturing it as always). Set by [`GreppyEnv`] for a caller
+/// that shows a running command's output live; never passed on to the command itself.
+pub const LIVE_OUTPUT_ENV: &str = "GREPPY_LIVE_OUTPUT";
+
 pub mod agent_loop;
 pub mod client;
 pub mod context;
