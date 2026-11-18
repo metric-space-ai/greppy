@@ -1189,7 +1189,7 @@ fn caller_output_limit_reaches_wire_and_continues() {
         r#"{"data":[{"id":"glm-5.3"}]}"#,
         Some(("glm-5.3", 65536)),
     );
-    let invoke = |bound: Option<&str>| {
+    let invoke = |endpoint: &str, bound: Option<&str>| {
         let mut command = Command::new(binary_path());
         command
             .current_dir(&repo)
@@ -1204,7 +1204,7 @@ fn caller_output_limit_reaches_wire_and_continues() {
                 "--model",
                 "glm-5.3",
                 "--endpoint",
-                &endpoint,
+                endpoint,
                 "--private-store",
                 "--skip-selfcheck",
             ]);
@@ -1213,11 +1213,25 @@ fn caller_output_limit_reaches_wire_and_continues() {
         }
         command.output().expect("spawn caller-bound CLI")
     };
-    let unknown = invoke(None);
-    assert_eq!(unknown.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&unknown.stderr)
-        .contains("no advertised or registered output limit"));
-    let bounded = invoke(Some("65536"));
+    // Neither the route nor greppy knows the model's cap: greppy asks with its own
+    // default output limit instead of refusing the run.
+    let (fallback_endpoint, fallback_stop, fallback_handle) = spawn_gateway_contract(
+        vec![stub_gateway_response()],
+        r#"{"data":[{"id":"glm-5.3"}]}"#,
+        Some(("glm-5.3", greppy_agent::client::DEFAULT_OUTPUT_LIMIT)),
+    );
+    let unknown = invoke(&fallback_endpoint, None);
+    fallback_stop.store(true, Ordering::SeqCst);
+    fallback_handle
+        .join()
+        .expect("fallback request body contract");
+    assert_eq!(
+        unknown.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    let bounded = invoke(&endpoint, Some("65536"));
     stop.store(true, Ordering::SeqCst);
     handle.join().expect("actual request body contract");
     assert_eq!(

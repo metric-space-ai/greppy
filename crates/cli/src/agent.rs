@@ -1131,6 +1131,8 @@ fn run_agent(
         } else {
             crate::agent_tui::AgentSettings::load().compaction_thresholds()
         },
+        // A model without a listed window is assumed to take 256k tokens.
+        default_compact_at_tokens: Some(greppy_agent::default_compact_at_tokens()),
         ..AgentConfig::default()
     }
     .with_max_tokens(

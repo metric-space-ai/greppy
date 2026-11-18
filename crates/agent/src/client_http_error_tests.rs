@@ -264,3 +264,83 @@ fn a_chosen_effort_goes_with_the_request_and_none_without() {
     assert_eq!(body["output_config"]["effort"], "high");
     assert!(client.with_effort("max").is_err());
 }
+
+#[test]
+fn the_output_limit_a_refusal_allows_is_read_from_it() {
+    // As Anthropic and OpenAI-style routes word it.
+    let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for made-up-model"}}"#;
+    assert_eq!(allowed_output_limit(anthropic, 64_000), Some(32_000));
+    let openai =
+        "max_tokens is too large: 64000. This model supports at most 16384 completion tokens.";
+    assert_eq!(allowed_output_limit(openai, 64_000), Some(16_384));
+    // About the output limit, without a number: half of what was asked.
+    assert_eq!(
+        allowed_output_limit("max_tokens is too large", 64_000),
+        Some(32_000)
+    );
+    assert_eq!(allowed_output_limit("max_tokens is too large", 6_000), None);
+    // About something else: not taken for the output limit.
+    assert_eq!(
+        allowed_output_limit("prompt is too long: 250000 tokens > 200000 maximum", 64_000),
+        None
+    );
+}
+
+#[test]
+fn a_refused_output_limit_is_asked_again_with_the_allowed_one_and_kept() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let refusal = r#"{"error":{"message":"max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens"}}"#;
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"made-up\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let server = thread::spawn(move || {
+        let mut asked = Vec::new();
+        // The catalog says nothing of a cap; then the refusal, then two answers.
+        for answer in [
+            None,
+            Some((400, refusal)),
+            Some((200, sse)),
+            Some((200, sse)),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (head, body) = read_request(&mut stream);
+            let (status, text) = match answer {
+                None => {
+                    assert!(head.starts_with("GET /v1/models"), "{head}");
+                    (200, r#"{"data":[{"id":"made-up"}]}"#)
+                }
+                Some(answer) => {
+                    asked.push(
+                        serde_json::from_slice::<Value>(&body).unwrap()["max_tokens"].clone(),
+                    );
+                    answer
+                }
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        asked
+    });
+    let client = Client::new(&format!("http://{address}"), "made-up");
+    let mut request = request();
+    request.model = "made-up".into();
+    request.max_tokens = u64::MAX;
+    let first = client.stream_turn(&request, &mut |_| {}).unwrap();
+    assert_eq!(first.stop_reason, crate::protocol::StopReason::EndTurn);
+    // The next request of this model asks with the allowed limit straight away.
+    client.stream_turn(&request, &mut |_| {}).unwrap();
+    let asked = server.join().unwrap();
+    assert_eq!(
+        asked,
+        [json!(DEFAULT_OUTPUT_LIMIT), json!(32_000), json!(32_000)]
+    );
+}

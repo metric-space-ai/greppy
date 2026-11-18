@@ -23,6 +23,12 @@ mod cancel_tests;
 #[path = "client_http_error_tests.rs"]
 mod http_error_tests;
 
+/// Output limit for a model whose cap neither the endpoint advertises nor greppy knows.
+/// An agent's answers need room (a large edit or a long report in one answer); where a
+/// provider allows less, it says so in its refusal and greppy asks again with what it
+/// allows ([`allowed_output_limit`]). Never sent where the caller gave a limit.
+pub const DEFAULT_OUTPUT_LIMIT: u64 = 64_000;
+
 /// Default hard cap on total SSE body bytes (64 MiB).
 pub const DEFAULT_STREAM_BYTE_CAP: usize = 64 * 1024 * 1024;
 /// Default hard cap on completed SSE records (every parsed `event:`/`data:`
@@ -221,8 +227,19 @@ impl Client {
         format!("{}/v1/messages", self.base_url)
     }
     /// Resolve a finite per-response bound without limiting the agent's turn budget.
+    #[cfg(test)]
     fn request_body(&self, req: &ModelRequest) -> Result<Value, ClientError> {
-        let limit = if req.max_tokens != u64::MAX {
+        self.request_body_and_limit(req).map(|(body, _)| body)
+    }
+
+    /// The request body, and the output limit it asks with where greppy chose it (none
+    /// where the caller did).
+    fn request_body_and_limit(
+        &self,
+        req: &ModelRequest,
+    ) -> Result<(Value, Option<u64>), ClientError> {
+        let chosen = req.max_tokens == u64::MAX;
+        let limit = if !chosen {
             Some(req.max_tokens)
         } else {
             let cached = self
@@ -243,20 +260,21 @@ impl Client {
                     limit
                 }
             };
-            advertised.or_else(|| registered_output_limit(&req.model))
+            advertised
+                .or_else(|| registered_output_limit(&req.model))
+                .or(Some(DEFAULT_OUTPUT_LIMIT))
         };
         let limit = limit.filter(|n| *n > 0 && *n != u64::MAX).ok_or_else(|| {
-            ClientError::Transport(format!(
-                "Anthropic Messages requires a finite positive max_tokens; model {} has no advertised or registered output limit",
-                req.model
-            ))
+            ClientError::Transport(
+                "Anthropic Messages requires a finite positive max_tokens".to_string(),
+            )
         })?;
         let mut body =
             to_messages_request_body_with_limit(req, limit).map_err(ClientError::Transport)?;
         if let Some(effort) = &self.effort {
             body["output_config"] = json!({ "effort": effort });
         }
-        Ok(body)
+        Ok((body, chosen.then_some(limit)))
     }
 
     /// List model ids advertised by `GET {base}/v1/models`.
@@ -344,9 +362,36 @@ impl Client {
         if cancel.load(Ordering::Relaxed) {
             return Err(ClientError::Cancelled);
         }
-        // Model-limit discovery may itself need a request-local runtime. Resolve
-        // it before entering the streaming runtime, never by nesting block_on.
-        let body = serde_json::to_string(&self.request_body(req)?)
+        // A provider that allows fewer output tokens than greppy chose says so in its
+        // refusal: ask again with what it allows (at most twice), and keep that for the
+        // model. A limit the caller gave is never changed.
+        let mut asked = 0;
+        loop {
+            let (body, chosen) = self.request_body_and_limit(req)?;
+            match self.stream_turn_once(body, on_event, cancel) {
+                Err(ClientError::Http { status: 400, body }) if asked < 2 && chosen.is_some() => {
+                    let Some(allowed) = allowed_output_limit(&body, chosen.unwrap_or(0)) else {
+                        return Err(ClientError::Http { status: 400, body });
+                    };
+                    if let Ok(mut limits) = self.output_limits.lock() {
+                        limits.insert(req.model.clone(), Some(allowed));
+                    }
+                    asked += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn stream_turn_once(
+        &self,
+        body: Value,
+        on_event: &mut dyn FnMut(StreamEvent),
+        cancel: &AtomicBool,
+    ) -> Result<TurnResult, ClientError> {
+        // Model-limit discovery may itself need a request-local runtime; it was
+        // resolved before this streaming runtime, never by nesting block_on.
+        let body = serde_json::to_string(&body)
             .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -638,6 +683,27 @@ fn advertised_output_limit(data: &str, model: &str) -> Option<u64> {
     lookup(model).or_else(|| lookup(capability_model_id(model)))
 }
 
+/// The output limit a provider's refusal names as allowed, below the `asked` one: where
+/// it refuses for the output limit (it names `max_tokens` or output tokens), the largest
+/// number it names below `asked` (at least 1024), else half of `asked` (at least 4096).
+/// None where the refusal is about something else.
+pub(crate) fn allowed_output_limit(refusal: &str, asked: u64) -> Option<u64> {
+    let lower = refusal.to_ascii_lowercase();
+    let about_output = lower.contains("max_tokens")
+        || lower.contains("max_output_tokens")
+        || lower.contains("max_completion_tokens")
+        || lower.contains("output tokens");
+    if !about_output {
+        return None;
+    }
+    let named = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|digits| digits.parse::<u64>().ok())
+        .filter(|n| (1024..asked).contains(n))
+        .max();
+    named.or_else(|| Some(asked / 2).filter(|half| *half >= 4096))
+}
+
 /// Recognize only gateway thinking grammar for capability lookup; never rewrite the wire ID.
 /// https://github.com/router-for-me/CLIProxyAPI/blob/585f97deac9aa57c700301221fb1a7085e1827cc/internal/thinking/suffix.go
 fn capability_model_id(model: &str) -> &str {
@@ -700,11 +766,11 @@ mod metadata_tests {
             .lock()
             .unwrap()
             .insert(req.model.clone(), None);
-        assert!(client
-            .request_body(&req)
-            .unwrap_err()
-            .to_string()
-            .contains("unregistered"));
+        // Neither advertised nor registered: greppy's own default, not a refusal.
+        assert_eq!(
+            client.request_body(&req).unwrap()["max_tokens"],
+            DEFAULT_OUTPUT_LIMIT
+        );
         req.max_tokens = 1234;
         assert_eq!(client.request_body(&req).unwrap()["max_tokens"], 1234);
         req.max_tokens = 0;
@@ -770,7 +836,12 @@ mod metadata_tests {
                 .lock()
                 .unwrap()
                 .insert(req.model.clone(), None);
-            assert!(client.request_body(&req).is_err(), "{unknown}");
+            // Not the registered limit of a near name: greppy's own default.
+            assert_eq!(
+                client.request_body(&req).unwrap()["max_tokens"],
+                DEFAULT_OUTPUT_LIMIT,
+                "{unknown}"
+            );
         }
     }
 

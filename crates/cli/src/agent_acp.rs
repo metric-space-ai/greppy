@@ -1276,6 +1276,7 @@ fn run_prompt(
             thresholds
         },
         measured_prompt_tokens: prepared.context_tokens,
+        default_compact_at_tokens: Some(greppy_agent::default_compact_at_tokens()),
         ..AgentConfig::default()
     }
     .with_max_tokens(

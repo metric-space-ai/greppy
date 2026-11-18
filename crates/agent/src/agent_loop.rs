@@ -75,6 +75,21 @@ pub struct AgentConfig {
     /// token trigger so a resumed conversation that is already full is
     /// compacted before its first request. Default: `None`.
     pub measured_prompt_tokens: Option<u64>,
+    /// Compaction threshold in prompt tokens for a model that
+    /// [`Self::compact_at_tokens`] does not list. `None` keeps the history byte
+    /// budget (the library default); greppy's own agents use
+    /// [`default_compact_at_tokens`]. Default: `None`.
+    pub default_compact_at_tokens: Option<u64>,
+}
+
+/// The context window greppy's agents assume for a model nobody listed a window
+/// for: agent work needs room, and the models offered for it take at least this.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 256_000;
+
+/// Where greppy's agents compact a model's conversation without a listed window:
+/// at 90 % of [`DEFAULT_CONTEXT_WINDOW`].
+pub fn default_compact_at_tokens() -> u64 {
+    DEFAULT_CONTEXT_WINDOW / 10 * 9
 }
 
 impl PartialEq for AgentConfig {
@@ -91,6 +106,7 @@ impl PartialEq for AgentConfig {
             && self.deadline_total == other.deadline_total
             && self.compact_at_tokens == other.compact_at_tokens
             && self.measured_prompt_tokens == other.measured_prompt_tokens
+            && self.default_compact_at_tokens == other.default_compact_at_tokens
     }
 }
 
@@ -112,6 +128,7 @@ impl Default for AgentConfig {
             cancel: None,
             compact_at_tokens: BTreeMap::new(),
             measured_prompt_tokens: None,
+            default_compact_at_tokens: None,
         }
     }
 }
@@ -335,8 +352,13 @@ pub fn run_agent_loop_with_content(
 
     let mut total_usage = Usage::default();
     let mut turns: usize = 0;
-    let mut compaction =
-        CompactionTrigger::new(config.compact_at_tokens.get(&config.model).copied());
+    let mut compaction = CompactionTrigger::new(
+        config
+            .compact_at_tokens
+            .get(&config.model)
+            .copied()
+            .or(config.default_compact_at_tokens),
+    );
     if let Some(tokens) = config.measured_prompt_tokens.filter(|tokens| *tokens > 0) {
         // Measured before this call's user message: it counts as appended since.
         compaction.measured = Some((tokens, history.len()));
@@ -346,6 +368,9 @@ pub fn run_agent_loop_with_content(
     let mut final_text = String::new();
     let mut turn_budget_advised = false;
     let mut deadline_advised = false;
+    // Whether this answer's prompt was already compacted because the provider
+    // refused it as too long (once per answer: a second refusal ends the run).
+    let mut compacted_for_overflow = false;
 
     // An optional action cap reserves a final reporting response without tools.
     loop {
@@ -469,8 +494,49 @@ pub fn run_agent_loop_with_content(
                 last_stop = LoopStop::Cancelled;
                 break;
             }
+            // The provider refused the prompt as longer than the model's window
+            // (a window greppy was not told, or an estimate that fell short):
+            // compact now and ask again, instead of ending the run.
+            Err(ClientError::Http { status: 400, body })
+                if !report_only && !compacted_for_overflow && prompt_too_long(&body) =>
+            {
+                compacted_for_overflow = true;
+                let template = ModelRequest {
+                    model: config.model.clone(),
+                    system: system.clone(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    tool_choice: ToolChoice::None,
+                    max_tokens: config.max_tokens,
+                };
+                let archive = messages.clone();
+                let budget = crate::context::history_bytes(&messages).saturating_sub(1);
+                match crate::context::try_compact_with_model(
+                    model,
+                    &mut messages,
+                    &mut system,
+                    &template,
+                    budget,
+                ) {
+                    Ok(Some(usage)) => {
+                        total_usage = sum_usage(total_usage, usage);
+                        compaction.compacted();
+                        on_event(LoopEvent::ContextCompacted {
+                            archive,
+                            messages: messages.clone(),
+                            summary: crate::context::saved_summary(system.as_deref())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        });
+                        continue;
+                    }
+                    // Nothing to cut, or the checkpoint failed: the refusal stands.
+                    Ok(None) | Err(_) => return Err(LoopError::Http { status: 400, body }),
+                }
+            }
             Err(error) => return Err(error.into()),
         };
+        compacted_for_overflow = false;
         turns += 1;
         total_usage = sum_usage(total_usage, turn.usage);
         // A degenerate response (thousands of argument-less calls in one
@@ -957,6 +1023,24 @@ impl CompactionTrigger {
                 .saturating_add(COMPACTION_RETRY_GROWTH_TOKENS);
         }
     }
+}
+
+/// Whether a provider's refusal says the prompt is longer than the model takes, as
+/// Anthropic, OpenAI and the common gateways word it.
+fn prompt_too_long(refusal: &str) -> bool {
+    let lower = refusal.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "input is too long",
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "exceeds the context",
+        "too many input tokens",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|said| lower.contains(said))
 }
 
 fn sum_usage(a: Usage, b: Usage) -> Usage {
@@ -1603,6 +1687,127 @@ mod tests {
         assert_eq!(checkpoints(Some(190_000)), vec![0]);
         assert_eq!(checkpoints(Some(90_000)), Vec::<usize>::new());
         assert_eq!(checkpoints(None), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn an_unlisted_model_compacts_at_the_default_window_not_at_the_byte_budget() {
+        // The history of the configured-window test: 20 actions of 16 KiB tool
+        // output (past the byte budget) at a reported 128k prompt, then 240k.
+        let mut prompt_tokens = vec![128_000; 20];
+        prompt_tokens.extend([240_000, 120_000]);
+        let output = ToolOutcome::ok("Prüfung der Grenzwerte ergab: ".repeat(512));
+        let checkpoints = |config: AgentConfig| {
+            let mut model = ReportedPromptModel {
+                prompt_tokens: prompt_tokens.clone(),
+                actions: 0,
+                checkpoints_before_action: Vec::new(),
+            };
+            let mut env = FakeEnv::new(vec![echo_tool()]).with_outcome("echo", output.clone());
+            run(&mut model, &mut env, &config, "Fix clamp").unwrap();
+            model.checkpoints_before_action
+        };
+        let product = AgentConfig {
+            default_compact_at_tokens: Some(default_compact_at_tokens()),
+            ..AgentConfig::default().with_model("unlisted-model")
+        };
+        assert_eq!(default_compact_at_tokens(), 230_400);
+        // Nothing at a reported 128k; one checkpoint after the turn that reported 240k.
+        assert_eq!(checkpoints(product), vec![21]);
+        // The library default is still the byte budget: long before that.
+        let library = checkpoints(AgentConfig::default().with_model("unlisted-model"));
+        assert!(library.first().is_some_and(|n| *n < 20), "{library:?}");
+    }
+
+    /// Refuses the first `refusals` ordinary requests as too long; answers
+    /// checkpoint requests with a valid checkpoint and anything else with "done".
+    struct OverflowModel {
+        refusals: usize,
+        checkpoints: usize,
+        asked: usize,
+    }
+
+    impl ModelStream for OverflowModel {
+        fn stream_turn(
+            &mut self,
+            req: &ModelRequest,
+            _: &mut dyn FnMut(StreamEvent),
+        ) -> Result<TurnResult, ClientError> {
+            if req
+                .system
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Create an accurate continuation checkpoint"))
+            {
+                self.checkpoints += 1;
+                let state = json!({"task":"Fix clamp", "constraints":[], "decisions":[],
+                    "changed_files":[], "tests_results":[], "open_work":["continue"],
+                    "recovery_ids":[]});
+                return text_turn(&state.to_string(), usage(20, 5)).result;
+            }
+            self.asked += 1;
+            if self.asked <= self.refusals {
+                return Err(ClientError::Http {
+                    status: 400,
+                    body: r#"{"error":{"message":"prompt is too long: 260000 tokens > 200000 maximum"}}"#.into(),
+                });
+            }
+            text_turn("done", usage(1, 1)).result
+        }
+    }
+
+    #[test]
+    fn a_prompt_refused_as_too_long_is_compacted_and_asked_again_once() {
+        let text = |role, text: String| Message {
+            role,
+            content: vec![ContentPart::Text { text }],
+        };
+        let history: Vec<Message> = (0..8)
+            .flat_map(|i| {
+                [
+                    text(Role::User, format!("step {i}")),
+                    text(Role::Assistant, "ok ".repeat(100)),
+                ]
+            })
+            .collect();
+        let config = AgentConfig::default().with_model("fixture");
+        let go = |refusals| {
+            let mut model = OverflowModel {
+                refusals,
+                checkpoints: 0,
+                asked: 0,
+            };
+            let mut env = FakeEnv::new(vec![echo_tool()]);
+            let mut compacted = 0;
+            let result = run_agent_loop_with_history(
+                &mut model,
+                &mut env,
+                &config,
+                &history,
+                "And on.",
+                &mut |event| {
+                    if matches!(event, LoopEvent::ContextCompacted { .. }) {
+                        compacted += 1;
+                    }
+                },
+            );
+            (result, model.checkpoints, compacted)
+        };
+        // Refused once: compacted, asked again, answered.
+        let (result, checkpoints, compacted) = go(1);
+        let result = result.unwrap();
+        assert_eq!(
+            (result.final_text.as_str(), checkpoints, compacted),
+            ("done", 1, 1)
+        );
+        // Refused again after compacting: the refusal ends the run, as before.
+        let (result, _, _) = go(2);
+        assert!(
+            matches!(result, Err(LoopError::Http { status: 400, .. })),
+            "{result:?}"
+        );
+        assert!(prompt_too_long(
+            "This model's maximum context length is 128000 tokens"
+        ));
+        assert!(!prompt_too_long("max_tokens: 64000 > 32000"));
     }
 
     #[test]
