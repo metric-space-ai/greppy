@@ -204,6 +204,7 @@ fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
             perms: Arc::clone(&session.perms),
             client_tools: Vec::new(),
             images: Vec::new(),
+            mcp: Default::default(),
             effort: None,
             compact_at: None,
             context_tokens: None,
@@ -531,6 +532,7 @@ fn prepared_for(server: &Server, id: &str) -> PreparedPrompt {
         perms: Arc::clone(&session.perms),
         client_tools: Vec::new(),
         images: Vec::new(),
+        mcp: Default::default(),
         effort: None,
         compact_at: None,
         context_tokens: None,
@@ -1081,8 +1083,8 @@ fn a_prompts_pictures_go_after_its_text_and_a_bad_one_is_refused() {
             data: PIXEL.into()
         }]
     );
-    // Pictures alone are no prompt.
-    assert!(prompt_text(&blocks[1..]).is_err());
+    // Pictures alone are a prompt too (the image capability is on); its text is empty.
+    assert_eq!(prompt_text(&blocks[1..]).unwrap(), "");
     for broken in [
         json!({"type": "image", "mimeType": "image/svg+xml", "data": PIXEL}),
         json!({"type": "image", "mimeType": "image/png", "data": "not base64!"}),
@@ -1093,4 +1095,44 @@ fn a_prompts_pictures_go_after_its_text_and_a_bad_one_is_refused() {
             "{broken}"
         );
     }
+}
+
+#[test]
+fn linked_and_embedded_resources_reach_the_model_as_words_or_pictures() {
+    const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let blocks = [
+        json!({"type": "text", "text": "Look at these."}),
+        json!({"type": "resource_link", "uri": "file:///work/made%20up/notes.md", "name": "notes.md",
+            "mimeType": "text/markdown", "description": "The made-up notes"}),
+        json!({"type": "resource_link", "uri": "https://example.invalid/spec", "name": "spec"}),
+        json!({"type": "resource", "resource": {"uri": "file:///work/a.rs", "mimeType": "text/x-rust",
+            "text": "fn made_up() {}"}}),
+        json!({"type": "resource", "resource": {"uri": "file:///work/blob.bin",
+            "mimeType": "application/octet-stream", "blob": "AAAA"}}),
+        json!({"type": "resource", "resource": {"uri": "file:///work/pixel.png",
+            "mimeType": "image/png", "blob": PIXEL}}),
+    ];
+    let text = prompt_text(&blocks).unwrap();
+    assert!(text.starts_with("Look at these.\n"), "{text}");
+    assert!(text.contains("[Linked resource: notes.md <file:///work/made%20up/notes.md>, a local file: /work/made up/notes.md, text/markdown — The made-up notes]"), "{text}");
+    assert!(
+        text.contains("[Linked resource: spec <https://example.invalid/spec>]"),
+        "{text}"
+    );
+    assert!(text.contains("<resource uri=\"file:///work/a.rs\" mimeType=\"text/x-rust\">\nfn made_up() {}\n</resource>"), "{text}");
+    assert!(text.contains("[Embedded binary resource file:///work/blob.bin (application/octet-stream, 4 bytes as base64), not shown]"), "{text}");
+    assert!(!text.contains(PIXEL));
+    // The embedded picture goes to the model as a picture.
+    assert_eq!(
+        prompt_images(&blocks).unwrap(),
+        [greppy_agent::ContentPart::Image {
+            media_type: "image/png".into(),
+            data: PIXEL.into()
+        }]
+    );
+    // A link needs its uri; audio is not taken.
+    assert!(prompt_text(&[json!({"type": "resource_link", "name": "x"})]).is_err());
+    assert!(
+        prompt_text(&[json!({"type": "audio", "mimeType": "audio/wav", "data": "AAAA"})]).is_err()
+    );
 }

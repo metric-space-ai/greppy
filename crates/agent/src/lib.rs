@@ -29,6 +29,7 @@ pub mod client;
 pub mod context;
 pub mod env;
 pub mod greppy_env;
+pub mod mcp;
 pub mod model;
 pub mod prompt;
 pub mod protocol;

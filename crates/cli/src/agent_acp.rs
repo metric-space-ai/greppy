@@ -257,6 +257,8 @@ struct Session {
     perms: Arc<Mutex<PermMemory>>,
     usage_in: u64,
     usage_out: u64,
+    /// The MCP servers the client named for this session, started once.
+    mcp: Arc<Mutex<greppy_agent::mcp::McpHub>>,
 }
 
 struct PermMemory {
@@ -506,10 +508,10 @@ impl Server {
                     "promptCapabilities": {
                         "image": true,
                         "audio": false,
-                        "embeddedContext": false
+                        "embeddedContext": true
                     },
                     "mcpCapabilities": {
-                        "http": false,
+                        "http": true,
                         "sse": false
                     },
                     "sessionCapabilities": {
@@ -653,9 +655,10 @@ impl Server {
     }
 
     fn session_new(&self, id: &Value, params: &Value) -> Value {
-        if let Err(message) = require_empty_mcp(params, true) {
-            return rpc_error(id, -32602, &message);
-        }
+        let servers = match mcp_servers(params, true) {
+            Ok(servers) => servers,
+            Err(message) => return rpc_error(id, -32602, &message),
+        };
         let cwd = match require_cwd(params) {
             Ok(cwd) => cwd,
             Err(message) => return rpc_error(id, -32602, &message),
@@ -675,6 +678,7 @@ impl Server {
         if let Err(error) = store.create(&record) {
             return rpc_error(id, -32603, &format!("cannot persist session: {error}"));
         }
+        let mcp = start_mcp(&servers, &cwd);
         let session = Session {
             id: session_id.clone(),
             cwd,
@@ -694,6 +698,7 @@ impl Server {
             })),
             usage_in: 0,
             usage_out: 0,
+            mcp,
         };
         lock_state(&self.state)
             .sessions
@@ -703,9 +708,10 @@ impl Server {
 
     fn session_load(&self, id: &Value, params: &Value, method: &str) -> Value {
         let mcp_required = method == "session/load";
-        if let Err(message) = require_empty_mcp(params, mcp_required) {
-            return rpc_error(id, -32602, &message);
-        }
+        let servers = match mcp_servers(params, mcp_required) {
+            Ok(servers) => servers,
+            Err(message) => return rpc_error(id, -32602, &message),
+        };
         let cwd = match require_cwd(params) {
             Ok(cwd) => cwd,
             Err(message) => return rpc_error(id, -32602, &message),
@@ -733,12 +739,17 @@ impl Server {
             }
         }
         let messages = protocol_from_persisted(&record.messages);
-        self.emit_replay(session_id, &messages);
+        // `session/load` replays the conversation to the client; `session/resume`
+        // restores it without a replay.
+        if method == "session/load" {
+            self.emit_replay(session_id, &messages);
+        }
         let model = if record.model.is_empty() {
             self.config.model.clone()
         } else {
             record.model.clone()
         };
+        let mcp = start_mcp(&servers, &cwd);
         let session = Session {
             id: session_id.to_string(),
             cwd,
@@ -760,6 +771,7 @@ impl Server {
             })),
             usage_in: record.usage.input_tokens,
             usage_out: record.usage.output_tokens,
+            mcp,
         };
         lock_state(&self.state)
             .sessions
@@ -1003,6 +1015,12 @@ impl Server {
                 return;
             }
         };
+        if prompt.trim().is_empty() && images.is_empty() {
+            let _ = self
+                .out
+                .send(&rpc_error(id, -32602, "prompt text is empty"));
+            return;
+        }
         let effort = match params.pointer("/_meta/greppy/effort") {
             None | Some(Value::Null) => None,
             Some(Value::String(effort)) if matches!(effort.as_str(), "low" | "medium" | "high") => {
@@ -1079,6 +1097,7 @@ impl Server {
                 perms: Arc::clone(&session.perms),
                 client_tools,
                 images,
+                mcp: Arc::clone(&session.mcp),
                 effort,
                 compact_at,
                 context_tokens,
@@ -1178,6 +1197,8 @@ struct PreparedPrompt {
     client_tools: Vec<greppy_agent::ToolDefinition>,
     /// The prompt's pictures, after its text.
     images: Vec<greppy_agent::ContentPart>,
+    /// The session's MCP servers.
+    mcp: Arc<Mutex<greppy_agent::mcp::McpHub>>,
     /// The reasoning effort chosen for this prompt (`_meta.greppy.effort`).
     effort: Option<String>,
     /// Prompt tokens at which this prompt's conversation is compacted (90 % of
@@ -1242,6 +1263,11 @@ fn run_prompt(
             Box::new(greppy)
         }
     };
+    // The tools of the session's MCP servers beside greppy's (permission as for any tool).
+    let inner: Box<dyn ExecutionEnv + Send> = Box::new(greppy_agent::mcp::McpEnv {
+        inner,
+        hub: Arc::clone(&prepared.mcp),
+    });
     let gated = GatingEnv {
         inner,
         session_id: prepared.session_id.clone(),
@@ -1292,11 +1318,13 @@ fn run_prompt(
         }
         let _ = emit_loop_event(out, &session_id, &event);
     };
-    let content = std::iter::once(greppy_agent::ContentPart::Text {
-        text: prompt.to_owned(),
-    })
-    .chain(prepared.images.iter().cloned())
-    .collect();
+    let content = (!prompt.is_empty())
+        .then(|| greppy_agent::ContentPart::Text {
+            text: prompt.to_owned(),
+        })
+        .into_iter()
+        .chain(prepared.images.iter().cloned())
+        .collect();
     match run_agent_loop_with_content(
         &mut client,
         &mut env,
@@ -1894,16 +1922,29 @@ fn require_cwd(params: &Value) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn require_empty_mcp(params: &Value, required: bool) -> Result<(), String> {
+/// The MCP servers a session request names (`mcpServers`: stdio, or http).
+fn mcp_servers(
+    params: &Value,
+    required: bool,
+) -> Result<Vec<greppy_agent::mcp::McpServerConfig>, String> {
     match params.get("mcpServers") {
         None if required => Err("mcpServers is required".to_string()),
-        None => Ok(()),
-        Some(Value::Array(items)) if items.is_empty() => Ok(()),
-        Some(Value::Array(_)) => {
-            Err("MCP servers are not supported; send an empty mcpServers array".to_string())
-        }
-        Some(_) => Err("mcpServers must be an array".to_string()),
+        None => Ok(Vec::new()),
+        Some(list) => greppy_agent::mcp::McpServerConfig::parse_list(list),
     }
+}
+
+/// Start a session's MCP servers in its folder; a server that cannot start is left out
+/// and said on stderr.
+fn start_mcp(
+    servers: &[greppy_agent::mcp::McpServerConfig],
+    cwd: &Path,
+) -> Arc<Mutex<greppy_agent::mcp::McpHub>> {
+    let hub = greppy_agent::mcp::McpHub::start(servers, cwd);
+    for note in &hub.notes {
+        eprintln!("greppy agent stdio: {note}");
+    }
+    Arc::new(Mutex::new(hub))
 }
 
 /// Most bytes of base64 one prompt's pictures may hold (about 15 MB of pictures).
@@ -1915,9 +1956,23 @@ fn prompt_images(blocks: &[Value]) -> Result<Vec<greppy_agent::ContentPart>, Str
     let mut images = Vec::new();
     let mut bytes = 0usize;
     for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("image") {
+        // An embedded resource that is a picture goes to the model as one.
+        let embedded = block.get("type").and_then(Value::as_str) == Some("resource")
+            && block.pointer("/resource/blob").is_some()
+            && is_picture_type(block.pointer("/resource/mimeType").and_then(Value::as_str));
+        let converted;
+        let block = if embedded {
+            converted = json!({
+                "type": "image",
+                "mimeType": block.pointer("/resource/mimeType").cloned().unwrap_or_default(),
+                "data": block.pointer("/resource/blob").cloned().unwrap_or_default(),
+            });
+            &converted
+        } else if block.get("type").and_then(Value::as_str) == Some("image") {
+            block
+        } else {
             continue;
-        }
+        };
         let media_type = block.get("mimeType").and_then(Value::as_str).unwrap_or("");
         if !matches!(
             media_type,
@@ -1946,30 +2001,96 @@ fn prompt_images(blocks: &[Value]) -> Result<Vec<greppy_agent::ContentPart>, Str
     Ok(images)
 }
 
+/// A prompt's words for the model, in order: text blocks as they are, a linked
+/// resource (`resource_link`) as a reference the model can follow (a local file by
+/// its path, which greppy reads), an embedded resource (`resource`) with its text, or,
+/// for binary content that is no picture, as a note. Pictures go separately
+/// ([`prompt_images`]); audio is not taken (the capability says so). Empty where the
+/// prompt is only pictures.
 fn prompt_text(blocks: &[Value]) -> Result<String, String> {
     if blocks.is_empty() {
         return Err("prompt is empty".to_string());
     }
-    let mut parts = Vec::with_capacity(blocks.len());
+    let mut parts: Vec<String> = Vec::with_capacity(blocks.len());
     for block in blocks {
         let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind == "image" {
-            continue;
+        let field = |name: &str| block.get(name).and_then(Value::as_str);
+        match kind {
+            "image" => {}
+            "text" => {
+                let Some(text) = field("text") else {
+                    return Err("text prompt block is missing text".to_string());
+                };
+                parts.push(text.to_owned());
+            }
+            "resource_link" => {
+                let Some(uri) = field("uri").filter(|uri| !uri.is_empty()) else {
+                    return Err("resource_link prompt block is missing uri".to_string());
+                };
+                let name = field("title").or(field("name")).unwrap_or(uri);
+                let mut line = format!("[Linked resource: {name} <{uri}>");
+                if let Some(path) = local_path(uri) {
+                    line.push_str(&format!(", a local file: {path}"));
+                }
+                if let Some(mime) = field("mimeType") {
+                    line.push_str(&format!(", {mime}"));
+                }
+                if let Some(description) = field("description") {
+                    line.push_str(&format!(" — {description}"));
+                }
+                line.push(']');
+                parts.push(line);
+            }
+            "resource" => {
+                let resource = block.get("resource").cloned().unwrap_or(Value::Null);
+                let Some(uri) = resource.get("uri").and_then(Value::as_str) else {
+                    return Err("resource prompt block is missing resource.uri".to_string());
+                };
+                let mime = resource.get("mimeType").and_then(Value::as_str);
+                match (
+                    resource.get("text").and_then(Value::as_str),
+                    resource.get("blob"),
+                ) {
+                    (Some(text), _) => parts.push(format!(
+                        "<resource uri=\"{uri}\"{}>\n{text}\n</resource>",
+                        mime.map(|mime| format!(" mimeType=\"{mime}\""))
+                            .unwrap_or_default()
+                    )),
+                    (None, Some(Value::String(blob))) if !is_picture_type(mime) => {
+                        parts.push(format!(
+                            "[Embedded binary resource {uri} ({}, {} bytes as base64), not shown]",
+                            mime.unwrap_or("unknown type"),
+                            blob.len()
+                        ))
+                    }
+                    (None, Some(Value::String(_))) => {}
+                    _ => {
+                        return Err(
+                            "resource prompt block has neither resource.text nor resource.blob"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            "" => return Err("unsupported prompt content type: unknown".to_string()),
+            other => return Err(format!("unsupported prompt content type: {other}")),
         }
-        if kind != "text" {
-            let label = if kind.is_empty() { "unknown" } else { kind };
-            return Err(format!("unsupported prompt content type: {label}"));
-        }
-        let Some(text) = block.get("text").and_then(Value::as_str) else {
-            return Err("text prompt block is missing text".to_string());
-        };
-        parts.push(text);
     }
-    let joined = parts.join("\n");
-    if joined.trim().is_empty() {
-        return Err("prompt text is empty".to_string());
-    }
-    Ok(joined)
+    Ok(parts.join("\n"))
+}
+
+/// The local path a `file://` URI names (percent-decoding not attempted beyond `%20`).
+fn local_path(uri: &str) -> Option<String> {
+    let path = uri.strip_prefix("file://")?;
+    let path = path.strip_prefix("localhost").unwrap_or(path);
+    path.starts_with('/').then(|| path.replace("%20", " "))
+}
+
+fn is_picture_type(mime: Option<&str>) -> bool {
+    matches!(
+        mime,
+        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    )
 }
 
 fn session_setup(session_id: &str, model: &str, include_id: bool) -> Value {
