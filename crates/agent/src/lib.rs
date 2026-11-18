@@ -38,8 +38,8 @@ pub mod wire;
 pub mod workspace;
 
 pub use agent_loop::{
-    run_agent_loop, run_agent_loop_with_history, AgentConfig, LoopError, LoopEvent, LoopResult,
-    LoopStop,
+    run_agent_loop, run_agent_loop_with_content, run_agent_loop_with_history, AgentConfig,
+    LoopError, LoopEvent, LoopResult, LoopStop,
 };
 pub use client::{Client, ClientError, ProbeError, TurnResult};
 pub use env::{ExecutionEnv, ToolOutcome};

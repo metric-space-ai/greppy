@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, AgentConfig, BuiltinPromptMode, Client, ClientError, ExecutionEnv,
+    run_agent_loop_with_content, AgentConfig, BuiltinPromptMode, Client, ClientError, ExecutionEnv,
     GreppyEnv, LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream,
     OutputTokenLimit, StreamEvent, ToolOutcome, TurnResult,
 };
@@ -42,6 +42,14 @@ const AUTH_METHOD_ID: &str = "greppy.env";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
 const DEFAULT_MAX_TURNS: usize = 0;
 const OUTPUT_LIMIT_METHOD: &str = "_greppy/set_output_limit";
+/// The request with which greppy has its client run a tool the client offered with a
+/// prompt (`_meta.greppy.clientTools`).
+const CLIENT_TOOL_METHOD: &str = "_greppy/client_tool";
+/// The smallest model window a client may name; below it the window is not taken (the
+/// instructions and tools alone take nearly that).
+const SMALLEST_WINDOW: u64 = 16_000;
+/// At most this many client tools go with one prompt.
+const CLIENT_TOOLS_LIMIT: usize = 64;
 
 thread_local! {
     static ACTIVE_TOOL_CALL: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -60,6 +68,12 @@ pub(crate) struct AcpConfig {
     /// Verified response limit for the initial model at this endpoint, not a global cap.
     pub max_output_tokens: Option<OutputTokenLimit>,
     pub api_key: Option<String>,
+    /// Further headers sent with every model request (`--header NAME:VALUE`).
+    pub headers: Vec<(String, String)>,
+    /// Confine every tool child (`--sandbox`): it may write only in the session's
+    /// folder and its run's own temporary folder, and has no network. Where that
+    /// cannot be made, tools are refused rather than run unconfined.
+    pub sandbox: bool,
     pub max_turns: usize,
     pub capabilities: greppy_agent::CapabilitySet,
     pub data_root: Option<PathBuf>,
@@ -80,6 +94,8 @@ impl Default for AcpConfig {
             api_key: std::env::var("GREPPY_API_KEY")
                 .ok()
                 .filter(|key| !key.is_empty()),
+            headers: Vec::new(),
+            sandbox: false,
             max_turns: DEFAULT_MAX_TURNS,
             capabilities: greppy_agent::CapabilitySet::default(),
             data_root: None,
@@ -115,6 +131,28 @@ struct StdioArgs {
     /// Include a capability manual from the first turn (`web`, `desktop`, or both).
     #[arg(long, value_name = "web|desktop")]
     enable: Vec<String>,
+    /// Send `NAME:VALUE` with every model request (repeatable), e.g. a router's
+    /// provider header. Never a secret: the key comes from GREPPY_API_KEY.
+    #[arg(long = "header", value_name = "NAME:VALUE")]
+    headers: Vec<String>,
+    /// Confine every command and greppy call: writes only in the session's folder
+    /// and the run's temporary folder, no network. Fail-closed: where the sandbox
+    /// cannot be made (no Landlock ≥ V3, no Seatbelt), tools are refused.
+    #[arg(long)]
+    sandbox: bool,
+}
+
+/// `NAME:VALUE` (spaces around the value trimmed) as a header pair.
+fn header_pair(said: &str) -> Result<(String, String), String> {
+    let (name, value) = said
+        .split_once(':')
+        .ok_or_else(|| format!("--header {said:?} is not NAME:VALUE"))?;
+    let (name, value) = (name.trim(), value.trim());
+    // The same check the client makes, so a bad header fails at start, not per request.
+    greppy_agent::Client::new(DEFAULT_ENDPOINT, "")
+        .with_header(name, value)
+        .map_err(|error| format!("--header: {error}"))?;
+    Ok((name.to_owned(), value.to_owned()))
 }
 
 /// Parse and serve `greppy agent stdio`.
@@ -149,9 +187,23 @@ pub(crate) fn run(rest: &[std::ffi::OsString]) -> u8 {
             return EXIT_USAGE;
         }
     };
+    let headers = match args
+        .headers
+        .iter()
+        .map(|said| header_pair(said))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(headers) => headers,
+        Err(error) => {
+            eprintln!("greppy agent stdio: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let defaults = AcpConfig::default();
     let config = AcpConfig {
         endpoint: args.endpoint,
+        headers,
+        sandbox: args.sandbox,
         model: args.model.unwrap_or(defaults.model),
         max_output_tokens: args.max_output_tokens,
         max_turns: args.max_turns,
@@ -445,12 +497,14 @@ impl Server {
                 "agentCapabilities": {
                     "_meta": {
                         "workjetImportHistory": {"version": 1},
-                        "greppyOutputLimit": {"version": 1, "method": OUTPUT_LIMIT_METHOD}
+                        "greppyOutputLimit": {"version": 1, "method": OUTPUT_LIMIT_METHOD},
+                        "greppyClientTools": {"version": 1, "method": CLIENT_TOOL_METHOD},
+                        "greppyPromptEffort": {"version": 1, "values": ["low", "medium", "high"]}
                     },
                     "loadSession": true,
 
                     "promptCapabilities": {
-                        "image": false,
+                        "image": true,
                         "audio": false,
                         "embeddedContext": false
                     },
@@ -942,6 +996,45 @@ impl Server {
                 return;
             }
         };
+        let images = match prompt_images(blocks) {
+            Ok(images) => images,
+            Err(message) => {
+                let _ = self.out.send(&rpc_error(id, -32602, &message));
+                return;
+            }
+        };
+        let effort = match params.pointer("/_meta/greppy/effort") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(effort)) if matches!(effort.as_str(), "low" | "medium" | "high") => {
+                Some(effort.clone())
+            }
+            Some(other) => {
+                let _ = self.out.send(&rpc_error(
+                    id,
+                    -32602,
+                    &format!("_meta.greppy.effort {other} is none of low, medium, high"),
+                ));
+                return;
+            }
+        };
+        // The model's window and what its latest request held, as the client knows them:
+        // the conversation is compacted at 90 % of a window of at least 16 000 tokens.
+        let number = |name: &str| {
+            params
+                .pointer(&format!("/_meta/greppy/{name}"))
+                .and_then(Value::as_u64)
+        };
+        let compact_at = number("contextWindow")
+            .filter(|window| *window >= SMALLEST_WINDOW)
+            .map(|window| window / 10 * 9);
+        let context_tokens = number("contextTokens");
+        let client_tools = match client_tools(params) {
+            Ok(tools) => tools,
+            Err(message) => {
+                let _ = self.out.send(&rpc_error(id, -32602, &message));
+                return;
+            }
+        };
         let prepared = {
             let mut state = lock_state(&self.state);
             let Some(session) = state.sessions.get_mut(session_id) else {
@@ -984,6 +1077,11 @@ impl Server {
                 max_output_tokens: session.max_output_tokens,
                 cancel: Arc::clone(&session.cancel),
                 perms: Arc::clone(&session.perms),
+                client_tools,
+                images,
+                effort,
+                compact_at,
+                context_tokens,
             }
         };
         let request_id = id.clone();
@@ -1076,6 +1174,17 @@ struct PreparedPrompt {
     max_output_tokens: Option<OutputTokenLimit>,
     cancel: Arc<AtomicBool>,
     perms: Arc<Mutex<PermMemory>>,
+    /// Tools the client offered with this prompt; it runs them (`_greppy/client_tool`).
+    client_tools: Vec<greppy_agent::ToolDefinition>,
+    /// The prompt's pictures, after its text.
+    images: Vec<greppy_agent::ContentPart>,
+    /// The reasoning effort chosen for this prompt (`_meta.greppy.effort`).
+    effort: Option<String>,
+    /// Prompt tokens at which this prompt's conversation is compacted (90 % of
+    /// `_meta.greppy.contextWindow`).
+    compact_at: Option<u64>,
+    /// What the conversation's latest request held (`_meta.greppy.contextTokens`).
+    context_tokens: Option<u64>,
 }
 
 struct PromptDone {
@@ -1110,6 +1219,12 @@ fn run_prompt(
     if let Some(key) = &config.api_key {
         client = client.with_api_key(key);
     }
+    for (name, value) in &config.headers {
+        client = client.with_header(name, value)?;
+    }
+    if let Some(effort) = &prepared.effort {
+        client = client.with_effort(effort)?;
+    }
     let mut client = CancelModel {
         client,
         cancel: Arc::clone(&prepared.cancel),
@@ -1118,16 +1233,28 @@ fn run_prompt(
     let inner: Box<dyn ExecutionEnv + Send> = if let Some(factory) = &config.tool_env {
         factory(&prepared.cwd)
     } else {
-        Box::new(
-            GreppyEnv::new(prepared.cwd.clone())
-                .map_err(|error| format!("cannot build the tool environment: {error}"))?
-                .with_capabilities(config.capabilities),
-        )
+        let greppy = GreppyEnv::new(prepared.cwd.clone())
+            .map_err(|error| format!("cannot build the tool environment: {error}"))?
+            .with_capabilities(config.capabilities);
+        if config.sandbox {
+            sandboxed(greppy, &prepared.cwd)
+        } else {
+            Box::new(greppy)
+        }
     };
-    let mut env = GatingEnv {
+    let gated = GatingEnv {
         inner,
         session_id: prepared.session_id.clone(),
         perms: Arc::clone(&prepared.perms),
+        cancel: Arc::clone(&prepared.cancel),
+        out: out.clone(),
+        pending: Arc::clone(pending),
+        next_request_id: Arc::clone(next_request_id),
+    };
+    let mut env = ClientToolEnv {
+        inner: gated,
+        tools: prepared.client_tools.clone(),
+        session_id: prepared.session_id.clone(),
         cancel: Arc::clone(&prepared.cancel),
         out: out.clone(),
         pending: Arc::clone(pending),
@@ -1141,7 +1268,14 @@ fn run_prompt(
         )),
         model: prepared.model.clone(),
         cancel: Some(Arc::clone(&prepared.cancel)),
-        compact_at_tokens: crate::agent_tui::AgentSettings::load().compaction_thresholds(),
+        compact_at_tokens: {
+            let mut thresholds = crate::agent_tui::AgentSettings::load().compaction_thresholds();
+            if let Some(at) = prepared.compact_at {
+                thresholds.insert(prepared.model.clone(), at);
+            }
+            thresholds
+        },
+        measured_prompt_tokens: prepared.context_tokens,
         ..AgentConfig::default()
     }
     .with_max_tokens(
@@ -1157,12 +1291,17 @@ fn run_prompt(
         }
         let _ = emit_loop_event(out, &session_id, &event);
     };
-    match run_agent_loop_with_history(
+    let content = std::iter::once(greppy_agent::ContentPart::Text {
+        text: prompt.to_owned(),
+    })
+    .chain(prepared.images.iter().cloned())
+    .collect();
+    match run_agent_loop_with_content(
         &mut client,
         &mut env,
         &agent_config,
         &prepared.history,
-        prompt,
+        content,
         &mut on_event,
     ) {
         Ok(result) => Ok(PromptDone {
@@ -1194,7 +1333,8 @@ fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result
             "title": tool_title(name, arguments),
             "kind": tool_kind(name, arguments),
             "status": "pending",
-            "rawInput": arguments
+            "rawInput": arguments,
+            "_meta": {"greppy": {"tool": name}}
         }),
         LoopEvent::ToolFinish {
             call_id, outcome, ..
@@ -1204,6 +1344,28 @@ fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result
             "status": if outcome.is_error { "failed" } else { "completed" },
             "rawOutput": truncate_chars(&outcome.content, 16_384)
         }),
+        // What one answered model request took, as the provider said it. `used` is
+        // the tokens that request held (prompt and answer); a provider that says
+        // nothing gives no update rather than zeros.
+        LoopEvent::TurnComplete { usage, .. } => {
+            let prompt = usage
+                .input_tokens
+                .saturating_add(usage.cache_read_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens);
+            if prompt == 0 && usage.output_tokens == 0 {
+                return Ok(());
+            }
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": prompt.saturating_add(usage.output_tokens),
+                "_meta": {"greppy": {
+                    "inputTokens": usage.input_tokens,
+                    "outputTokens": usage.output_tokens,
+                    "cachedReadTokens": usage.cache_read_input_tokens,
+                    "cachedWriteTokens": usage.cache_creation_input_tokens
+                }}
+            })
+        }
         _ => return Ok(()),
     };
     out.send(&json!({
@@ -1285,6 +1447,203 @@ fn finish_prompt(
         session.usage_out = session.usage_out.saturating_add(done.usage.output_tokens);
     }
     Ok(())
+}
+
+/// greppy's tools confined to `folder` and the run's own temporary folder, without
+/// network; where that sandbox cannot be made, the same tools refusing every call
+/// with the reason.
+fn sandboxed(greppy: GreppyEnv, folder: &Path) -> Box<dyn ExecutionEnv + Send> {
+    let roots = [folder.to_path_buf(), greppy.run_scratch().to_path_buf()];
+    match greppy_agent::sandbox::resolve_enforce_spec(&roots) {
+        Ok(greppy_agent::SandboxMode::Enforce(spec)) => Box::new(
+            greppy.with_sandbox(greppy_agent::SandboxMode::Enforce(spec.without_network())),
+        ),
+        Ok(greppy_agent::SandboxMode::Off) => Box::new(Refusing {
+            tools: greppy.tool_definitions(),
+            why: "the sandbox cannot be made on this host".to_owned(),
+        }),
+        Err(error) => Box::new(Refusing {
+            tools: greppy.tool_definitions(),
+            why: format!("the sandbox cannot be made on this host: {error}"),
+        }),
+    }
+}
+
+/// Tools that are offered but refused, with the reason: a sandbox that was asked for
+/// and cannot be made is never replaced by running unconfined.
+struct Refusing {
+    tools: Vec<greppy_agent::ToolDefinition>,
+    why: String,
+}
+
+impl ExecutionEnv for Refusing {
+    fn tool_definitions(&self) -> Vec<greppy_agent::ToolDefinition> {
+        self.tools.clone()
+    }
+
+    fn call_tool(&mut self, _: &str, _: &Value) -> ToolOutcome {
+        ToolOutcome::err(format!("Not run: {}.", self.why))
+    }
+}
+
+/// The tools a client offered with a prompt (`_meta.greppy.clientTools`, each
+/// `{name, description, inputSchema}`), checked: named plainly and once, described, and
+/// not under the name of greppy's own tool.
+fn client_tools(params: &Value) -> Result<Vec<greppy_agent::ToolDefinition>, String> {
+    let Some(offered) = params.pointer("/_meta/greppy/clientTools") else {
+        return Ok(Vec::new());
+    };
+    let offered = offered
+        .as_array()
+        .ok_or("_meta.greppy.clientTools must be an array")?;
+    if offered.len() > CLIENT_TOOLS_LIMIT {
+        return Err(format!(
+            "at most {CLIENT_TOOLS_LIMIT} client tools go with one prompt"
+        ));
+    }
+    let mut tools: Vec<greppy_agent::ToolDefinition> = Vec::with_capacity(offered.len());
+    for tool in offered {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+        let plain = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !plain {
+            return Err(format!(
+                "client tool name {name:?} must be 1-64 letters, digits, _ or -"
+            ));
+        }
+        if name == "greppy" || tools.iter().any(|known| known.name == name) {
+            return Err(format!(
+                "client tool {name} is named twice or as greppy's own"
+            ));
+        }
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if description.trim().is_empty() {
+            return Err(format!("client tool {name} has no description"));
+        }
+        let schema = tool
+            .get("inputSchema")
+            .filter(|schema| schema.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        tools.push(greppy_agent::ToolDefinition {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            input_schema: schema,
+        });
+    }
+    Ok(tools)
+}
+
+/// greppy's tools, and the client's: a call of one of the client's is a request to the
+/// client (`_greppy/client_tool`), whose answer is the tool's result. Client tools need
+/// no permission: the client offered them.
+struct ClientToolEnv {
+    inner: GatingEnv,
+    tools: Vec<greppy_agent::ToolDefinition>,
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+    out: Out,
+    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+impl ExecutionEnv for ClientToolEnv {
+    fn tool_definitions(&self) -> Vec<greppy_agent::ToolDefinition> {
+        let mut tools = self.inner.tool_definitions();
+        let own: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+        tools.extend(
+            self.tools
+                .iter()
+                .filter(|tool| !own.contains(&tool.name))
+                .cloned(),
+        );
+        tools
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolOutcome {
+        let own = self
+            .inner
+            .tool_definitions()
+            .iter()
+            .any(|tool| tool.name == name);
+        if own || !self.tools.iter().any(|tool| tool.name == name) {
+            return self.inner.call_tool(name, arguments);
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            return ToolOutcome::err("cancelled before execution");
+        }
+        let request_number = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request_id = Value::from(request_number);
+        let (tx, rx) = mpsc::channel();
+        lock_pending(&self.pending).insert(
+            id_key(&request_id),
+            PendingPermission {
+                session_id: self.session_id.clone(),
+                sender: tx,
+            },
+        );
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": CLIENT_TOOL_METHOD,
+            "params": {
+                "sessionId": self.session_id,
+                "toolCallId": active_tool_call_id(request_number),
+                "name": name,
+                "input": arguments
+            },
+            "headers": []
+        });
+        let answer = if self.out.send(&request).is_ok() {
+            wait_permission(&rx, &self.cancel)
+        } else {
+            None
+        };
+        lock_pending(&self.pending).remove(&id_key(&request_id));
+        match answer {
+            None if self.cancel.load(Ordering::Relaxed) => {
+                ToolOutcome::err("cancelled before the client answered")
+            }
+            None => ToolOutcome::err(format!("the client did not run the tool {name}")),
+            Some(answer) => match (answer.get("result"), answer.get("error")) {
+                (Some(result), _) => {
+                    let content = result
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+                        ToolOutcome::err(content)
+                    } else {
+                        ToolOutcome::ok(content)
+                    }
+                }
+                (None, Some(error)) => ToolOutcome::err(
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the client refused the tool")
+                        .to_owned(),
+                ),
+                (None, None) => ToolOutcome::err(format!("the client did not run the tool {name}")),
+            },
+        }
+    }
+}
+
+fn lock_pending(
+    pending: &Mutex<HashMap<String, PendingPermission>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, PendingPermission>> {
+    match pending.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 struct GatingEnv {
@@ -1546,6 +1905,46 @@ fn require_empty_mcp(params: &Value, required: bool) -> Result<(), String> {
     }
 }
 
+/// Most bytes of base64 one prompt's pictures may hold (about 15 MB of pictures).
+const PROMPT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// A prompt's pictures (`{"type":"image","mimeType","data"}` blocks): png, jpeg, gif or
+/// webp, as base64, after its text. A prompt is never only pictures.
+fn prompt_images(blocks: &[Value]) -> Result<Vec<greppy_agent::ContentPart>, String> {
+    let mut images = Vec::new();
+    let mut bytes = 0usize;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        let media_type = block.get("mimeType").and_then(Value::as_str).unwrap_or("");
+        if !matches!(
+            media_type,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Err(format!("unsupported image type: {media_type:?}"));
+        }
+        let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+        let base64 = !data.is_empty()
+            && data.len() % 4 == 0
+            && data
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='));
+        if !base64 {
+            return Err("image data must be base64".to_string());
+        }
+        bytes = bytes.saturating_add(data.len());
+        if bytes > PROMPT_IMAGE_BYTES {
+            return Err("the prompt's images are too large".to_string());
+        }
+        images.push(greppy_agent::ContentPart::Image {
+            media_type: media_type.to_owned(),
+            data: data.to_owned(),
+        });
+    }
+    Ok(images)
+}
+
 fn prompt_text(blocks: &[Value]) -> Result<String, String> {
     if blocks.is_empty() {
         return Err("prompt is empty".to_string());
@@ -1553,6 +1952,9 @@ fn prompt_text(blocks: &[Value]) -> Result<String, String> {
     let mut parts = Vec::with_capacity(blocks.len());
     for block in blocks {
         let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "image" {
+            continue;
+        }
         if kind != "text" {
             let label = if kind.is_empty() { "unknown" } else { kind };
             return Err(format!("unsupported prompt content type: {label}"));

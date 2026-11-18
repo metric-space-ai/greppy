@@ -236,6 +236,12 @@ impl GreppyEnv {
         &self.sandbox
     }
 
+    /// This run's own temporary folder: a confined tool child's TMPDIR, HOME and
+    /// caches live below it, so a sandbox grants it as a writable root.
+    pub fn run_scratch(&self) -> &Path {
+        &self.run_scratch
+    }
+
     fn greppy_tool_def() -> ToolDefinition {
         ToolDefinition {
             name: "greppy".to_string(),

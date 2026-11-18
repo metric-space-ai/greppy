@@ -69,6 +69,12 @@ pub struct AgentConfig {
     /// prompt reaches the threshold; any other model keeps the history byte
     /// budget. Looked up by [`Self::model`] on every turn. Default: empty.
     pub compact_at_tokens: BTreeMap<String, u64>,
+    /// Prompt tokens the provider reported for the latest request of this
+    /// conversation before the history passed in (a resumed conversation's
+    /// last measurement, which a new process does not hold itself). Seeds the
+    /// token trigger so a resumed conversation that is already full is
+    /// compacted before its first request. Default: `None`.
+    pub measured_prompt_tokens: Option<u64>,
 }
 
 impl PartialEq for AgentConfig {
@@ -84,6 +90,7 @@ impl PartialEq for AgentConfig {
             && self.deadline == other.deadline
             && self.deadline_total == other.deadline_total
             && self.compact_at_tokens == other.compact_at_tokens
+            && self.measured_prompt_tokens == other.measured_prompt_tokens
     }
 }
 
@@ -104,6 +111,7 @@ impl Default for AgentConfig {
             deadline_total: None,
             cancel: None,
             compact_at_tokens: BTreeMap::new(),
+            measured_prompt_tokens: None,
         }
     }
 }
@@ -302,20 +310,37 @@ pub fn run_agent_loop_with_history(
     prompt: &str,
     on_event: &mut dyn FnMut(LoopEvent),
 ) -> Result<LoopResult, LoopError> {
+    let content = vec![ContentPart::Text {
+        text: prompt.to_string(),
+    }];
+    run_agent_loop_with_content(model, env, config, history, content, on_event)
+}
+
+/// The same, with a user message of several parts (text and pictures, in order).
+pub fn run_agent_loop_with_content(
+    model: &mut dyn ModelStream,
+    env: &mut dyn ExecutionEnv,
+    config: &AgentConfig,
+    history: &[Message],
+    content: Vec<ContentPart>,
+    on_event: &mut dyn FnMut(LoopEvent),
+) -> Result<LoopResult, LoopError> {
     let mut messages: Vec<Message> = history.to_vec();
     let mut system = config.system.clone();
     crate::context::restore_summary(&mut system, config.context_summary.as_deref());
     messages.push(Message {
         role: Role::User,
-        content: vec![ContentPart::Text {
-            text: prompt.to_string(),
-        }],
+        content,
     });
 
     let mut total_usage = Usage::default();
     let mut turns: usize = 0;
     let mut compaction =
         CompactionTrigger::new(config.compact_at_tokens.get(&config.model).copied());
+    if let Some(tokens) = config.measured_prompt_tokens.filter(|tokens| *tokens > 0) {
+        // Measured before this call's user message: it counts as appended since.
+        compaction.measured = Some((tokens, history.len()));
+    }
     // Every exit from the loop below sets this before `break`.
     let mut last_stop: LoopStop;
     let mut final_text = String::new();
@@ -1532,6 +1557,52 @@ mod tests {
                 model.checkpoints_before_action
             );
         }
+    }
+
+    #[test]
+    fn a_resumed_conversation_measured_full_is_compacted_before_its_first_request() {
+        // A new process goes on with a conversation whose last request held 190k
+        // tokens of a 200k window (compaction at 180k): its own count starts empty,
+        // the caller's measurement does not.
+        let text = |role, text: String| Message {
+            role,
+            content: vec![ContentPart::Text { text }],
+        };
+        let history: Vec<Message> = (0..8)
+            .flat_map(|i| {
+                [
+                    text(Role::User, format!("step {i}")),
+                    text(Role::Assistant, "ok ".repeat(100)),
+                ]
+            })
+            .collect();
+        let checkpoints = |measured: Option<u64>| {
+            let config = AgentConfig {
+                compact_at_tokens: BTreeMap::from([("fixture".to_string(), 180_000)]),
+                measured_prompt_tokens: measured,
+                ..AgentConfig::default().with_model("fixture")
+            };
+            let mut model = ReportedPromptModel {
+                prompt_tokens: vec![1_000],
+                actions: 0,
+                checkpoints_before_action: Vec::new(),
+            };
+            let mut env = FakeEnv::new(vec![echo_tool()]);
+            let result = run_agent_loop_with_history(
+                &mut model,
+                &mut env,
+                &config,
+                &history,
+                "And on.",
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.stop, LoopStop::EndTurn);
+            model.checkpoints_before_action
+        };
+        assert_eq!(checkpoints(Some(190_000)), vec![0]);
+        assert_eq!(checkpoints(Some(90_000)), Vec::<usize>::new());
+        assert_eq!(checkpoints(None), Vec::<usize>::new());
     }
 
     #[test]

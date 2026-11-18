@@ -202,6 +202,11 @@ fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
             history: vec![],
             cancel: Arc::clone(&session.cancel),
             perms: Arc::clone(&session.perms),
+            client_tools: Vec::new(),
+            images: Vec::new(),
+            effort: None,
+            compact_at: None,
+            context_tokens: None,
         }
     };
     let data_root = server.config.data_root.as_ref().unwrap();
@@ -256,6 +261,8 @@ fn fixture(root: &Path) -> (Server, Receiver<Value>) {
         endpoint: "http://127.0.0.1:1".into(),
         model: "fixture-model".into(),
         api_key: None,
+        headers: Vec::new(),
+        sandbox: false,
         max_turns: 2,
         max_output_tokens: None,
         capabilities: greppy_agent::CapabilitySet::default(),
@@ -335,9 +342,10 @@ fn initialize_and_invalid_requests_have_framed_typed_errors() {
         "initialize",
         json!({"protocolVersion":1}),
     );
+    // Pictures go to the model after a prompt's text (png, jpeg, gif, webp).
     assert_eq!(
         init["result"]["agentCapabilities"]["promptCapabilities"]["image"],
-        false
+        true
     );
     assert_eq!(init["result"]["agentCapabilities"]["loadSession"], true);
     server.dispatch_line("invalid JSON");
@@ -521,6 +529,11 @@ fn prepared_for(server: &Server, id: &str) -> PreparedPrompt {
         history: session.messages.clone(),
         cancel: Arc::clone(&session.cancel),
         perms: Arc::clone(&session.perms),
+        client_tools: Vec::new(),
+        images: Vec::new(),
+        effort: None,
+        compact_at: None,
+        context_tokens: None,
     }
 }
 
@@ -876,4 +889,208 @@ fn same_session_cross_process_writer_cannot_overwrite_a_successful_turn() {
     assert_eq!(reopened.messages.len(), 4);
     assert_eq!(reopened.turns, 2);
     assert_eq!(reopened.model, "after-release");
+}
+
+#[test]
+fn each_answered_model_request_is_said_as_a_usage_update_and_a_silent_one_is_not() {
+    let (tx, rx) = mpsc::channel();
+    let out = Out {
+        inner: Arc::new(Mutex::new(Frames {
+            bytes: Vec::new(),
+            tx,
+        })),
+    };
+    let usage = greppy_agent::Usage {
+        input_tokens: 400,
+        output_tokens: 90,
+        cache_read_input_tokens: 800,
+        cache_creation_input_tokens: 0,
+    };
+    let answered = |usage| LoopEvent::TurnComplete {
+        stop_reason: greppy_agent::StopReason::EndTurn,
+        usage,
+    };
+    emit_loop_event(&out, "fixture-session", &answered(usage)).unwrap();
+    let frame = next(&rx);
+    assert_eq!(frame["method"], "session/update");
+    let update = &frame["params"]["update"];
+    assert_eq!(update["sessionUpdate"], "usage_update", "{frame}");
+    assert_eq!(update["used"], 1290, "{frame}");
+    assert_eq!(update["_meta"]["greppy"]["inputTokens"], 400);
+    assert_eq!(update["_meta"]["greppy"]["cachedReadTokens"], 800);
+    assert_eq!(update["_meta"]["greppy"]["outputTokens"], 90);
+    emit_loop_event(
+        &out,
+        "fixture-session",
+        &answered(greppy_agent::Usage::default()),
+    )
+    .unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn header_flags_are_name_value_pairs_and_a_broken_one_is_refused() {
+    assert_eq!(
+        header_pair("x-workjet-provider: made-up").unwrap(),
+        ("x-workjet-provider".to_owned(), "made-up".to_owned())
+    );
+    for said in ["no-colon", ": value", "x-a:", "x a: v"] {
+        assert!(header_pair(said).is_err(), "{said}");
+    }
+}
+
+/// greppy's own tool, under its own name, counting its calls.
+struct OwnTool(Arc<AtomicUsize>);
+impl ExecutionEnv for OwnTool {
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "greppy".into(),
+            description: "fixture".into(),
+            input_schema: json!({"type": "object"}),
+        }]
+    }
+    fn call_tool(&mut self, _: &str, _: &Value) -> ToolOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ToolOutcome::ok("fixture executed")
+    }
+}
+
+fn notes_tool() -> Value {
+    json!({"name": "look_up_notes", "description": "Look up the made-up notes.",
+        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}})
+}
+
+#[test]
+fn client_tools_are_checked_named_plainly_once_and_never_as_greppys_own() {
+    let offered =
+        |tools: Value| client_tools(&json!({"_meta": {"greppy": {"clientTools": tools}}}));
+    let tools = offered(json!([notes_tool()])).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "look_up_notes");
+    assert_eq!(
+        tools[0].input_schema["properties"]["query"]["type"],
+        "string"
+    );
+    assert!(client_tools(&json!({})).unwrap().is_empty());
+    for broken in [
+        json!([notes_tool(), notes_tool()]),
+        json!([{"name": "greppy", "description": "poses as greppy"}]),
+        json!([{"name": "has space", "description": "x"}]),
+        json!([{"name": "look_up_notes"}]),
+        json!({"name": "not-a-list"}),
+    ] {
+        assert!(offered(broken.clone()).is_err(), "{broken}");
+    }
+}
+
+#[test]
+fn a_client_tool_is_run_by_the_client_without_permission_and_its_answer_is_the_result() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let env = {
+        let state = lock_state(&server.state);
+        let session = &state.sessions[&id];
+        ClientToolEnv {
+            inner: GatingEnv {
+                inner: Box::new(OwnTool(Arc::clone(&calls))),
+                session_id: id.clone(),
+                perms: Arc::clone(&session.perms),
+                cancel: Arc::clone(&session.cancel),
+                out: server.out.clone(),
+                pending: Arc::clone(&server.pending),
+                next_request_id: Arc::clone(&server.next_request_id),
+            },
+            tools: client_tools(&json!({"_meta": {"greppy": {"clientTools": [notes_tool()]}}}))
+                .unwrap(),
+            session_id: id.clone(),
+            cancel: Arc::clone(&session.cancel),
+            out: server.out.clone(),
+            pending: Arc::clone(&server.pending),
+            next_request_id: Arc::clone(&server.next_request_id),
+        }
+    };
+    let names: Vec<String> = env
+        .tool_definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert_eq!(names, ["greppy", "look_up_notes"]);
+    let env = Arc::new(Mutex::new(env));
+    let call = |name: &'static str, input: Value| {
+        let env = Arc::clone(&env);
+        let (tx, outcome) = mpsc::channel();
+        thread::spawn(move || {
+            let result = env.lock().unwrap().call_tool(name, &input);
+            tx.send(result).unwrap();
+        });
+        outcome
+    };
+
+    // The client runs it: one request, no permission asked, its answer is the result.
+    let outcome = call("look_up_notes", json!({"query": "release"}));
+    let asked = next(&rx);
+    assert_eq!(asked["method"], CLIENT_TOOL_METHOD, "{asked}");
+    assert_eq!(asked["params"]["name"], "look_up_notes");
+    assert_eq!(asked["params"]["input"], json!({"query": "release"}));
+    assert_eq!(asked["params"]["sessionId"], json!(id));
+    server.complete_response(&json!({"jsonrpc": "2.0", "id": asked["id"],
+        "result": {"content": "The release is on a made-up day."}}));
+    let result = outcome.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(result, ToolOutcome::ok("The release is on a made-up day."));
+
+    // What the client refuses is the tool's error, with the reason.
+    let outcome = call("look_up_notes", json!({"query": "more"}));
+    let asked = next(&rx);
+    server.complete_response(&json!({"jsonrpc": "2.0", "id": asked["id"],
+        "error": {"code": -32000, "message": "the notes module is not docked any more"}}));
+    let result = outcome.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        result,
+        ToolOutcome::err("the notes module is not docked any more")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // greppy's own tool still goes through its permission gate, not to the client.
+    let outcome = call("greppy", json!({"args": ["where-am-i"]}));
+    let asked = next(&rx);
+    assert_eq!(asked["method"], "session/request_permission", "{asked}");
+    server.complete_response(&json!({"jsonrpc": "2.0", "id": asked["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}));
+    assert_eq!(
+        outcome.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ToolOutcome::ok("fixture executed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_prompts_pictures_go_after_its_text_and_a_bad_one_is_refused() {
+    const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let blocks = [
+        json!({"type": "text", "text": "Look at this."}),
+        json!({"type": "image", "mimeType": "image/png", "data": PIXEL}),
+    ];
+    assert_eq!(prompt_text(&blocks).unwrap(), "Look at this.");
+    assert_eq!(
+        prompt_images(&blocks).unwrap(),
+        [greppy_agent::ContentPart::Image {
+            media_type: "image/png".into(),
+            data: PIXEL.into()
+        }]
+    );
+    // Pictures alone are no prompt.
+    assert!(prompt_text(&blocks[1..]).is_err());
+    for broken in [
+        json!({"type": "image", "mimeType": "image/svg+xml", "data": PIXEL}),
+        json!({"type": "image", "mimeType": "image/png", "data": "not base64!"}),
+        json!({"type": "image", "mimeType": "image/png", "data": ""}),
+    ] {
+        assert!(
+            prompt_images(&[blocks[0].clone(), broken.clone()]).is_err(),
+            "{broken}"
+        );
+    }
 }

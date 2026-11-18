@@ -122,12 +122,16 @@ pub struct SandboxSpec {
     /// Paths + (Linux) directory FDs opened once at preparation. Shared across
     /// clones of this spec for the whole agent run.
     prepared: Arc<PreparedRoots>,
+    /// Whether the child may use the network. Without it, no IP socket can be
+    /// opened (Seatbelt on macOS, a seccomp filter in the Linux launcher); Unix
+    /// sockets stay usable. Default: allowed.
+    pub network: bool,
 }
 
 impl PartialEq for SandboxSpec {
     fn eq(&self, other: &Self) -> bool {
         // Path equality only; FD identity is not part of equality.
-        self.writable_roots == other.writable_roots
+        self.writable_roots == other.writable_roots && self.network == other.network
     }
 }
 
@@ -147,7 +151,14 @@ impl SandboxSpec {
         Ok(Self {
             writable_roots: roots,
             prepared: Arc::new(prepared),
+            network: true,
         })
+    }
+
+    /// The same spec, with the network closed to the child.
+    pub fn without_network(mut self) -> Self {
+        self.network = false;
+        self
     }
 }
 
@@ -302,6 +313,9 @@ fn run_landlock_launcher_inner(argv: &[OsString]) -> Result<(), String> {
         None => None,
     };
     landlock_restrict_fds(&root_fds, dev_null_fd.as_ref()).map_err(|e| e.to_string())?;
+    if fd_spec.deny_network {
+        deny_network_seccomp()?;
+    }
 
     let real_bin = PathBuf::from(&argv[4]);
     let real_args: Vec<&OsStr> = argv[5..].iter().map(OsString::as_os_str).collect();
@@ -309,6 +323,94 @@ fn run_landlock_launcher_inner(argv: &[OsString]) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let err = Command::new(&real_bin).args(real_args).exec();
     Err(format!("exec {} failed: {err}", real_bin.display()))
+}
+
+/// Close the network to this process and everything it runs: a seccomp filter
+/// lets `socket()` create only Unix sockets (EPERM for every other family:
+/// IPv4, IPv6, packet, netlink) and refuses `io_uring_setup` (an io_uring could
+/// open sockets past the filter). A process of a foreign architecture (32-bit,
+/// x32) gets EPERM for every system call. Installed after `no_new_privs`
+/// (Landlock set it) and before exec; seccomp filters survive exec and fork and
+/// cannot be lifted.
+#[cfg(target_os = "linux")]
+fn deny_network_seccomp() -> Result<(), String> {
+    #[repr(C)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+    extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+    const LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    const JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
+    const RET_K: u16 = 0x06; // BPF_RET | BPF_K
+    const ALLOW: u32 = 0x7fff_0000; // SECCOMP_RET_ALLOW
+    const EPERM: u32 = 0x0005_0000 | 1; // SECCOMP_RET_ERRNO | EPERM
+    const AF_UNIX: u32 = 1;
+    const IO_URING_SETUP: u32 = 425;
+    // (struct seccomp_data: nr at 0, arch at 4, args[0] at 16, little-endian low word.)
+    #[cfg(target_arch = "x86_64")]
+    let (arch, socket, x32): (u32, u32, u32) = (0xC000_003E, 41, 0x4000_0000);
+    #[cfg(target_arch = "aarch64")]
+    let (arch, socket, x32): (u32, u32, u32) = (0xC000_00B7, 198, u32::MAX);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    return Err("closing the network is not built for this architecture".into());
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        let op = |code, jt, jf, k| SockFilter { code, jt, jf, k };
+        // Jumps are relative: a taken jump goes to pc + 1 + jt.
+        let program = [
+            op(LD_W_ABS, 0, 0, 4),           // 0: arch
+            op(JEQ_K, 1, 0, arch),           // 1: native → 3
+            op(RET_K, 0, 0, EPERM),          // 2: foreign arch
+            op(LD_W_ABS, 0, 0, 0),           // 3: nr
+            op(JGE_K, 5, 0, x32),            // 4: x32 ABI → 10
+            op(JEQ_K, 2, 0, socket),         // 5: socket → 8
+            op(JEQ_K, 3, 0, IO_URING_SETUP), // 6: io_uring_setup → 10
+            op(RET_K, 0, 0, ALLOW),          // 7: anything else
+            op(LD_W_ABS, 0, 0, 16),          // 8: socket's family
+            op(JEQ_K, 1, 0, AF_UNIX),        // 9: AF_UNIX → 11
+            op(RET_K, 0, 0, EPERM),          // 10
+            op(RET_K, 0, 0, ALLOW),          // 11
+        ];
+        let fprog = SockFprog {
+            len: program.len() as u16,
+            filter: program.as_ptr(),
+        };
+        const PR_SET_NO_NEW_PRIVS: i32 = 38;
+        const PR_SET_SECCOMP: i32 = 22;
+        const SECCOMP_MODE_FILTER: u64 = 2;
+        // SAFETY: plain prctl calls; `fprog` and `program` outlive them, and the
+        // kernel copies the filter.
+        unsafe {
+            if prctl(PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
+                return Err(format!("no_new_privs: {}", std::io::Error::last_os_error()));
+            }
+            if prctl(
+                PR_SET_SECCOMP,
+                SECCOMP_MODE_FILTER,
+                &fprog as *const SockFprog as u64,
+                0u64,
+                0u64,
+            ) != 0
+            {
+                return Err(format!(
+                    "seccomp network filter: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn apply_enforce(
@@ -334,7 +436,7 @@ fn apply_enforce(
     );
     #[cfg(target_os = "macos")]
     {
-        apply_macos(cmd, bin, args, &spec.prepared.paths)
+        apply_macos(cmd, bin, args, &spec.prepared.paths, spec.network)
     }
     #[cfg(target_os = "linux")]
     {
@@ -681,8 +783,9 @@ fn apply_macos(
     bin: &Path,
     args: &[impl AsRef<OsStr>],
     roots: &[PathBuf],
+    network: bool,
 ) -> Result<(), SandboxError> {
-    let profile = render_seatbelt_profile(roots);
+    let profile = render_seatbelt_profile_with(roots, network);
     // Fail-closed: if sandbox-exec is missing, surface as Profile error so the
     // CLI aborts rather than silently running unrestricted.
     if !Path::new("/usr/bin/sandbox-exec").exists() {
@@ -737,6 +840,15 @@ fn preflight_macos(roots: &[PathBuf]) -> Result<(), SandboxError> {
 /// cross-compile `--target` and must not see this symbol at all).
 #[cfg(target_os = "macos")]
 fn render_seatbelt_profile(canonical_roots: &[PathBuf]) -> String {
+    render_seatbelt_profile_with(canonical_roots, true)
+}
+
+/// The same profile; without `network`, no IP traffic either way: outgoing to any
+/// IP address and binding a local IP port are denied, Unix sockets stay usable
+/// (measured on macOS 26: TCP connect, UDP send and a 127.0.0.1 bind fail with
+/// EPERM, an AF_UNIX connect succeeds).
+#[cfg(target_os = "macos")]
+fn render_seatbelt_profile_with(canonical_roots: &[PathBuf], network: bool) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("(version 1)\n");
     out.push_str("(allow default)\n");
@@ -758,6 +870,10 @@ fn render_seatbelt_profile(canonical_roots: &[PathBuf]) -> String {
     // Intentionally NO blanket `(subpath "/private/var/folders")`. Allowed
     // temp writes are the canonicalized `std::env::temp_dir()` root already
     // present in `canonical_roots` (plus the other explicit roots).
+    if !network {
+        out.push_str("(deny network-outbound (remote ip))\n");
+        out.push_str("(deny network-bind (local ip))\n");
+    }
     out
 }
 
@@ -808,6 +924,9 @@ struct LandlockFdSpec {
     root_fds: Vec<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dev_null_fd: Option<i32>,
+    /// Close the network to the real command (seccomp, before exec).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deny_network: bool,
 }
 
 /// Minimum Landlock ABI we require: V3 mediates `truncate` / `ftruncate` /
@@ -856,6 +975,7 @@ fn apply_linux(
     let fd_spec = encode_landlock_fd_spec(&LandlockFdSpec {
         root_fds: root_raw,
         dev_null_fd: null_raw,
+        deny_network: !spec.network,
     })?;
 
     let launcher = std::env::current_exe()
@@ -2081,6 +2201,7 @@ mod tests {
         let spec = LandlockFdSpec {
             root_fds: vec![7, 8, 9],
             dev_null_fd: Some(10),
+            deny_network: true,
         };
         let s = encode_landlock_fd_spec(&spec).unwrap();
         let back = decode_landlock_fd_spec(&s).unwrap();
@@ -2089,6 +2210,7 @@ mod tests {
         let spec2 = LandlockFdSpec {
             root_fds: vec![3],
             dev_null_fd: None,
+            deny_network: false,
         };
         let s2 = encode_landlock_fd_spec(&spec2).unwrap();
         assert!(

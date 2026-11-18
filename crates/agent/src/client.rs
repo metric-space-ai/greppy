@@ -10,7 +10,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::protocol::{ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, Usage};
 use crate::wire::{to_messages_request_body_with_limit, SseItem, SseParser};
@@ -101,6 +101,11 @@ pub struct Client {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    /// Further headers sent with every request (a router's provider header, for one).
+    headers: Vec<(String, String)>,
+    /// Reasoning effort the caller chose (`low`, `medium`, `high`), sent as
+    /// `output_config.effort`; none: the provider's default.
+    effort: Option<String>,
     /// Injectable stream byte cap (tests use a small value).
     stream_byte_cap: usize,
     /// Injectable stream event cap (tests use a small value).
@@ -115,6 +120,14 @@ impl std::fmt::Debug for Client {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
             .field("stream_byte_cap", &self.stream_byte_cap)
             .field("stream_event_cap", &self.stream_event_cap)
             .finish()
@@ -131,6 +144,8 @@ impl Client {
             base_url: normalize_base_url(base_url),
             model: model.to_string(),
             api_key: None,
+            headers: Vec::new(),
+            effort: None,
             stream_byte_cap: DEFAULT_STREAM_BYTE_CAP,
             stream_event_cap: DEFAULT_STREAM_EVENT_CAP,
             output_limits: Default::default(),
@@ -145,6 +160,29 @@ impl Client {
         self
     }
 
+    /// Send `name: value` with every request. A name or value that is not one
+    /// plain ASCII line is refused, so a header cannot break the request head.
+    pub fn with_header(mut self, name: &str, value: &str) -> Result<Self, String> {
+        let plain =
+            |text: &str| !text.is_empty() && text.is_ascii() && !text.contains(['\r', '\n']);
+        if !plain(name) || name.contains([':', ' ']) || !plain(value) {
+            return Err(format!("header {name:?} is not one plain line"));
+        }
+        self.headers.push((name.to_owned(), value.to_owned()));
+        Ok(self)
+    }
+
+    /// Ask every request with this reasoning effort: `low`, `medium` or `high`.
+    pub fn with_effort(mut self, effort: &str) -> Result<Self, String> {
+        if !matches!(effort, "low" | "medium" | "high") {
+            return Err(format!(
+                "reasoning effort {effort:?} is none of low, medium, high"
+            ));
+        }
+        self.effort = Some(effort.to_owned());
+        Ok(self)
+    }
+
     /// Override the SSE stream byte / event caps (tests).
     pub fn with_stream_caps(mut self, byte_cap: usize, event_cap: usize) -> Self {
         self.stream_byte_cap = byte_cap;
@@ -153,7 +191,10 @@ impl Client {
     }
 
     /// Apply the configured auth headers, if any, to a request.
-    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn authed(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in &self.headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
         match &self.api_key {
             Some(key) => req.header("x-api-key", key).bearer_auth(key),
             None => req,
@@ -210,7 +251,12 @@ impl Client {
                 req.model
             ))
         })?;
-        to_messages_request_body_with_limit(req, limit).map_err(ClientError::Transport)
+        let mut body =
+            to_messages_request_body_with_limit(req, limit).map_err(ClientError::Transport)?;
+        if let Some(effort) = &self.effort {
+            body["output_config"] = json!({ "effort": effort });
+        }
+        Ok(body)
     }
 
     /// List model ids advertised by `GET {base}/v1/models`.

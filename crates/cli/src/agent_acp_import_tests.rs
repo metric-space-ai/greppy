@@ -114,7 +114,7 @@ fn imports_retries_appends_and_restart_preserve_actual_model_history() {
     let mut model = CaptureModel { requests: vec![] };
     let calls = Arc::new(AtomicUsize::new(0));
     let mut env = CountTools(Arc::clone(&calls));
-    let result = run_agent_loop_with_history(
+    let result = greppy_agent::run_agent_loop_with_history(
         &mut model,
         &mut env,
         &AgentConfig::default()

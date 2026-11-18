@@ -204,3 +204,63 @@ fn model_discovery_preserves_auth_and_does_not_nest_runtimes() {
         );
     }
 }
+
+#[test]
+fn extra_headers_go_with_every_model_request_and_broken_ones_are_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (headers, _) = read_request(&mut stream);
+        let body = "no";
+        let response = format!(
+            "HTTP/1.1 503 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        headers.to_ascii_lowercase()
+    });
+    let client = Client::new(&format!("http://{address}"), "fixture-model")
+        .with_header("x-workjet-provider", "made-up")
+        .unwrap();
+    let result = client.stream_turn(&request(), &mut |_| {});
+    let headers = server.join().unwrap();
+    assert!(matches!(result, Err(ClientError::Http { status: 503, .. })));
+    assert!(headers.starts_with("post /v1/messages "), "{headers}");
+    assert!(
+        headers.contains("x-workjet-provider: made-up\r\n"),
+        "{headers}"
+    );
+
+    let base = Client::new("http://127.0.0.1:1", "fixture-model");
+    for (name, value) in [
+        ("x-a:b", "v"),
+        ("x-a", "v\r\nx-b: w"),
+        ("", "v"),
+        ("x-a", ""),
+    ] {
+        assert!(
+            base.clone().with_header(name, value).is_err(),
+            "{name:?}: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn a_chosen_effort_goes_with_the_request_and_none_without() {
+    let client = Client::new("http://127.0.0.1:1", "fixture-model");
+    let request = request();
+    assert!(client
+        .request_body(&request)
+        .unwrap()
+        .get("output_config")
+        .is_none());
+    let body = client
+        .clone()
+        .with_effort("high")
+        .unwrap()
+        .request_body(&request)
+        .unwrap();
+    assert_eq!(body["output_config"]["effort"], "high");
+    assert!(client.with_effort("max").is_err());
+}
