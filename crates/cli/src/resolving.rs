@@ -297,7 +297,9 @@ pub(crate) fn resolve_qualified_ids(
     let mut ids: Vec<i64> = rows
         .iter()
         .filter(|r| {
-            is_primary_label(&r.label)
+            // `SourceState::next_page` names a field as precisely as
+            // `Dock::serve` names a method.
+            is_addressable_definition_label(&r.label)
                 && (r.name.eq_ignore_ascii_case(symbol)
                     || (r.name.eq_ignore_ascii_case(member)
                         && qname_owner_segment(&r.qualified_name)

@@ -98,6 +98,11 @@ pub mod rust_queries {
         (function_item
             name: (identifier) @name) @def
 
+        (trait_item
+            body: (declaration_list
+                (function_signature_item
+                    name: (identifier) @name) @def))
+
         (struct_item
             name: (type_identifier) @name) @def
 

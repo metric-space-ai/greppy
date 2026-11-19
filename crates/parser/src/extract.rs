@@ -1453,9 +1453,16 @@ fn rust_direct_self_field_receiver(source: &[u8], callee: Node<'_>) -> Option<se
     if node_text(source, base) != "self" || field.kind() != "field_identifier" {
         return None;
     }
-    let mut ancestor = callee.parent();
+    rust_self_field_fact(source, callee, node_text(source, field))
+}
+
+/// The `direct_self_field` receiver fact for `self.<field>.method()` at `at`:
+/// the receiver is the field of the enclosing inherent impl's type. A closure
+/// inside the method still sees the method's `self`.
+fn rust_self_field_fact(source: &[u8], at: Node<'_>, field: &str) -> Option<serde_json::Value> {
+    let mut ancestor = at.parent();
     while let Some(node) = ancestor {
-        if node.kind() == "closure_expression" || node.kind() == "trait_item" {
+        if node.kind() == "trait_item" {
             return None;
         }
         if node.kind() == "function_item" {
@@ -1478,7 +1485,7 @@ fn rust_direct_self_field_receiver(source: &[u8], callee: Node<'_>) -> Option<se
                 return None;
             }
             return Some(
-                serde_json::json!({"kind":"direct_self_field", "base_type":node_text(source, ty), "field":node_text(source, field)}),
+                serde_json::json!({"kind":"direct_self_field", "base_type":node_text(source, ty), "field":field}),
             );
         }
         ancestor = node.parent();
@@ -1754,37 +1761,199 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
     None
 }
 
-/// Resolve the owner type of an unambiguous Rust receiver call when the AST
-/// carries enough local type evidence. `self.method()` inherits the enclosing
-/// impl owner; named receivers are accepted for explicitly typed parameters or
-/// locals and for locals initialized directly from a struct literal. Other
-/// inferred values deliberately return `None` so the graph resolver cannot
-/// attach the call to an unrelated same-named method.
-fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str> {
+/// Resolve the owner type of a Rust receiver call when the AST carries the
+/// evidence. `self.method()` inherits the enclosing impl owner; a named
+/// receiver takes the type of its parameter, closure parameter or `let`
+/// annotation, or of a `let` initializer whose type the syntax names (see
+/// [`rust_initializer_owner`]).
+///
+/// An owner is a type name (`Dock`) or a deferred return type the resolver
+/// looks up: `Dock::rights_of()` is "what `Dock::rights_of` returns",
+/// `make_report()` "what the function `make_report` returns". The resolver
+/// binds the call only when that type really defines the method, so an
+/// unknown owner never attaches the call to an unrelated same-named method.
+fn rust_receiver_owner(source: &[u8], callee: Node<'_>) -> Option<String> {
     let field = callee.parent()?;
     if field.kind() != "field_expression" {
         return None;
     }
     let receiver = field.child_by_field_name("value")?;
+    rust_value_owner(source, receiver, callee)
+}
+
+/// The owner type of the value expression `receiver` (see
+/// [`rust_receiver_owner`]); `at` locates the scope its names are read in.
+fn rust_value_owner(source: &[u8], receiver: Node<'_>, at: Node<'_>) -> Option<String> {
     let receiver_text = node_text(source, receiver).trim();
     if receiver_text == "self" {
-        return enclosing_impl_type(source, callee);
+        return enclosing_impl_type(source, at).map(str::to_string);
     }
     if receiver.kind() != "identifier" || receiver_text.is_empty() {
-        return rust_slice_iterator_owner(source, receiver, callee);
+        return rust_slice_iterator_owner(source, receiver, at).map(str::to_string);
     }
+    if let Some(owner) = rust_option_pattern_owner(source, at, receiver_text) {
+        return owner.map(str::to_string);
+    }
+    rust_named_value_owner(source, at, receiver_text, 0)
+}
 
-    if let Some(owner) = rust_option_pattern_owner(source, callee, receiver_text) {
+/// Smart pointers whose methods a Rust receiver reaches through `Deref`:
+/// `shown.say()` on an `Arc<Shown>` calls `Shown::say`.
+fn rust_deref_wrapper(name: &str) -> bool {
+    matches!(name, "Arc" | "Rc" | "Box" | "Pin" | "Cow")
+}
+
+/// The type whose methods a receiver of type `ty` calls: references and the
+/// `Deref` wrappers above are transparent, `Self` is the enclosing impl type,
+/// and `dyn Trait` / `impl Trait` name the trait.
+fn rust_receiver_type_owner<'a>(source: &'a [u8], ty: Node<'_>, at: Node<'_>) -> Option<&'a str> {
+    let mut names = Vec::new();
+    type_identifiers_in(source, ty, &mut names);
+    let owner = names.into_iter().find(|name| !rust_deref_wrapper(name))?;
+    if owner == "Self" {
+        return enclosing_impl_type(source, at);
+    }
+    Some(owner)
+}
+
+/// Methods that hand back their receiver's value, unwrapped or converted
+/// error-side only: the owner of `x.unwrap()` is the owner of `x`'s payload.
+fn rust_payload_preserving_method(name: &str) -> bool {
+    matches!(
+        name,
+        "unwrap"
+            | "expect"
+            | "clone"
+            | "cloned"
+            | "unwrap_or_default"
+            | "map_err"
+            | "context"
+            | "with_context"
+            | "ok_or"
+            | "ok_or_else"
+            | "to_owned"
+    )
+}
+
+/// The owner type of a `let` initializer: a struct literal, `Type::f(..)`,
+/// `recv.method(..)` on a receiver of known owner, a free `function(..)`
+/// (the last three deferred to their declared return type), another local,
+/// through `.await`, `?`, `&` and the payload-preserving methods above, and
+/// through `Arc::new(..)` / `Arc::clone(..)` / `Box::pin(..)`.
+fn rust_initializer_owner(
+    source: &[u8],
+    value: Node<'_>,
+    at: Node<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    match value.kind() {
+        "try_expression"
+        | "await_expression"
+        | "parenthesized_expression"
+        | "reference_expression" => {
+            let inner = value
+                .child_by_field_name("value")
+                .or_else(|| value.named_child(0))?;
+            rust_initializer_owner(source, inner, at, depth + 1)
+        }
+        "struct_expression" => {
+            let type_node = value
+                .child_by_field_name("name")
+                .or_else(|| value.named_child(0))?;
+            rust_receiver_type_owner(source, type_node, at).map(str::to_string)
+        }
+        "identifier" => {
+            let name = node_text(source, value);
+            if name == "self" {
+                return enclosing_impl_type(source, at).map(str::to_string);
+            }
+            rust_named_value_owner(source, value, name, depth + 1)
+        }
+        "self" => enclosing_impl_type(source, at).map(str::to_string),
+        // `let source = match check_source(..).await { Ok(source) => source,
+        // Err(..) => .. }`: the bound value is the scrutinee's payload, which
+        // the resolver unwraps from the declared `Result`/`Option`.
+        "match_expression" => {
+            let scrutinee = value.child_by_field_name("value")?;
+            let owner = rust_initializer_owner(source, scrutinee, at, depth + 1)?;
+            owner.ends_with("()").then_some(owner)
+        }
+        "call_expression" => {
+            let function = value.child_by_field_name("function")?;
+            let arguments = value.child_by_field_name("arguments");
+            match function.kind() {
+                "field_expression" => {
+                    let method = node_text(source, function.child_by_field_name("field")?);
+                    let receiver = function.child_by_field_name("value")?;
+                    if rust_payload_preserving_method(method) {
+                        return rust_initializer_owner(source, receiver, at, depth + 1);
+                    }
+                    // What the receiver's method returns; one level only.
+                    let owner = match receiver.kind() {
+                        "self" => enclosing_impl_type(source, at).map(str::to_string),
+                        "identifier" if node_text(source, receiver) == "self" => {
+                            enclosing_impl_type(source, at).map(str::to_string)
+                        }
+                        "identifier" => rust_named_value_owner(
+                            source,
+                            receiver,
+                            node_text(source, receiver),
+                            depth + 1,
+                        ),
+                        _ => None,
+                    }?;
+                    (!owner.ends_with("()")).then(|| format!("{owner}::{method}()"))
+                }
+                "scoped_identifier" => {
+                    let path = function.child_by_field_name("path")?;
+                    let name = node_text(source, function.child_by_field_name("name")?);
+                    let owner = node_text(source, path).rsplit("::").next()?.trim();
+                    let first_argument = arguments.and_then(|arguments| arguments.named_child(0));
+                    if rust_deref_wrapper(owner) {
+                        // `Arc::new(x)`, `Arc::clone(&x)`, `Box::pin(x)`.
+                        return rust_initializer_owner(source, first_argument?, at, depth + 1);
+                    }
+                    let owner = if owner == "Self" {
+                        enclosing_impl_type(source, at)?
+                    } else {
+                        owner
+                    };
+                    owner
+                        .chars()
+                        .next()
+                        .is_some_and(|first| first.is_ascii_uppercase())
+                        .then(|| format!("{owner}::{name}()"))
+                }
+                "identifier" => {
+                    let name = node_text(source, function);
+                    // A local closure is not the function of that name.
+                    (!rust_usage_has_local_value_binding(source, function, name))
+                        .then(|| format!("{name}()"))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The owner of a local value named `name`, visible at `at`: the nearest
+/// `let` (explicit type, or an initializer [`rust_initializer_owner`]
+/// understands), an enclosing closure parameter, or a function parameter.
+fn rust_named_value_owner(source: &[u8], at: Node<'_>, name: &str, depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let (found, owner) = rust_local_binding_owner_at(source, at, name, depth);
+    if found {
         return owner;
     }
-    let mut ancestor = field.parent();
+    let mut ancestor = at.parent();
     while let Some(node) = ancestor {
         if node.kind() == "function_item" {
-            let (local_found, local_owner) =
-                rust_local_binding_owner(source, callee, receiver_text);
-            if local_found {
-                return local_owner;
-            }
             let parameters = node.child_by_field_name("parameters")?;
             for index in 0..parameters.named_child_count() {
                 let Some(parameter) = parameters.named_child(index) else {
@@ -1796,13 +1965,12 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
                 let Some(pattern) = parameter.child_by_field_name("pattern") else {
                     continue;
                 };
-                if node_text(source, pattern).trim() != receiver_text {
+                let text = node_text(source, pattern).trim();
+                if text != name && text.strip_prefix("mut ").map(str::trim) != Some(name) {
                     continue;
                 }
                 let ty = parameter.child_by_field_name("type")?;
-                let mut names = Vec::new();
-                type_identifiers_in(source, ty, &mut names);
-                return names.into_iter().next();
+                return rust_receiver_type_owner(source, ty, at).map(str::to_string);
             }
             return None;
         }
@@ -1811,19 +1979,52 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
     None
 }
 
-/// Return the nearest preceding local binding whose owner is explicit in the
-/// syntax. A type annotation is authoritative; a struct literal also names its
-/// constructed type directly. Calls and arbitrary expressions are excluded
-/// because their return type would require semantic type inference.
-fn rust_local_binding_owner<'a>(
-    source: &'a [u8],
+/// Return the nearest preceding local binding of `receiver_name` visible at
+/// `callee`: `(true, owner)` when one binds the name (its owner when the
+/// syntax reveals it), `(false, None)` when none does.
+fn rust_local_binding_owner_at(
+    source: &[u8],
     callee: Node<'_>,
     receiver_name: &str,
-) -> (bool, Option<&'a str>) {
+    depth: usize,
+) -> (bool, Option<String>) {
     let mut ancestor = callee.parent();
     while let Some(node) = ancestor {
         if node.kind() == "function_item" {
             break;
+        }
+        if node.kind() == "closure_expression" {
+            // A closure parameter shadows every outer binding of its name.
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                for index in 0..parameters.named_child_count() {
+                    let Some(parameter) = parameters.named_child(index) else {
+                        continue;
+                    };
+                    let (pattern, ty) = if parameter.kind() == "parameter" {
+                        (
+                            parameter.child_by_field_name("pattern"),
+                            parameter.child_by_field_name("type"),
+                        )
+                    } else {
+                        (Some(parameter), None)
+                    };
+                    let Some(pattern) = pattern else {
+                        continue;
+                    };
+                    let text = node_text(source, pattern).trim();
+                    if text == receiver_name
+                        || text.strip_prefix("mut ").map(str::trim) == Some(receiver_name)
+                    {
+                        let owner = ty
+                            .and_then(|ty| rust_receiver_type_owner(source, ty, node))
+                            .map(str::to_string);
+                        return (true, owner);
+                    }
+                    if rust_pattern_binds(source, pattern, receiver_name) {
+                        return (true, None);
+                    }
+                }
+            }
         }
         if node.kind() == "block" {
             // Only direct statements in this lexical block are visible here.
@@ -1836,37 +2037,48 @@ fn rust_local_binding_owner<'a>(
                 if binding.end_byte() > callee.start_byte() || binding.kind() != "let_declaration" {
                     continue;
                 }
-                let matches_receiver = binding
-                    .child_by_field_name("pattern")
-                    .is_some_and(|pattern| node_text(source, pattern).trim() == receiver_name);
+                let Some(pattern) = binding.child_by_field_name("pattern") else {
+                    continue;
+                };
+                let pattern_text = node_text(source, pattern).trim();
+                let matches_receiver = pattern_text == receiver_name
+                    || pattern_text.strip_prefix("mut ").map(str::trim) == Some(receiver_name);
                 if !matches_receiver {
+                    // A destructuring `let (a, b) = …` still shadows the name.
+                    if rust_pattern_binds(source, pattern, receiver_name) {
+                        return (true, None);
+                    }
                     continue;
                 }
                 if let Some(ty) = binding.child_by_field_name("type") {
-                    let mut names = Vec::new();
-                    type_identifiers_in(source, ty, &mut names);
-                    return (true, names.into_iter().next());
+                    let owner = rust_receiver_type_owner(source, ty, binding).map(str::to_string);
+                    return (true, owner);
                 }
-                if let Some(value) = binding.child_by_field_name("value") {
-                    if value.kind() == "struct_expression" {
-                        let type_node = value
-                            .child_by_field_name("name")
-                            .or_else(|| value.named_child(0));
-                        if let Some(type_node) = type_node {
-                            let mut names = Vec::new();
-                            type_identifiers_in(source, type_node, &mut names);
-                            return (true, names.into_iter().next());
-                        }
-                    }
-                }
-                // A local binding shadows any parameter of the same name, but
-                // its arbitrary initializer does not reveal a safe owner.
-                return (true, None);
+                let owner = binding
+                    .child_by_field_name("value")
+                    .and_then(|value| rust_initializer_owner(source, value, binding, depth + 1));
+                return (true, owner);
             }
         }
         ancestor = node.parent();
     }
     (false, None)
+}
+
+/// True when the pattern `pattern` binds the value name `name` (identifiers
+/// and shorthand fields; constructor paths and field labels do not bind).
+fn rust_pattern_binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+    if matches!(pattern.kind(), "identifier" | "shorthand_field_identifier") {
+        return node_text(source, pattern) == name;
+    }
+    let constructor = pattern.child_by_field_name("type");
+    let field_label = (pattern.kind() == "field_pattern")
+        .then(|| pattern.child_by_field_name("name"))
+        .flatten();
+    (0..pattern.named_child_count())
+        .filter_map(|index| pattern.named_child(index))
+        .filter(|child| Some(*child) != constructor && Some(*child) != field_label)
+        .any(|child| rust_pattern_binds(source, child, name))
 }
 
 /// Walk `node`'s ancestors and return the qname of the nearest enclosing
@@ -2232,7 +2444,19 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
         if n.kind() == "call_expression" && !nearest_call_seen {
             nearest_call_seen = true;
             if rust_node_is_call_target(node, n) {
-                return true;
+                // `state.next_page.map(..)` calls `map`; `next_page` is a
+                // field read on the way to the receiver, not the callee.
+                let receiver_field = node.kind() == "field_identifier"
+                    && n.child_by_field_name("function").is_some_and(|function| {
+                        function.kind() == "field_expression"
+                            && function
+                                .child_by_field_name("field")
+                                .map(|field| field.id())
+                                != Some(node.id())
+                    });
+                if !receiver_field {
+                    return true;
+                }
             }
         }
         if n.kind() == "macro_invocation" {
@@ -2280,7 +2504,10 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
         {
             break;
         }
-        if matches!(parent.kind(), "let_declaration" | "let_condition") {
+        if matches!(
+            parent.kind(),
+            "let_declaration" | "let_condition" | "for_expression"
+        ) {
             if parent
                 .child_by_field_name("pattern")
                 .is_some_and(|pattern| node_contains(pattern, reference))
@@ -2288,6 +2515,9 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
                 return true;
             }
             break;
+        }
+        if parent.kind() == "closure_parameters" {
+            return true;
         }
         if matches!(
             parent.kind(),
@@ -2320,9 +2550,14 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
                     let Some(parameter) = parameters.named_child(index) else {
                         continue;
                     };
-                    let pattern = parameter
-                        .child_by_field_name("pattern")
-                        .or_else(|| (parameter.kind() == "identifier").then_some(parameter));
+                    // A closure parameter is a bare pattern: `|x|`, but also
+                    // `|(name, secret)|` or `|Item { id, .. }|`.
+                    let pattern = parameter.child_by_field_name("pattern").or_else(|| {
+                        (parameter.kind() == "identifier"
+                            || (scope.kind() == "closure_expression"
+                                && parameter.kind() != "parameter"))
+                            .then_some(parameter)
+                    });
                     if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
                         return true;
                     }
@@ -4807,6 +5042,406 @@ fn rust_expression_macro_has_local_type_binding(
     false
 }
 
+/// Standard macros whose arguments are ordinary expressions. Their direct
+/// calls are recovered by reparsing the arguments as an expression list
+/// ([`rust_expression_macro_calls`]).
+const RUST_EXPRESSION_MACROS: &[&str] = &[
+    "ensure",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "format",
+    "format_args",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "write",
+    "writeln",
+];
+
+/// True when [`rust_expression_macro_calls`] reparses this invocation (a
+/// standard expression macro whose name is not rebound in the file).
+fn rust_expression_macro_admitted(
+    path: &str,
+    shadowed: &std::collections::HashSet<String>,
+) -> bool {
+    if let Some((owner, name)) = path.rsplit_once("::") {
+        !shadowed.contains(owner)
+            && ((owner == "anyhow" && name == "ensure")
+                || (matches!(owner, "std" | "core") && RUST_EXPRESSION_MACROS.contains(&name)))
+    } else {
+        RUST_EXPRESSION_MACROS.contains(&path) && !shadowed.contains(path)
+    }
+}
+
+/// Macros of well-known crates whose token trees are ordinary Rust code:
+/// expressions, `pattern = future => handler` arms, JSON values or format
+/// arguments. Custom macros (`macro_rules!`, unknown crates) define their own
+/// syntax, so their tokens are never read as calls.
+const RUST_TOKEN_MACRO_CRATES: &[(&str, &[&str])] = &[
+    ("tokio", &["select", "join", "try_join", "pin"]),
+    (
+        "futures",
+        &["select", "select_biased", "join", "try_join", "pin_mut"],
+    ),
+    ("serde_json", &["json"]),
+    (
+        "tracing",
+        &[
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "event",
+            "span",
+            "info_span",
+            "debug_span",
+        ],
+    ),
+    ("log", &["trace", "debug", "info", "warn", "error", "log"]),
+    ("anyhow", &["anyhow", "bail", "ensure", "format_err"]),
+];
+
+/// Standard macros (prelude) whose arguments are expressions.
+const RUST_TOKEN_MACRO_STD: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "format",
+    "format_args",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "write",
+    "writeln",
+    "vec",
+    "matches",
+    "dbg",
+    "panic",
+    "todo",
+    "unreachable",
+    "unimplemented",
+];
+
+/// Decide per invocation path whether [`rust_macro_token_edges`] may read
+/// its tokens: a standard expression macro or a listed crate's macro, under
+/// a name no local `macro_rules!`, module or rebinding import shadows.
+fn rust_token_macros_admitted<'s>(
+    source: &'s [u8],
+    root: Node<'_>,
+    shadowed: &'s std::collections::HashSet<String>,
+) -> impl Fn(&str) -> bool + 's {
+    // Bare macro names imported from a listed crate (`use tokio::select;`).
+    let mut crate_imports: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut local_macros = std::collections::HashSet::new();
+    let mut scan = vec![root];
+    while let Some(node) = scan.pop() {
+        if node.kind() == "macro_definition" {
+            if let Some(name) = node.child_by_field_name("name") {
+                local_macros.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "use_declaration" {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                for import in expand_use_tree(source, argument, "") {
+                    if !import.is_glob {
+                        crate_imports.insert(import.imported_name, import.path);
+                    }
+                }
+            }
+        }
+        scan.extend(node.named_children(&mut node.walk()));
+    }
+    let listed = |krate: &str, name: &str| {
+        RUST_TOKEN_MACRO_CRATES
+            .iter()
+            .any(|(listed, names)| *listed == krate && names.contains(&name))
+    };
+    move |path: &str| {
+        let path = path.trim_start_matches("::");
+        match path.split_once("::") {
+            Some((krate, rest)) => {
+                let name = rest.rsplit("::").next().unwrap_or(rest);
+                if shadowed.contains(krate) {
+                    return false;
+                }
+                listed(krate, name)
+                    || (matches!(krate, "std" | "core") && RUST_TOKEN_MACRO_STD.contains(&name))
+            }
+            None => {
+                if local_macros.contains(path) {
+                    return false;
+                }
+                match crate_imports.get(path) {
+                    Some(imported) => imported.split_once("::").is_some_and(|(krate, rest)| {
+                        let name = rest.rsplit("::").next().unwrap_or(rest);
+                        listed(krate, name)
+                            || (matches!(krate, "std" | "core")
+                                && RUST_TOKEN_MACRO_STD.contains(&name))
+                    }),
+                    // `#[macro_use]` or the prelude.
+                    None => {
+                        RUST_TOKEN_MACRO_STD.contains(&path)
+                            || RUST_TOKEN_MACRO_CRATES
+                                .iter()
+                                .any(|(_, names)| names.contains(&path))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Calls and plain argument references inside macro token trees, which
+/// tree-sitter does not parse into expressions: `tokio::select!` arms,
+/// `tokio::join!`, `json!` and any other macro. The scan reads the token
+/// stream: `name(…)` is a call, `recv.name(…)` a method call on `recv`,
+/// `a::b::name(…)` a path call. A method receiver that is a local or
+/// parameter gets the owner its binding names; `self.field.name(…)` gets the
+/// same field fact as outside a macro. Direct calls of macros that
+/// [`rust_expression_macro_calls`] already reparses are left to it.
+fn rust_macro_token_edges(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    free_function_qnames: &std::collections::HashMap<usize, String>,
+) -> Vec<ExtractedEdge> {
+    let shadowed =
+        rust_expression_macro_shadowed_bindings(source, root, RUST_EXPRESSION_MACROS, false);
+    let admitted = rust_token_macros_admitted(source, root, &shadowed);
+    let mut edges = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "macro_invocation"
+            && node
+                .child_by_field_name("macro")
+                .is_some_and(|name| admitted(node_text(source, name)))
+        {
+            let tokens = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "token_tree");
+            let name = node
+                .child_by_field_name("macro")
+                .map(|name| node_text(source, name))
+                .unwrap_or("");
+            let caller = enclosing_function_qname(source, node, file_path, free_function_qnames);
+            if let (Some(tokens), Some(caller)) = (tokens, caller) {
+                let reparsed = rust_expression_macro_admitted(name, &shadowed);
+                let mut scan = vec![tokens];
+                while let Some(tree) = scan.pop() {
+                    let children: Vec<Node<'_>> = (0..tree.child_count())
+                        .filter_map(|index| tree.child(index))
+                        .collect();
+                    for (index, child) in children.iter().enumerate() {
+                        if child.kind() == "token_tree" {
+                            scan.push(*child);
+                            continue;
+                        }
+                        if child.kind() != "identifier" {
+                            continue;
+                        }
+                        let text = node_text(source, *child);
+                        if is_rust_keyword_or_self(text) {
+                            continue;
+                        }
+                        let previous = index.checked_sub(1).map(|i| children[i]);
+                        let next = children.get(index + 1).copied();
+                        // Keywords may surface as identifier tokens inside a
+                        // token tree, so compare token text, not node kinds.
+                        let previous_kind = previous.map(|n| node_text(source, n)).unwrap_or("");
+                        let is_call = next.is_some_and(|next| {
+                            next.kind() == "token_tree" && node_text(source, next).starts_with('(')
+                        });
+                        let line = child.start_position().row as u32 + 1;
+                        if !is_call && previous_kind == "." {
+                            // `source.article_type` inside `json!(..)`: a field
+                            // read, owned by the receiver's type when known.
+                            let receiver = index.checked_sub(2).map(|i| children[i]);
+                            let chained = index
+                                .checked_sub(3)
+                                .is_some_and(|i| node_text(source, children[i]) == ".");
+                            let mut properties = serde_json::json!({
+                                "ref_name": text,
+                                "rust_field_access": true,
+                            });
+                            let owner = match receiver {
+                                Some(receiver)
+                                    if !chained && node_text(source, receiver) == "self" =>
+                                {
+                                    enclosing_impl_type(source, node).map(str::to_string)
+                                }
+                                Some(receiver) if !chained && receiver.kind() == "identifier" => {
+                                    rust_named_value_owner(
+                                        source,
+                                        node,
+                                        node_text(source, receiver),
+                                        0,
+                                    )
+                                }
+                                _ => None,
+                            };
+                            if let Some(owner) = owner {
+                                let key = if owner.ends_with("()") {
+                                    "receiver_return_of"
+                                } else {
+                                    "receiver_owner"
+                                };
+                                properties[key] = serde_json::json!(owner);
+                            }
+                            edges.push(ExtractedEdge {
+                                edge_type: "USAGE".into(),
+                                source_qualified_name: caller.clone(),
+                                target_qualified_name: format!("{file_path}::__ref__::{text}"),
+                                file_path: file_path.to_string(),
+                                line,
+                                properties,
+                            });
+                            continue;
+                        }
+                        if !is_call {
+                            // A bare argument (`serve(&kinds, carry_out)`) is a
+                            // reference to the named value or function.
+                            let next_kind = next.map(|n| node_text(source, n)).unwrap_or(")");
+                            if matches!(previous_kind, "(" | "," | "&")
+                                && matches!(next_kind, ")" | ",")
+                            {
+                                let mut properties = serde_json::json!({ "ref_name": text });
+                                if rust_usage_has_local_value_binding(source, node, text) {
+                                    properties["ref_local_binding"] = serde_json::json!(true);
+                                }
+                                edges.push(ExtractedEdge {
+                                    edge_type: "USAGE".into(),
+                                    source_qualified_name: caller.clone(),
+                                    target_qualified_name: format!("{file_path}::__ref__::{text}"),
+                                    file_path: file_path.to_string(),
+                                    line,
+                                    properties,
+                                });
+                            }
+                            continue;
+                        }
+                        if matches!(
+                            previous_kind,
+                            "fn" | "struct" | "enum" | "!" | "macro_rules"
+                        ) {
+                            continue;
+                        }
+                        let mut properties = serde_json::json!({
+                            "callee_text": text,
+                            "callee_name": text,
+                            "rust_macro_tokens": name,
+                        });
+                        if previous_kind == "." {
+                            properties["callee_form"] = serde_json::json!("receiver");
+                            let receiver = index.checked_sub(2).map(|i| children[i]);
+                            let before_receiver = index.checked_sub(3).map(|i| children[i]);
+                            let chained =
+                                before_receiver.is_some_and(|n| node_text(source, n) == ".");
+                            match receiver {
+                                Some(receiver)
+                                    if node_text(source, receiver) == "self" && !chained =>
+                                {
+                                    if let Some(owner) = enclosing_impl_type(source, node) {
+                                        properties["receiver_owner"] = serde_json::json!(owner);
+                                    }
+                                }
+                                Some(receiver) if receiver.kind() == "identifier" && !chained => {
+                                    let receiver = node_text(source, receiver);
+                                    if let Some(owner) =
+                                        rust_named_value_owner(source, node, receiver, 0)
+                                    {
+                                        let key = if owner.ends_with("()") {
+                                            "receiver_return_of"
+                                        } else {
+                                            "receiver_owner"
+                                        };
+                                        properties[key] = serde_json::json!(owner);
+                                    }
+                                }
+                                Some(receiver)
+                                    if receiver.kind() == "identifier"
+                                        && index.checked_sub(4).is_some_and(|i| {
+                                            node_text(source, children[i]) == "self"
+                                        }) =>
+                                {
+                                    let base = index.checked_sub(4).map(|i| children[i]);
+                                    let base_is_self = base
+                                        .is_some_and(|n| node_text(source, n) == "self")
+                                        && index
+                                            .checked_sub(5)
+                                            .map(|i| node_text(source, children[i]) != ".")
+                                            .unwrap_or(true);
+                                    if base_is_self {
+                                        if let Some(fact) = rust_self_field_fact(
+                                            source,
+                                            node,
+                                            node_text(source, receiver),
+                                        ) {
+                                            properties["receiver_provenance"] = fact;
+                                        }
+                                    }
+                                }
+                                // A computed receiver (`format!(..).is_empty()`,
+                                // `a.b().c()`) has no type evidence here.
+                                _ => continue,
+                            }
+                        } else {
+                            if reparsed {
+                                continue;
+                            }
+                            properties["callee_form"] = serde_json::json!("direct");
+                            if previous_kind == "::" {
+                                let mut start = index;
+                                while start >= 2
+                                    && node_text(source, children[start - 1]) == "::"
+                                    && (children[start - 2].kind() == "identifier"
+                                        || matches!(
+                                            node_text(source, children[start - 2]),
+                                            "crate" | "super" | "self"
+                                        ))
+                                {
+                                    start -= 2;
+                                }
+                                let path = children[start..=index]
+                                    .iter()
+                                    .map(|n| node_text(source, *n))
+                                    .collect::<String>();
+                                if start == index {
+                                    continue;
+                                }
+                                properties["callee_path"] = serde_json::json!(path);
+                            } else if rust_usage_has_local_value_binding(source, node, text) {
+                                // A local closure, not a function of the same name.
+                                continue;
+                            }
+                        }
+                        edges.push(ExtractedEdge {
+                            edge_type: "CALLS".into(),
+                            source_qualified_name: caller.clone(),
+                            target_qualified_name: format!("{file_path}::Function::{text}"),
+                            file_path: file_path.to_string(),
+                            line,
+                            properties,
+                        });
+                    }
+                }
+            }
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    edges
+}
+
 fn rust_expression_macro_calls(
     source: &[u8],
     root: Node<'_>,
@@ -4814,23 +5449,7 @@ fn rust_expression_macro_calls(
     free_function_qnames: &std::collections::HashMap<usize, String>,
 ) -> greppy_core::Result<Vec<ExtractedEdge>> {
     const PREFIX: &str = "async fn __greppy_macro_arguments__() { let _ = (";
-    const MACROS: &[&str] = &[
-        "ensure",
-        "assert",
-        "assert_eq",
-        "assert_ne",
-        "debug_assert",
-        "debug_assert_eq",
-        "debug_assert_ne",
-        "format",
-        "format_args",
-        "print",
-        "println",
-        "eprint",
-        "eprintln",
-        "write",
-        "writeln",
-    ];
+    const MACROS: &[&str] = RUST_EXPRESSION_MACROS;
     let queries = crate::query::cached_query_set(&Language::Rust)
         .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
     let shadowed = rust_expression_macro_shadowed_bindings(source, root, MACROS, false);
@@ -5146,7 +5765,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 let text = node_text(source, node);
                 let label = match node.parent().map(|p| p.kind()) {
                     Some(k) => match k {
-                        "function_item" => {
+                        // A required trait method (`fn admits(&self) -> bool;`)
+                        // is the method every `dyn Trait` call names.
+                        "function_item" | "function_signature_item" => {
                             let impl_ctx = enclosing_impl_type(source, node);
                             // Free function vs. method: we label
                             // methods "Method" to make the type
@@ -5248,6 +5869,23 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 if mods.is_const {
                     properties.insert("is_const".into(), serde_json::Value::Bool(true));
                 }
+                // A method of `impl Trait for Type` is reached through every
+                // call of the trait's method on a `dyn Trait` / generic value.
+                if label == "Method" {
+                    let trait_impl = def_node
+                        .parent()
+                        .and_then(|list| list.parent())
+                        .filter(|item| item.kind() == "impl_item")
+                        .and_then(|item| item.child_by_field_name("trait"))
+                        .map(|name| impl_type_name(source, name))
+                        .filter(|name| !name.is_empty());
+                    if let Some(trait_name) = trait_impl {
+                        properties.insert(
+                            "rust_trait_impl".into(),
+                            serde_json::Value::String(trait_name.to_string()),
+                        );
+                    }
+                }
                 if let Some((module, module_vis)) = rust_enclosing_inline_modules(source, def_node)
                 {
                     properties.insert(
@@ -5264,7 +5902,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 // BOUND edges for each generic constraint. Captures the
                 // signature/params/return type on `function_item`.
                 if matches!(label.as_str(), "Method" | "Function")
-                    && def_node.kind() == "function_item"
+                    && matches!(def_node.kind(), "function_item" | "function_signature_item")
                 {
                     if let Some(sig) = signature_info(source, def_node) {
                         properties
@@ -5451,7 +6089,13 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         rust_option_pattern_owner(source, node, node_text(source, receiver))
                             .is_some()
                     });
-                let receiver_owner = rust_receiver_owner(source, node);
+                let inferred_owner = rust_receiver_owner(source, node);
+                // A type the syntax names outright; a deferred return-type
+                // owner (`Dock::rights_of()`) is only used where the factory
+                // and field facts below do not already describe the receiver.
+                let receiver_owner = inferred_owner
+                    .as_deref()
+                    .filter(|owner| !owner.ends_with("()"));
                 let receiver_factory_pattern = (callee_form == "receiver"
                     && receiver_owner.is_none())
                 .then(|| node.parent()?.child_by_field_name("value"))
@@ -5493,6 +6137,14 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             .or_else(|| rust_typed_field_chain_receiver(source, node))
                     })
                     .flatten();
+                let receiver_return_of = inferred_owner
+                    .as_deref()
+                    .filter(|owner| owner.ends_with("()"))
+                    .filter(|_| {
+                        callee_form == "receiver"
+                            && receiver_factory_pattern.is_none()
+                            && receiver_provenance.is_none()
+                    });
                 // The scoped path a direct call names (`store::f` for
                 // `store::f()`), so the indexer can honour an explicit module
                 // over a same-named function in the caller's own file.
@@ -5550,6 +6202,16 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             {
                                 object.insert(
                                     "receiver_owner".into(),
+                                    serde_json::Value::String(owner.to_string()),
+                                );
+                            }
+                            if let (Some(owner), Some(object)) =
+                                (receiver_return_of, properties.as_object_mut())
+                            {
+                                // The receiver is what this call returns:
+                                // the resolver reads its declared return type.
+                                object.insert(
+                                    "receiver_return_of".into(),
                                     serde_json::Value::String(owner.to_string()),
                                 );
                             }
@@ -5611,6 +6273,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
         file_path,
         &free_function_qnames,
     )?);
+    result.edges.extend(rust_macro_token_edges(
+        source,
+        tree.root_node(),
+        file_path,
+        &free_function_qnames,
+    ));
 
     // PASS 4+5 — usages (the unified reference model). There are NO separate
     // `TYPE_REF`/`USES` passes: every non-call, non-import identifier
@@ -5665,6 +6333,27 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         // Keep the raw reference, but never bind a proven local
                         // value to a same-named module function or type.
                         properties["ref_local_binding"] = serde_json::json!(true);
+                    }
+                    // A field read (`rights.may_lead`) names the field of the
+                    // receiver's type: record that type for the resolver.
+                    if let Some(access) = node.parent().filter(|parent| {
+                        node.kind() == "field_identifier"
+                            && parent.kind() == "field_expression"
+                            && parent.child_by_field_name("field").map(|field| field.id())
+                                == Some(node.id())
+                    }) {
+                        properties["rust_field_access"] = serde_json::json!(true);
+                        if let Some(owner) = access
+                            .child_by_field_name("value")
+                            .and_then(|value| rust_value_owner(source, value, node))
+                        {
+                            let key = if owner.ends_with("()") {
+                                "receiver_return_of"
+                            } else {
+                                "receiver_owner"
+                            };
+                            properties[key] = serde_json::json!(owner);
+                        }
                     }
                     if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
                         if rust_usage_has_local_type_binding(
@@ -19864,16 +20553,20 @@ fn plain() {}
             }
         "#;
         let r = extract(Language::Rust, SRC.as_bytes(), "src/lib.rs").unwrap();
-        let speak = r
+        let speak: Vec<_> = r
             .nodes
             .iter()
-            .find(|n| n.name == "speak" && n.label == "Method")
-            .expect("speak method node must exist");
-        assert_eq!(
-            speak.qualified_name, "src/lib.rs::Dog::speak",
-            "trait-impl method must be owned by the implementing type Dog, got {}",
-            speak.qualified_name
+            .filter(|n| n.name == "speak" && n.label == "Method")
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        // The implementation is owned by Dog; the trait's required method is
+        // a definition of its own, owned by the trait.
+        assert!(
+            speak.contains(&"src/lib.rs::Dog::speak"),
+            "trait-impl method must be owned by the implementing type Dog, got {speak:?}"
         );
+        assert!(speak.contains(&"src/lib.rs::Animal::speak"), "{speak:?}");
+        assert_eq!(speak.len(), 2, "{speak:?}");
     }
 
     // ---- inheritance: enum variants ----
