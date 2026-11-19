@@ -1798,8 +1798,20 @@ fn resolve_and_persist_edges_with_progress_and_preserved(
         edges,
         progress,
         preserved_overlay_edges,
-        false,
+        EdgePersistence::Insert,
     )
+}
+
+/// How the resolved edges of a run reach the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgePersistence {
+    /// Upsert every resolved edge; the caller has removed what must go.
+    Insert,
+    /// Replace the Rust-sourced reference edges of a single store.
+    ReplaceRust,
+    /// The run resolved every raw edge of the project: make the stored
+    /// reference edges equal that result by writing only the differences.
+    Reconcile,
 }
 
 fn resolve_edges_with_replacement(
@@ -1808,7 +1820,7 @@ fn resolve_edges_with_replacement(
     edges: &[ExtractedEdge],
     progress: &mut dyn FnMut(IndexBuildProgress),
     preserved_overlay_edges: &[NewOverlayEdge],
-    replace_single_rust_edges: bool,
+    persistence: EdgePersistence,
 ) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
@@ -2069,11 +2081,13 @@ fn resolve_edges_with_replacement(
         let mut logical = preserved_overlay_edges.to_vec();
         logical.extend(resolved_logical);
         store.replace_overlay_edges(project, &logical)?;
+    } else if persistence == EdgePersistence::Reconcile {
+        reconcile_resolved_edges(store, project, &resolved)?;
     } else {
         persist_edges_batched(
             store,
             &resolved,
-            replace_single_rust_edges.then_some(project),
+            (persistence == EdgePersistence::ReplaceRust).then_some(project),
         )?;
     }
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![anyhow_factory_repair_key(project),index.anyhow_dependency_binding]).map_err(sqlite_err)?;
@@ -3568,7 +3582,14 @@ pub fn rebuild_single_store_rust_edges(store: &mut Store, project: &str) -> Resu
         }
     }
     note_reresolved(rust_edges.len());
-    resolve_edges_with_replacement(store, project, &rust_edges, &mut |_| {}, &[], true)
+    resolve_edges_with_replacement(
+        store,
+        project,
+        &rust_edges,
+        &mut |_| {},
+        &[],
+        EdgePersistence::ReplaceRust,
+    )
 }
 
 /// Rebuild the complete bounded logical edge contribution of a private
@@ -3921,24 +3942,23 @@ fn resolve_edges_incremental(
     if &def_fp_after != def_fp_before {
         // The resolvable def set changed: a name referenced by an UNCHANGED
         // file may now be ambiguous (or newly resolvable), so its SURVIVING
-        // resolved edge could be stale. `resolve_and_persist_edges` is
-        // insert-only and would leave that stale edge in place, diverging from
-        // a full reindex. Clear ALL of the project's resolved edges first, then
-        // re-resolve from scratch so the result is byte-identical to a full
-        // first run (the incremental == full correctness invariant).
-        store
-            .conn()
-            .execute(
-                "DELETE FROM main.edges WHERE project = ?1",
-                rusqlite::params![project],
-            )
-            .map_err(sqlite_err)?;
-        profile_step("incremental: definitions changed, all edges deleted", step);
+        // resolved edge could be stale. Resolve every raw edge again — the
+        // result is by construction that of a full first run — but write
+        // only what differs from the stored edges. Deleting and re-inserting
+        // a million unchanged rows (and the structural edges with them) cost
+        // more than the resolution itself.
         let step = std::time::Instant::now();
         let raw_edges = load_all_raw_edges(store, project)?;
         profile_step("incremental: load all raw edges", step);
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
+        return resolve_edges_with_replacement(
+            store,
+            project,
+            &raw_edges,
+            progress,
+            &[],
+            EdgePersistence::Reconcile,
+        );
     }
 
     // ── Pure body edit(s): def set unchanged. Re-resolve only the cascaded
@@ -4665,6 +4685,124 @@ fn merge_edge_sites(edges: &[NewEdge]) -> Vec<std::borrow::Cow<'_, NewEdge>> {
         merged.push(std::borrow::Cow::Owned(edge));
     }
     merged
+}
+
+/// Make the project's stored reference edges equal `edges`, the complete
+/// resolution of its raw edges, by deleting the rows that are no longer
+/// resolved and upserting only new or changed ones. The structural spine
+/// (`CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`) belongs to the structural
+/// pass and is left alone.
+fn reconcile_resolved_edges(store: &mut Store, project: &str, edges: &[NewEdge]) -> Result<()> {
+    let step = std::time::Instant::now();
+    let merged = merge_edge_sites(edges);
+    let mut wanted: std::collections::HashMap<&str, std::collections::HashMap<(i64, i64), String>> =
+        std::collections::HashMap::new();
+    for edge in merged.iter() {
+        let properties = serde_json::to_string(&edge.properties)
+            .map_err(|err| greppy_core::Error::Store(format!("json: {err}")))?;
+        wanted
+            .entry(edge.edge_type.as_str())
+            .or_default()
+            .insert((edge.source_id, edge.target_id), properties);
+    }
+    let conn = store.conn();
+    let mut stale = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source_id, target_id, edge_type, properties FROM main.edges
+                 WHERE project = ?1
+                   AND edge_type NOT IN ('CONTAINS_FOLDER', 'CONTAINS_FILE', 'DEFINES')",
+            )
+            .map_err(sqlite_err)?;
+        let mut rows = stmt.query([project]).map_err(sqlite_err)?;
+        while let Some(row) = rows.next().map_err(sqlite_err)? {
+            let id: i64 = row.get(0).map_err(sqlite_err)?;
+            let key: (i64, i64) = (
+                row.get(1).map_err(sqlite_err)?,
+                row.get(2).map_err(sqlite_err)?,
+            );
+            let edge_type = row.get_ref(3).map_err(sqlite_err)?;
+            let edge_type = edge_type
+                .as_str()
+                .map_err(|err| greppy_core::Error::Store(format!("edge type: {err}")))?;
+            let properties = row.get_ref(4).map_err(sqlite_err)?;
+            let properties = properties
+                .as_str()
+                .map_err(|err| greppy_core::Error::Store(format!("edge properties: {err}")))?;
+            let stored_as_resolved = wanted
+                .get(edge_type)
+                .and_then(|edges| edges.get(&key))
+                .map(|resolved| resolved == properties);
+            match stored_as_resolved {
+                // Already stored as resolved: nothing to write.
+                Some(true) => {
+                    if let Some(edges) = wanted.get_mut(edge_type) {
+                        edges.remove(&key);
+                    }
+                }
+                // Same endpoints, different sites or reasons: the upsert rewrites it.
+                Some(false) => {}
+                None => stale.push(id),
+            }
+        }
+    }
+    let unchanged_skipped = merged.len() - wanted.values().map(|edges| edges.len()).sum::<usize>();
+    conn.execute_batch("BEGIN").map_err(sqlite_err)?;
+    let result = (|| -> Result<()> {
+        {
+            let mut delete = conn
+                .prepare_cached("DELETE FROM main.edges WHERE id = ?1")
+                .map_err(sqlite_err)?;
+            for id in &stale {
+                delete.execute([id]).map_err(sqlite_err)?;
+            }
+        }
+        let mut upsert = conn
+            .prepare_cached(
+                "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
+                   properties = excluded.properties",
+            )
+            .map_err(sqlite_err)?;
+        // Resolution order, so new rows get ids in the order a full run assigns.
+        for edge in merged.iter() {
+            let Some(properties) = wanted
+                .get(edge.edge_type.as_str())
+                .and_then(|edges| edges.get(&(edge.source_id, edge.target_id)))
+            else {
+                continue;
+            };
+            upsert
+                .execute(rusqlite::params![
+                    project,
+                    edge.source_id,
+                    edge.target_id,
+                    edge.edge_type,
+                    properties,
+                ])
+                .map_err(sqlite_err)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(sqlite_err)?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    if std::env::var_os("GREPPY_PROFILE").is_some() {
+        eprintln!(
+            "[profile] reconcile: {} resolved, {} unchanged, {} removed {:?}",
+            merged.len(),
+            unchanged_skipped,
+            stale.len(),
+            step.elapsed()
+        );
+    }
+    Ok(())
 }
 
 fn persist_edges_batched(
@@ -16225,7 +16363,15 @@ pub fn load_scene() {
             )
             .unwrap();
         let raw = load_all_raw_edges(&store, "test").unwrap();
-        resolve_edges_with_replacement(&mut store, "test", &raw, &mut |_| {}, &[], true).unwrap();
+        resolve_edges_with_replacement(
+            &mut store,
+            "test",
+            &raw,
+            &mut |_| {},
+            &[],
+            EdgePersistence::ReplaceRust,
+        )
+        .unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
         assert!(!option_edge_names(
             &store,
