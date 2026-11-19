@@ -502,6 +502,17 @@ impl Store {
     }
 
     /// Count the raw edges stored for `project`.
+    /// Whether the project has any raw edge. `count_raw_edges(..) > 0` reads
+    /// every row of a table that holds most of a large store.
+    pub fn has_raw_edges(&self, project: &str) -> Result<bool> {
+        let found: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM raw_edges WHERE project = ?1)",
+            params![project],
+            |row| row.get(0),
+        )?;
+        Ok(found)
+    }
+
     pub fn count_raw_edges(&self, project: &str) -> Result<i64> {
         let n: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM raw_edges WHERE project = ?1",
