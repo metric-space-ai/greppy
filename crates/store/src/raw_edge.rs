@@ -502,6 +502,21 @@ impl Store {
     }
 
     /// Count the raw edges stored for `project`.
+    /// The raw edges of one type physically stored in this database, in
+    /// `list_raw_edges` order. Rows of other types are skipped before their
+    /// properties are decoded.
+    pub fn list_raw_edges_of_type(&self, project: &str, edge_type: &str) -> Result<Vec<RawEdge>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, project, file_path, source_qname, target_qname, edge_type, properties
+             FROM main.raw_edges WHERE project = ?1 AND edge_type = ?2
+             ORDER BY file_path, id",
+        )?;
+        let rows = stmt
+            .query_map(params![project, edge_type], row_to_raw_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Whether the project has any raw edge. `count_raw_edges(..) > 0` reads
     /// every row of a table that holds most of a large store.
     pub fn has_raw_edges(&self, project: &str) -> Result<bool> {

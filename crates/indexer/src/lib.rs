@@ -4340,7 +4340,17 @@ fn usage_persist_label(edge_type: &str) -> &str {
 /// File branch, so their IMPORTS resolution is unaffected.
 fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
     let index = GraphIndex::load(store, project)?;
-    let raw = load_all_raw_edges(store, project)?;
+    // Only the imports: decoding every raw edge of the project again for
+    // this pass cost seconds on a large workspace.
+    let raw = if store.is_overlay() {
+        load_all_raw_edges(store, project)?
+    } else {
+        store
+            .list_raw_edges_of_type(project, "IMPORTS")?
+            .into_iter()
+            .map(extracted_edge_from_raw)
+            .collect()
+    };
     let mut resolved: Vec<NewEdge> = Vec::new();
     for edge in raw.iter().filter(|e| e.edge_type == "IMPORTS") {
         let name = match edge
@@ -4446,6 +4456,44 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
 
 fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     persist_edges_batched(store, edges, None)
+}
+
+/// Insert the structural spine's edges. They carry no properties, so a row
+/// that already exists is already right: unlike the reference-edge upsert
+/// this rewrites nothing for the unchanged files of a refresh.
+fn insert_structural_edges(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
+    if store.is_overlay() || edges.is_empty() {
+        return insert_edges_batched(store, edges);
+    }
+    let conn = store.conn();
+    conn.execute_batch("BEGIN").map_err(sqlite_err)?;
+    let result = (|| -> Result<()> {
+        let mut insert = conn
+            .prepare_cached(
+                "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
+                 VALUES (?1, ?2, ?3, ?4, '{}')
+                 ON CONFLICT(source_id, target_id, edge_type) DO NOTHING",
+            )
+            .map_err(sqlite_err)?;
+        for edge in edges {
+            insert
+                .execute(rusqlite::params![
+                    edge.project,
+                    edge.source_id,
+                    edge.target_id,
+                    edge.edge_type,
+                ])
+                .map_err(sqlite_err)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(sqlite_err),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 /// Method names of the standard library's traits and containers. A receiver
