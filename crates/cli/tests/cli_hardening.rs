@@ -2850,6 +2850,66 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
     assert_eq!(v["integrity_ok"], true);
 }
 
+/// A refresh is seeded from the active store without reading all of it
+/// first. A store that opens but is structurally corrupt must still be
+/// detected (by the snapshot's own integrity check or by SQLite while the
+/// seeded build runs), quarantined, and rebuilt from the sources.
+#[test]
+fn r3_structurally_corrupt_active_snapshot_is_quarantined_and_replaced() {
+    let (repo, store, _scratch) = make_repo("r3corrupt-page", "old_page_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
+
+    let db = find_graph_db(&store).expect("graph.db must exist after first index");
+    let (page_size, root_page) = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        let page_size: u64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let root_page: u64 = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (page_size, root_page)
+    };
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        file.seek(SeekFrom::Start((root_page - 1) * page_size))
+            .unwrap();
+        file.write_all(&vec![0xff; page_size as usize]).unwrap();
+        file.sync_all().unwrap();
+    }
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn new_page_marker() -> i32 { 12 }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "a rebuilt snapshot should replace the corrupt active DB; stdout={out} stderr={err}"
+    );
+    assert!(
+        err.contains("quarantined"),
+        "corrupt active DB should be reported as quarantined; stderr={err}"
+    );
+    let (code, out, err) = run(&["search-symbol", "new_page_marker"], &repo, &store);
+    assert_eq!(code, 0, "replacement snapshot should query; stderr={err}");
+    assert!(out.contains("new_page_marker"), "{out:?}");
+    let (code, out, err) = run(&["diagnostics", "--json", "--diagnostics"], &repo, &store);
+    assert_eq!(code, 0, "stderr={err}\nstdout={out}");
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
+    assert_eq!(v["integrity_ok"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn r3_killed_index_before_publish_preserves_active_and_recovers() {
