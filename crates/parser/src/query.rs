@@ -362,6 +362,10 @@ pub mod js_queries {
         (variable_declarator
             name: (identifier) @name
             value: [(arrow_function) (function_expression)]) @def
+
+        (pair
+            key: (property_identifier) @name
+            value: [(arrow_function) (function_expression)]) @def
     "#;
 
     /// Captures:
@@ -423,6 +427,13 @@ pub mod ts_queries {
         (variable_declarator
             name: (identifier) @name
             value: [(arrow_function) (function_expression)]) @def
+
+        (pair
+            key: (property_identifier) @name
+            value: [(arrow_function) (function_expression)]) @def
+
+        (method_signature
+            name: (property_identifier) @name) @def
 
         (interface_declaration
             name: (type_identifier) @name) @def

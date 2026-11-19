@@ -254,6 +254,8 @@ pub const JAVASCRIPT: LangSpec = LangSpec {
         DefRule::ty("class_declaration", "Class"),
         DefRule::method("method_definition"),
         DefRule::method("variable_declarator"),
+        // `{ agentNow: () => heard }`: an object-literal function member.
+        DefRule::method("pair"),
     ],
     owner_kinds: &["class_declaration", "class"],
     calls: CallSpec {
@@ -271,11 +273,20 @@ pub const TYPESCRIPT: LangSpec = LangSpec {
         DefRule::ty("class_declaration", "Class"),
         DefRule::method("method_definition"),
         DefRule::method("variable_declarator"),
+        DefRule::method("pair"),
+        // `agentNow(): EngineAgent | null;` in an interface: the member its
+        // implementations and callers name.
+        DefRule::method("method_signature"),
         DefRule::ty("interface_declaration", "Interface"),
         DefRule::ty("type_alias_declaration", "Type"),
         DefRule::ty("enum_declaration", "Enum"),
     ],
-    owner_kinds: &["class_declaration", "class"],
+    owner_kinds: &[
+        "class_declaration",
+        "class",
+        "interface_declaration",
+        "type_alias_declaration",
+    ],
     calls: CallSpec {
         skip_callees: &["require"],
     },

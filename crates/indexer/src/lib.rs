@@ -6620,6 +6620,14 @@ impl GraphIndex {
     /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
         clear_option_field_unresolved();
+        if edge
+            .properties
+            .get("js_builtin_member")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return None;
+        }
         if let Some(name) = edge
             .properties
             .get("rust_expression_macro")

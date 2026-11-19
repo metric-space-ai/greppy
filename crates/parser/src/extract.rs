@@ -3483,6 +3483,16 @@ fn js_ts_module_variable_name<'a>(declarator: Node<'_>, source: &'a [u8]) -> Opt
 fn js_ts_func_name<'a, 't>(func: Node<'t>, source: &'a [u8]) -> Option<(&'a str, Node<'t>)> {
     if matches!(func.kind(), "arrow_function" | "function_expression") {
         let parent = func.parent()?;
+        // `{ agentNow: () => heard }` is defined as the member `agentNow`.
+        if parent.kind() == "pair"
+            && parent.child_by_field_name("value").map(|value| value.id()) == Some(func.id())
+        {
+            let key = parent.child_by_field_name("key")?;
+            return (key.kind() == "property_identifier")
+                .then(|| node_text(source, key))
+                .filter(|name| !name.is_empty())
+                .map(|name| (name, parent));
+        }
         if parent.kind() != "variable_declarator"
             || parent.child_by_field_name("value").map(|value| value.id()) != Some(func.id())
         {
@@ -3537,16 +3547,20 @@ fn extract_js_ts_calls(
             if let Some(callee) = js_ts_callee_name(node, source) {
                 if !callee.is_empty() && callee != "require" {
                     let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
+                    let mut properties = serde_json::json!({
+                        "callee_text": callee,
+                        "callee_name": callee,
+                    });
+                    if js_ts_builtin_member_call(node, source, callee) {
+                        properties["js_builtin_member"] = serde_json::json!(true);
+                    }
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
                         source_qualified_name: src,
                         target_qualified_name: format!("{file_path}::Function::{callee}"),
                         file_path: file_path.to_string(),
                         line: node.start_position().row as u32 + 1,
-                        properties: serde_json::json!({
-                            "callee_text": callee,
-                            "callee_name": callee,
-                        }),
+                        properties,
                     });
                 }
             }
@@ -3556,6 +3570,93 @@ fn extract_js_ts_calls(
             stack.push(child);
         }
     }
+}
+
+/// A member call of the language's own library: `rows.filter(..)`,
+/// `text.split(..)`, `promise.then(..)`, or any call on a global namespace
+/// (`Object.keys`, `JSON.parse`, `Math.max`). Binding it by name to a
+/// same-named project function would invent a caller; `this.filter()` stays a
+/// candidate for the project's own method.
+fn js_ts_builtin_member_call(call: Node<'_>, source: &[u8], callee: &str) -> bool {
+    const PROTOTYPE_METHODS: &[&str] = &[
+        "filter",
+        "map",
+        "forEach",
+        "reduce",
+        "reduceRight",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "some",
+        "every",
+        "includes",
+        "indexOf",
+        "lastIndexOf",
+        "join",
+        "slice",
+        "splice",
+        "concat",
+        "push",
+        "pop",
+        "shift",
+        "unshift",
+        "sort",
+        "reverse",
+        "flat",
+        "flatMap",
+        "fill",
+        "at",
+        "split",
+        "replace",
+        "replaceAll",
+        "trim",
+        "trimStart",
+        "trimEnd",
+        "startsWith",
+        "endsWith",
+        "toLowerCase",
+        "toUpperCase",
+        "padStart",
+        "padEnd",
+        "charAt",
+        "charCodeAt",
+        "codePointAt",
+        "substring",
+        "match",
+        "matchAll",
+        "then",
+        "catch",
+        "finally",
+        "toString",
+        "toFixed",
+        "hasOwnProperty",
+        "localeCompare",
+        "toISOString",
+        "getTime",
+        "pipe",
+    ];
+    const GLOBALS: &[&str] = &[
+        "Object", "JSON", "Math", "Promise", "Array", "Number", "String", "Reflect", "Date",
+        "console", "Symbol", "Intl", "BigInt", "Atomics", "URL",
+    ];
+    if call.kind() != "call_expression" {
+        return false;
+    }
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = function.child_by_field_name("object") else {
+        return false;
+    };
+    let object_text = node_text(source, object);
+    if object.kind() == "this" || object_text == "this" || object.kind() == "super" {
+        return false;
+    }
+    GLOBALS.contains(&object_text) || PROTOTYPE_METHODS.contains(&callee)
 }
 
 /// The simple (last-segment) callee name of a JS/TS `call_expression` /
@@ -21585,12 +21686,15 @@ export function Comp(): JSX.Element { return <span/>; }
         assert_eq!(repo.qualified_name, "src/a.ts::Interface::Repo");
         let id = r.nodes.iter().find(|n| n.name == "ID").unwrap();
         assert_eq!(id.qualified_name, "src/a.ts::Type::ID");
-        let find = r
+        let find: Vec<_> = r
             .nodes
             .iter()
-            .find(|n| n.name == "find" && n.label == "Method")
-            .unwrap();
-        assert_eq!(find.qualified_name, "src/a.ts::FileRepo::find");
+            .filter(|n| n.name == "find" && n.label == "Method")
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        // The class method, and the interface member it implements.
+        assert!(find.contains(&"src/a.ts::FileRepo::find"), "{find:?}");
+        assert!(find.contains(&"src/a.ts::Repo::find"), "{find:?}");
     }
 
     #[test]
