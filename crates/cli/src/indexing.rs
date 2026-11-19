@@ -2523,6 +2523,13 @@ pub(crate) fn index_atomic_snapshot_attempt(
         }
     };
 
+    // The snapshot is checkpointed once when it is complete. SQLite's
+    // default checkpoints (and fsyncs) every 1000 WAL pages, which a run of
+    // many small transactions pays again and again.
+    temp_store
+        .conn()
+        .execute_batch("PRAGMA wal_autocheckpoint = 65536;")
+        .map_err(|error| Error::Store(format!("configure snapshot WAL: {error}")))?;
     greppy_indexer::profile_step("snapshot: open the seeded store", step);
     let step = std::time::Instant::now();
     let index_result = if let Some(job) = background_job.as_deref_mut() {

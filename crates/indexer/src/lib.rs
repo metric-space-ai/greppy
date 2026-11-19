@@ -418,7 +418,7 @@ pub fn index_with_options_and_progress(
     // clause is false for it, so we correctly fall back to a full reindex
     // (safe — it repopulates `raw_edges`).
     let raw_edges_present =
-        store.count_raw_edges(project_name)? > 0 || !legacy_raw_edge_sidecar_exists(store)?;
+        store.has_raw_edges(project_name)? || !legacy_raw_edge_sidecar_exists(store)?;
 
     let worker_count = greppy_core::default_worker_count(true).max(1);
     report.worker_count = worker_count;
@@ -5056,11 +5056,24 @@ impl UniqueResolution {
 /// Languages that share an import and call namespace. A same-named definition
 /// in any other language must not make an in-language match ambiguous.
 fn resolution_language_family(path: &str) -> &'static str {
-    match greppy_parser::language_for_path(Path::new(path)) {
-        Language::JavaScript | Language::TypeScript { .. } => "javascript",
-        Language::C | Language::Cpp => "c",
-        other => other.name(),
+    // Resolution asks this for every candidate of every edge. Classifying a
+    // path walks its components; a workspace has far fewer files than edges.
+    thread_local! {
+        static FAMILIES: std::cell::RefCell<std::collections::HashMap<String, &'static str>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
+    FAMILIES.with(|families| {
+        if let Some(family) = families.borrow().get(path) {
+            return *family;
+        }
+        let family = match greppy_parser::language_for_path(Path::new(path)) {
+            Language::JavaScript | Language::TypeScript { .. } => "javascript",
+            Language::C | Language::Cpp => "c",
+            other => other.name(),
+        };
+        families.borrow_mut().insert(path.to_string(), family);
+        family
+    })
 }
 
 fn rust_module_files_for_module_path_with_crate_roots(
