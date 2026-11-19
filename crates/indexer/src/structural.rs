@@ -203,10 +203,12 @@ pub(crate) fn build_structural(
     }
 
     // Insert Folder nodes; remember their ids by rel_dir for edge wiring.
-    let mut folder_id: HashMap<String, i64> = HashMap::new();
+    // One transaction for all of them: a commit per node made the spine of
+    // a large repository cost thousands of commits on every refresh.
     progress("building_folders", 0, dirs.len());
-    for (index, dir) in dirs.iter().enumerate() {
-        let id = store.insert_node(&NewNode {
+    let folder_nodes = dirs
+        .iter()
+        .map(|dir| NewNode {
             project: project.to_string(),
             label: "Folder".into(),
             name: basename(dir).to_string(),
@@ -215,10 +217,14 @@ pub(crate) fn build_structural(
             start_line: 0,
             end_line: 0,
             properties: serde_json::json!({}),
-        })?;
-        folder_id.insert(dir.clone(), id);
-        progress("building_folders", index + 1, dirs.len());
-    }
+        })
+        .collect::<Vec<_>>();
+    let folder_id: HashMap<String, i64> = dirs
+        .iter()
+        .cloned()
+        .zip(store.insert_nodes(&folder_nodes)?)
+        .collect();
+    progress("building_folders", dirs.len(), dirs.len());
 
     // CONTAINS_FOLDER: parent(dir) → dir. The parent is the enclosing
     // directory's Folder node, or the Project node when the dir is
@@ -246,20 +252,27 @@ pub(crate) fn build_structural(
     // drop structural nodes left behind by a now-deleted file/folder.
     let mut valid_files: BTreeSet<String> = BTreeSet::new();
     progress("building_files", 0, entries.len());
-    for (index, entry) in entries.iter().enumerate() {
-        let rel = norm(&entry.rel_path);
-        let qn = file_qn(project, &rel);
-        valid_files.insert(qn.clone());
-        let file_id = store.insert_node(&NewNode {
-            project: project.to_string(),
-            label: "File".into(),
-            name: basename(&rel).to_string(),
-            qualified_name: qn,
-            file_path: rel.clone(),
-            start_line: 0,
-            end_line: 0,
-            properties: serde_json::json!({ "extension": extension(&rel) }),
-        })?;
+    let file_nodes = entries
+        .iter()
+        .map(|entry| {
+            let rel = norm(&entry.rel_path);
+            let qn = file_qn(project, &rel);
+            valid_files.insert(qn.clone());
+            NewNode {
+                project: project.to_string(),
+                label: "File".into(),
+                name: basename(&rel).to_string(),
+                qualified_name: qn,
+                properties: serde_json::json!({ "extension": extension(&rel) }),
+                file_path: rel,
+                start_line: 0,
+                end_line: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let file_ids = store.insert_nodes(&file_nodes)?;
+    for (index, (node, file_id)) in file_nodes.iter().zip(file_ids).enumerate() {
+        let rel = node.file_path.clone();
 
         // CONTAINS_FILE: parent(dir) → file (Project when at repo root).
         let parent_rel = parent_dir(&rel);
@@ -301,7 +314,7 @@ pub(crate) fn build_structural(
     // atomic, this avoids opening one SQLite transaction per edge on large
     // repositories.
     progress("writing_structure_edges", 0, edges.len());
-    super::insert_edges_batched(store, &edges)?;
+    super::insert_structural_edges(store, &edges)?;
     progress("writing_structure_edges", edges.len(), edges.len());
 
     // ── Incremental cleanup (review finding P1: stale spine) ─────────
