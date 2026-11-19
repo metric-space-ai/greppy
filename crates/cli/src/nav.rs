@@ -1152,11 +1152,18 @@ pub(crate) fn dispatch_impact(
     // rows are capped separately so the footer can report the true transitive
     // total.
     let starts = resolve_symbol_nodes(&store, symbol)?;
-    let starts = if starts.is_empty() {
+    let mut starts = if starts.is_empty() {
         vec![start]
     } else {
         starts
     };
+    // A trait-impl method is reached through every call of the trait method.
+    if matches!(dir, greppy_search::ReachDirection::Incoming) {
+        let dispatch = trait_dispatch_declarations(&store, &project, &starts)?;
+        starts.extend(dispatch);
+        starts.sort_unstable();
+        starts.dedup();
+    }
     let start_ids: std::collections::HashSet<i64> = starts.iter().copied().collect();
     let mut by_id: std::collections::HashMap<i64, greppy_search::ImpactNode> =
         std::collections::HashMap::new();
@@ -1222,6 +1229,7 @@ pub(crate) fn dispatch_impact(
             greppy_search::ReachDirection::Outgoing => "(it reaches nothing transitively)",
         };
         println!("{what}");
+        print_possible_caller_note(&store, dir, &starts, query_symbol)?;
         return Ok(0);
     }
     // Preparation admission and target resolution precede model work.
@@ -1387,7 +1395,36 @@ pub(crate) fn dispatch_impact(
     if omitted > 0 {
         println!("… {omitted} more reached — greppy impact {query_symbol} --all");
     }
+    print_possible_caller_note(&store, dir, &starts, query_symbol)?;
     Ok(0)
+}
+
+/// Impact follows proven references only. Calls whose receiver type the
+/// source does not reveal may also reach the symbol: say how many, and where
+/// they are listed, instead of presenting the tree as the whole answer.
+fn print_possible_caller_note(
+    store: &greppy_store::Store,
+    dir: greppy_search::ReachDirection,
+    starts: &[i64],
+    query_symbol: &str,
+) -> Result<()> {
+    if !matches!(dir, greppy_search::ReachDirection::Incoming) {
+        return Ok(());
+    }
+    let possible = unresolved_option_receivers(store, starts, usize::MAX)?
+        .into_iter()
+        .filter(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason.ends_with("_unproven"))
+        })
+        .count();
+    if possible > 0 {
+        println!(
+            "+ {possible} possible call sites whose receiver type is not proven — greppy who-calls {query_symbol}"
+        );
+    }
+    Ok(())
 }
 
 /// One node per line, its children indented by the step. A node already printed
@@ -2072,6 +2109,18 @@ impl<'a> BriefRender<'a> {
                 return Some(sentence);
             }
         }
+        // The doc comment the parser attached (JSDoc, docstrings, block
+        // comments), as written: a generated summary is only for code that
+        // has none.
+        if let Some(doc) = node
+            .properties
+            .get("doc_full")
+            .and_then(|value| value.as_str())
+            .map(|doc| doc.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|doc| !doc.is_empty())
+        {
+            return Some(doc);
+        }
         if !self.with_hints {
             return None;
         }
@@ -2103,6 +2152,15 @@ impl<'a> BriefRender<'a> {
         let mut i = start as usize;
         while i >= 2 {
             let trimmed = lines[i - 2].trim();
+            // A comment is never part of an attribute, whatever brackets its
+            // prose holds (`/// … (aborted when …` / `/// … changes).`).
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+            {
+                break;
+            }
             let opens = trimmed.matches(['(', '[']).count() as i32;
             let closes = trimmed.matches([')', ']']).count() as i32;
             balance += opens - closes;
@@ -2998,7 +3056,22 @@ pub(crate) fn nav_kind_word(lines: Option<&Vec<String>>, node: &greppy_store::No
     ];
     if let Some(lines) = lines {
         if let Some(line) = lines.get((node.start_line.max(1) as usize).saturating_sub(1)) {
-            for word in line.split_whitespace() {
+            // Only the words before the definition's own name declare its
+            // kind: `async fn audit(..) -> Result<(), &'static str>` is not a
+            // static, and a lifetime (`'static`) is never a keyword.
+            let head = line
+                .match_indices(node.name.as_str())
+                .find(|(at, _)| {
+                    let before = line[..*at].chars().next_back();
+                    let after = line[*at + node.name.len()..].chars().next();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+                .map_or(line.as_str(), |(at, _)| &line[..at]);
+            for word in head.split_whitespace() {
+                if word.starts_with('\'') {
+                    continue;
+                }
                 let word = word.trim_matches(|c: char| !c.is_alphanumeric());
                 if KEYWORDS.contains(&word) {
                     return word.to_string();
@@ -3110,7 +3183,7 @@ pub(crate) fn nav_refuse_non_callable(
         });
     }
     println!(
-        "next: every reference to the {}: greppy find-usages {target}",
+        "next: every reference to the {}: greppy who-calls {target}",
         { nav_kind_word(lines.as_ref(), node) }
     );
     Ok(Some(1))
@@ -3125,10 +3198,11 @@ pub(crate) fn nav_refuse_ambiguous(
     target: &str,
     ids: &[i64],
 ) -> Result<Option<i32>> {
-    if ids.len() < 2 || split_path_qualified(target).is_some() {
+    if ids.len() < 2 {
         return Ok(None);
     }
-    let mut sites: Vec<(String, i64)> = Vec::new();
+    let path_qualified = split_path_qualified(target).is_some();
+    let mut sites: Vec<(String, i64, String)> = Vec::new();
     for id in ids {
         let Some(node) = store.get_node(*id)? else {
             continue;
@@ -3142,20 +3216,55 @@ pub(crate) fn nav_refuse_ambiguous(
         let start = node.start_line.max(1);
         if !sites
             .iter()
-            .any(|(file, line)| file == &node.file_path && *line == start)
+            .any(|(file, line, _)| file == &node.file_path && *line == start)
         {
-            sites.push((node.file_path.clone(), start));
+            sites.push((node.file_path.clone(), start, node.qualified_name.clone()));
         }
     }
     if sites.len() < 2 {
         return Ok(None);
     }
+    // A file-qualified name still names several definitions when one file
+    // has two owners of that name (`Calls::new`, `Call::new`). Variants of
+    // one definition (cfg twins, a type and its impl) share their owner.
+    if path_qualified && !definitions_have_distinct_owners(&sites) {
+        return Ok(None);
+    }
     sites.sort();
     println!("`{target}` is {} definitions", sites.len());
-    for (file, line) in &sites {
-        println!("{file}:{line}");
+    let addresses = definition_addresses(&sites);
+    for ((file, line, _), address) in sites.iter().zip(addresses) {
+        println!("{file}:{line}  {address}");
     }
     Ok(Some(1))
+}
+
+/// True when the definitions belong to different owners in their files.
+pub(crate) fn definitions_have_distinct_owners(sites: &[(String, i64, String)]) -> bool {
+    let mut owners = sites
+        .iter()
+        .map(|(file, _, qualified)| (file.as_str(), crate::qname_owner_segment(qualified)))
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners.dedup();
+    owners.len() > 1
+}
+
+/// The spelling that names each definition alone: `<path>::<name>`, or
+/// `<path>::<Owner>::<name>` where the file holds the name more than once.
+pub(crate) fn definition_addresses(sites: &[(String, i64, String)]) -> Vec<String> {
+    sites
+        .iter()
+        .map(|(file, _, qualified)| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let name = name.split('@').next().unwrap_or(name);
+            let shared_file = sites.iter().filter(|(other, _, _)| other == file).count() > 1;
+            match crate::qname_owner_segment(qualified) {
+                Some(owner) if shared_file => format!("{file}::{owner}::{name}"),
+                _ => format!("{file}::{name}"),
+            }
+        })
+        .collect()
 }
 
 /// The name does not resolve. Say so, and add only what the agent could not get
@@ -3318,20 +3427,41 @@ pub(crate) fn unresolved_option_receivers(
     // must not hide matching paths beyond an unrelated prefix.
     let fetch = i64::MAX as usize;
     let _ = limit;
+    // `UNRESOLVED_CALLS`: an Option payload whose adapter was not proven;
+    // `POSSIBLE_CALLS`: a receiver whose type the source does not reveal.
+    let incoming = |id: i64| -> Result<Vec<greppy_store::Edge>> {
+        let mut edges = store.incoming_edges(id, Some("UNRESOLVED_CALLS"), fetch)?;
+        edges.extend(store.incoming_edges(id, Some("POSSIBLE_CALLS"), fetch)?);
+        Ok(edges)
+    };
     for id in target_ids {
-        for edge in store.incoming_edges(*id, Some("UNRESOLVED_CALLS"), fetch)? {
+        for edge in incoming(*id)? {
             let Some(node) = store.get_node(edge.source_id)? else {
                 continue;
             };
             if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
                 continue;
             }
-            let line = edge
+            let mut site_lines = edge
                 .properties
-                .get("line")
-                .and_then(|value| value.as_u64())
-                .map(|value| value as u32)
-                .unwrap_or_else(|| node.start_line.max(1) as u32);
+                .get("lines")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_u64().map(|line| line as u32))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if site_lines.is_empty() {
+                site_lines.push(
+                    edge.properties
+                        .get("line")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value as u32)
+                        .unwrap_or_else(|| node.start_line.max(1) as u32),
+                );
+            }
             let reasons = edge
                 .properties
                 .get("unresolved_reasons")
@@ -3343,12 +3473,14 @@ pub(crate) fn unresolved_option_receivers(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            lines.push(UnresolvedReceiver {
-                file: node.file_path.clone(),
-                line,
-                caller: nav_short_name(&node),
-                reasons,
-            });
+            for line in site_lines {
+                lines.push(UnresolvedReceiver {
+                    file: node.file_path.clone(),
+                    line,
+                    caller: nav_short_name(&node),
+                    reasons: reasons.clone(),
+                });
+            }
         }
     }
     lines.sort_by(|left, right| {
@@ -3369,6 +3501,28 @@ pub(crate) fn unresolved_option_receivers(
 }
 
 pub(crate) fn unresolved_receiver_line(item: &UnresolvedReceiver) -> String {
+    if item
+        .reasons
+        .iter()
+        .any(|reason| reason == "receiver_type_unproven")
+    {
+        // A method call whose receiver type the source does not spell out:
+        // a possible caller, listed so that no call site is silently missing.
+        return format!(
+            "possible caller: {}:{} {} — receiver type not proven",
+            item.file, item.line, item.caller
+        );
+    }
+    if item
+        .reasons
+        .iter()
+        .any(|reason| reason == "field_owner_unproven")
+    {
+        return format!(
+            "possible use: {}:{} {} — receiver type not proven",
+            item.file, item.line, item.caller
+        );
+    }
     if item.reasons.is_empty() {
         format!(
             "unresolved receiver: {}:{} {} — Option as_ref receiver was not proven",
@@ -3515,6 +3669,47 @@ pub(crate) fn unresolved_receiver_json(
     })
 }
 
+/// The trait method declarations a Rust trait-impl method is dispatched
+/// through: for `impl Service for Blobs { fn answer(..) }` the `answer` the
+/// trait `Service` declares (`<file>::Service::answer`).
+pub(crate) fn trait_dispatch_declarations(
+    store: &greppy_store::Store,
+    project: &str,
+    targets: &[i64],
+) -> Result<Vec<i64>> {
+    let mut declarations = Vec::new();
+    for id in targets {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        let Some(trait_name) = node
+            .properties
+            .get("rust_trait_impl")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        let suffix = format!("::{trait_name}::{}", node.name);
+        for candidate in store.list_nodes_by_name(project, &node.name, usize::MAX)? {
+            if candidate.id == node.id
+                || candidate.label != "Method"
+                || !candidate.file_path.ends_with(".rs")
+                || !candidate.qualified_name.ends_with(&suffix)
+                || candidate.properties.get("rust_trait_impl").is_some()
+            {
+                continue;
+            }
+            // The declaration lives in the trait itself, not in a struct
+            // that happens to share the trait's name.
+            let trait_qname = format!("{}::Interface::{trait_name}", candidate.file_path);
+            if store.get_node_by_qname(project, &trait_qname)?.is_some() {
+                declarations.push(candidate.id);
+            }
+        }
+    }
+    Ok(declarations)
+}
+
 pub(crate) fn dispatch_who_calls(
     symbol: Option<&str>,
     paths: &[String],
@@ -3601,14 +3796,20 @@ pub(crate) fn dispatch_who_calls(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
+    // A method of `impl Trait for Type` is also called wherever the trait's
+    // method is called on a `dyn Trait` or generic value.
+    let mut edge_targets = targets.clone();
+    edge_targets.extend(trait_dispatch_declarations(&store, &project, &targets)?);
+    edge_targets.sort_unstable();
+    edge_targets.dedup();
     let mut edges = Vec::new();
-    for target in &targets {
+    for target in &edge_targets {
         for edge_type in ["CALLS", "USAGE"] {
             edges.extend(store.incoming_edges(*target, Some(edge_type), 1024)?);
         }
     }
     let fetch_limit = unresolved_receiver_fetch_limit(code, all);
-    let mut unresolved = unresolved_option_receivers(&store, &targets, fetch_limit)?;
+    let mut unresolved = unresolved_option_receivers(&store, &edge_targets, fetch_limit)?;
     unresolved.retain(|item| path_filters.matches(&item.file));
     let unresolved_page = unresolved_receiver_page(&unresolved, code, all, 0);
     let unresolved_report = unresolved_page_report(&unresolved_page, query_symbol);
@@ -3666,7 +3867,22 @@ pub(crate) fn dispatch_who_calls(
     let mut sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
     let mut call_sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
     for e in &edges {
-        if let Some(l) = e.properties.get("line").and_then(|v| v.as_u64()) {
+        // A caller that calls the target several times carries every site
+        // in `lines`; `line` alone is its first site.
+        let lines = e
+            .properties
+            .get("lines")
+            .and_then(|v| v.as_array())
+            .map(|values| values.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
+            .filter(|lines| !lines.is_empty())
+            .or_else(|| {
+                e.properties
+                    .get("line")
+                    .and_then(|v| v.as_u64())
+                    .map(|line| vec![line])
+            })
+            .unwrap_or_default();
+        for l in lines {
             sites.entry(e.source_id).or_default().push(l as u32);
             if e.edge_type == "CALLS" {
                 call_sites.entry(e.source_id).or_default().push(l as u32);
@@ -3739,6 +3955,19 @@ pub(crate) fn dispatch_who_calls(
     let shown = total.min(cap);
     let preferred_site_lines =
         |node_id: i64| sorted_site_lines(call_sites.get(&node_id).or_else(|| sites.get(&node_id)));
+    // Every site of a caller, not only the first: the answer to "where is
+    // this called" is each call, and an agent changing the target must visit
+    // all of them.
+    let all_site_lines = |node_id: i64| {
+        let mut lines = call_sites
+            .get(&node_id)
+            .or_else(|| sites.get(&node_id))
+            .cloned()
+            .unwrap_or_default();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    };
     let repo_root = resolve_root(root)?;
     let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut evidence: std::collections::HashMap<i64, (u32, (u32, u32))> = Default::default();
@@ -3797,6 +4026,7 @@ pub(crate) fn dispatch_who_calls(
                 });
                 let module =
                     is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name);
+                let lines = all_site_lines(node.id);
                 serde_json::json!({
                     // Keep the stored graph identity so JSON piping can
                     // resolve this row again. `<module>` is presentation,
@@ -3805,6 +4035,7 @@ pub(crate) fn dispatch_who_calls(
                     "name": if module { "<module>".into() } else { nav_short_name(node) },
                     "file": &node.file_path,
                     "line": site,
+                    "lines": if lines.is_empty() { vec![site] } else { lines },
                     "file_path": &node.file_path,
                     "start_line": span.0,
                     "end_line": span.1,
@@ -3838,19 +4069,41 @@ pub(crate) fn dispatch_who_calls(
             (start, (start, end))
         });
         let lines = sources.get(&n.file_path).and_then(Option::as_ref);
-        rows.push(NavAnswerRow {
-            file: n.file_path.clone(),
-            line: site,
-            span,
-            name: if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
-                "<module>".into()
+        let name = if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+            "<module>".to_string()
+        } else {
+            nav_short_name(n)
+        };
+        let test = nav_is_test(lines, n);
+        let mut site_lines = all_site_lines(n.id);
+        if site_lines.is_empty() {
+            site_lines.push(site);
+        }
+        // One row per call site, each a `file:line  name` location.
+        for line in site_lines {
+            let span = if line == site {
+                span
             } else {
-                nav_short_name(n)
-            },
-            test: nav_is_test(lines, n),
-        });
+                match lines {
+                    Some(source) if code => nav_statement_span(source, line),
+                    _ => (line, line),
+                }
+            };
+            rows.push(NavAnswerRow {
+                file: n.file_path.clone(),
+                line,
+                span,
+                name: name.clone(),
+                test,
+            });
+        }
     }
-    print_nav_rows(&repo_root, "callers", &mut rows, code, all);
+    let noun = if rows.len() > nodes.len() {
+        "call sites"
+    } else {
+        "callers"
+    };
+    print_nav_rows(&repo_root, noun, &mut rows, code, all);
     if unresolved_report.incomplete() {
         print_unresolved_receivers(&unresolved_page);
     }

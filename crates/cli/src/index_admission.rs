@@ -71,6 +71,16 @@ fn gated_command(
     } else {
         "python3"
     });
+    // The gate's disk floor protects the volume the job writes to. A greppy
+    // index job writes its store and inference cache (and the TMPDIR the gate
+    // assigns); tell the gate where, so a store on another volume is not
+    // refused for a full system disk it never touches.
+    if let Ok(writes) = std::env::join_paths([
+        greppy_core::cache::data_root(),
+        greppy_core::cache::shared_inference_root(),
+    ]) {
+        command.env("DEV_HEAVY_WRITES", writes);
+    }
     command
         .arg(gate)
         .arg("--owner")

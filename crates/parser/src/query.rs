@@ -98,6 +98,11 @@ pub mod rust_queries {
         (function_item
             name: (identifier) @name) @def
 
+        (trait_item
+            body: (declaration_list
+                (function_signature_item
+                    name: (identifier) @name) @def))
+
         (struct_item
             name: (type_identifier) @name) @def
 
@@ -362,6 +367,10 @@ pub mod js_queries {
         (variable_declarator
             name: (identifier) @name
             value: [(arrow_function) (function_expression)]) @def
+
+        (pair
+            key: (property_identifier) @name
+            value: [(arrow_function) (function_expression)]) @def
     "#;
 
     /// Captures:
@@ -423,6 +432,13 @@ pub mod ts_queries {
         (variable_declarator
             name: (identifier) @name
             value: [(arrow_function) (function_expression)]) @def
+
+        (pair
+            key: (property_identifier) @name
+            value: [(arrow_function) (function_expression)]) @def
+
+        (method_signature
+            name: (property_identifier) @name) @def
 
         (interface_declaration
             name: (type_identifier) @name) @def

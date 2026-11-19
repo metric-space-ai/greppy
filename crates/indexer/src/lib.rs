@@ -1992,6 +1992,7 @@ fn resolve_edges_with_replacement(
 
         let Some(target_id) = target_id else {
             clear_option_field_unresolved();
+            push_unproven_receiver_edges(&index, project, src_id, edge, &mut resolved);
             continue;
         };
 
@@ -3781,6 +3782,10 @@ fn def_fingerprint(store: &Store, project: &str) -> Result<std::collections::BTr
                             COALESCE(json_extract(properties, '$.has_bounds'), '')
                             || char(31)
                             || COALESCE(json_extract(properties, '$.as_ref_receiver'), '')
+                        WHEN label IN ('Method', 'Function') THEN
+                            COALESCE(json_extract(properties, '$.return_type'), '')
+                            || char(31)
+                            || COALESCE(json_extract(properties, '$.rust_trait_impl'), '')
                         ELSE ''
                     END
              FROM nodes WHERE project = ?1
@@ -4016,6 +4021,7 @@ fn resolve_edges_incremental(
         };
         let Some(target_id) = target_id else {
             clear_option_field_unresolved();
+            push_unproven_receiver_edges(&index, project, src_id, edge, &mut resolved);
             continue;
         };
         if target_id == src_id && edge.edge_type != "CALLS" {
@@ -4051,7 +4057,7 @@ fn edge_references_name(edge: &ExtractedEdge, names: &std::collections::HashSet<
     let prop = match edge.edge_type.as_str() {
         "CALLS" => "callee_name",
         "TYPE_REF" => "type_name",
-        "USES" => "ref_name",
+        "USES" | "USAGE" => "ref_name",
         "IMPORTS" => "imported_name",
         _ => return false,
     };
@@ -4168,6 +4174,46 @@ fn push_rust_enum_owner_usage(
         edge_type: "USAGE".into(),
         properties: serde_json::json!({ "line": edge.line, "rust_enum_variant_owner": true, "variant": qname }),
     });
+}
+
+/// Persist an unresolved Rust receiver call or field read as
+/// `POSSIBLE_CALLS` to each member it may reach (see
+/// `unproven_receiver_candidates`). Unlike `UNRESOLVED_CALLS` (one declared
+/// Option payload whose adapter was not proven), this is a candidate set.
+fn push_unproven_receiver_edges(
+    index: &GraphIndex,
+    project: &str,
+    src_id: i64,
+    edge: &ExtractedEdge,
+    resolved: &mut Vec<NewEdge>,
+) {
+    let (targets, reason) = match edge.edge_type.as_str() {
+        "CALLS" => (
+            index.unproven_receiver_candidates(src_id, edge),
+            "receiver_type_unproven",
+        ),
+        "USAGE" => (
+            index.unproven_field_candidates(src_id, edge),
+            "field_owner_unproven",
+        ),
+        _ => return,
+    };
+    for target_id in targets {
+        let mut properties = edge.properties.clone();
+        if let Some(map) = properties.as_object_mut() {
+            map.insert("unresolved_reasons".into(), serde_json::json!([reason]));
+            if edge.line > 0 {
+                map.insert("line".into(), serde_json::json!(edge.line));
+            }
+        }
+        resolved.push(NewEdge {
+            project: project.to_string(),
+            source_id: src_id,
+            target_id,
+            edge_type: "POSSIBLE_CALLS".to_string(),
+            properties,
+        });
+    }
 }
 
 /// Build a [`NewEdge`] from a resolved source/target pair, cloning the
@@ -4355,6 +4401,245 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     persist_edges_batched(store, edges, None)
 }
 
+/// Method names of the standard library's traits and containers. A receiver
+/// call with one of these names and an unknown receiver type is far more often
+/// a `Vec`/`Option`/`Clone`… call than a call of the project's own method.
+fn rust_std_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "clone"
+            | "clone_from"
+            | "to_owned"
+            | "to_string"
+            | "fmt"
+            | "eq"
+            | "ne"
+            | "cmp"
+            | "partial_cmp"
+            | "hash"
+            | "from"
+            | "into"
+            | "try_from"
+            | "try_into"
+            | "default"
+            | "drop"
+            | "deref"
+            | "deref_mut"
+            | "as_ref"
+            | "as_mut"
+            | "borrow"
+            | "borrow_mut"
+            | "next"
+            | "iter"
+            | "iter_mut"
+            | "into_iter"
+            | "len"
+            | "is_empty"
+            | "get"
+            | "get_mut"
+            | "insert"
+            | "remove"
+            | "push"
+            | "pop"
+            | "contains"
+            | "contains_key"
+            | "extend"
+            | "clear"
+            | "unwrap"
+            | "expect"
+            | "map"
+            | "and_then"
+            | "ok"
+            | "err"
+            | "lock"
+            | "read"
+            | "write"
+            | "send"
+            | "recv"
+            | "poll"
+            | "call"
+            | "index"
+            | "add"
+            | "sub"
+            | "mul"
+            | "div"
+            | "neg"
+            | "not"
+            | "from_str"
+            | "parse"
+            | "join"
+            | "split"
+            | "trim"
+            | "starts_with"
+            | "ends_with"
+            | "as_str"
+            | "as_bytes"
+            | "to_vec"
+            | "first"
+            | "last"
+            | "entry"
+            | "keys"
+            | "values"
+            | "filter"
+            | "collect"
+            | "take"
+            | "replace"
+            | "flush"
+            | "close"
+            | "run"
+            | "new"
+    )
+}
+
+/// The type a Rust function's declared return type hands to its caller's
+/// binding: `Result<Rights>` → `Rights`, `anyhow::Result<Option<Arc<Dock>>>`
+/// → `Dock`, `Self` → `Self`. Anything else (tuples, generics, `impl Trait`)
+/// names no single type.
+fn rust_return_payload(declared: &str) -> Option<&str> {
+    const WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Pin", "Cow"];
+    let mut ty = declared.trim();
+    loop {
+        ty = ty.trim_start_matches('&').trim_start();
+        if ty.starts_with('\'') {
+            ty = ty.split_once(' ')?.1.trim_start();
+        }
+        if let Some(rest) = ty.strip_prefix("mut ") {
+            ty = rest.trim_start();
+        }
+        let Some(open) = ty.find('<') else {
+            break;
+        };
+        let head = ty[..open].trim();
+        let wrapper = head.rsplit("::").next().unwrap_or(head);
+        if !WRAPPERS.contains(&wrapper) || !ty.ends_with('>') {
+            break;
+        }
+        // The first top-level generic argument is the payload.
+        let inner = &ty[open + 1..ty.len() - 1];
+        let mut depth = 0i32;
+        let mut end = inner.len();
+        for (index, ch) in inner.char_indices() {
+            match ch {
+                '<' | '(' | '[' => depth += 1,
+                '>' | ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    end = index;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        ty = inner[..end].trim();
+    }
+    let ty = ty.split('<').next()?.trim();
+    // `Self::Output` is an associated type, `T` a generic parameter.
+    if ty.starts_with("Self::") {
+        return None;
+    }
+    let name = ty.rsplit("::").next()?.trim();
+    (name.len() > 1
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+    .then_some(name)
+}
+
+/// The directory of the Cargo package a Rust file belongs to, by layout:
+/// `engine/dock/src/lib.rs` and `engine/dock/tests/x.rs` → `engine/dock`.
+fn rust_crate_dir(path: &str) -> &str {
+    for marker in ["/src/", "/tests/", "/examples/", "/benches/"] {
+        if let Some(at) = path.find(marker) {
+            return &path[..at];
+        }
+    }
+    if ["src/", "tests/", "examples/", "benches/"]
+        .iter()
+        .any(|marker| path.starts_with(marker))
+    {
+        return "";
+    }
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Strip references and the `Deref` smart pointers (`Arc`, `Rc`, `Box`) off a
+/// declared Rust type: `Arc<Dock>` → `Dock`, `&mut Box<Shown>` → `Shown`.
+fn rust_deref_payload(declared: &str) -> &str {
+    let mut ty = declared.trim();
+    loop {
+        if let Some(rest) = ty.strip_prefix('&') {
+            ty = rest.trim_start();
+            ty = ty.strip_prefix("mut ").unwrap_or(ty).trim_start();
+            continue;
+        }
+        let unwrapped = ["Arc<", "Rc<", "Box<", "std::sync::Arc<", "std::rc::Rc<"]
+            .iter()
+            .find_map(|wrapper| ty.strip_prefix(wrapper))
+            .and_then(|rest| rest.strip_suffix('>'));
+        match unwrapped {
+            Some(inner) => ty = inner.trim(),
+            None => return ty,
+        }
+    }
+}
+
+/// One graph edge per (source, target, type) — but a caller that calls the
+/// same target several times has one site per call. Fold every site line of
+/// a pair into `lines` (ascending, `line` = the first) so navigation reports
+/// all of them instead of whichever row the upsert kept last.
+fn merge_edge_sites(edges: &[NewEdge]) -> Vec<std::borrow::Cow<'_, NewEdge>> {
+    let edge_lines = |edge: &NewEdge| {
+        edge.properties
+            .get("lines")
+            .and_then(|value| value.as_array())
+            .map(|values| values.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(edge.properties.get("line").and_then(|value| value.as_u64()))
+    };
+    // The last row of a pair carries its facts (as the upsert it replaces
+    // kept the last row); only pairs with several rows collect their lines.
+    let mut last: std::collections::HashMap<(i64, i64, &str), usize> =
+        std::collections::HashMap::with_capacity(edges.len());
+    let mut repeated = std::collections::HashSet::new();
+    for (index, edge) in edges.iter().enumerate() {
+        let key = (edge.source_id, edge.target_id, edge.edge_type.as_str());
+        if last.insert(key, index).is_some() {
+            repeated.insert(key);
+        }
+    }
+    let mut sites: std::collections::HashMap<(i64, i64, &str), Vec<u64>> =
+        std::collections::HashMap::with_capacity(repeated.len());
+    for edge in edges {
+        let key = (edge.source_id, edge.target_id, edge.edge_type.as_str());
+        if repeated.contains(&key) {
+            sites.entry(key).or_default().extend(edge_lines(edge));
+        }
+    }
+    let mut merged = Vec::with_capacity(last.len());
+    for (index, edge) in edges.iter().enumerate() {
+        let key = (edge.source_id, edge.target_id, edge.edge_type.as_str());
+        if last.get(&key) != Some(&index) {
+            continue;
+        }
+        let Some(mut lines) = sites.remove(&key) else {
+            merged.push(std::borrow::Cow::Borrowed(edge));
+            continue;
+        };
+        lines.sort_unstable();
+        lines.dedup();
+        let mut edge = edge.clone();
+        if let Some(map) = edge.properties.as_object_mut() {
+            if let Some(first) = lines.first() {
+                map.insert("line".into(), serde_json::json!(first));
+            }
+            if lines.len() > 1 {
+                map.insert("lines".into(), serde_json::json!(lines));
+            }
+        }
+        merged.push(std::borrow::Cow::Owned(edge));
+    }
+    merged
+}
+
 fn persist_edges_batched(
     store: &mut Store,
     edges: &[NewEdge],
@@ -4363,6 +4648,8 @@ fn persist_edges_batched(
     if edges.is_empty() && replace_rust_project.is_none() {
         return Ok(());
     }
+    let merged = merge_edge_sites(edges);
+    let edges = merged.as_slice();
     if store.is_overlay() {
         let mut qualified_names: std::collections::HashMap<(String, i64), String> =
             std::collections::HashMap::new();
@@ -4492,6 +4779,9 @@ fn navigation_label_rank(label: &str) -> u8 {
     }
 }
 
+/// `(file, deferred owner)` → `(type name, file that spells it)`.
+type ReturnOwnerMemo = std::collections::HashMap<(String, String), Option<(String, String)>>;
+
 /// In-memory mirror of the project's node graph, built **once** per index
 /// run so edge resolution issues no per-edge SQLite queries. It replicates
 /// the `greppy-resolver` semantics exactly:
@@ -4559,6 +4849,27 @@ struct GraphIndex {
     /// reject a by-value adapter that can hide Option::as_ref.
     as_ref_receivers: std::collections::HashMap<String, String>,
     open_traits: std::collections::HashSet<i64>,
+    /// Rust methods of `impl Trait for Type`, by node id → trait name.
+    rust_trait_impl_methods: std::collections::HashMap<i64, String>,
+    /// Declared return types of Rust functions and methods, by node id.
+    rust_return_types: std::collections::HashMap<i64, String>,
+    /// Rust fields by name, and by (owner type, name).
+    rust_fields_by_name: std::collections::HashMap<String, Vec<i64>>,
+    rust_fields_by_owner: std::collections::HashMap<(String, String), Vec<i64>>,
+    /// Names a Rust file imports from the standard library (`use std::…`).
+    std_imported_names_by_file:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Every name a Rust file imports by `use`, with its path.
+    rust_imported_paths_by_file:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    /// The repository root, to read the project's own Cargo manifests.
+    repo_root: Option<std::path::PathBuf>,
+    /// `resolve_return_owner` answers by (file, deferred owner): every
+    /// `let x = Type::new()` in a file asks the same question.
+    return_owner_memo: std::sync::Mutex<ReturnOwnerMemo>,
+    /// Package and library names (`_` for `-`) of every `Cargo.toml` in the
+    /// project, with the package directory; read on first use.
+    project_crates: std::sync::OnceLock<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5779,6 +6090,12 @@ impl GraphIndex {
         let mut rust_inline_scopes = std::collections::HashMap::new();
         let mut as_ref_receivers = std::collections::HashMap::new();
         let mut open_traits = std::collections::HashSet::new();
+        let mut rust_trait_impl_methods = std::collections::HashMap::new();
+        let mut rust_return_types = std::collections::HashMap::new();
+        let mut rust_fields_by_name: std::collections::HashMap<String, Vec<i64>> =
+            std::collections::HashMap::new();
+        let mut rust_fields_by_owner: std::collections::HashMap<(String, String), Vec<i64>> =
+            std::collections::HashMap::new();
         {
             let conn = store.conn();
             let mut stmt = conn
@@ -5799,7 +6116,11 @@ impl GraphIndex {
                             CASE WHEN file_path LIKE '%.rs'
                                 THEN json_extract(properties, '$.visibility') END,
                             CASE WHEN file_path LIKE '%.rs'
-                                THEN json_extract(properties, '$.rust_inline_module_vis') END
+                                THEN json_extract(properties, '$.rust_inline_module_vis') END,
+                            CASE WHEN label = 'Method' AND file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.rust_trait_impl') END,
+                            CASE WHEN label IN ('Method', 'Function') AND file_path LIKE '%.rs'
+                                THEN json_extract(properties, '$.return_type') END
                      FROM nodes WHERE project = ?1 ORDER BY qualified_name",
                 )
                 .map_err(sqlite_err)?;
@@ -5818,6 +6139,8 @@ impl GraphIndex {
                         r.get::<_, Option<String>>(9)?,
                         r.get::<_, Option<String>>(10)?,
                         r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<String>>(12)?,
+                        r.get::<_, Option<String>>(13)?,
                     ))
                 })
                 .map_err(sqlite_err)?;
@@ -5835,8 +6158,30 @@ impl GraphIndex {
                     rust_inline_module,
                     visibility,
                     rust_inline_module_vis,
+                    rust_trait_impl,
+                    rust_return_type,
                 ) = row.map_err(sqlite_err)?;
+                if let Some(return_type) = rust_return_type.filter(|ty| !ty.is_empty()) {
+                    rust_return_types.insert(id, return_type);
+                }
+                if label == "Field" && file_path.ends_with(".rs") {
+                    let mut segments = qname.rsplit("::");
+                    segments.next();
+                    if let Some(owner) = segments.next() {
+                        rust_fields_by_owner
+                            .entry((owner.to_string(), name.clone()))
+                            .or_default()
+                            .push(id);
+                    }
+                    rust_fields_by_name
+                        .entry(name.clone())
+                        .or_default()
+                        .push(id);
+                }
                 note_edge_resolution_work(1);
+                if let Some(trait_name) = rust_trait_impl.filter(|name| !name.is_empty()) {
+                    rust_trait_impl_methods.insert(id, trait_name);
+                }
                 if label == "File" {
                     let base = file_path.rsplit('/').next().unwrap_or(&file_path);
                     let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
@@ -5889,6 +6234,11 @@ impl GraphIndex {
                 by_qname.insert(qname, node);
             }
         }
+        let repo_root = store
+            .get_project(project)
+            .ok()
+            .flatten()
+            .and_then(|project| std::fs::canonicalize(project.root_path).ok());
         let metadata = rust_crate_roots_for_project(store, project, &known_files);
         let (rust_crate_roots, rust_libraries) = match metadata {
             Some((roots, libraries)) => (Some(roots), libraries),
@@ -6037,6 +6387,15 @@ impl GraphIndex {
             rust_inline_scopes,
             as_ref_receivers,
             open_traits,
+            rust_trait_impl_methods,
+            rust_return_types,
+            rust_fields_by_name,
+            rust_fields_by_owner,
+            std_imported_names_by_file: std::collections::HashMap::new(),
+            rust_imported_paths_by_file: std::collections::HashMap::new(),
+            repo_root,
+            return_owner_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
+            project_crates: std::sync::OnceLock::new(),
         })
     }
 
@@ -6060,6 +6419,44 @@ impl GraphIndex {
     }
 
     fn record_import_items(&mut self, edge: &ExtractedEdge, file: &str) {
+        if file.ends_with(".rs") {
+            // `use std::path::Path;` binds `Path` to the standard library in
+            // this file: a project type of the same name is not the receiver.
+            let items = edge
+                .properties
+                .get("imported_items")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let entries = if items.is_empty() {
+                vec![edge.properties.clone()]
+            } else {
+                items
+            };
+            for item in entries {
+                let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item
+                    .get("imported_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let std_path = ["std::", "core::", "alloc::", "::std::", "::core::"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix));
+                if std_path && !name.is_empty() {
+                    self.std_imported_names_by_file
+                        .entry(file.to_string())
+                        .or_default()
+                        .insert(name.to_string());
+                }
+                let glob = item.get("glob").and_then(|v| v.as_bool()) == Some(true);
+                if !glob && !name.is_empty() && !path.is_empty() {
+                    self.rust_imported_paths_by_file
+                        .entry(file.to_string())
+                        .or_default()
+                        .insert(name.to_string(), path.to_string());
+                }
+            }
+        }
         if matches!(
             greppy_parser::language_for_path(Path::new(file)),
             Language::JavaScript | Language::TypeScript { .. }
@@ -6620,6 +7017,14 @@ impl GraphIndex {
     /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
         clear_option_field_unresolved();
+        if edge
+            .properties
+            .get("js_builtin_member")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return None;
+        }
         if let Some(name) = edge
             .properties
             .get("rust_expression_macro")
@@ -6651,6 +7056,14 @@ impl GraphIndex {
         }
         if edge
             .properties
+            .get("js_member_method_only")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return self.resolve_unique_with_imports(&["Method"], name, src_id);
+        }
+        if edge
+            .properties
             .get("callee_form")
             .and_then(|value| value.as_str())
             == Some("receiver")
@@ -6664,6 +7077,15 @@ impl GraphIndex {
                     return self.resolve_direct_self_field_receiver(src_id, fact, name);
                 }
                 return self.resolve_option_field_receiver(src_id, edge, fact, name);
+            }
+            if edge.properties.get("receiver_owner").is_none() {
+                if let Some((owner, owner_file)) = edge
+                    .properties
+                    .get("receiver_return_of")
+                    .and_then(|_| self.receiver_owner_type(src_id, edge))
+                {
+                    return self.resolve_receiver_method(&owner_file, &owner, name);
+                }
             }
             let owner = edge
                 .properties
@@ -7012,8 +7434,9 @@ impl GraphIndex {
         if field.label != "Field" {
             return None;
         }
-        let declared = field.declared_type.as_deref()?.trim();
-        // No wrapper, reference, generic substitution or opaque inference.
+        // `Arc<T>`, `Rc<T>`, `Box<T>` and references reach `T`'s methods
+        // through `Deref`; any other wrapper or generic stays unresolved.
+        let declared = rust_deref_payload(field.declared_type.as_deref()?.trim());
         if declared.is_empty()
             || declared.split("::").any(|segment| {
                 segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
@@ -7324,6 +7747,17 @@ impl GraphIndex {
                 let [module] = modules.as_slice() else {
                     return None;
                 };
+                // A glob shadows the prelude macro only if its module imports
+                // that name: `use super::*;` in a test module leaves
+                // `assert!` the standard macro, even when the parent module
+                // itself re-exports a glob of unrelated items.
+                let binds = self
+                    .import_alias_sources_by_file
+                    .get(module.as_str())
+                    .is_some_and(|aliases| aliases.contains_key(path));
+                if !binds {
+                    continue;
+                }
                 identities.insert(self.rust_expression_macro_identity(
                     module,
                     path,
@@ -7331,10 +7765,12 @@ impl GraphIndex {
                     &mut seen.clone(),
                 )?);
             }
-            if identities.len() != 1 {
+            if identities.len() > 1 {
                 return None;
             }
-            return identities.into_iter().next();
+            if let Some(identity) = identities.into_iter().next() {
+                return Some(identity);
+            }
         }
         // ensure is not in the Rust prelude. Only the standard expression
         // macros can use an unshadowed, import-free prelude binding.
@@ -7414,6 +7850,14 @@ impl GraphIndex {
         {
             return None;
         }
+        if edge
+            .properties
+            .get("rust_field_access")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return self.resolve_rust_field_access(edge, src_id);
+        }
         let labels = if edge
             .properties
             .get("rust_type_reference")
@@ -7472,6 +7916,363 @@ impl GraphIndex {
         self.resolve_unique_with_imports(labels, name, src_id)
     }
 
+    /// Methods a Rust receiver call whose receiver type the syntax does not
+    /// reveal may reach: every same-language `Method` of that name the caller
+    /// can reach, when there are few. They are persisted as `POSSIBLE_CALLS`
+    /// (never `CALLS`), so `who-calls` can list the site as a possible caller
+    /// instead of silently omitting it. Names shared with the standard
+    /// traits add nothing, nor does a receiver of a standard or dependency
+    /// type. A receiver whose type is known but does not define the method
+    /// (a generic `T: Store`, a type using a trait's default method) can only
+    /// reach a trait's declaration.
+    fn unproven_receiver_candidates(&self, src_id: i64, edge: &ExtractedEdge) -> Vec<i64> {
+        const MAX_CANDIDATES: usize = 16;
+        let properties = &edge.properties;
+        if edge.edge_type != "CALLS"
+            || !edge.file_path.ends_with(".rs")
+            || properties.get("callee_form").and_then(|v| v.as_str()) != Some("receiver")
+            || properties.get("receiver_provenance").is_some()
+        {
+            return Vec::new();
+        }
+        let known_owner = self.receiver_owner_type(src_id, edge);
+        if known_owner
+            .as_ref()
+            .is_some_and(|(owner, file)| self.rust_std_type(file, owner))
+        {
+            return Vec::new();
+        }
+        let Some(name) = properties.get("callee_name").and_then(|v| v.as_str()) else {
+            return Vec::new();
+        };
+        if rust_std_method_name(name) {
+            return Vec::new();
+        }
+        let family = resolution_language_family(&edge.file_path);
+        let methods = self
+            .defs_named(&["Method"], name)
+            .into_iter()
+            .filter(|node| resolution_language_family(&node.file_path) == family)
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        // A name every other type defines is no evidence at all; stop before
+        // any per-candidate work.
+        if methods.is_empty() || methods.len() > 4 * MAX_CANDIDATES {
+            return Vec::new();
+        }
+        let owner_of = |id: i64| {
+            self.qname_for_id(id).and_then(|qname| {
+                let mut segments = qname.rsplit("::");
+                segments.next()?;
+                segments.next()
+            })
+        };
+        // A trait's implementations are reached through its declaration:
+        // `who-calls` on an impl method includes the declaration's callers.
+        let declared_traits = methods
+            .iter()
+            .filter(|id| !self.rust_trait_impl_methods.contains_key(id))
+            .filter_map(|id| owner_of(*id))
+            .collect::<std::collections::HashSet<_>>();
+        let declared_in_trait = |id: i64| {
+            owner_of(id)
+                .zip(self.file_of(id))
+                .is_some_and(|(owner, file)| {
+                    self.by_qname(&format!("{file}::Interface::{owner}"))
+                        .is_some()
+                })
+        };
+        let candidates = methods
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.rust_trait_impl_methods
+                    .get(id)
+                    .is_none_or(|trait_name| !declared_traits.contains(trait_name.as_str()))
+            })
+            .filter(|id| known_owner.is_none() || declared_in_trait(*id))
+            .collect::<Vec<_>>();
+        if candidates.len() > MAX_CANDIDATES {
+            return Vec::new();
+        }
+        candidates
+            .into_iter()
+            .filter(|id| self.rust_member_reachable(&edge.file_path, *id))
+            .collect()
+    }
+
+    /// Fields a Rust field read whose receiver type the source does not
+    /// reveal may name: the few (at most four) reachable fields of that name.
+    /// A common name is no evidence.
+    fn unproven_field_candidates(&self, src_id: i64, edge: &ExtractedEdge) -> Vec<i64> {
+        const MAX_CANDIDATES: usize = 4;
+        let properties = &edge.properties;
+        if edge.edge_type != "USAGE"
+            || !edge.file_path.ends_with(".rs")
+            || properties
+                .get("rust_field_access")
+                .and_then(|v| v.as_bool())
+                != Some(true)
+            || properties.get("receiver_owner").is_some()
+            || properties.get("ref_local_binding").is_some()
+        {
+            return Vec::new();
+        }
+        let Some(fields) = properties
+            .get("ref_name")
+            .and_then(|v| v.as_str())
+            .and_then(|name| self.rust_fields_by_name.get(name))
+        else {
+            return Vec::new();
+        };
+        if fields.len() > MAX_CANDIDATES {
+            return Vec::new();
+        }
+        if self.receiver_owner_type(src_id, edge).is_some() {
+            return Vec::new();
+        }
+        fields
+            .iter()
+            .copied()
+            .filter(|id| self.rust_member_reachable(&edge.file_path, *id))
+            .collect()
+    }
+
+    /// A member is reachable from `caller_file` when it lives in the caller's
+    /// package, or when its owner type or trait, as imported or defined in the
+    /// caller's file, is the member's own (same package), not a namesake.
+    fn rust_member_reachable(&self, caller_file: &str, id: i64) -> bool {
+        let Some(file) = self.file_of(id) else {
+            return false;
+        };
+        let member_crate = rust_crate_dir(file);
+        if member_crate == rust_crate_dir(caller_file) {
+            return true;
+        }
+        let Some(owner) = self.qname_for_id(id).and_then(|qname| {
+            let mut segments = qname.rsplit("::");
+            segments.next()?;
+            segments.next()
+        }) else {
+            return false;
+        };
+        let same_crate = |id: &i64| {
+            self.file_of(*id)
+                .is_some_and(|file| rust_crate_dir(file) == member_crate)
+        };
+        self.import_aliases_by_file
+            .get(caller_file)
+            .and_then(|aliases| aliases.get(owner))
+            .is_some_and(|ids| ids.iter().any(same_crate))
+            || self
+                .resolve_bare_rust_type_name(caller_file, owner)
+                .is_some_and(|id| same_crate(&id))
+            || self.rust_import_crate_dir(caller_file, owner) == Some(member_crate)
+    }
+
+    /// The type a deferred receiver owner names: `Dock::rights_of()` is the
+    /// payload of what `Dock::rights_of` is declared to return,
+    /// `make_report()` that of the function `make_report` the caller sees,
+    /// and `Vec::new()` (no project definition) is `Vec`.
+    /// Returns the type name with the file whose source spells it.
+    fn resolve_return_owner(
+        &self,
+        src_id: i64,
+        file_path: &str,
+        deferred: &str,
+    ) -> Option<(String, String)> {
+        let key = (file_path.to_string(), deferred.to_string());
+        if let Some(known) = self
+            .return_owner_memo
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(&key).cloned())
+        {
+            return known;
+        }
+        let answer = self.resolve_return_owner_uncached(src_id, file_path, deferred);
+        if let Ok(mut memo) = self.return_owner_memo.lock() {
+            memo.insert(key, answer.clone());
+        }
+        answer
+    }
+
+    fn resolve_return_owner_uncached(
+        &self,
+        src_id: i64,
+        file_path: &str,
+        deferred: &str,
+    ) -> Option<(String, String)> {
+        let call = deferred.strip_suffix("()")?;
+        let (owner, target) = match call.rsplit_once("::") {
+            Some((owner, method)) => {
+                let Some(target) = self.resolve_receiver_method(file_path, owner, method) else {
+                    // `Vec::new()`, `Connection::open(..)`, a derived
+                    // `Config::default()`: an associated function the project
+                    // does not define constructs its own type.
+                    return Some((owner.to_string(), file_path.to_string()));
+                };
+                (Some(owner), target)
+            }
+            None => (
+                None,
+                self.resolve_unique_with_imports(&CALLABLE_LABELS, call, src_id)?,
+            ),
+        };
+        let payload = rust_return_payload(self.rust_return_types.get(&target)?)?;
+        let target_file = self.file_of(target)?.to_string();
+        if payload == "Self" {
+            // The impl owner of the method that returns `Self`.
+            let qname = self.qname_for_id(target)?;
+            let mut segments = qname.rsplit("::");
+            segments.next()?;
+            let owner = segments.next().or(owner)?;
+            return Some((owner.to_string(), target_file));
+        }
+        Some((payload.to_string(), target_file))
+    }
+
+    /// The owner type of a receiver: the named type, or the resolved type of a
+    /// deferred return-type owner. A project function whose declared return
+    /// type names no single type (`impl Future`, a tuple) gives none.
+    fn receiver_owner_type(&self, src_id: i64, edge: &ExtractedEdge) -> Option<(String, String)> {
+        let properties = &edge.properties;
+        if let Some(owner) = properties.get("receiver_owner").and_then(|v| v.as_str()) {
+            return Some((owner.to_string(), edge.file_path.clone()));
+        }
+        let deferred = properties
+            .get("receiver_return_of")
+            .and_then(|v| v.as_str())?;
+        self.resolve_return_owner(src_id, &edge.file_path, deferred)
+    }
+
+    /// Resolve a Rust field access (`rights.may_lead`) to its `Field` by the
+    /// receiver's owner type, when the source reveals it. A field access is
+    /// never a function or type of the same name; one whose receiver type is
+    /// unknown is at most a possible use (`unproven_field_candidates`).
+    fn resolve_rust_field_access(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
+        let name = edge.properties.get("ref_name").and_then(|v| v.as_str())?;
+        if !edge.file_path.ends_with(".rs") {
+            return None;
+        }
+        note_edge_resolution_work(1);
+        if let Some((owner, owner_file)) = self.receiver_owner_type(src_id, edge) {
+            if self.rust_std_type(&owner_file, &owner) {
+                return None;
+            }
+            let owned = self
+                .rust_fields_by_owner
+                .get(&(owner.clone(), name.to_string()))?;
+            return match owned.as_slice() {
+                [id] => Some(*id),
+                // Two packages each define `Type::field`: the crate of the
+                // type this file sees, else the caller's own.
+                _ => {
+                    let in_crate = |crate_dir: &str| {
+                        let mut found = owned.iter().copied().filter(|id| {
+                            self.file_of(*id)
+                                .is_some_and(|file| rust_crate_dir(file) == crate_dir)
+                        });
+                        let first = found.next()?;
+                        found.next().is_none().then_some(first)
+                    };
+                    self.resolve_bare_rust_type_name(&owner_file, &owner)
+                        .and_then(|type_id| self.file_of(type_id))
+                        .and_then(|type_file| in_crate(rust_crate_dir(type_file)))
+                        .or_else(|| in_crate(rust_crate_dir(&edge.file_path)))
+                }
+            };
+        }
+        None
+    }
+
+    /// True when `owner`, as spelled in `file`, is not a project type: a
+    /// standard-library type (imported from `std`/`core`/`alloc`, or a prelude
+    /// type), or a name the file imports from another crate (`use
+    /// rusqlite::Connection;`) whose import does not resolve to a project
+    /// definition. A project type of the same name elsewhere is a namesake.
+    fn rust_std_type(&self, file: &str, owner: &str) -> bool {
+        if !file.ends_with(".rs") {
+            return false;
+        }
+        // Cheap evidence first: most receivers name a project type that no
+        // `use` of another crate mentions.
+        let std_type = self
+            .std_imported_names_by_file
+            .get(file)
+            .is_some_and(|names| names.contains(owner))
+            || matches!(owner, "String" | "Vec" | "Option" | "Result" | "Box");
+        let foreign_import = !std_type
+            && self
+                .rust_imported_paths_by_file
+                .get(file)
+                .and_then(|imports| imports.get(owner))
+                .is_some_and(|path| {
+                    let krate = path
+                        .trim_start_matches("::")
+                        .split("::")
+                        .next()
+                        .unwrap_or("");
+                    !matches!(krate, "crate" | "self" | "super")
+                        && !self.project_crates().contains_key(krate)
+                        && !self
+                            .import_aliases_by_file
+                            .get(file)
+                            .is_some_and(|aliases| aliases.contains_key(owner))
+                });
+        // A local definition of that name still wins over either.
+        (std_type || foreign_import) && self.resolve_bare_rust_type_name(file, owner).is_none()
+    }
+
+    /// The crates the project itself defines, by crate name, with their
+    /// package directory: every `Cargo.toml` in the repository (any
+    /// workspace) names its package and library. A `use` from any other crate
+    /// imports a dependency's type.
+    fn project_crates(&self) -> &std::collections::HashMap<String, String> {
+        self.project_crates.get_or_init(|| {
+            let mut names = std::collections::HashMap::<String, String>::new();
+            let mut shared = std::collections::HashSet::new();
+            let Some(root) = self.repo_root.as_ref() else {
+                return names;
+            };
+            for file in &self.known_files {
+                if !(file == "Cargo.toml" || file.ends_with("/Cargo.toml")) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+                    continue;
+                };
+                let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+                    continue;
+                };
+                let dir = file
+                    .strip_suffix("Cargo.toml")
+                    .unwrap_or("")
+                    .trim_end_matches('/')
+                    .to_string();
+                for table in ["package", "lib"] {
+                    if let Some(name) = document
+                        .get(table)
+                        .and_then(|item| item.get("name"))
+                        .and_then(|item| item.as_str())
+                    {
+                        let name = name.replace('-', "_");
+                        if names
+                            .insert(name.clone(), dir.clone())
+                            .is_some_and(|other| other != dir)
+                        {
+                            shared.insert(name);
+                        }
+                    }
+                }
+            }
+            // A crate name two packages share (fixtures, examples) identifies
+            // neither.
+            names.retain(|name, _| !shared.contains(name));
+            names
+        })
+    }
+
     /// Resolve a receiver call only when its statically observed owner and
     /// method name identify one Method node. Prefer the exact same-file qname;
     /// cross-file resolution requires a globally unique owner/name suffix.
@@ -7483,6 +8284,11 @@ impl GraphIndex {
         if let Some(target) = self.by_qname(&local_qname) {
             return (target.label == "Method").then_some(target.id);
         }
+        // A receiver typed with a standard-library type (imported from `std`,
+        // or a prelude type) is not a project type that shares its name.
+        if self.rust_std_type(file_path, owner) {
+            return None;
+        }
 
         let suffix = format!("::{owner}::{name}");
         let family = resolution_language_family(file_path);
@@ -7490,7 +8296,7 @@ impl GraphIndex {
         // Scanning every project node here made cross-file receiver calls
         // proportional to the whole graph for every individual edge.
         let candidates = self.defs_named(&["Method"], name);
-        let mut matches = candidates
+        let matches = candidates
             .into_iter()
             .filter(|node| {
                 resolution_language_family(&node.file_path) == family
@@ -7498,9 +8304,63 @@ impl GraphIndex {
                         .qname_for_id(node.id)
                         .is_some_and(|qname| qname.ends_with(&suffix))
             })
-            .map(|node| node.id);
-        let target = matches.next()?;
-        matches.next().is_none().then_some(target)
+            .map(|node| (node.id, node.file_path.as_str()))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => return None,
+            [(id, _)] => return Some(*id),
+            _ => {}
+        }
+        if !file_path.ends_with(".rs") {
+            return None;
+        }
+        // Two crates each define `Dock::serve`: the one meant is the crate of
+        // the `Dock` this file sees (local or imported), else the caller's own.
+        let in_crate = |crate_dir: &str| {
+            let mut owned = matches
+                .iter()
+                .filter(|(_, file)| rust_crate_dir(file) == crate_dir)
+                .map(|(id, _)| *id);
+            let first = owned.next()?;
+            owned.next().is_none().then_some(first)
+        };
+        self.resolve_bare_rust_type_name(file_path, owner)
+            .and_then(|type_id| self.file_of(type_id))
+            .and_then(|type_file| in_crate(rust_crate_dir(type_file)))
+            .or_else(|| {
+                // `use wj_dock::Dock;` names the package `wj-dock` even when
+                // its manifest is not a dependency the resolver followed.
+                self.rust_import_crate_dir(file_path, owner)
+                    .and_then(in_crate)
+            })
+            .or_else(|| {
+                // A glob import of another project crate may be what names
+                // `owner` here; the caller's own namesake is then a guess.
+                let own = rust_crate_dir(file_path);
+                let foreign_glob = self
+                    .import_globs_by_file
+                    .get(file_path)
+                    .is_some_and(|globs| {
+                        globs.iter().any(|path| {
+                            let krate = path.trim_start_matches("::").split("::").next();
+                            krate
+                                .and_then(|krate| self.project_crates().get(krate))
+                                .is_some_and(|dir| dir != own)
+                        })
+                    });
+                if foreign_glob {
+                    None
+                } else {
+                    in_crate(own)
+                }
+            })
+    }
+
+    /// The package directory of the crate a Rust file imports `name` from.
+    fn rust_import_crate_dir(&self, file: &str, name: &str) -> Option<&str> {
+        let path = self.rust_imported_paths_by_file.get(file)?.get(name)?;
+        let krate = path.trim_start_matches("::").split("::").next()?;
+        self.project_crates().get(krate).map(String::as_str)
     }
 
     /// Resolve a reference edge: try the parser's direct same-file guess
@@ -16235,5 +17095,44 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         let (_, dropped, error) = validate_or_degrade(Language::C, "a.h", extraction);
         assert!(dropped >= 1, "the anonymous node is dropped");
         assert!(error.is_none(), "the file is not refused: {error:?}");
+    }
+}
+
+#[cfg(test)]
+mod receiver_type_tests {
+    use super::{rust_crate_dir, rust_deref_payload, rust_return_payload};
+
+    #[test]
+    fn a_declared_return_type_names_the_type_its_caller_binds() {
+        assert_eq!(rust_return_payload("Result<Rights>"), Some("Rights"));
+        assert_eq!(
+            rust_return_payload("Result<Rights, Failure>"),
+            Some("Rights")
+        );
+        assert_eq!(
+            rust_return_payload("anyhow::Result<Option<Arc<wj_dock::Dock>>>"),
+            Some("Dock")
+        );
+        assert_eq!(rust_return_payload("&'a mut Self"), Some("Self"));
+        assert_eq!(rust_return_payload("Result<(), String>"), None);
+        assert_eq!(rust_return_payload("impl Future<Output = ()>"), None);
+        // A standard type: the resolver's std check keeps it from binding.
+        assert_eq!(rust_return_payload("Vec<Dock>"), Some("Vec"));
+        assert_eq!(rust_return_payload("bool"), None);
+    }
+
+    #[test]
+    fn deref_wrappers_and_references_are_transparent_for_fields() {
+        assert_eq!(rust_deref_payload("Arc<Dock>"), "Dock");
+        assert_eq!(rust_deref_payload("&mut Box<Shown>"), "Shown");
+        assert_eq!(rust_deref_payload("Mutex<Dock>"), "Mutex<Dock>");
+    }
+
+    #[test]
+    fn a_rust_file_belongs_to_the_package_its_layout_names() {
+        assert_eq!(rust_crate_dir("engine/dock/src/lib.rs"), "engine/dock");
+        assert_eq!(rust_crate_dir("engine/node/tests/window.rs"), "engine/node");
+        assert_eq!(rust_crate_dir("src/lib.rs"), "");
+        assert_eq!(rust_crate_dir("tests/it.rs"), "");
     }
 }
