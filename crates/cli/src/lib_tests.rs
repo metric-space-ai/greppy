@@ -3924,3 +3924,18 @@ fn graph_reads_do_not_follow_embedding_progress() {
         &serde_json::json!({"kind": "embedding", "state": "writing_graph"})
     )));
 }
+
+#[test]
+fn a_search_that_stops_waiting_keeps_only_its_own_embedding_job_running() {
+    let dir = std::env::temp_dir().join(format!("greppy-retained-marker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let job = dir.join("job.json");
+    // No marker: the demand monitor may stop the job after its last waiter.
+    assert!(!background_job_retained(&job, 41));
+    std::fs::write(background_job_retained_marker(&job), "41").unwrap();
+    assert!(background_job_retained(&job, 41));
+    // A marker left by an earlier job never retains a later one.
+    assert!(!background_job_retained(&job, 42));
+    let _ = std::fs::remove_dir_all(&dir);
+}

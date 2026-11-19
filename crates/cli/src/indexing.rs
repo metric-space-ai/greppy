@@ -1552,8 +1552,8 @@ fn dispatch_index_health_with_detail(
         if vectors_missing_with_model {
             println!(
                 "vectors: none stored though an embedding model is configured \
-                 — `semantic-search` will build them on first use, or run \
-                 `grep index` now"
+                 — `greppy search` will build them on first use, or run \
+                 `greppy index` now"
             );
         }
         println!("root: {}", effective_root.display());
@@ -2243,7 +2243,7 @@ fn dispatch_index_with_progress(
                 println!("{}", embedding_progress_text(&progress));
             } else {
                 println!(
-                    "semantic-search: semantic index is pending; the next semantic query will retry the background job."
+                    "search: semantic index is pending; the next `greppy search` will retry the background job."
                 );
             }
         }

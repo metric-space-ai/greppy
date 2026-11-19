@@ -294,17 +294,27 @@ pub(crate) fn resolve_qualified_ids(
         .next()
         .and_then(|s| s.rsplit('.').next())
         .unwrap_or(owner);
-    let mut ids: Vec<i64> = rows
-        .iter()
-        .filter(|r| {
-            is_primary_label(&r.label)
-                && (r.name.eq_ignore_ascii_case(symbol)
+    let owned = |primary: bool| -> Vec<i64> {
+        rows.iter()
+            .filter(|r| {
+                (if primary {
+                    is_primary_label(&r.label)
+                } else {
+                    is_addressable_definition_label(&r.label)
+                }) && (r.name.eq_ignore_ascii_case(symbol)
                     || (r.name.eq_ignore_ascii_case(member)
                         && qname_owner_segment(&r.qualified_name)
                             .is_some_and(|owner| owner.eq_ignore_ascii_case(owner_tail))))
-        })
-        .map(|r| r.id)
-        .collect();
+            })
+            .map(|r| r.id)
+            .collect()
+    };
+    // `Foo::name` is the method when `Foo` has both a field and a getter of
+    // that name; `SourceState::next_page` is the field when nothing else is.
+    let mut ids = owned(true);
+    if ids.is_empty() {
+        ids = owned(false);
+    }
     ids.sort_unstable();
     ids.dedup();
     Some(ids)

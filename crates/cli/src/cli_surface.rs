@@ -728,12 +728,16 @@ pub enum Command {
     /// Fused search: combine literal/full-text, symbol, fuzzy semantic,
     /// and graph-neighbour signals into grep-like ranked hits.
     /// This is search output, not a generated answer: each row stays
-    /// `file:line score signals symbol snippet`.
+    /// grep-shaped, `file:line:snippet`; `--explain` appends
+    /// `# score=… signals=… symbol=…` to every row.
     Plus {
         query: Option<String>,
         /// Number of ranked hits to print.
         #[arg(long, default_value_t = 10)]
         k: usize,
+        /// Restrict hits to these files or directory subtrees. Repeatable.
+        #[arg(long = "path", value_name = "PATH")]
+        path_opts: Vec<String>,
         /// Print the enclosing source span under symbol-backed hits.
         #[arg(long)]
         code: bool,

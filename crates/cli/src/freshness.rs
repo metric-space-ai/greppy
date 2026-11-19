@@ -337,7 +337,13 @@ fn maybe_reindex_stale_with_capability(
     if freshness_is_reindexable_stale(&freshness) {
         if structural_only {
             let effective_root = resolve_root(root)?;
-            wait_for_index_publication(root, &effective_root, "structural-workspace-drift")?;
+            if refresh_deferred(wait_for_index_publication(
+                root,
+                &effective_root,
+                "structural-workspace-drift",
+            ))? {
+                return Ok(());
+            }
             if let Ok(fresh) = open_default_store_query_writer(root) {
                 *store = fresh;
             }
@@ -347,13 +353,92 @@ fn maybe_reindex_stale_with_capability(
             freshness_within_inline_drift_cap(root, &freshness) && try_auto_reindex_inline(root);
         if !rebuilt {
             let effective_root = resolve_root(root)?;
-            wait_for_index_publication(root, &effective_root, "workspace-drift")?;
+            if refresh_deferred(wait_for_index_publication(
+                root,
+                &effective_root,
+                "workspace-drift",
+            ))? {
+                return Ok(());
+            }
         }
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
         }
     }
     Ok(())
+}
+
+/// The refresh this process asked for and host admission deferred (for
+/// example while the system disk is low): queries keep answering from the
+/// published index, saying that it predates the changed files. Only new
+/// index work waits.
+static REFRESH_DEFERRAL: std::sync::Mutex<Vec<(std::path::PathBuf, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn deferral_for(root: &std::path::Path) -> Option<String> {
+    REFRESH_DEFERRAL
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(deferred, _)| deferred == root)
+        .map(|(_, detail)| detail.clone())
+}
+
+/// `Ok(true)` when the refresh was deferred by admission (recorded, not an
+/// error); other failures stay errors.
+fn refresh_deferred(outcome: Result<()>) -> Result<bool> {
+    match outcome {
+        Ok(()) => Ok(false),
+        Err(Error::AdmissionDeferred { root, detail }) => {
+            if let Ok(mut deferrals) = REFRESH_DEFERRAL.lock() {
+                deferrals.retain(|(deferred, _)| deferred != &root);
+                deferrals.push((root, detail));
+            }
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Serve the published index after a deferred refresh of this workspace: it
+/// exists and only drifted in a way a reindex heals. A cold, broken or
+/// unknown store, and a version drift that changes scope, are still refused.
+/// Read-only queries use this; symbol edits do not (see `edit.rs`), because a
+/// rename planned on a stale graph misses references.
+fn serve_after_deferred_refresh(
+    root: Option<&str>,
+    freshness: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let effective_root = resolve_root(root).ok()?;
+    let detail = deferral_for(&effective_root)?;
+    let deferred_failure = freshness.get("state").and_then(serde_json::Value::as_str)
+        == Some("failed")
+        && freshness
+            .get("preparation_failure_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("admission_deferred");
+    if !(freshness_is_reindexable_stale(freshness) || deferred_failure) {
+        return None;
+    }
+    if published_graph_generation(&effective_root).unwrap_or(0) == 0 {
+        return None;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let changed = freshness
+        .get("stale_file_count")
+        .and_then(serde_json::Value::as_u64);
+    WARNED.call_once(|| {
+        let files = changed.map_or_else(|| "changed files".to_string(), |n| format!("{n} changed files"));
+        eprintln!(
+            "greppy: answering from the existing index, which predates {files}; the refresh was deferred: {detail}"
+        );
+    });
+    let mut served = freshness.clone();
+    if let Some(map) = served.as_object_mut() {
+        map.insert("served_stale".into(), serde_json::json!(true));
+        map.insert("refresh_deferred".into(), serde_json::json!(detail));
+    }
+    Some(served)
 }
 
 /// The index is stale AND the drift is one an automatic reindex can heal
@@ -463,6 +548,11 @@ pub(crate) fn freshness_serve_decision_with_policy(
     let freshness = preparation_refusal_diagnostics(freshness, root);
     if freshness_json_is_fresh(&freshness) {
         return FreshnessServe::Fresh(freshness);
+    }
+    if !writer_active {
+        if let Some(served) = serve_after_deferred_refresh(root, &freshness) {
+            return FreshnessServe::Fresh(served);
+        }
     }
     if writer_active {
         return FreshnessServe::Refuse(refresh_state_for_query(root, freshness, true));

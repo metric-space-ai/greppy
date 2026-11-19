@@ -4446,13 +4446,12 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
         &store,
         &[("GREPPY_HEAVY_GATE", gate.to_str().unwrap())],
     );
-    assert_ne!(
-        code, 0,
-        "rejected launch unexpectedly served stale hits: {out} {err}"
-    );
+    // A read-only query keeps answering from the published index and says
+    // that the answer predates the change and why the refresh did not run.
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("refresh_marker"), "{out} {err}");
     assert!(
-        err.contains("no index work started")
-            || err.contains("automatic index preparation did not start"),
+        err.contains("answering from the existing index") && err.contains("no index work started"),
         "{out} {err}"
     );
     assert!(

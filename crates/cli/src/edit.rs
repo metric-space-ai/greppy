@@ -48,12 +48,19 @@ pub(crate) fn dispatch_edit_inner(
         let mut store = open_default_store_query_writer(root)?;
         maybe_reindex_stale(&mut store, root)?;
         let project = project_for(root)?;
-        if let FreshnessServe::Refuse(freshness) =
-            freshness_serve_decision_with_policy(&store, root, &project, true, false, true)
-        {
+        let decision =
+            freshness_serve_decision_with_policy(&store, root, &project, true, false, true);
+        // A query may answer from an index whose refresh admission deferred;
+        // a symbol edit may not: its reference sites come from the graph.
+        let served_stale = decision
+            .freshness()
+            .get("served_stale")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if served_stale || matches!(decision, FreshnessServe::Refuse(_)) {
             return Err(Error::Index(indexed_stale_skip_message(
                 "symbol edit",
-                &freshness,
+                decision.freshness(),
             )));
         }
     }

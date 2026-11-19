@@ -1745,9 +1745,33 @@ pub(crate) fn dispatch_semantic(
         if !embedding_scope_complete(&store, &project, generation, &cfg.model_id, &prefixes) {
             let root_path = resolve_root(root)?;
             drop(store);
-            store = wait_for_embedding_publication(
+            store = match wait_for_embedding_publication(
                 root, &root_path, &project, generation, &cfg, &prefixes,
-            )?;
+            )? {
+                EmbeddingWait::Published(store) => *store,
+                EmbeddingWait::Building(progress) => {
+                    // The embedding job keeps running in the background. A
+                    // search never blocks on it: it answers with the
+                    // retryable status and its ETA.
+                    let status = crate::inference::embedding_progress_text(&progress);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "command": "search",
+                                "status": "semantic_index_building",
+                                "retryable": true,
+                                "message": status,
+                                "progress": progress,
+                            }))
+                            .map_err(|e| Error::Invalid(format!("serialize search JSON: {e}")))?
+                        );
+                    } else {
+                        println!("{status}; retry the same search when it is done");
+                    }
+                    return Ok(i32::from(crate::EXIT_TEMPFAIL));
+                }
+            };
             let reopened_decision = freshness_serve_decision_with_policy(
                 &store,
                 root,
@@ -2006,6 +2030,16 @@ mod semantic_work_announcement_tests {
     }
 }
 
+/// How long a `search` waits in the foreground for a missing semantic index
+/// before it answers with the retryable building status instead.
+const SEMANTIC_FOREGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+enum EmbeddingWait {
+    Published(Box<greppy_store::Store>),
+    /// Still building after [`SEMANTIC_FOREGROUND_WAIT`]; the job's progress.
+    Building(serde_json::Value),
+}
+
 fn wait_for_embedding_publication(
     root: Option<&str>,
     effective_root: &std::path::Path,
@@ -2013,7 +2047,7 @@ fn wait_for_embedding_publication(
     requested_generation: u64,
     cfg: &EmbeddingModelConfig,
     prefixes: &[String],
-) -> Result<greppy_store::Store> {
+) -> Result<EmbeddingWait> {
     let mut announced = false;
     let progress_started = std::time::Instant::now();
     crate::context_status::restricted(
@@ -2065,6 +2099,25 @@ fn wait_for_embedding_publication(
                 ),
                 BackgroundEmbeddingObservation::Pending
             ) {
+                // Leave only a job that can be kept alive: until it has
+                // recorded its pid, this waiter is what keeps it running.
+                let job_pid = progress
+                    .as_ref()
+                    .and_then(|job| job.get("pid"))
+                    .and_then(serde_json::Value::as_u64);
+                if let Some(pid) =
+                    job_pid.filter(|_| progress_started.elapsed() >= SEMANTIC_FOREGROUND_WAIT)
+                {
+                    let retained = std::fs::write(
+                        crate::background_job_retained_marker(launch.path()),
+                        pid.to_string(),
+                    );
+                    if retained.is_ok() {
+                        return Ok(EmbeddingWait::Building(progress.unwrap_or_else(|| {
+                            embedding_progress_value(effective_root, cfg, requested_generation)
+                        })));
+                    }
+                }
                 if !announced
                     && should_announce_semantic_work(progress_started.elapsed(), progress.as_ref())
                 {
@@ -2110,7 +2163,7 @@ fn wait_for_embedding_publication(
                         crate::context_status::Capability::Semantic,
                     );
                 }
-                return Ok(store);
+                return Ok(EmbeddingWait::Published(Box::new(store)));
             }
             BackgroundEmbeddingObservation::FollowIndex => {
                 drop(store);
