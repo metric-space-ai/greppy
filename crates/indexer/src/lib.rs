@@ -268,9 +268,12 @@ pub fn index_with_options_and_progress(
     progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<IndexReport> {
     progress(IndexBuildProgress::new("discovering_files", 0, 0));
+    let step = std::time::Instant::now();
     let abs_root = greppy_discover::detect_repo_root(root)?;
     let indexer_version = indexer_version_for_options(options);
     let prior_state = store.list_private_file_states(project_name)?;
+    profile_step("index: read prior file states", step);
+    let step = std::time::Instant::now();
     // Compatibility must be read before publishing the new version or filtering
     // the inventory. Migrate every retained file in this store layer, even when
     // this invocation would ordinarily refresh only a few Delta paths.
@@ -325,6 +328,7 @@ pub fn index_with_options_and_progress(
     } else {
         (discovered_entries, Vec::new())
     };
+    profile_step("index: walk the worktree", step);
     // Store inventory preparation is not file classification. Incompatible
     // generations can spend substantial time here before any file is parsed.
     progress(IndexBuildProgress::new("preparing_graph_inventory", 0, 0));
@@ -1756,6 +1760,14 @@ const USAGE_LABELS: [&str; 11] = [
 /// CALLS-keeps-self-loops rule). The determinism test
 /// (`parallel_and_sequential_indexers_produce_identical_graph`) and the
 /// cross-file resolution tests enforce that.
+/// With `GREPPY_PROFILE` set, one stderr line per resolution step: where a
+/// refresh spends its time must be readable without a profiler.
+pub fn profile_step(label: &str, started: std::time::Instant) {
+    if std::env::var_os("GREPPY_PROFILE").is_some() {
+        eprintln!("[profile] {label} {:?}", started.elapsed());
+    }
+}
+
 fn resolve_and_persist_edges(
     store: &mut Store,
     project: &str,
@@ -1800,7 +1812,10 @@ fn resolve_edges_with_replacement(
 ) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
+    let step = std::time::Instant::now();
     let mut index = GraphIndex::load(store, project)?;
+    profile_step("resolve: load graph index", step);
+    let step = std::time::Instant::now();
 
     // Resolve `IMPORTS` edges BEFORE the reference edges (CALLS / TYPE_REF
     // / USES). The import-based disambiguation reads a file's resolved
@@ -1957,6 +1972,9 @@ fn resolve_edges_with_replacement(
         }
     }
 
+    profile_step("resolve: imports pass", step);
+    let step = std::time::Instant::now();
+
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
     for edge in edges.iter().filter(|e| e.edge_type != "IMPORTS") {
         examined += 1;
@@ -2009,6 +2027,9 @@ fn resolve_edges_with_replacement(
         push_rust_enum_owner_usage(&index, project, src_id, target_id, edge, &mut resolved);
     }
 
+    profile_step("resolve: reference pass", step);
+    let step = std::time::Instant::now();
+
     // Persist every resolved edge in a SINGLE transaction (was: one
     // transaction per edge). Determinism is unchanged — the edge order is
     // the same IMPORTS-then-references order resolved above.
@@ -2058,6 +2079,7 @@ fn resolve_edges_with_replacement(
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![anyhow_factory_repair_key(project),index.anyhow_dependency_binding]).map_err(sqlite_err)?;
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("{DIRECT_SELF_FIELD_REPAIR_KEY}.{project}")]).map_err(sqlite_err)?;
     progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
+    profile_step("resolve: persist edges", step);
     Ok(resolved.len())
 }
 
@@ -3893,7 +3915,9 @@ fn resolve_edges_incremental(
     // Did a changed file alter the resolvable definition set? If so, an
     // UNCHANGED file's edge could now resolve differently — fall back to the
     // full, insert-only re-resolution (identical to a first run).
+    let step = std::time::Instant::now();
     let def_fp_after = def_fingerprint(store, project)?;
+    profile_step("incremental: definition fingerprint", step);
     if &def_fp_after != def_fp_before {
         // The resolvable def set changed: a name referenced by an UNCHANGED
         // file may now be ambiguous (or newly resolvable), so its SURVIVING
@@ -3909,7 +3933,10 @@ fn resolve_edges_incremental(
                 rusqlite::params![project],
             )
             .map_err(sqlite_err)?;
+        profile_step("incremental: definitions changed, all edges deleted", step);
+        let step = std::time::Instant::now();
         let raw_edges = load_all_raw_edges(store, project)?;
+        profile_step("incremental: load all raw edges", step);
         note_reresolved(raw_edges.len());
         return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
     }

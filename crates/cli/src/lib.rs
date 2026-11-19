@@ -11468,11 +11468,33 @@ fn should_defer_embedding(cfg: &EmbeddingModelConfig, candidate_nodes: usize) ->
     candidate_nodes >= threshold
 }
 
+/// Whether the store a publication replaces still has to be verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacedStore {
+    /// Run the full integrity check; a corrupt store is quarantined.
+    Verify,
+    /// The snapshot was seeded from this very store and passed its own
+    /// integrity check: every page the two share is already verified.
+    CoveredBySeededSnapshot,
+}
+
 fn publish_store_snapshot(
     temp_path: &std::path::Path,
     active_path: &std::path::Path,
 ) -> Result<()> {
-    let active_backupable = match prepare_existing_active_store(active_path) {
+    publish_store_snapshot_replacing(temp_path, active_path, ReplacedStore::Verify)
+}
+
+fn publish_store_snapshot_replacing(
+    temp_path: &std::path::Path,
+    active_path: &std::path::Path,
+    replaced: ReplacedStore,
+) -> Result<()> {
+    let verify = replaced == ReplacedStore::Verify;
+    let step = std::time::Instant::now();
+    let quiesced = quiesce_existing_active_store(active_path, verify);
+    greppy_indexer::profile_step("publish: quiesce the replaced store", step);
+    let active_backupable = match quiesced {
         Ok(()) => active_path.exists(),
         Err(e) if active_snapshot_is_recoverable(&e) && active_path.exists() => {
             let quarantine_path = quarantine_active_store(active_path)?;
@@ -11494,6 +11516,7 @@ fn publish_store_snapshot(
         // readers keep their old inode; new readers see the complete new DB.
         // No full-size graph.db.prev copy is needed or retained.
         cleanup_sqlite_family(&backup_path)?;
+        let step = std::time::Instant::now();
         std::fs::rename(temp_path, active_path).map_err(|error| {
             Error::io(
                 format!(
@@ -11506,10 +11529,15 @@ fn publish_store_snapshot(
         })?;
         workspace_locator::ensure_db_mode(active_path)
             .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
+        greppy_indexer::profile_step("publish: rename", step);
+        let step = std::time::Instant::now();
         sync_file(active_path)?;
+        greppy_indexer::profile_step("publish: sync the published file", step);
+        let step = std::time::Instant::now();
         cleanup_sqlite_sidecars(temp_path)?;
         cleanup_sqlite_family(&backup_path)?;
         sync_parent_dir(active_path)?;
+        greppy_indexer::profile_step("publish: sync the directory", step);
         Ok(())
     }
 
@@ -11681,19 +11709,31 @@ fn restore_active_from_backup(
 }
 
 fn prepare_existing_active_store(active_path: &std::path::Path) -> Result<()> {
+    quiesce_existing_active_store(active_path, true)
+}
+
+/// Bring the active store to one quiescent file (WAL checkpointed, sidecars
+/// removed). `verify` adds SQLite's full integrity check, which reads the
+/// whole database: tens of seconds for a multi-gigabyte store on a cold disk.
+/// A default writable open runs that check by itself, so the store is opened
+/// without it here and checked at most once.
+fn quiesce_existing_active_store(active_path: &std::path::Path, verify: bool) -> Result<()> {
     if !active_path.exists() {
         return Ok(());
     }
     workspace_locator::ensure_db_mode(active_path)
         .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
-    let store = greppy_store::Store::open(active_path)?;
+    let store =
+        greppy_store::Store::open_with(active_path, greppy_store::OpenOptions::query_writer())?;
     checkpoint_store(&store, active_path)?;
-    store.integrity_check().map_err(|e| {
-        Error::Store(format!(
-            "active index integrity_check failed for {} before snapshot publish: {e}",
-            active_path.display()
-        ))
-    })?;
+    if verify {
+        store.integrity_check().map_err(|e| {
+            Error::Store(format!(
+                "active index integrity_check failed for {} before snapshot publish: {e}",
+                active_path.display()
+            ))
+        })?;
+    }
     drop(store);
     cleanup_sqlite_sidecars(active_path)?;
     workspace_locator::ensure_db_mode(active_path)
@@ -11808,17 +11848,40 @@ fn seed_temp_store_from_active_if_usable(
     active_path: &std::path::Path,
     temp_path: &std::path::Path,
 ) -> Result<bool> {
+    seed_temp_store_from_active(active_path, temp_path, true)
+}
+
+/// Seed without reading the whole active store first. The caller must run
+/// the integrity check on the finished snapshot (it covers every seeded
+/// page) and, if a seeded build fails, verify the active store before
+/// trusting it again; see `index_atomic_snapshot`.
+fn seed_temp_store_from_unverified_active(
+    active_path: &std::path::Path,
+    temp_path: &std::path::Path,
+) -> Result<bool> {
+    seed_temp_store_from_active(active_path, temp_path, false)
+}
+
+fn seed_temp_store_from_active(
+    active_path: &std::path::Path,
+    temp_path: &std::path::Path,
+    verify: bool,
+) -> Result<bool> {
     if !active_path.exists() {
         return Ok(false);
     }
-    match prepare_existing_active_store(active_path) {
+    let step = std::time::Instant::now();
+    match quiesce_existing_active_store(active_path, verify) {
         Ok(()) => {}
         Err(e) if active_snapshot_is_recoverable(&e) => {
             return Ok(false);
         }
         Err(e) => return Err(e),
     }
+    greppy_indexer::profile_step("seed: quiesce the active store", step);
+    let step = std::time::Instant::now();
     if try_clone_store_file(active_path, temp_path)? {
+        greppy_indexer::profile_step("seed: clone", step);
         workspace_locator::ensure_db_mode(temp_path)
             .map_err(|e| Error::io(format!("chmod db {}", temp_path.display()), e))?;
         return Ok(true);
