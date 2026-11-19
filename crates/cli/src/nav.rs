@@ -2072,6 +2072,18 @@ impl<'a> BriefRender<'a> {
                 return Some(sentence);
             }
         }
+        // The doc comment the parser attached (JSDoc, docstrings, block
+        // comments), as written: a generated summary is only for code that
+        // has none.
+        if let Some(doc) = node
+            .properties
+            .get("doc_full")
+            .and_then(|value| value.as_str())
+            .map(|doc| doc.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|doc| !doc.is_empty())
+        {
+            return Some(doc);
+        }
         if !self.with_hints {
             return None;
         }
@@ -2103,6 +2115,15 @@ impl<'a> BriefRender<'a> {
         let mut i = start as usize;
         while i >= 2 {
             let trimmed = lines[i - 2].trim();
+            // A comment is never part of an attribute, whatever brackets its
+            // prose holds (`/// … (aborted when …` / `/// … changes).`).
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+            {
+                break;
+            }
             let opens = trimmed.matches(['(', '[']).count() as i32;
             let closes = trimmed.matches([')', ']']).count() as i32;
             balance += opens - closes;
@@ -2998,7 +3019,22 @@ pub(crate) fn nav_kind_word(lines: Option<&Vec<String>>, node: &greppy_store::No
     ];
     if let Some(lines) = lines {
         if let Some(line) = lines.get((node.start_line.max(1) as usize).saturating_sub(1)) {
-            for word in line.split_whitespace() {
+            // Only the words before the definition's own name declare its
+            // kind: `async fn audit(..) -> Result<(), &'static str>` is not a
+            // static, and a lifetime (`'static`) is never a keyword.
+            let head = line
+                .match_indices(node.name.as_str())
+                .find(|(at, _)| {
+                    let before = line[..*at].chars().next_back();
+                    let after = line[*at + node.name.len()..].chars().next();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+                .map_or(line.as_str(), |(at, _)| &line[..at]);
+            for word in head.split_whitespace() {
+                if word.starts_with('\'') {
+                    continue;
+                }
                 let word = word.trim_matches(|c: char| !c.is_alphanumeric());
                 if KEYWORDS.contains(&word) {
                     return word.to_string();
@@ -3110,7 +3146,7 @@ pub(crate) fn nav_refuse_non_callable(
         });
     }
     println!(
-        "next: every reference to the {}: greppy find-usages {target}",
+        "next: every reference to the {}: greppy who-calls {target}",
         { nav_kind_word(lines.as_ref(), node) }
     );
     Ok(Some(1))
@@ -3125,10 +3161,11 @@ pub(crate) fn nav_refuse_ambiguous(
     target: &str,
     ids: &[i64],
 ) -> Result<Option<i32>> {
-    if ids.len() < 2 || split_path_qualified(target).is_some() {
+    if ids.len() < 2 {
         return Ok(None);
     }
-    let mut sites: Vec<(String, i64)> = Vec::new();
+    let path_qualified = split_path_qualified(target).is_some();
+    let mut sites: Vec<(String, i64, String)> = Vec::new();
     for id in ids {
         let Some(node) = store.get_node(*id)? else {
             continue;
@@ -3142,20 +3179,55 @@ pub(crate) fn nav_refuse_ambiguous(
         let start = node.start_line.max(1);
         if !sites
             .iter()
-            .any(|(file, line)| file == &node.file_path && *line == start)
+            .any(|(file, line, _)| file == &node.file_path && *line == start)
         {
-            sites.push((node.file_path.clone(), start));
+            sites.push((node.file_path.clone(), start, node.qualified_name.clone()));
         }
     }
     if sites.len() < 2 {
         return Ok(None);
     }
+    // A file-qualified name still names several definitions when one file
+    // has two owners of that name (`Calls::new`, `Call::new`). Variants of
+    // one definition (cfg twins, a type and its impl) share their owner.
+    if path_qualified && !definitions_have_distinct_owners(&sites) {
+        return Ok(None);
+    }
     sites.sort();
     println!("`{target}` is {} definitions", sites.len());
-    for (file, line) in &sites {
-        println!("{file}:{line}");
+    let addresses = definition_addresses(&sites);
+    for ((file, line, _), address) in sites.iter().zip(addresses) {
+        println!("{file}:{line}  {address}");
     }
     Ok(Some(1))
+}
+
+/// True when the definitions belong to different owners in their files.
+pub(crate) fn definitions_have_distinct_owners(sites: &[(String, i64, String)]) -> bool {
+    let mut owners = sites
+        .iter()
+        .map(|(file, _, qualified)| (file.as_str(), crate::qname_owner_segment(qualified)))
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners.dedup();
+    owners.len() > 1
+}
+
+/// The spelling that names each definition alone: `<path>::<name>`, or
+/// `<path>::<Owner>::<name>` where the file holds the name more than once.
+pub(crate) fn definition_addresses(sites: &[(String, i64, String)]) -> Vec<String> {
+    sites
+        .iter()
+        .map(|(file, _, qualified)| {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified);
+            let name = name.split('@').next().unwrap_or(name);
+            let shared_file = sites.iter().filter(|(other, _, _)| other == file).count() > 1;
+            match crate::qname_owner_segment(qualified) {
+                Some(owner) if shared_file => format!("{file}::{owner}::{name}"),
+                _ => format!("{file}::{name}"),
+            }
+        })
+        .collect()
 }
 
 /// The name does not resolve. Say so, and add only what the agent could not get

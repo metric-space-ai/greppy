@@ -236,8 +236,16 @@ pub(crate) fn plus_token_similarity(a: &str, b: &str) -> f64 {
     if a.len() < 3 || b.len() < 3 {
         return 0.0;
     }
+    let (a_len, b_len) = (a.chars().count(), b.chars().count());
+    let width = a_len.max(b_len) as f64;
+    // The length difference bounds the edit distance from below, so
+    // `bound` bounds the similarity from above. Tokens whose lengths alone
+    // keep them under the fuzzy threshold skip the O(n·m) table.
+    let bound = 1.0 - (a_len.abs_diff(b_len) as f64 / width);
+    if bound < 0.86 {
+        return bound.clamp(0.0, 1.0);
+    }
     let distance = plus_levenshtein(a, b) as f64;
-    let width = a.chars().count().max(b.chars().count()) as f64;
     (1.0 - (distance / width)).clamp(0.0, 1.0)
 }
 
@@ -551,6 +559,7 @@ pub(crate) fn plus_json(
 pub(crate) fn dispatch_plus(
     query: Option<&str>,
     k: usize,
+    paths: &[String],
     code: bool,
     explain: bool,
     json: bool,
@@ -564,6 +573,7 @@ pub(crate) fn dispatch_plus(
         return Err(Error::Invalid("a query is required".into()));
     }
     let k = cli_result_limit(k).max(1);
+    let path_filters = prepare_query_path_filters(root, "plus", q, paths)?;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
     // Combined search also refuses stale indexed lexical/graph/vector rows.
@@ -647,6 +657,13 @@ pub(crate) fn dispatch_plus(
     }
     let q_tokens = plus_query_tokens(q);
     let code_intent = plus_is_code_intent(&q_tokens);
+    // Ranked signals return their best `fetch` hits project-wide; under
+    // `--path` the best ones may all lie elsewhere. Fetch deeper, then scope.
+    let signal_fetch = if path_filters.is_empty() {
+        fetch
+    } else {
+        fetch.max(2000)
+    };
     let mut hits: std::collections::BTreeMap<String, PlusHit> = std::collections::BTreeMap::new();
     let mut vector_status = if vectors { Some("requested") } else { None };
     let mut vector_candidate_total = None;
@@ -656,7 +673,27 @@ pub(crate) fn dispatch_plus(
     // Literal/full-text signal: exact current-worktree lines remain
     // first-class grep-like results even though source bodies are not copied
     // into SQLite by default.
-    let code_hits = source_code_hits_ranked(&store, &project, q, &root_path, fetch)?;
+    let scoped_paths = path_filters
+        .repo_prefixes()
+        .into_iter()
+        .filter(|prefix| !prefix.is_empty())
+        .collect::<Vec<_>>();
+    let code_hits = if scoped_paths.is_empty() {
+        source_code_hits_ranked(&store, &project, q, &root_path, signal_fetch)?
+    } else {
+        // The ranked literal signal covers only indexed text; under `--path`
+        // the literal hits are the scoped files' own lines.
+        live_grep_search_code_paths_pattern(q, &root_path, &scoped_paths, true, false, None)?
+            .into_iter()
+            .take(signal_fetch)
+            .map(|hit| greppy_search::RankedCodeHit {
+                location: hit.location,
+                snippet: hit.snippet,
+                rank: 0.0,
+                relevance: 1.0,
+            })
+            .collect()
+    };
     let exact_literal_text = !code && !code_hits.is_empty() && plus_is_literal_intent(q, &q_tokens);
     let vector_control_intent = if vectors {
         plus_vector_control_intent(q, &q_tokens, exact_literal_text)
@@ -698,7 +735,8 @@ pub(crate) fn dispatch_plus(
             if !seen_tokens.insert(tok.clone()) {
                 continue;
             }
-            for h in source_code_hits_ranked(&store, &project, &tok, &root_path, fetch / 2)? {
+            for h in source_code_hits_ranked(&store, &project, &tok, &root_path, signal_fetch / 2)?
+            {
                 let Some((file, line_str)) = h.location.rsplit_once(':') else {
                     continue;
                 };
@@ -722,7 +760,8 @@ pub(crate) fn dispatch_plus(
     if !exact_literal_text {
         // Symbol FTS signal: identifier/camel-case aware, still output as a
         // location + snippet, not as prose.
-        let symbol_hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
+        let symbol_hits =
+            greppy_search::search_symbols_in_project(&store, &project, q, signal_fetch)?;
         let symbol_ranks: Vec<f64> = symbol_hits.iter().map(|h| h.rank).collect();
         for h in symbol_hits {
             if let Some(n) = store.get_node(h.node_id)? {
@@ -749,7 +788,8 @@ pub(crate) fn dispatch_plus(
         // such as normalisation/normalize without turning the command into prose.
         if !q_tokens.is_empty() {
             for n in store.list_nodes(&project, "", "", 0, 100_000)? {
-                if !plus_allows_ranked_node(&n, code_intent) {
+                if !path_filters.matches(&n.file_path) || !plus_allows_ranked_node(&n, code_intent)
+                {
                     continue;
                 }
                 let node_tokens = plus_symbol_tokens(&n);
@@ -780,7 +820,7 @@ pub(crate) fn dispatch_plus(
 
         // Fuzzy semantic signal: algorithmic semantic scorer over indexed symbol
         // metadata. This is the "plus" part, still represented as a search hit.
-        for h in greppy_search::semantic_query(&store, q, None, Some(&project), fetch)? {
+        for h in greppy_search::semantic_query(&store, q, None, Some(&project), signal_fetch)? {
             if let Some(n) = plus_store_node_from_row(&store, &h.node)? {
                 if !plus_allows_ranked_node(&n, code_intent) {
                     continue;
@@ -857,6 +897,8 @@ pub(crate) fn dispatch_plus(
         }
     }
 
+    // `--path` scopes every signal's hits, before the graph work per hit.
+    hits.retain(|_, hit| path_filters.matches(&hit.file_path));
     for hit in hits.values_mut() {
         plus_add_graph_signals(&store, hit)?;
     }

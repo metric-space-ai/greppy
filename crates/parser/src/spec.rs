@@ -1263,6 +1263,13 @@ fn doc_anchor(def_node: Node<'_>) -> Node<'_> {
             }
         }
     }
+    // JS/TS: the JSDoc of `export function f()` precedes the export
+    // statement, not the declaration inside it.
+    if let Some(parent) = def_node.parent() {
+        if parent.kind() == "export_statement" {
+            return parent;
+        }
+    }
     // Ruby: a method/class with no prev sibling sits first in a wrapping
     // `body_statement`; the comment is a sibling of that body_statement.
     if def_node.prev_sibling().is_none() {

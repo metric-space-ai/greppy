@@ -1131,6 +1131,14 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                         .map(str::trim)
                 }),
             ) {
+                // `trace` names its start with `--symbol`. Dropping the name
+                // would trace from an arbitrary first node instead.
+                if sub == "trace" {
+                    println!(
+                        "`trace` takes its start symbol as `--symbol S`; nothing was traced: greppy trace --symbol {stray}"
+                    );
+                    return 64;
+                }
                 println!("note: `{sub}` takes no argument; ignoring `{stray}`");
                 return run_os(reduced);
             }
@@ -2616,6 +2624,12 @@ fn dispatch_subcommand(
             }
             dispatch_search_graph(q, name_filter, json, root)
         }
+        Command::Trace { symbol: None, .. } => {
+            // A trace without a start would begin at whatever node comes
+            // first in the store (a manifest entry), which answers nothing.
+            println!("`trace` needs its start symbol: greppy trace --symbol S");
+            Ok(64)
+        }
         Command::Trace {
             symbol,
             direction,
@@ -3117,12 +3131,14 @@ fn dispatch_subcommand(
         Command::Plus {
             query,
             k,
+            path_opts,
             code,
             explain,
             json,
         } => dispatch_plus(
             query.as_deref(),
             k,
+            &path_opts,
             code,
             explain,
             json,
@@ -5053,7 +5069,7 @@ fn start_background_demand_monitor(
             ) {
                 Ok(Some(_exclusive)) => {
                     let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
-                    if *terminal {
+                    if *terminal || background_job_retained(&job_path, expected_pid) {
                         return;
                     }
                     let job = read_background_job(&job_path);
@@ -5138,6 +5154,19 @@ fn start_background_demand_monitor(
         }
         std::process::exit(70);
     }
+}
+
+/// A marker that keeps a background job running after its last query waiter
+/// exits: `search` returns the retryable building status instead of waiting,
+/// and the semantic index it asked for must still be finished. It holds the
+/// job's pid so a stale marker never retains a later job.
+pub(crate) fn background_job_retained_marker(job_path: &std::path::Path) -> std::path::PathBuf {
+    job_path.with_extension("retained")
+}
+
+fn background_job_retained(job_path: &std::path::Path, expected_pid: u32) -> bool {
+    std::fs::read_to_string(background_job_retained_marker(job_path))
+        .is_ok_and(|pid| pid.trim() == expected_pid.to_string())
 }
 
 fn background_demand_may_cancel(
@@ -8295,10 +8324,12 @@ fn unknown_targets_message(
 /// names that select each definition. Several nodes on one definition site (a
 /// struct and its impl) are not ambiguity.
 fn ensure_unambiguous_target(store: &greppy_store::Store, target: &str, ids: &[i64]) -> Result<()> {
-    if ids.len() < 2 || split_path_qualified(target).is_some() {
+    if ids.len() < 2 {
         return Ok(());
     }
+    let path_qualified = split_path_qualified(target).is_some();
     let mut files: Vec<String> = Vec::new();
+    let mut sites: Vec<(String, i64, String)> = Vec::new();
     for id in ids {
         let Some(node) = store.get_node(*id)? else {
             continue;
@@ -8309,6 +8340,30 @@ fn ensure_unambiguous_target(store: &greppy_store::Store, target: &str, ids: &[i
         if !files.contains(&node.file_path) {
             files.push(node.file_path.clone());
         }
+        let start = node.start_line.max(1);
+        if !sites
+            .iter()
+            .any(|(file, line, _)| file == &node.file_path && *line == start)
+        {
+            sites.push((node.file_path.clone(), start, node.qualified_name.clone()));
+        }
+    }
+    if path_qualified {
+        // One file can still hold the name twice (`Calls::new`, `Call::new`).
+        if sites.len() < 2 || !nav::definitions_have_distinct_owners(&sites) {
+            return Ok(());
+        }
+        sites.sort();
+        return Err(Error::Invalid(format!(
+            "`{target}` is {} definitions, so the answer would be a merge of them. Name the \
+             definition: {}",
+            sites.len(),
+            nav::definition_addresses(&sites)
+                .iter()
+                .map(|address| format!("`{address}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
     if files.len() < 2 {
         return Ok(());
