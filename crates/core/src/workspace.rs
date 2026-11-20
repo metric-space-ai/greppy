@@ -188,6 +188,7 @@ pub fn project_identity(start: &Path) -> String {
 pub fn project_identity_from_workspace(start: &Path) -> String {
     let root = resolve_workspace_root(start);
     linked_worktree_project_identity(&root)
+        .or_else(|| adopted_project_identity(&root))
         .or_else(|| {
             root.file_name()
                 .and_then(|s| s.to_str())
@@ -195,6 +196,33 @@ pub fn project_identity_from_workspace(start: &Path) -> String {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| "default".to_string())
+}
+
+/// File in a workspace's store directory that names the project its index
+/// rows carry when that is not the checkout's directory name.
+pub const ADOPTED_PROJECT_FILE: &str = "project.identity";
+
+/// The project name this checkout took over with its first index: an index
+/// started from another clone of the same repository keeps that clone's
+/// project column, because renaming it would rewrite every row.
+pub fn adopted_project_identity(root: &Path) -> Option<String> {
+    let recorded = std::fs::read_to_string(store_dir(root).join(ADOPTED_PROJECT_FILE)).ok()?;
+    let recorded = recorded.trim();
+    crate::validate::is_valid_project_name(recorded).then(|| recorded.to_string())
+}
+
+/// Record the project name of the index this checkout starts from. Call it
+/// before that index is published, so no query sees the rows under a name it
+/// does not look for.
+pub fn adopt_project_identity(root: &Path, project: &str) -> std::io::Result<()> {
+    if !crate::validate::is_valid_project_name(project) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("`{project}` is not a project name"),
+        ));
+    }
+    let dir = crate::cache::ensure_workspace_store(root)?;
+    crate::cache::atomic_write(&dir.join(ADOPTED_PROJECT_FILE), project.as_bytes())
 }
 
 /// A linked worktree has an arbitrary directory basename, but every worktree
@@ -228,11 +256,13 @@ fn linked_worktree_project_identity(root: &Path) -> Option<String> {
     } else {
         return None;
     };
-    repository_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty() && crate::validate::is_valid_project_name(name))
-        .map(ToOwned::to_owned)
+    adopted_project_identity(repository_root).or_else(|| {
+        repository_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && crate::validate::is_valid_project_name(name))
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// Mode for newly-created store/sidecar directories. The actual `mkdir`

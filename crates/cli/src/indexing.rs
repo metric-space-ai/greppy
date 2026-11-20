@@ -1929,6 +1929,24 @@ fn dispatch_index_with_progress(
             target.display()
         )));
     }
+    // Before the project name is read: a first index that starts from another
+    // clone's index adopts that clone's project name.
+    let sibling_seed = crate::sibling_seed::for_first_index(&effective_root);
+    if std::env::var_os(crate::index_admission::ENV_REFRESH_LANE).is_some()
+        && sibling_seed.is_none()
+        && !crate::sibling_seed::has_published_graph(
+            &workspace_locator::store_path(&effective_root),
+            &effective_root,
+        )
+    {
+        // The launcher saw a sibling index that is gone now. A first index
+        // from the sources is a heavy job and belongs under the host gate.
+        eprintln!(
+            "Capacity gate: no index of another clone is left to start from; the first index of {} needs the host gate.",
+            effective_root.display()
+        );
+        return Ok(EXIT_TEMPFAIL as i32);
+    }
     let project = workspace_locator::project_identity(&effective_root);
     let index_options = greppy_indexer::IndexOptions {
         discover_overrides: discover_overrides_from_env()?,
@@ -2172,7 +2190,7 @@ fn dispatch_index_with_progress(
         );
     }
     let is_background = background_job.is_background();
-    let snapshot = match index_atomic_snapshot(
+    let snapshot = match index_atomic_snapshot_from(
         &store_path,
         &target,
         &project,
@@ -2184,6 +2202,7 @@ fn dispatch_index_with_progress(
         } else {
             None
         },
+        sibling_seed,
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -2447,14 +2466,43 @@ pub(crate) fn index_atomic_snapshot(
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
     allow_deferred_embeddings: bool,
+    background_job: Option<&mut BackgroundJobGuard>,
+) -> Result<IndexSnapshotReport> {
+    index_atomic_snapshot_from(
+        active_path,
+        target,
+        project,
+        embedding_config,
+        index_options,
+        allow_deferred_embeddings,
+        background_job,
+        None,
+    )
+}
+
+/// [`index_atomic_snapshot`], with the index of another clone of the same
+/// repository to start a first index from. `project` must already be that
+/// clone's project name (`sibling_seed::for_first_index`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn index_atomic_snapshot_from(
+    active_path: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    embedding_config: Option<&EmbeddingModelConfig>,
+    index_options: &greppy_indexer::IndexOptions,
+    allow_deferred_embeddings: bool,
     mut background_job: Option<&mut BackgroundJobGuard>,
+    sibling: Option<crate::sibling_seed::SiblingSeed>,
 ) -> Result<IndexSnapshotReport> {
     // A refresh is seeded from the active store without verifying it first:
     // the finished snapshot's own integrity check covers every seeded page.
     // Only when a seeded build fails is the active store verified, and a
     // corrupt one is then rebuilt from the sources (and quarantined when the
     // rebuilt snapshot is published).
-    let mut seed = SnapshotSeed::ActiveUnverified;
+    let mut seed = match sibling {
+        Some(sibling) => SnapshotSeed::Sibling(sibling),
+        None => SnapshotSeed::ActiveUnverified,
+    };
     let mut workspace_changes = 0;
     while workspace_changes < 2 {
         match index_atomic_snapshot_attempt(
@@ -2465,7 +2513,7 @@ pub(crate) fn index_atomic_snapshot(
             index_options,
             allow_deferred_embeddings,
             background_job.as_deref_mut(),
-            seed,
+            &seed,
         ) {
             Ok(Some(report)) => return Ok(report),
             Ok(None) => {
@@ -2485,6 +2533,16 @@ pub(crate) fn index_atomic_snapshot(
             {
                 seed = SnapshotSeed::None;
             }
+            // A sibling's index that does not carry this checkout is no reason
+            // to fail: build from the sources, unless this job was admitted
+            // only as a refresh.
+            Err(error)
+                if matches!(seed, SnapshotSeed::Sibling(_))
+                    && active_snapshot_is_recoverable(&error)
+                    && std::env::var_os(crate::index_admission::ENV_REFRESH_LANE).is_none() =>
+            {
+                seed = SnapshotSeed::None;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -2494,11 +2552,14 @@ pub(crate) fn index_atomic_snapshot(
 }
 
 /// What an atomic snapshot build starts from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SnapshotSeed {
     /// A clone of the active store, taken without verifying it.
     ActiveUnverified,
-    /// Nothing: the active store failed verification.
+    /// The published index of another clone of the same repository: this
+    /// checkout has none yet.
+    Sibling(crate::sibling_seed::SiblingSeed),
+    /// Nothing: the store to start from failed verification.
     None,
 }
 
@@ -2511,7 +2572,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
     index_options: &greppy_indexer::IndexOptions,
     allow_deferred_embeddings: bool,
     mut background_job: Option<&mut BackgroundJobGuard>,
-    seed: SnapshotSeed,
+    seed: &SnapshotSeed,
 ) -> Result<Option<IndexSnapshotReport>> {
     let step = std::time::Instant::now();
     cleanup_stale_snapshot_artifacts(active_path, true)?;
@@ -2520,9 +2581,30 @@ pub(crate) fn index_atomic_snapshot_attempt(
     greppy_indexer::profile_step("snapshot: clean stale artifacts", step);
     let step = std::time::Instant::now();
     // A store that cannot even be opened and checkpointed is no seed either.
-    let seeded = seed == SnapshotSeed::ActiveUnverified
-        && seed_temp_store_from_unverified_active(active_path, &temp_path)?;
-    greppy_indexer::profile_step("snapshot: seed from the active store", step);
+    let seeded = match seed {
+        SnapshotSeed::ActiveUnverified => {
+            seed_temp_store_from_unverified_active(active_path, &temp_path)?
+        }
+        SnapshotSeed::Sibling(sibling) => {
+            // The spelling the indexer will look its workspace row up by.
+            let root = greppy_discover::detect_repo_root(target).map_err(|error| {
+                Error::Invalid(format!("resolve {}: {error}", target.display()))
+            })?;
+            let seeded =
+                crate::sibling_seed::seed_temp_store(sibling, &root, active_path, &temp_path)?;
+            if !seeded && std::env::var_os(crate::index_admission::ENV_REFRESH_LANE).is_some() {
+                return Err(Error::Store(format!(
+                    "the index of {} could not be copied as a start; a first index from the sources needs the host gate, retry the command",
+                    sibling.root.display()
+                )));
+            }
+            // Without the sibling's index, start as any first index does;
+            // that keeps what this checkout's store already holds.
+            !seeded && seed_temp_store_from_unverified_active(active_path, &temp_path)?
+        }
+        SnapshotSeed::None => false,
+    };
+    greppy_indexer::profile_step("snapshot: seed the new store", step);
     let step = std::time::Instant::now();
     let replaced = if seeded {
         ReplacedStore::CoveredBySeededSnapshot

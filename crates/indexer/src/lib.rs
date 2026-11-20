@@ -703,7 +703,7 @@ fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<Inve
     })
 }
 
-fn indexer_version_for_options(options: &IndexOptions) -> String {
+pub fn indexer_version_for_options(options: &IndexOptions) -> String {
     let scope = options.discover_overrides.scope_key();
     if scope == "default" {
         greppy_core::INDEXER_VERSION_BASE.into()
