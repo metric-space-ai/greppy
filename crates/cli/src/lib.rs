@@ -6575,7 +6575,19 @@ fn spawn_background_job_handle_scoped(
     if start_background_job_record(&job_path, &value).is_err() {
         return None;
     }
-    let (mut command, admission_stderr) = match index_admission::command(&exe, &job_path) {
+    // A structural refresh of a published index is not a heavy job: it does
+    // not wait for the host's build lease. A graph repair extracts every
+    // file again and stays under the gate.
+    let work = if kind == "index"
+        && target_generation > 1
+        && cause == "structural-workspace-drift"
+        && index_admission::refresh_slots() > 0
+    {
+        index_admission::Work::Refresh
+    } else {
+        index_admission::Work::Heavy
+    };
+    let (mut command, admission_stderr) = match index_admission::command(&exe, &job_path, work) {
         Ok(command) => command,
         Err(error) => {
             value["state"] = serde_json::json!("failed");
@@ -6676,7 +6688,10 @@ fn spawn_background_job_handle_scoped(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
-    if let Some(detail) = index_admission::occupied_gate_deferral() {
+    if let Some(detail) = (work == index_admission::Work::Heavy)
+        .then(index_admission::occupied_gate_deferral)
+        .flatten()
+    {
         value["state"] = serde_json::json!("failed");
         value["preparation_failure_kind"] = serde_json::json!("admission_deferred");
         value["last_error"] = serde_json::json!(detail);

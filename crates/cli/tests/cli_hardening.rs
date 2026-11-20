@@ -4504,7 +4504,11 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
         &["search-symbol", "refresh_marker"],
         &repo,
         &store,
-        &[("GREPPY_HEAVY_GATE", gate.to_str().unwrap())],
+        &[
+            ("GREPPY_HEAVY_GATE", gate.to_str().unwrap()),
+            // Without a refresh lane this refresh is a heavy job again.
+            ("GREPPY_REFRESH_SLOTS", "0"),
+        ],
     );
     // A read-only query keeps answering from the published index and says
     // that the answer predates the change and why the refresh did not run.

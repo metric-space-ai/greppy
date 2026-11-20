@@ -1,6 +1,9 @@
-//! Queries keep answering from an existing index when host admission defers
-//! its refresh (for example while the system disk is low). Only new index
-//! work waits; a missing index is still not invented.
+//! Queries keep answering when host admission defers index work.
+//!
+//! A structural refresh of a published index does not wait for the host's
+//! build gate at all: it runs in greppy's own refresh lane. When that lane is
+//! full, or turned off and the gate defers, the query answers from the
+//! published index and says so. A missing index is still not invented.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,12 +23,23 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 fn run(args: &[&str], repo: &Path, store: &Path, gate: Option<&Path>) -> (i32, String, String) {
+    run_with(args, repo, store, gate, &[])
+}
+
+fn run_with(
+    args: &[&str],
+    repo: &Path,
+    store: &Path,
+    gate: Option<&Path>,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> (i32, String, String) {
     let mut command = Command::new(bin());
     command
         .args(args)
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
-        .env("GREPPY_TEST_SKIP_INFERENCE", "1");
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .envs(env.iter().copied());
     if let Some(gate) = gate {
         command.env("GREPPY_HEAVY_GATE", gate);
     }
@@ -49,9 +63,10 @@ fn refusing_gate(dir: &Path) -> PathBuf {
     gate
 }
 
-#[test]
-fn a_deferred_refresh_answers_from_the_existing_index() {
-    let root = scratch("existing");
+/// An indexed two-file repository whose `util.rs` then gains a second caller
+/// of `helper`.
+fn indexed_then_drifted(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let root = scratch(tag);
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -64,16 +79,91 @@ fn a_deferred_refresh_answers_from_the_existing_index() {
     let store = root.join("store");
     let (code, out, err) = run(&["index", "."], &repo, &store, None);
     assert_eq!(code, 0, "index: stderr={err}\nstdout={out}");
-
-    // The workspace drifts; its refresh is deferred by admission.
     std::fs::write(
         repo.join("src/util.rs"),
-        "pub fn helper() {}\npub fn added() {}\n",
+        "pub fn helper() {}\npub fn added() { helper(); }\n",
     )
     .unwrap();
-    let gate = refusing_gate(&root);
+    (root, repo, store)
+}
 
-    let (code, out, err) = run(&["who-calls", "helper"], &repo, &store, Some(&gate));
+#[test]
+fn a_structural_refresh_does_not_wait_for_the_build_gate() {
+    let (root, repo, store) = indexed_then_drifted("lane");
+    // The host's build gate refuses every job; the refresh never asks it.
+    let gate = refusing_gate(&root);
+    let lane = root.join("lane-tmp");
+    std::fs::create_dir_all(&lane).unwrap();
+    let (code, out, err) = run_with(
+        &["who-calls", "helper"],
+        &repo,
+        &store,
+        Some(&gate),
+        &[("TMPDIR", lane.as_os_str())],
+    );
+    assert_eq!(code, 0, "who-calls: stderr={err}\nstdout={out}");
+    assert!(
+        out.contains("src/util.rs:2  added"),
+        "the new caller needs the refreshed index: {out}"
+    );
+    assert!(
+        !err.contains("answering from the existing index"),
+        "the refresh ran, nothing is stale: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_full_refresh_lane_answers_from_the_existing_index() {
+    let (root, repo, store) = indexed_then_drifted("lane-full");
+    // Both refresh slots of this (private) lane are held by someone else.
+    let lane = root.join("lane-tmp");
+    let slots = lane.join(format!("greppy-refresh-lane-{}", unsafe {
+        libc::geteuid()
+    }));
+    let _held = (0..2)
+        .map(|slot| {
+            greppy_core::cache::acquire_named_lock_in(
+                &slots,
+                &format!("refresh-slot-{slot}"),
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            )
+            .unwrap()
+            .expect("free slot")
+        })
+        .collect::<Vec<_>>();
+    let (code, out, err) = run_with(
+        &["who-calls", "helper"],
+        &repo,
+        &store,
+        None,
+        &[("TMPDIR", lane.as_os_str())],
+    );
+    assert_eq!(code, 0, "who-calls: stderr={err}\nstdout={out}");
+    assert!(out.contains("src/lib.rs:2  caller"), "{out}");
+    assert!(
+        err.contains("answering from the existing index") && err.contains("refresh slots"),
+        "the answer must say it predates the change and why: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_deferred_refresh_answers_from_the_existing_index() {
+    let (root, repo, store) = indexed_then_drifted("existing");
+    // Without a refresh lane every refresh is a heavy job; the gate defers it.
+    let gate = refusing_gate(&root);
+    let no_lane = [("GREPPY_REFRESH_SLOTS", std::ffi::OsStr::new("0"))];
+
+    let (code, out, err) = run_with(
+        &["who-calls", "helper"],
+        &repo,
+        &store,
+        Some(&gate),
+        &no_lane,
+    );
     assert_eq!(code, 0, "who-calls: stderr={err}\nstdout={out}");
     assert!(out.contains("src/lib.rs:2  caller"), "{out}");
     assert!(
@@ -82,7 +172,7 @@ fn a_deferred_refresh_answers_from_the_existing_index() {
     );
 
     for args in [&["stats"][..], &["where-am-i"][..]] {
-        let (code, out, err) = run(args, &repo, &store, Some(&gate));
+        let (code, out, err) = run_with(args, &repo, &store, Some(&gate), &no_lane);
         assert_eq!(code, 0, "{args:?}: stderr={err}\nstdout={out}");
     }
     let _ = std::fs::remove_dir_all(&root);
