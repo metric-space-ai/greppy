@@ -850,6 +850,33 @@ fn ensure_workspace_manifest(dir: &Path, workspace_root: &Path) -> io::Result<()
     Ok(())
 }
 
+/// Every workspace store of this installation, with the checkout it indexes.
+pub fn workspace_stores() -> Vec<(PathBuf, StoreManifest)> {
+    let mut namespaces = vec![(workspaces_root(), data_root())];
+    if std::env::var_os("GREPPY_STORE_DIR").is_none() {
+        let volume = Path::new("/Volumes/tmp");
+        if validate_disposable_volume(volume).is_ok() {
+            namespaces.push((disposable_workspaces_root(volume), volume.to_path_buf()));
+        }
+    }
+    let mut stores = Vec::new();
+    for (root, anchor) in namespaces {
+        if !namespace_chain_is_safe_in(&root, &anchor) {
+            continue;
+        }
+        let Ok(items) = fs::read_dir(&root) else {
+            continue;
+        };
+        for item in items.flatten() {
+            let path = item.path();
+            if let Ok(manifest) = read_store_manifest(&path) {
+                stores.push((path, manifest));
+            }
+        }
+    }
+    stores
+}
+
 /// Create one model digest directory without following symlinked namespace
 /// components. Model names are one plain path component and digests are the
 /// 64-hex content IDs used by cache validation and leases.

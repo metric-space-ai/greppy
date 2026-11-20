@@ -81,6 +81,7 @@ mod context_status;
 mod freshness;
 mod index_admission;
 mod query_progress;
+mod sibling_seed;
 use freshness::*;
 mod emit;
 use emit::*;
@@ -6576,12 +6577,16 @@ fn spawn_background_job_handle_scoped(
         return None;
     }
     // A structural refresh of a published index is not a heavy job: it does
-    // not wait for the host's build lease. A graph repair extracts every
-    // file again and stays under the gate.
+    // not wait for the host's build lease. Neither does a first index that
+    // starts from another clone's index, which is the same work. A graph
+    // repair extracts every file again and stays under the gate.
+    let refreshes_published_index = target_generation > 1 && cause == "structural-workspace-drift";
     let work = if kind == "index"
-        && target_generation > 1
-        && cause == "structural-workspace-drift"
         && index_admission::refresh_slots() > 0
+        && (refreshes_published_index
+            || (target_generation == 1
+                && cause == "first-use"
+                && sibling_seed::for_first_index(&root).is_some()))
     {
         index_admission::Work::Refresh
     } else {
@@ -11901,7 +11906,7 @@ fn seed_temp_store_from_active(
             .map_err(|e| Error::io(format!("chmod db {}", temp_path.display()), e))?;
         return Ok(true);
     }
-    ensure_copy_headroom(active_path)?;
+    ensure_copy_headroom(active_path, temp_path)?;
     std::fs::copy(active_path, temp_path).map_err(|e| {
         Error::io(
             format!(
@@ -11965,15 +11970,15 @@ fn try_clone_store_file(_source: &std::path::Path, _target: &std::path::Path) ->
     Ok(false)
 }
 
-fn ensure_copy_headroom(active_path: &std::path::Path) -> Result<()> {
-    let active_bytes = std::fs::metadata(active_path)
-        .map_err(|error| Error::io(format!("stat {}", active_path.display()), error))?
+/// Refuse a byte copy of `source` next to `target` that would leave the
+/// target's volume without a reserve.
+fn ensure_copy_headroom(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let active_bytes = std::fs::metadata(source)
+        .map_err(|error| Error::io(format!("stat {}", source.display()), error))?
         .len();
     let reserve = (active_bytes / 4).max(256 * 1024 * 1024);
     let required = active_bytes.saturating_add(reserve);
-    let parent = active_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let output = std::process::Command::new("df")
         .args(["-Pk"])
         .arg(parent)
@@ -11982,7 +11987,7 @@ fn ensure_copy_headroom(active_path: &std::path::Path) -> Result<()> {
     if !output.status.success() {
         return Err(Error::Store(format!(
             "cannot verify free space before copying {}",
-            active_path.display()
+            source.display()
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
