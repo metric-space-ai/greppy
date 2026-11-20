@@ -788,7 +788,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("session daemon three-run stability", web_runtime_ci)
         self.assertIn("for attempt in 1 2 3", web_runtime_ci)
-        self.assertIn("branches: ['**']", web_runtime_ci)
+        # Release tags are cut on main: the suite runs on every push there and
+        # on pull requests that touch the web runtime (#325 dropped the
+        # duplicate run for every feature-branch push).
+        self.assertIn("branches: ['main']", web_runtime_ci)
+        self.assertIn("pull_request:", web_runtime_ci)
         self.assertIn("Build exact Greppy CLI test asset", web_runtime_ci)
         self.assertIn("CI: 'true'", web_runtime_ci)
         self.assertIn("--features ci-test-assets", web_runtime_ci)
