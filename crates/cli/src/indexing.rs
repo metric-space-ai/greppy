@@ -1852,6 +1852,25 @@ pub(crate) fn dispatch_index(
     root: Option<&str>,
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
+    // A refresh started through the refresh lane holds one of the host's
+    // refresh slots until it exits. With none free it has not started any
+    // index work: the launching query reports the deferral.
+    let _refresh_slot = if std::env::var_os(crate::index_admission::ENV_REFRESH_LANE).is_some() {
+        match crate::index_admission::acquire_refresh_slot() {
+            Ok(None) => {
+                eprintln!(
+                    "Capacity gate: all {} greppy refresh slots on this host are in use.",
+                    crate::index_admission::refresh_slots()
+                );
+                return Ok(EXIT_TEMPFAIL as i32);
+            }
+            Ok(slot) => slot,
+            // A host without a usable lock directory still refreshes.
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let mut background_job = BackgroundJobGuard::from_env();
     let result = dispatch_index_with_progress(path, root, embedding_args, &mut background_job);
     if let Err(error) = &result {

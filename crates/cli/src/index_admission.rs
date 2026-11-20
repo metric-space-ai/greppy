@@ -6,7 +6,83 @@ use std::{
     process::Command,
 };
 
-pub(crate) fn command(executable: &Path, job: &Path) -> io::Result<(Command, Option<PathBuf>)> {
+/// What an automatic job asks of the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Work {
+    /// A first index or embedding work: a heavy job under the host gate.
+    Heavy,
+    /// A structural refresh of an already published index. It is bounded
+    /// graph work, so it does not queue behind builds for the host's
+    /// exclusive lease; greppy limits how many run at once by itself.
+    Refresh,
+}
+
+/// Set for the child of a [`Work::Refresh`] job: it must hold a refresh slot.
+pub(crate) const ENV_REFRESH_LANE: &str = "GREPPY_REFRESH_LANE";
+/// How many structural refreshes may run on this host at once (default 2).
+/// `0` turns the lane off: every refresh is a heavy job again.
+pub(crate) const ENV_REFRESH_SLOTS: &str = "GREPPY_REFRESH_SLOTS";
+const DEFAULT_REFRESH_SLOTS: usize = 2;
+
+pub(crate) fn refresh_slots() -> usize {
+    std::env::var(ENV_REFRESH_SLOTS)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(DEFAULT_REFRESH_SLOTS, |slots| slots.min(16))
+}
+
+/// Take one of the host's refresh slots for the life of this process.
+/// `Ok(None)`: all of them are held by other refreshes.
+pub(crate) fn acquire_refresh_slot() -> io::Result<Option<greppy_core::cache::FileLock>> {
+    // Host-wide, not per store directory: agents with separate stores still
+    // share the machine's memory.
+    let root = std::env::temp_dir().join(format!("greppy-refresh-lane-{}", user_tag()));
+    for slot in 0..refresh_slots() {
+        if let Some(lock) = greppy_core::cache::acquire_named_lock_in(
+            &root,
+            &format!("refresh-slot-{slot}"),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )? {
+            return Ok(Some(lock));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn user_tag() -> String {
+    unsafe { libc::geteuid() }.to_string()
+}
+
+#[cfg(not(unix))]
+fn user_tag() -> String {
+    std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
+}
+
+fn refresh_lane_command(executable: &Path, job: &Path) -> io::Result<(Command, Option<PathBuf>)> {
+    let stderr = job.with_extension("admission-stderr");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let output = options.open(&stderr)?;
+    let mut command = Command::new(executable);
+    command.env(ENV_REFRESH_LANE, "1").stderr(output);
+    Ok((command, Some(stderr)))
+}
+
+pub(crate) fn command(
+    executable: &Path,
+    job: &Path,
+    work: Work,
+) -> io::Result<(Command, Option<PathBuf>)> {
+    if work == Work::Refresh {
+        return refresh_lane_command(executable, job);
+    }
     let Some(gate) = configured_gate()? else {
         return Ok((Command::new(executable), None));
     };
