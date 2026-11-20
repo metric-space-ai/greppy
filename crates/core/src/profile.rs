@@ -54,6 +54,14 @@ pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// One stderr line for a finished step when [`PROFILE_ENV`] is set: where an
+/// index run spends its time must be readable without a profiler.
+pub fn step(label: &str, started: Instant) {
+    if std::env::var_os(PROFILE_ENV).is_some() {
+        eprintln!("[profile] {label} {:?}", started.elapsed());
+    }
+}
+
 /// A single recorded span: a phase, an optional sub-phase, the elapsed
 /// duration, and an optional item count used to compute a throughput rate.
 #[derive(Debug, Clone, PartialEq, Eq)]

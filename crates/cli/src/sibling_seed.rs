@@ -62,10 +62,7 @@ fn find(root: &Path) -> Option<SiblingSeed> {
     }
     let head = git(root, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?;
     let indexer_version =
-        greppy_indexer::indexer_version_for_options(&greppy_indexer::IndexOptions {
-            discover_overrides: crate::discover_overrides_from_env().ok()?,
-            only_paths: None,
-        });
+        greppy_core::indexer_version(&crate::discover_overrides_from_env().ok()?.scope_key());
     let own = greppy_core::workspace::workspace_hash(root);
     let mut stores = greppy_core::cache::workspace_stores()
         .into_iter()

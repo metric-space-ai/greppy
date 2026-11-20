@@ -45,6 +45,17 @@
 ///   new node and edge properties exist only after full re-extraction.
 pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v11";
 
+/// The version an index records: [`INDEXER_VERSION_BASE`], and the discovery
+/// scope when it is not the default one. An index of another scope holds
+/// another file set.
+pub fn indexer_version(discover_scope: &str) -> String {
+    if discover_scope == "default" {
+        INDEXER_VERSION_BASE.into()
+    } else {
+        format!("{INDEXER_VERSION_BASE};discover_scope={discover_scope}")
+    }
+}
+
 pub mod cache;
 pub mod diag;
 pub mod error;

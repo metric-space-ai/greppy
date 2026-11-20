@@ -2578,7 +2578,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     let temp_path = unique_store_sibling(active_path, "next");
     cleanup_sqlite_family(&temp_path)?;
-    greppy_indexer::profile_step("snapshot: clean stale artifacts", step);
+    greppy_core::profile::step("snapshot: clean stale artifacts", step);
     let step = std::time::Instant::now();
     // A store that cannot even be opened and checkpointed is no seed either.
     let seeded = match seed {
@@ -2604,7 +2604,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
         }
         SnapshotSeed::None => false,
     };
-    greppy_indexer::profile_step("snapshot: seed the new store", step);
+    greppy_core::profile::step("snapshot: seed the new store", step);
     let step = std::time::Instant::now();
     let replaced = if seeded {
         ReplacedStore::CoveredBySeededSnapshot
@@ -2631,7 +2631,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
         .conn()
         .execute_batch("PRAGMA wal_autocheckpoint = 65536;")
         .map_err(|error| Error::Store(format!("configure snapshot WAL: {error}")))?;
-    greppy_indexer::profile_step("snapshot: open the seeded store", step);
+    greppy_core::profile::step("snapshot: open the seeded store", step);
     let step = std::time::Instant::now();
     let index_result = if let Some(job) = background_job.as_deref_mut() {
         greppy_indexer::index_with_options_and_progress(
@@ -2653,7 +2653,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
         }
     };
 
-    greppy_indexer::profile_step("snapshot: index", step);
+    greppy_core::profile::step("snapshot: index", step);
     let step = std::time::Instant::now();
     if !report.is_clean()
         || report.files_skipped_by_file_limit > 0
@@ -2702,7 +2702,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }
     drop(temp_store);
     checkpoint_store_path(&temp_path)?;
-    greppy_indexer::profile_step("snapshot: embeddings and checkpoint", step);
+    greppy_core::profile::step("snapshot: embeddings and checkpoint", step);
     let step = std::time::Instant::now();
 
     if let Some(job) = background_job.as_deref_mut() {
@@ -2717,7 +2717,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
         ))
     })?;
     drop(integrity_store);
-    greppy_indexer::profile_step("snapshot: integrity check", step);
+    greppy_core::profile::step("snapshot: integrity check", step);
     let step = std::time::Instant::now();
 
     if let Some(job) = background_job.as_deref_mut() {
@@ -2727,7 +2727,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
     sync_file(&temp_path)?;
     sync_parent_dir(&temp_path)?;
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
-    greppy_indexer::profile_step("snapshot: sync", step);
+    greppy_core::profile::step("snapshot: sync", step);
     let step = std::time::Instant::now();
 
     if let Some(job) = background_job.as_deref_mut() {
@@ -2752,7 +2752,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
         return Ok(None);
     }
 
-    greppy_indexer::profile_step("snapshot: verify freshness", step);
+    greppy_core::profile::step("snapshot: verify freshness", step);
     let step = std::time::Instant::now();
     if let Some(job) = background_job.as_deref_mut() {
         job.finalization_phase("publishing_snapshot");
@@ -2765,10 +2765,10 @@ pub(crate) fn index_atomic_snapshot_attempt(
     } else {
         publish_store_snapshot_replacing(&temp_path, active_path, replaced)?;
     }
-    greppy_indexer::profile_step("snapshot: publish", step);
+    greppy_core::profile::step("snapshot: publish", step);
     let step = std::time::Instant::now();
     cleanup_stale_snapshot_artifacts(active_path, true)?;
-    greppy_indexer::profile_step("snapshot: clean artifacts after publish", step);
+    greppy_core::profile::step("snapshot: clean artifacts after publish", step);
     crate::context_status::published(
         &workspace_locator::resolve_workspace_root(target),
         report.graph_generation,
