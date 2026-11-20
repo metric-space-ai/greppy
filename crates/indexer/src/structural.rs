@@ -314,7 +314,7 @@ pub(crate) fn build_structural(
     // atomic, this avoids opening one SQLite transaction per edge on large
     // repositories.
     progress("writing_structure_edges", 0, edges.len());
-    super::insert_structural_edges(store, &edges)?;
+    insert_structural_edges(store, &edges)?;
     progress("writing_structure_edges", edges.len(), edges.len());
 
     // ── Incremental cleanup (review finding P1: stale spine) ─────────
@@ -341,6 +341,44 @@ pub(crate) fn build_structural(
         }
     }
     Ok(())
+}
+
+/// Insert the structural spine's edges. They carry no properties, so a row
+/// that already exists is already right: unlike the reference-edge upsert
+/// this rewrites nothing for the unchanged files of a refresh.
+fn insert_structural_edges(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
+    if store.is_overlay() || edges.is_empty() {
+        return super::insert_edges_batched(store, edges);
+    }
+    let conn = store.conn();
+    conn.execute_batch("BEGIN").map_err(super::sqlite_err)?;
+    let result = (|| -> Result<()> {
+        let mut insert = conn
+            .prepare_cached(
+                "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
+                 VALUES (?1, ?2, ?3, ?4, '{}')
+                 ON CONFLICT(source_id, target_id, edge_type) DO NOTHING",
+            )
+            .map_err(super::sqlite_err)?;
+        for edge in edges {
+            insert
+                .execute(rusqlite::params![
+                    edge.project,
+                    edge.source_id,
+                    edge.target_id,
+                    edge.edge_type,
+                ])
+                .map_err(super::sqlite_err)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(super::sqlite_err),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

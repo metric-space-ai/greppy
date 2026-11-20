@@ -272,7 +272,7 @@ pub fn index_with_options_and_progress(
     let abs_root = greppy_discover::detect_repo_root(root)?;
     let indexer_version = indexer_version_for_options(options);
     let prior_state = store.list_private_file_states(project_name)?;
-    profile_step("index: read prior file states", step);
+    greppy_core::profile::step("index: read prior file states", step);
     let step = std::time::Instant::now();
     // Compatibility must be read before publishing the new version or filtering
     // the inventory. Migrate every retained file in this store layer, even when
@@ -328,7 +328,7 @@ pub fn index_with_options_and_progress(
     } else {
         (discovered_entries, Vec::new())
     };
-    profile_step("index: walk the worktree", step);
+    greppy_core::profile::step("index: walk the worktree", step);
     // Store inventory preparation is not file classification. Incompatible
     // generations can spend substantial time here before any file is parsed.
     progress(IndexBuildProgress::new("preparing_graph_inventory", 0, 0));
@@ -703,16 +703,8 @@ fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<Inve
     })
 }
 
-pub fn indexer_version_for_options(options: &IndexOptions) -> String {
-    let scope = options.discover_overrides.scope_key();
-    if scope == "default" {
-        greppy_core::INDEXER_VERSION_BASE.into()
-    } else {
-        format!(
-            "{};discover_scope={scope}",
-            greppy_core::INDEXER_VERSION_BASE
-        )
-    }
+fn indexer_version_for_options(options: &IndexOptions) -> String {
+    greppy_core::indexer_version(&options.discover_overrides.scope_key())
 }
 
 fn is_rust_reexport_migration(prior: &str, current: &str) -> bool {
@@ -1760,14 +1752,6 @@ const USAGE_LABELS: [&str; 11] = [
 /// CALLS-keeps-self-loops rule). The determinism test
 /// (`parallel_and_sequential_indexers_produce_identical_graph`) and the
 /// cross-file resolution tests enforce that.
-/// With `GREPPY_PROFILE` set, one stderr line per resolution step: where a
-/// refresh spends its time must be readable without a profiler.
-pub fn profile_step(label: &str, started: std::time::Instant) {
-    if std::env::var_os("GREPPY_PROFILE").is_some() {
-        eprintln!("[profile] {label} {:?}", started.elapsed());
-    }
-}
-
 fn resolve_and_persist_edges(
     store: &mut Store,
     project: &str,
@@ -1826,7 +1810,7 @@ fn resolve_edges_with_replacement(
     // nodes) instead of querying the store per edge.
     let step = std::time::Instant::now();
     let mut index = GraphIndex::load(store, project)?;
-    profile_step("resolve: load graph index", step);
+    greppy_core::profile::step("resolve: load graph index", step);
     let step = std::time::Instant::now();
 
     // Resolve `IMPORTS` edges BEFORE the reference edges (CALLS / TYPE_REF
@@ -1984,7 +1968,7 @@ fn resolve_edges_with_replacement(
         }
     }
 
-    profile_step("resolve: imports pass", step);
+    greppy_core::profile::step("resolve: imports pass", step);
     let step = std::time::Instant::now();
 
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
@@ -2039,7 +2023,7 @@ fn resolve_edges_with_replacement(
         push_rust_enum_owner_usage(&index, project, src_id, target_id, edge, &mut resolved);
     }
 
-    profile_step("resolve: reference pass", step);
+    greppy_core::profile::step("resolve: reference pass", step);
     let step = std::time::Instant::now();
 
     // Persist every resolved edge in a SINGLE transaction (was: one
@@ -2093,7 +2077,7 @@ fn resolve_edges_with_replacement(
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![anyhow_factory_repair_key(project),index.anyhow_dependency_binding]).map_err(sqlite_err)?;
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("{DIRECT_SELF_FIELD_REPAIR_KEY}.{project}")]).map_err(sqlite_err)?;
     progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
-    profile_step("resolve: persist edges", step);
+    greppy_core::profile::step("resolve: persist edges", step);
     Ok(resolved.len())
 }
 
@@ -3938,7 +3922,7 @@ fn resolve_edges_incremental(
     // full, insert-only re-resolution (identical to a first run).
     let step = std::time::Instant::now();
     let def_fp_after = def_fingerprint(store, project)?;
-    profile_step("incremental: definition fingerprint", step);
+    greppy_core::profile::step("incremental: definition fingerprint", step);
     if &def_fp_after != def_fp_before {
         // The resolvable def set changed: a name referenced by an UNCHANGED
         // file may now be ambiguous (or newly resolvable), so its SURVIVING
@@ -3949,7 +3933,7 @@ fn resolve_edges_incremental(
         // more than the resolution itself.
         let step = std::time::Instant::now();
         let raw_edges = load_all_raw_edges(store, project)?;
-        profile_step("incremental: load all raw edges", step);
+        greppy_core::profile::step("incremental: load all raw edges", step);
         note_reresolved(raw_edges.len());
         return resolve_edges_with_replacement(
             store,
@@ -4456,44 +4440,6 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
 
 fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     persist_edges_batched(store, edges, None)
-}
-
-/// Insert the structural spine's edges. They carry no properties, so a row
-/// that already exists is already right: unlike the reference-edge upsert
-/// this rewrites nothing for the unchanged files of a refresh.
-fn insert_structural_edges(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
-    if store.is_overlay() || edges.is_empty() {
-        return insert_edges_batched(store, edges);
-    }
-    let conn = store.conn();
-    conn.execute_batch("BEGIN").map_err(sqlite_err)?;
-    let result = (|| -> Result<()> {
-        let mut insert = conn
-            .prepare_cached(
-                "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
-                 VALUES (?1, ?2, ?3, ?4, '{}')
-                 ON CONFLICT(source_id, target_id, edge_type) DO NOTHING",
-            )
-            .map_err(sqlite_err)?;
-        for edge in edges {
-            insert
-                .execute(rusqlite::params![
-                    edge.project,
-                    edge.source_id,
-                    edge.target_id,
-                    edge.edge_type,
-                ])
-                .map_err(sqlite_err)?;
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT").map_err(sqlite_err),
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
 }
 
 /// Method names of the standard library's traits and containers. A receiver

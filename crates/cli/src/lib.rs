@@ -11513,7 +11513,7 @@ fn publish_store_snapshot_replacing(
     let verify = replaced == ReplacedStore::Verify;
     let step = std::time::Instant::now();
     let quiesced = quiesce_existing_active_store(active_path, verify);
-    greppy_indexer::profile_step("publish: quiesce the replaced store", step);
+    greppy_core::profile::step("publish: quiesce the replaced store", step);
     let active_backupable = match quiesced {
         Ok(()) => active_path.exists(),
         Err(e) if active_snapshot_is_recoverable(&e) && active_path.exists() => {
@@ -11549,15 +11549,15 @@ fn publish_store_snapshot_replacing(
         })?;
         workspace_locator::ensure_db_mode(active_path)
             .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
-        greppy_indexer::profile_step("publish: rename", step);
+        greppy_core::profile::step("publish: rename", step);
         let step = std::time::Instant::now();
         sync_file(active_path)?;
-        greppy_indexer::profile_step("publish: sync the published file", step);
+        greppy_core::profile::step("publish: sync the published file", step);
         let step = std::time::Instant::now();
         cleanup_sqlite_sidecars(temp_path)?;
         cleanup_sqlite_family(&backup_path)?;
         sync_parent_dir(active_path)?;
-        greppy_indexer::profile_step("publish: sync the directory", step);
+        greppy_core::profile::step("publish: sync the directory", step);
         Ok(())
     }
 
@@ -11898,10 +11898,10 @@ fn seed_temp_store_from_active(
         }
         Err(e) => return Err(e),
     }
-    greppy_indexer::profile_step("seed: quiesce the active store", step);
+    greppy_core::profile::step("seed: quiesce the active store", step);
     let step = std::time::Instant::now();
     if try_clone_store_file(active_path, temp_path)? {
-        greppy_indexer::profile_step("seed: clone", step);
+        greppy_core::profile::step("seed: clone", step);
         workspace_locator::ensure_db_mode(temp_path)
             .map_err(|e| Error::io(format!("chmod db {}", temp_path.display()), e))?;
         return Ok(true);
