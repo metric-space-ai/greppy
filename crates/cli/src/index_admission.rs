@@ -142,6 +142,13 @@ fn gated_command(
         options.mode(0o600);
     }
     let output = options.open(&stderr)?;
+    let mut command = gate_command(gate, "auto-index", executable);
+    command.stderr(output);
+    Ok((command, Some(stderr)))
+}
+
+/// `executable` run by the host gate as task `<task>-<pid>` of project greppy.
+fn gate_command(gate: &Path, task: &str, executable: &Path) -> Command {
     let mut command = Command::new(if cfg!(target_os = "macos") {
         "/usr/bin/python3"
     } else {
@@ -157,18 +164,43 @@ fn gated_command(
     ]) {
         command.env("DEV_HEAVY_WRITES", writes);
     }
+    let pid = std::process::id();
     command
         .arg(gate)
         .arg("--owner")
-        .arg(format!("greppy-auto-index-{}", std::process::id()))
+        .arg(format!("greppy-{task}-{pid}"))
         .arg("--project")
         .arg("greppy")
         .arg("--task")
-        .arg(format!("auto-index-{}", std::process::id()))
+        .arg(format!("{task}-{pid}"))
         .arg("--")
-        .arg(executable)
-        .stderr(output);
-    Ok((command, Some(stderr)))
+        .arg(executable);
+    command
+}
+
+/// Set for an index command the host gate admitted: it runs the work itself.
+const ENV_INDEX_ADMITTED: &str = "GREPPY_INDEX_ADMITTED";
+
+/// Run this `greppy index` command again under the host gate and return its
+/// exit code: the gate's own 75 when the host is busy. `None` when there is
+/// no gate, this command already is the admitted one, or it runs inside a
+/// job the gate admitted.
+pub(crate) fn rerun_under_gate() -> io::Result<Option<i32>> {
+    if std::env::var_os(ENV_INDEX_ADMITTED).is_some() {
+        return Ok(None);
+    }
+    let Some(gate) = configured_gate()? else {
+        return Ok(None);
+    };
+    if default_gate_lease_is_inherited(&gate) {
+        return Ok(None);
+    }
+    let executable = std::env::current_exe()?;
+    let status = gate_command(&gate, "index", &executable)
+        .args(std::env::args_os().skip(1))
+        .env(ENV_INDEX_ADMITTED, "1")
+        .status()?;
+    Ok(Some(status.code().unwrap_or(70)))
 }
 
 pub(crate) fn failure_detail(

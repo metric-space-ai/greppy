@@ -57,6 +57,16 @@ pub enum Error {
     #[error("index preparation deferred for {root}: {detail}")]
     AdmissionDeferred { root: PathBuf, detail: String },
 
+    /// There is no index for this checkout and the command does not build
+    /// one itself; `greppy index` does.
+    #[error("no index for {root}: {detail}")]
+    NoIndex { root: PathBuf, detail: String },
+
+    /// The index work this command needs is running and the command did not
+    /// wait for its end; the work goes on, so a retry finds it further.
+    #[error("the index for {root} is still being built: {detail}")]
+    IndexBuilding { root: PathBuf, detail: String },
+
     /// Workspace fingerprint / lock / freshness failure.
     #[error("workspace error: {0}")]
     Workspace(String),

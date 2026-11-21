@@ -1232,8 +1232,6 @@ pub(crate) fn dispatch_impact(
         print_possible_caller_note(&store, dir, &starts, query_symbol)?;
         return Ok(0);
     }
-    // Preparation admission and target resolution precede model work.
-    prewarm_summary_daemon();
     let total = reached.len();
     // `--all` lifts the print cap so the full transitive set is inspectable
     // in one call (the footer's "T total" was previously unreachable — clap
@@ -1312,6 +1310,9 @@ pub(crate) fn dispatch_impact(
         )?;
         return Ok(0);
     }
+    // Only the tree below prints purposes; the JSON answer above never loads
+    // the summary model.
+    prewarm_summary_daemon();
     // A flat list of hops throws away the one thing `impact` has that six
     // `who-calls` calls do not: which route leads where. At `hop 3 dispatch_edit`
     // nobody can tell whether the path runs through `data_set` or `data_delete`.
