@@ -296,6 +296,9 @@ pub async fn audit(_dock: &u8) -> Result<(), &'static str> {
 pub const OTHER_LIB_RS: &str = r#"pub struct Dock;
 
 impl Dock {
+    pub async fn open(_folder: &str, _name: &str) -> Result<Dock, String> {
+        Ok(Dock)
+    }
     pub fn serve(&self) {}
     pub fn stand_by(&self) {}
 }
@@ -316,16 +319,26 @@ fn make() -> Dock {
 pub const WJ_DOCK_CARGO: &str = "[package]\nname = \"wj-dock\"\nversion = \"0.1.0\"\n";
 
 pub const WJ_DOCK_LIB_RS: &str = r#"pub struct Dock;
+pub struct Stream;
 
 impl Dock {
+    pub async fn open(_folder: &str, _name: &str) -> Result<Dock, String> {
+        Ok(Dock)
+    }
     pub fn stand_by(&self) {}
 }
 "#;
 
-pub const APP_LIB_RS: &str = r#"use wj_dock::Dock;
+pub const APP_LIB_RS: &str = r#"use wj_dock::{Dock, Stream};
 
 pub fn wait(dock: &Dock) {
     dock.stand_by(); // workspace-import
+}
+
+pub async fn start(node_folder: &str) -> Result<Option<Stream>, String> {
+    let dock = Dock::open(node_folder, "accounts").await?; // workspace-open
+    dock.stand_by();
+    Ok(None)
 }
 "#;
 
