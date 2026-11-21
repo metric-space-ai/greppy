@@ -629,10 +629,10 @@ pub fn normalize_score(value: i32) -> i32 { value.max(0) }
         [Text.UTF8Encoding]::new($false)
     )
 
-    $indexEmbed = Start-GreppyProcess @('--root', $RepoEmbed, 'index', $RepoEmbed)
+    $indexEmbed = Start-GreppyProcess @('--root', $RepoEmbed, 'index', '--with-embeddings', $RepoEmbed)
     Complete-GreppyProcess $indexEmbed (Join-Path $Work 'out\index-embed.txt') $false
     if ($indexEmbed.Process.ExitCode -ne 0) { throw 'embedding fixture index failed' }
-    $indexBrief = Start-GreppyProcess @('--root', $RepoBrief, 'index', $RepoBrief)
+    $indexBrief = Start-GreppyProcess @('--root', $RepoBrief, 'index', '--with-embeddings', $RepoBrief)
     Complete-GreppyProcess $indexBrief (Join-Path $Work 'out\index-brief.txt') $false
     if ($indexBrief.Process.ExitCode -ne 0) { throw 'brief fixture index failed' }
 
