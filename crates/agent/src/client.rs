@@ -300,7 +300,9 @@ impl Client {
         }
         // Model-limit discovery may itself need a request-local runtime. Resolve
         // it before entering the streaming runtime, never by nesting block_on.
-        let body = serde_json::to_string(&self.request_body(req)?)
+        let body = self.request_body(req)?;
+        crate::wire::log_first_sent_model_request(&body);
+        let body = serde_json::to_string(&body)
             .map_err(|error| ClientError::Transport(format!("serialize model request: {error}")))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

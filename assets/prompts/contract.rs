@@ -61,15 +61,36 @@ pub const APPROVED_DESKTOP_BUILTIN_CAPABILITY_SHA256: &str =
 // {"batch": [[…], […]]} (run in order; a failed edit stops the rest), and pipe a search straight
 // into a read (`search-symbol NAME | read -` inside bash-smart)." Previous adapter d86ef405…;
 // ACP rendering unchanged.
+// 2026-11-03: Michael approved the quality text as the new signed reference.
+// Exactly two wording changes in the adapter, applied to every built-in mode
+// that includes the introduction: the opening sentence now starts "When working
+// on a code base, never work in the user's checkout", and HOW A TASK RUNS step 1
+// says the worktree "should have been created". AGENTS.md is unchanged. ACP
+// still uses only the first sentence, so its rendered hash is unchanged.
+// Previous adapter dd0133ec…; previous one-shot 887653ab…, interactive 2f444986…,
+// serve 2f93c68e….
+// 2026-11-04: Michael approved the next quality wording. HOW A TASK RUNS step 2
+// no longer tells the agent to pipe a search into a read inside bash-smart.
+// After the bash-smart sentence, both modes say bash-smart is only for builds,
+// tests, git and other commands greppy has no command for, and never for
+// grep, rg, find, cat, sed, head or tail on source files. AGENTS.md is
+// unchanged. ACP still uses only the first sentence, so its rendered hash
+// is unchanged. Previous adapter 9facb78a…; previous one-shot d3eb31ba…,
+// interactive 6dc67477…, serve 117dde23….
+// 2026-11-09: merge of origin/main (#325 capability manuals) into PR #321.
+// The PR's owner-approved adapter wording (11-03, 11-04 above) is combined
+// with main's signed rendering and manuals; the sixteen start digests below
+// are regenerated from render::render_start over these exact sources. ACP
+// digests are unchanged (ACP uses only the role sentence).
 pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
-    "dd0133ecff891859bbbd3890ffe0c9a3857393e512f2665a8521487cb9d15280";
+    "2494fd281878fe2de692b647bcb3c39dd6b22c86b8332026494ac71dd5aaec61";
 
 pub fn approved_rendered_sha256(mode: render::BuiltinPromptMode) -> &'static str {
     use render::BuiltinPromptMode::*;
     match mode {
-        OneShot => "8d4eac5f57ef71b0f118f98bb619cc41255eb8297372bdc511ee372c8d1ed4ac",
-        Interactive => "b1a6760221db89cf0f4f38b220577163e9d58f29a10dc6b38148e251ca7af839",
-        Serve => "aa28c9e9d82fdf90c8c08ec8469e7e7bd68c6f1e790860055036803847e9d025",
+        OneShot => "ca66effc20b8d2d8a1aa25215f330a103ecbb1c6ca3b897abcb7744c6e134437",
+        Interactive => "13ab08b65cabac34fcf72392460057aaa5fa1284ce906a5b78ec99e66038276e",
+        Serve => "0dfef323eada5f385b5d94e74bb59c0f393b7905c35b557baf442af7f70fba59",
         Acp => "d9d5fa63fa9c9ad05584d534d9800a3d00ee9c480412bc4e8a40f40b7a39df1b",
     }
 }
@@ -84,24 +105,24 @@ pub fn approved_start_sha256(
     match (mode, web, desktop) {
         (mode, false, false) => approved_rendered_sha256(mode),
         (OneShot, true, false) => {
-            "c61632799619fe882eac69ed05e70b24cdca989456291967732d12d525b6222b"
+            "12ba29cfac06269a82110e86bde95cd469054c5075ffc02229658b3575a30c50"
         }
         (OneShot, false, true) => {
-            "ac4c7cdc22b3fe5085dc8b8cab10deacdfc2bf03a6a49b8c6b80a15b86354cd9"
+            "6fa6fca3a1c4c94a5eb6dfe900a86297652ff609aec08eaebc4f1801f54f9e30"
         }
-        (OneShot, true, true) => "d9ce57416e0c50306fb3a26ce6e52c10f9779f2965e250be38a2d92f2a9cd239",
+        (OneShot, true, true) => "2ff36a12a7fd17e763878916f1a13e235f188b06b660a726c3ee1981fc9682f0",
         (Interactive, true, false) => {
-            "550deef4cbd133c05a3814e92d170a8747237203b9acbff57a7a0de1dea89085"
+            "c1eb7c9cb80a604b55402f1c889799ad84d2e7376daebb680d5fc400cce09606"
         }
         (Interactive, false, true) => {
-            "5f1665efd98d264c9ff482205850abb67d7412495fe89c0a5f164296373670f9"
+            "79daf56c7b3504d4a3414dd4393c71df20048b2a6ed41a0b1a3d5f0156ccc4c6"
         }
         (Interactive, true, true) => {
-            "02d8d468c0e06b6ac6c0c99abd65a1fc4ad69a8a4a751386cfc5319619265104"
+            "fb980dc69d16b6d51790ac44e2df666de43d26704fd0f2654e0ea490edddd8ab"
         }
-        (Serve, true, false) => "6aeb3d769e59a2154700c527bf667d549ba56b6f3e99d3e1883ffea67dfb8d9f",
-        (Serve, false, true) => "bc89067c27e8d4ef3dd7d2ddeb9cb46a6700900c299e417c8bb7f416839c2fe3",
-        (Serve, true, true) => "1c5cbf2939dde730e45ad7f2e7ad664fd79101ac336d5d8225524ec717e0df54",
+        (Serve, true, false) => "ebcf66551c67f3f18288c63d7d880f56bc0a4768ba599969e5f42442798706f0",
+        (Serve, false, true) => "49662f7d3a236cccf5db5f9e3daf78323aba29e68357d0a20d66bffe21d4718b",
+        (Serve, true, true) => "94e3331e58a09c335fe75a72ed1e4ca50deb3dd7fc62509fc778a5f18b007f47",
         (Acp, true, false) => "fd86b895e615fbec6d9c2e1bd55cd8f7fa9957ed7241ea257127a0d39691af8e",
         (Acp, false, true) => "f7b837ec737da01bf05030396d21d36148597fa4643a3cf4c11dde02957f347d",
         (Acp, true, true) => "297a40c5bad538aeace2cbfe3b0b9de0b85323b8da7326d5883000388536ea29",

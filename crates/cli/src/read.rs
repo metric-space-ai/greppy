@@ -144,7 +144,10 @@ pub(crate) fn read_span_with_meta(
     })
 }
 
-const READ_FILE_PAGE_LINES: usize = 400;
+/// Implicit `read-file` page and `expand` continuation, in lines.
+const READ_FILE_PAGE_LINES: usize = 250;
+/// Same window: `read-file` without `--lines` shows this many lines.
+const READ_FILE_DEFAULT_WINDOW: usize = READ_FILE_PAGE_LINES;
 const READ_FILE_PAGE_BYTES: usize = 64 * 1024;
 
 // Probe only one byte beyond the preview budget. UTF-8 errors inside the
@@ -661,6 +664,296 @@ fn read_unsupported_definition_coverage(
         .collect())
 }
 
+#[derive(Clone)]
+struct MisqualifiedHit {
+    id: i64,
+    qualified_name: String,
+    file_path: String,
+    start_line: i64,
+}
+
+/// `path::Type::name` missed that path. Look up the trailing name (and the
+/// type, when it selects something) across the whole index.
+///
+/// `None` means this query is not path-qualified or the index has no such
+/// name, so the caller can still fall back to the named file. `Some` means
+/// the answer was printed: a single definition, or the list when several match.
+fn try_misqualified_index_read(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    json: bool,
+    with_handle: bool,
+) -> Result<Option<i32>> {
+    let Some((path, spec)) = split_path_qualified(query) else {
+        return Ok(None);
+    };
+    let name = spec
+        .rsplit("::")
+        .next()
+        .and_then(|part| part.rsplit('.').next())
+        .unwrap_or(spec);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let owner = spec.rsplit("::").nth(1).filter(|part| !part.is_empty());
+    let rows = symbol_candidate_rows(store, Some(name))?;
+    let mut hits = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if !bare_symbol_name_matches(&row.name, name)
+            || !is_addressable_definition_label(&row.label)
+        {
+            continue;
+        }
+        if indexed_path_matches_query(&row.file_path, path) {
+            continue;
+        }
+        if !seen.insert((row.file_path.clone(), row.start_line, row.name.clone())) {
+            continue;
+        }
+        hits.push(MisqualifiedHit {
+            id: row.id,
+            qualified_name: row.qualified_name,
+            file_path: row.file_path,
+            start_line: row.start_line,
+        });
+    }
+    let typed = if let Some(owner) = owner {
+        hits.iter()
+            .filter(|hit| {
+                qname_owner_segment(&hit.qualified_name).is_some_and(|segment| segment == owner)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let chosen = if typed.is_empty() { hits } else { typed };
+    if chosen.is_empty() {
+        return Ok(None);
+    }
+    if chosen.len() == 1 {
+        let hit = &chosen[0];
+        let Some(node) = store.get_node(hit.id)? else {
+            return Ok(None);
+        };
+        let located = format!(
+            "note: `{query}` is not an indexed definition in `{path}`; found {} in {}:{}",
+            hit.qualified_name,
+            hit.file_path,
+            hit.start_line.max(1)
+        );
+        let Some(definition) = read_definition(store, root_path, node)? else {
+            return Ok(None);
+        };
+        if json {
+            let source = read_line_slice(
+                &definition.content,
+                definition.start_line,
+                definition.end_line,
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": "greppy.read.v1",
+                    "command": "read",
+                    "status": "relocated",
+                    "query": query,
+                    "note": located,
+                    "qualified_name": definition.node.qualified_name,
+                    "path": definition.node.file_path,
+                    "start_line": definition.start_line,
+                    "end_line": definition.end_line,
+                    "source": source,
+                })
+            );
+            return Ok(Some(0));
+        }
+        println!("{located}");
+        for (start_line, end_line) in read_text_segments(&definition, None, None) {
+            print!(
+                "{}",
+                read_render_block(
+                    store,
+                    project,
+                    root_path,
+                    &definition,
+                    start_line,
+                    end_line,
+                    with_handle,
+                )?
+            );
+        }
+        return Ok(Some(0));
+    }
+    if json {
+        let candidates = chosen
+            .iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "qualified_name": hit.qualified_name,
+                    "path": hit.file_path,
+                    "line": hit.start_line.max(1),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": "greppy.read.v1",
+                "command": "read",
+                "status": "ambiguous",
+                "query": query,
+                "note": format!("`{name}` is {} definitions; none are in `{path}`", chosen.len()),
+                "candidates": candidates,
+            })
+        );
+        return Ok(Some(0));
+    }
+    println!(
+        "`{name}` is {} definitions; none are in `{path}`:",
+        chosen.len()
+    );
+    for hit in &chosen {
+        println!(
+            "{}:{}  {}",
+            hit.file_path,
+            hit.start_line.max(1),
+            hit.qualified_name
+        );
+    }
+    Ok(Some(0))
+}
+
+/// `file.ext::Type::method` missed the symbol index. Show the file around the
+/// trailing name instead of stopping at "no symbol".
+///
+/// `Some(true)` printed a source window. `Some(false)` was path-qualified but
+/// the file was missing. `None` is not a file-qualified query.
+fn try_qualified_file_fallback(
+    query: &str,
+    root_path: &std::path::Path,
+    json: bool,
+) -> Result<Option<bool>> {
+    let Some((path, spec)) = split_path_qualified(query) else {
+        return Ok(None);
+    };
+    let name = spec
+        .rsplit("::")
+        .next()
+        .and_then(|part| part.rsplit('.').next())
+        .unwrap_or(spec);
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+    let Some((shown, canonical)) = read_resolve_file(root_path, &canonical_root, path) else {
+        let message = format!("no symbol `{query}`\nfile not found: {path}");
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": "greppy.read.v1",
+                    "command": "read",
+                    "status": "not-found",
+                    "query": query,
+                    "file": path,
+                })
+            );
+        } else {
+            println!("{message}");
+        }
+        return Ok(Some(false));
+    };
+    let text = std::fs::read_to_string(&canonical).unwrap_or_default();
+    let (start, end, found) = qualified_name_window(&text, name);
+    let body = read_line_slice(&text, start, end);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": "greppy.read.v1",
+                "command": "read",
+                "status": "file-fallback",
+                "query": query,
+                "path": shown,
+                "name": name,
+                "name_found": found,
+                "start_line": start,
+                "end_line": end,
+                "source": body,
+            })
+        );
+        return Ok(Some(true));
+    }
+    println!(
+        "note: no indexed symbol `{query}`; showing {shown}:{start}-{end}{}",
+        if found {
+            format!(" around `{name}`")
+        } else {
+            format!(" (`{name}` not found; first lines)")
+        }
+    );
+    print!("{}", read_numbered_lines(body, start));
+    if !body.ends_with('\n') {
+        println!();
+    }
+    Ok(Some(true))
+}
+
+fn qualified_name_window(text: &str, name: &str) -> (usize, usize, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return (1, 1, false);
+    }
+    let definition = lines
+        .iter()
+        .position(|line| line_mentions_name(line, name) && looks_like_definition_line(line));
+    let mention = lines.iter().position(|line| line_mentions_name(line, name));
+    let found_at = definition.or(mention);
+    let from = found_at.map(|index| index.saturating_sub(5)).unwrap_or(0);
+    let to = (from + READ_FILE_DEFAULT_WINDOW).min(lines.len());
+    (from + 1, to.max(from + 1), found_at.is_some())
+}
+
+fn looks_like_definition_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.contains("fn ")
+        || trimmed.contains("func ")
+        || trimmed.contains("def ")
+        || trimmed.contains("function ")
+        || trimmed.contains("class ")
+        || trimmed.contains("struct ")
+        || trimmed.contains("impl ")
+        || trimmed.starts_with("type ")
+}
+
+fn line_mentions_name(line: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let needle = name.as_bytes();
+    let mut index = 0;
+    while index + needle.len() <= bytes.len() {
+        if &bytes[index..index + needle.len()] == needle {
+            let before_ok = index == 0 || !is_ident_byte(bytes[index - 1]);
+            let after = index + needle.len();
+            let after_ok = after == bytes.len() || !is_ident_byte(bytes[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn read_report_missing(
     store: &greppy_store::Store,
     project: &str,
@@ -747,10 +1040,9 @@ fn read_json_miss(
 /// whole; longer blocks are folded one level again.
 const READ_SMART_EXPAND_WHOLE_LINES: usize = 150;
 
-/// Files up to this many lines are printed whole by `read-file` and by
-/// `read PATH`; longer indexed sources answer with an outline.
-const READ_SMALL_FILE_LINES: usize = 60;
-
+/// `read PATH` prints the file in the `read-file` format up to
+/// [`READ_FILE_DEFAULT_WINDOW`] lines. Longer indexed files keep the outline
+/// and name `read-file --lines`.
 #[expect(
     clippy::too_many_arguments,
     reason = "keeps the read compatibility decisions at one dispatch boundary"
@@ -852,8 +1144,8 @@ pub(crate) fn dispatch_read(
         }
     }
 
-    // `read PATH` on one small file: the file is the answer. An outline of a
-    // short file only cost agents a second call (`read-file`) in the v3 bench.
+    // `read PATH` up to the read-file window is the numbered file. An outline
+    // of that file only cost the agent another `read-file --lines` turn.
     if !json && head.is_none() && tail.is_none() {
         if let [subject] = subjects {
             if file_intents.first().copied().unwrap_or(false) {
@@ -861,8 +1153,8 @@ pub(crate) fn dispatch_read(
                     read_resolve_file(&file_base, &canonical_root, subject)
                 {
                     if let Ok(text) = std::fs::read_to_string(&canonical) {
-                        let total = text.lines().count();
-                        if (1..=READ_SMALL_FILE_LINES).contains(&total) {
+                        let total = read_line_count(&text);
+                        if (1..=READ_FILE_DEFAULT_WINDOW).contains(&total) {
                             let range = format!("1:{total}");
                             return dispatch_read_line_range(
                                 subjects,
@@ -1159,6 +1451,14 @@ pub(crate) fn dispatch_read_symbols(
         let mut nodes = read_real_nodes(&store, &ids)?;
         nodes.retain(|node| path_filters.matches(&node.file_path));
         if nodes.is_empty() {
+            if let Some(code) =
+                try_misqualified_index_read(&store, &project, query, &root_path, json, with_handle)?
+            {
+                return Ok(code);
+            }
+            if let Some(shown) = try_qualified_file_fallback(query, &root_path, json)? {
+                return Ok(if shown { 0 } else { 1 });
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&read_json_miss(
@@ -1276,11 +1576,44 @@ pub(crate) fn dispatch_read_symbols(
             failed = true;
             continue;
         }
-        let Some(node) = nodes.first().cloned() else {
-            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
-            previous_ended_with_newline = true;
-            failed = true;
-            continue;
+        let node = if let Some(node) = nodes.first().cloned() {
+            node
+        } else {
+            match try_misqualified_index_read(
+                &store,
+                &project,
+                query,
+                &root_path,
+                json,
+                with_handle,
+            )? {
+                Some(0) => {
+                    previous_ended_with_newline = true;
+                    continue;
+                }
+                Some(_) => {
+                    previous_ended_with_newline = true;
+                    failed = true;
+                    continue;
+                }
+                None => match try_qualified_file_fallback(query, &root_path, json)? {
+                    Some(true) => {
+                        previous_ended_with_newline = true;
+                        continue;
+                    }
+                    Some(false) => {
+                        previous_ended_with_newline = true;
+                        failed = true;
+                        continue;
+                    }
+                    None => {
+                        read_report_missing(&store, &project, query, &root_path, &path_filters)?;
+                        previous_ended_with_newline = true;
+                        failed = true;
+                        continue;
+                    }
+                },
+            }
         };
         let Some(definition) = read_definition(&store, &root_path, node)? else {
             read_report_missing(&store, &project, query, &root_path, &path_filters)?;
@@ -2068,6 +2401,11 @@ fn read_file_outline_result(
         "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B\n",
         top_level[0].qualified_name
     ));
+    if symbol_read {
+        outline.push_str(&format!(
+            "first {READ_FILE_DEFAULT_WINDOW} lines: greppy read-file {shown} --lines 1:{READ_FILE_DEFAULT_WINDOW}\n"
+        ));
+    }
     Ok(outline)
 }
 
@@ -2320,38 +2658,13 @@ pub(crate) fn dispatch_read_files(
             previous_ended_with_newline = true;
             continue;
         }
-        if lines.is_none() && !all && line_count > READ_SMALL_FILE_LINES {
-            if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
-                if json_output {
-                    json_files.push(serde_json::json!({
-                        "path": shown,
-                        "kind": "outline",
-                        "content": outline,
-                        "handle": serde_json::Value::Null,
-                        "handle_unavailable": with_handle.then_some(
-                            "outlines cannot produce an edit handle; request an explicit --lines A:B span"
-                        ),
-                    }));
-                    continue;
-                }
-                read_begin_group(&mut printed, &mut previous_ended_with_newline);
-                print!("{outline}");
-                if with_handle {
-                    println!(
-                        "note: for a handle, choose a symbol or an explicit --lines A:B span first"
-                    );
-                }
-                previous_ended_with_newline = true;
-                continue;
-            }
-        }
         let (start_line, end_line, continuation) = if let Some(raw) = lines {
             let (start, end) = read_parse_file_range(raw, line_count)?;
             (start, end, None)
-        } else if all || line_count <= READ_FILE_PAGE_LINES {
+        } else if all || line_count <= READ_FILE_DEFAULT_WINDOW {
             (1, line_count, None)
         } else {
-            let end = READ_FILE_PAGE_LINES;
+            let end = READ_FILE_DEFAULT_WINDOW;
             if project.is_none() {
                 project = Some(workspace_locator::project_identity(&root_path));
             }
@@ -2743,4 +3056,23 @@ pub(crate) fn read_last_used_unix_secs(dir: &std::path::Path) -> u64 {
                 .map(|age| age.as_secs())
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod qualified_fallback_tests {
+    use super::qualified_name_window;
+
+    #[test]
+    fn file_qualified_miss_windows_on_the_trailing_name() {
+        let text = format!(
+            "intro\n{}\nfn FindString() {{\n    return\n}}\n",
+            "pad\n".repeat(20)
+        );
+        let (start, end, found) = qualified_name_window(&text, "FindString");
+        assert!(found);
+        assert!(start > 1);
+        assert!(end >= start);
+        let slice = super::read_line_slice(&text, start, end);
+        assert!(slice.contains("fn FindString"));
+    }
 }
