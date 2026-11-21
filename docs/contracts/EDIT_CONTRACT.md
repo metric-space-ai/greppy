@@ -6,6 +6,10 @@ JSON schemas next to it (`edit-plan.v1.schema.json`,
 them. Changes require the same re-registration discipline as benchmark
 thresholds: documented rationale, version bump, owner sign-off.
 
+## Proposed extension: configured C authority v1 (unsigned draft)
+
+[C_VALIDATION_CONTRACT.md](C_VALIDATION_CONTRACT.md) and its versioned context/result schemas contain the proposed explicit `--c-context` authority for trained `write`/`patch`. This is a contract extension awaiting Owner sign-off under the registration rule above. It does not change the default parser path, post-publication `--verify`, or the signed system prompt. Do not land or install the unsigned authority.
+
 ## Principles (binding)
 
 1. No fuzzy application of any kind, permanently. Selectors match exactly

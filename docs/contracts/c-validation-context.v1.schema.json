@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:greppy:c-validation-context:v1",
+  "title": "DRAFT configured C frontend context v1; Owner sign-off outstanding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "configuration",
+    "compiler",
+    "translation_units",
+    "input_files"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "greppy.c-validation-context.v1"
+    },
+    "configuration": {
+      "type": "string",
+      "minLength": 1
+    },
+    "compiler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "executable"
+      ],
+      "properties": {
+        "family": {
+          "enum": [
+            "gcc",
+            "clang"
+          ]
+        },
+        "executable": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Explicit absolute local frontend executable; resolved identity is recorded"
+        }
+      }
+    },
+    "translation_units": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file",
+          "directory",
+          "arguments"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "pattern": "\\.c$"
+          },
+          "directory": {
+            "type": "string",
+            "minLength": 1
+          },
+          "arguments": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "string"
+            },
+            "description": "Runtime validates supported frontend arguments, exactly one {source} and -fsyntax-only; no shell/driver-stop/output/additional-source mode"
+          }
+        }
+      }
+    },
+    "input_files": {
+      "type": "array",
+      "maxItems": 2048,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60,
+      "default": 60
+    }
+  }
+}

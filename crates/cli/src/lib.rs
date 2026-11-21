@@ -556,6 +556,7 @@ pub enum EditCommand {
         verify: bool,
     },
     Write {
+        c_context: Option<String>,
         path: String,
         new: Option<String>,
         dry_run: bool,
@@ -594,6 +595,7 @@ pub enum EditCommand {
         verify: bool,
     },
     Patch {
+        c_context: Option<String>,
         diff: Option<String>,
         dry_run: bool,
         verify: bool,
@@ -1166,6 +1168,11 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // list, yet clap rejects, was retired there -- also a refusal.
             // Both fall through to the usage path below, which names the
             // corrected invocation.
+            // A requested validation authority must never be dropped by guessed-flag recovery.
+            if unknown_flag_name(first).as_deref() == Some("--c-context") {
+                println!("--c-context is supported only by write and patch; select one of those commands or omit the option; nothing written");
+                return 64;
+            }
             let flag_kind = classify_unknown_flag(&argv, sub, first);
             if !matches!(
                 flag_kind,
@@ -2894,6 +2901,7 @@ fn dispatch_subcommand(
             )
         }
         Command::Write {
+            c_context,
             path,
             new,
             dry_run,
@@ -2902,6 +2910,7 @@ fn dispatch_subcommand(
             json,
         } => dispatch_edit(
             EditCommand::Write {
+                c_context,
                 path,
                 new,
                 dry_run,
@@ -2994,6 +3003,7 @@ fn dispatch_subcommand(
             root,
         ),
         Command::Patch {
+            c_context,
             diff,
             dry_run,
             verify,
@@ -3001,6 +3011,7 @@ fn dispatch_subcommand(
             json,
         } => dispatch_edit(
             EditCommand::Patch {
+                c_context,
                 diff,
                 dry_run,
                 verify,
