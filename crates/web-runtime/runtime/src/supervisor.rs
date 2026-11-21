@@ -1227,6 +1227,12 @@ fn spawn_unix_in_window(
         if let Some(dir) = content_config_dir.as_ref() {
             command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
         }
+        if worker == WorkerKind::Content {
+            // llvmpipe compiles shaders at run time in every new content worker because
+            // the sandbox forbids Mesa's disk cache; skipping LLVM optimization passes
+            // cuts that start-up cost without changing rendered pixels.
+            command.env("GALLIVM_PERF", "nopt");
+        }
         if let Some(dir) = persistent_profiles.as_ref() {
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
