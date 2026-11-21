@@ -1227,6 +1227,12 @@ fn spawn_unix_in_window(
         if let Some(dir) = content_config_dir.as_ref() {
             command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
         }
+        if worker == WorkerKind::Content {
+            // llvmpipe compiles shaders at run time in every new content worker because
+            // the sandbox forbids Mesa's disk cache; skipping LLVM optimization passes
+            // cuts that start-up cost without changing rendered pixels.
+            command.env("GALLIVM_PERF", "nopt");
+        }
         if let Some(dir) = persistent_profiles.as_ref() {
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
@@ -1531,160 +1537,21 @@ struct ImageId {
 
 
 #[cfg(unix)]
-fn image_digest_cache_path(_path: &Path, meta: &std::fs::Metadata) -> PathBuf {
-    use std::os::unix::fs::MetadataExt;
-    std::env::temp_dir().join(image_digest_cache_name(
-        meta.dev(),
-        meta.ino(),
-        meta.size(),
-        (meta.mtime(), meta.mtime_nsec()),
-        (meta.ctime(), meta.ctime_nsec()),
-    ))
-}
-
-#[cfg(unix)]
-fn image_digest_cache_name(
-    device: u64,
-    inode: u64,
-    size: u64,
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-) -> String {
-    // The cache must use the same metadata identity as identity_mismatch.
-    // Same-size writes can restore mtime but still advance ctime. Old keys
-    // without ctime deliberately miss; never migrate their unbound digest.
-    format!(
-        "greppy-web-image-{device}-{inode}-{size}-{}-{}-{}-{}.sha256",
-        mtime.0, mtime.1, ctime.0, ctime.1
-    )
-}
-
-#[cfg(unix)]
-fn digest_from_sha256sums(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let hex = parts.next()?;
-        let name = parts.next()?.trim_start_matches('*');
-        if hex.len() == 64
-            && hex.bytes().all(|b| b.is_ascii_hexdigit())
-            && (name == "web-runtime"
-                || name == "bin/web-runtime"
-                || name.ends_with("/web-runtime"))
-        {
-            return Some(hex.to_ascii_lowercase());
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn prefill_digest_cache_from_dist(exe: &Path, meta: &std::fs::Metadata) {
-    let Some(parent) = exe.parent() else {
-        return;
-    };
-    for sums in [parent.join("SHA256SUMS"), parent.join("..").join("SHA256SUMS")] {
-        let Ok(text) = fs::read_to_string(&sums) else {
-            continue;
-        };
-        if let Some(digest) = digest_from_sha256sums(&text) {
-            store_image_digest_cache(exe, meta, &digest);
-            return;
-        }
-    }
-}
-
-#[cfg(unix)]
-fn reap_stale_image_digest_caches(keep: &std::fs::Metadata) {
-    let directory = std::env::temp_dir();
-    let keep_path = image_digest_cache_path(Path::new(""), keep);
-    prune_image_digest_caches(
-        &directory,
-        &keep_path,
-        std::time::SystemTime::now(),
-        unsafe { libc::geteuid() },
-    );
-}
-
-#[cfg(unix)]
-fn prune_image_digest_caches(
-    directory: &Path,
-    keep_path: &Path,
-    now: std::time::SystemTime,
-    owner_uid: u32,
-) {
-    use std::os::unix::fs::MetadataExt;
-    // Multiple installed/test images can run under the same user and TMPDIR.
-    // A different inode is not evidence that its digest is stale: deleting it
-    // forces the next supervisor to hash its entire executable before binding.
-    const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("greppy-web-image-") || !name.ends_with(".sha256") {
-            continue;
-        }
-        let path = entry.path();
-        if path == keep_path {
-            continue;
-        }
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.is_file() || meta.uid() != owner_uid {
-            continue;
-        }
-        let Some(age) = meta
-            .modified()
-            .ok()
-            .and_then(|mtime| now.duration_since(mtime).ok())
-        else {
-            continue;
-        };
-        if age >= RETENTION {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn load_image_digest_cache(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
-    let cached = fs::read_to_string(image_digest_cache_path(path, meta)).ok()?;
-    let digest = cached.trim().to_owned();
-    if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(digest)
-    } else {
-        None
-    }
-}
-
-#[cfg(unix)]
-fn store_image_digest_cache(path: &Path, meta: &std::fs::Metadata, digest: &str) {
-    let _ = fs::write(image_digest_cache_path(path, meta), digest);
-}
-
-#[cfg(unix)]
 fn observe_image(path: &Path, digest: bool) -> io::Result<ImageId> {
     use std::os::unix::fs::MetadataExt;
     let path = fs::canonicalize(path)?;
     let meta = fs::metadata(&path)?;
     let sha256 = if digest {
-        reap_stale_image_digest_caches(&meta);
-        prefill_digest_cache_from_dist(&path, &meta);
-        if let Some(cached) = load_image_digest_cache(&path, &meta) {
-            phase!("web-runtime: phase parent-image cache-hit");
-            cached
-        } else {
-            let digest = crate::artifacts::hex_sha256_file(&path)?;
-            store_image_digest_cache(&path, &meta, &digest);
-            digest
-        }
+        let image_id = greppy_web_client::runtime_image_id(&path)?;
+        image_id
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected runtime image id format: {image_id}"),
+                )
+            })?
+            .to_owned()
     } else {
         String::new()
     };
@@ -2480,88 +2347,6 @@ mod tests {
         reap_stale_content_worker_dirs();
 
         assert!(!path.exists(), "{}", path.display());
-    }
-
-    #[test]
-    fn digest_from_sha256sums_reads_bin_web_runtime() {
-        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  bin/web-runtime\n";
-        assert_eq!(
-            digest_from_sha256sums(text).as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-        assert_eq!(digest_from_sha256sums("not-a-sum\n"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn image_digest_cache_key_binds_every_metadata_identity_field() {
-        let key = image_digest_cache_name(1, 2, 3, (4, 5), (6, 7));
-        assert_eq!(key, image_digest_cache_name(1, 2, 3, (4, 5), (6, 7)));
-        for changed in [
-            image_digest_cache_name(9, 2, 3, (4, 5), (6, 7)),
-            image_digest_cache_name(1, 9, 3, (4, 5), (6, 7)),
-            image_digest_cache_name(1, 2, 9, (4, 5), (6, 7)),
-            image_digest_cache_name(1, 2, 3, (9, 5), (6, 7)),
-            image_digest_cache_name(1, 2, 3, (4, 9), (6, 7)),
-            image_digest_cache_name(1, 2, 3, (4, 5), (9, 7)),
-            image_digest_cache_name(1, 2, 3, (4, 5), (6, 9)),
-        ] {
-            assert_ne!(key, changed);
-        }
-        assert_ne!(key, "greppy-web-image-1-2-3-4-5.sha256");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn image_digest_cleanup_preserves_other_fresh_images_and_bounds_old_entries() {
-        use std::os::unix::fs::{symlink, MetadataExt};
-        use std::time::{Duration, SystemTime};
-
-        let owned = OwnedTempDir::for_content_worker().unwrap();
-        let directory = &owned.path;
-        let current = directory.join("greppy-web-image-current.sha256");
-        let other = directory.join("greppy-web-image-other.sha256");
-        let expired = directory.join("greppy-web-image-expired.sha256");
-        let future = directory.join("greppy-web-image-future.sha256");
-        let linked = directory.join("greppy-web-image-symlink.sha256");
-        let unrelated = directory.join("unrelated.sha256");
-        let now = SystemTime::now();
-        let old = now - Duration::from_secs(8 * 24 * 60 * 60);
-        for path in [&current, &other, &expired, &future, &unrelated] {
-            fs::write(path, "a".repeat(64)).unwrap();
-        }
-        for path in [&current, &expired, &unrelated] {
-            fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
-        }
-        fs::File::options()
-            .write(true)
-            .open(&future)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(now + Duration::from_secs(60)))
-            .unwrap();
-        symlink(&expired, &linked).unwrap();
-        let uid = fs::metadata(&expired).unwrap().uid();
-
-        prune_image_digest_caches(directory, &current, now, uid.wrapping_add(1));
-        assert!(
-            expired.exists(),
-            "another user's files must not be pruned"
-        );
-        prune_image_digest_caches(directory, &current, now, uid);
-        assert!(
-            current.exists(),
-            "the current image cache stays even when old"
-        );
-        assert!(other.exists(), "another image's fresh cache must stay warm");
-        assert!(!expired.exists(), "old unused caches should be reclaimed");
-        assert!(future.exists(), "clock skew is not proof of staleness");
-        assert!(fs::symlink_metadata(linked).unwrap().file_type().is_symlink());
-        assert!(unrelated.exists());
     }
 
     #[test]

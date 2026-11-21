@@ -1082,10 +1082,19 @@ pub(super) fn supervisor_for_session(
     spawn: &SupervisorSpawn,
     session: Option<&str>,
 ) -> std::result::Result<SupervisorCtx, ErrorObject> {
-    let current_image = resolve_runtime()
-        .ok()
-        .and_then(|runtime| greppy_web_client::runtime_image_id(&runtime.executable).ok());
     if let Some(session) = session {
+        let mut current_image: Option<Option<String>> = None;
+        let mut matches_current_image = |runtime_image_id: &str, legacy: bool| -> bool {
+            if legacy {
+                return false;
+            }
+            let image = current_image.get_or_insert_with(|| {
+                resolve_runtime().ok().and_then(|runtime| {
+                    greppy_web_client::runtime_image_id(&runtime.executable).ok()
+                })
+            });
+            image.as_deref() == Some(runtime_image_id)
+        };
         if let Some(route) = load_session_route(root, session) {
             if !valid_session_route_image(&route) {
                 remove_session_route(root, session);
@@ -1105,7 +1114,7 @@ pub(super) fn supervisor_for_session(
             let capability = select_route_capability(
                 load_attach_cookie(&route_socket),
                 crate::web_attach::current_token(),
-                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+                matches_current_image(&route.runtime_image_id, route.legacy),
             );
             if let Some(capability) = capability {
                 if let Some(live) = route_runtime_status(&route_socket, &route_run_id, &capability)?
@@ -1143,7 +1152,7 @@ pub(super) fn supervisor_for_session(
             let capability = select_route_capability(
                 load_attach_cookie(&route_socket),
                 crate::web_attach::current_token(),
-                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+                matches_current_image(&route.runtime_image_id, route.legacy),
             );
             if let Some(capability) = capability {
                 if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
@@ -1661,6 +1670,7 @@ fn ensure_supervisor_with_identity(
         let started = Instant::now();
         let mut saw_starting = false;
         let mut startup_exit = None;
+        let mut poll_attempt = 0u32;
         loop {
             match observe_runtime_startup(&socket, &run_id, &capability) {
                 RuntimeProbe::Ready(live) if live.runtime_image_id == expected_runtime_image_id => {
@@ -1695,7 +1705,8 @@ fn ensure_supervisor_with_identity(
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(startup_poll_interval(poll_attempt));
+            poll_attempt = poll_attempt.saturating_add(1);
         }
         if let Some(mut child) = spawned_child.borrow_mut().take() {
             reap_detached_runtime(&mut child, &socket, &run_id, &capability);
@@ -1764,6 +1775,10 @@ fn startup_wait_budget(saw_starting: bool) -> Duration {
     }
 }
 
+fn startup_poll_interval(attempt: u32) -> Duration {
+    Duration::from_millis((5u64 << attempt.min(4)).min(50))
+}
+
 fn observe_runtime_startup(socket: &Path, run_id: &str, capability: &str) -> RuntimeProbe {
     #[cfg(unix)]
     {
@@ -1788,6 +1803,7 @@ fn wait_runtime_status(
 ) -> std::result::Result<Option<LiveRuntimeStatus>, StatusProbeError> {
     let started = Instant::now();
     let mut saw_starting = false;
+    let mut poll_attempt = 0u32;
     loop {
         match observe_runtime_startup(socket, run_id, capability) {
             RuntimeProbe::Ready(status) => return Ok(Some(status)),
@@ -1801,7 +1817,8 @@ fn wait_runtime_status(
         if started.elapsed() >= startup_wait_budget(saw_starting) {
             return Err(StatusProbeError::Starting);
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(startup_poll_interval(poll_attempt));
+        poll_attempt = poll_attempt.saturating_add(1);
     }
 }
 
@@ -2585,6 +2602,14 @@ mod target_tests {
     fn starting_status_extends_the_runtime_wait_to_three_minutes() {
         assert_eq!(startup_wait_budget(false), Duration::from_secs(60));
         assert_eq!(startup_wait_budget(true), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn startup_poll_interval_doubles_from_5ms_and_caps_at_50ms() {
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5].map(startup_poll_interval),
+            [5, 10, 20, 40, 50, 50].map(Duration::from_millis)
+        );
     }
 
     #[test]

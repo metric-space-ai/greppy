@@ -4,6 +4,16 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Web runtime on small machines
+
+- The runtime image is hashed once per file identity: a private per-user
+  digest cache (`$XDG_CACHE_HOME/greppy/web-image-digest`, 0700, entries
+  0600) replaces six full SHA-256 passes over the ~230 MB executable per
+  `web do` plus `web runtime stop` (-15 % on one core).
+- Runtime start-up is polled every 5-50 ms instead of every 250 ms.
+- Content workers skip LLVM optimisation of llvmpipe shaders
+  (`GALLIVM_PERF=nopt`; -18 % on the first round, same pixels).
+
 ## [0.4.8] — 2026-11-21
 
 ### Index and queries in daily use
