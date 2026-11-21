@@ -1082,10 +1082,19 @@ pub(super) fn supervisor_for_session(
     spawn: &SupervisorSpawn,
     session: Option<&str>,
 ) -> std::result::Result<SupervisorCtx, ErrorObject> {
-    let current_image = resolve_runtime()
-        .ok()
-        .and_then(|runtime| greppy_web_client::runtime_image_id(&runtime.executable).ok());
     if let Some(session) = session {
+        let mut current_image: Option<Option<String>> = None;
+        let mut matches_current_image = |runtime_image_id: &str, legacy: bool| -> bool {
+            if legacy {
+                return false;
+            }
+            let image = current_image.get_or_insert_with(|| {
+                resolve_runtime().ok().and_then(|runtime| {
+                    greppy_web_client::runtime_image_id(&runtime.executable).ok()
+                })
+            });
+            image.as_deref() == Some(runtime_image_id)
+        };
         if let Some(route) = load_session_route(root, session) {
             if !valid_session_route_image(&route) {
                 remove_session_route(root, session);
@@ -1105,7 +1114,7 @@ pub(super) fn supervisor_for_session(
             let capability = select_route_capability(
                 load_attach_cookie(&route_socket),
                 crate::web_attach::current_token(),
-                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+                matches_current_image(&route.runtime_image_id, route.legacy),
             );
             if let Some(capability) = capability {
                 if let Some(live) = route_runtime_status(&route_socket, &route_run_id, &capability)?
@@ -1143,7 +1152,7 @@ pub(super) fn supervisor_for_session(
             let capability = select_route_capability(
                 load_attach_cookie(&route_socket),
                 crate::web_attach::current_token(),
-                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+                matches_current_image(&route.runtime_image_id, route.legacy),
             );
             if let Some(capability) = capability {
                 if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
