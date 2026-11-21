@@ -7487,6 +7487,7 @@ impl GraphIndex {
         }
         let referrer_file = self.file_of(src_id)?;
         let owner_path = ref_path.strip_suffix(name)?.strip_suffix("::")?;
+        let mut imported_from_project_crate = false;
         let owner_id = if owner_path == "Self" {
             let source_qname = self.qname_for_id(src_id)?;
             if self.by_qname(source_qname)?.label != "Method" {
@@ -7496,8 +7497,19 @@ impl GraphIndex {
             self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, context_owner, src_id)
                 .unique_id()?
         } else if owner_path == owner {
-            self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, owner, src_id)
-                .unique_id()?
+            match self
+                .resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, owner, src_id)
+                .unique_id()
+            {
+                Some(id) => id,
+                None => {
+                    imported_from_project_crate = true;
+                    self.rust_imported_paths_by_file
+                        .get(referrer_file)
+                        .and_then(|imports| imports.get(owner))
+                        .and_then(|path| self.resolve_rust_owner_in_project_crate(path))?
+                }
+            }
         } else {
             let first_segment = owner_path.split("::").next().unwrap_or("");
             let module_files = self
@@ -7535,7 +7547,8 @@ impl GraphIndex {
             }
         };
         let owner_file = self.file_of(owner_id)?;
-        if self.by_id.get(&owner_id)?.label == "Enum"
+        if !imported_from_project_crate
+            && self.by_id.get(&owner_id)?.label == "Enum"
             && (owner_path == owner || owner_path == "Self")
         {
             // Enum owners must be bound in the current file. Project-wide
@@ -7568,6 +7581,44 @@ impl GraphIndex {
             .map(|node| node.id)
             .collect::<Vec<_>>();
         match matches.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Resolve a Rust type path whose leading segment names a package of this
+    /// repository (`wj_dock::Dock`, `wj_dock::sub::Dock`) to the unique type
+    /// definition in that package.
+    fn resolve_rust_owner_in_project_crate(&self, path: &str) -> Option<i64> {
+        let segments: Vec<&str> = path
+            .trim()
+            .trim_start_matches("::")
+            .split("::")
+            .filter(|part| !part.is_empty())
+            .collect();
+        if segments.len() < 2 {
+            return None;
+        }
+        let crate_dir = self.project_crates().get(segments[0])?.as_str();
+        let in_crate: Vec<&NodeLite> = self
+            .defs_named(&CONSTRUCTABLE_LABELS, segments.last()?)
+            .into_iter()
+            .filter(|node| rust_crate_dir(&node.file_path) == crate_dir)
+            .collect();
+        if let [one] = in_crate.as_slice() {
+            return Some(one.id);
+        }
+        let lib_rs = Path::new(crate_dir)
+            .join("src/lib.rs")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let expected = rust_library_module_files(&lib_rs, &segments[1..segments.len() - 1]);
+        let exact: Vec<i64> = in_crate
+            .iter()
+            .filter(|node| expected.contains(&node.file_path))
+            .map(|node| node.id)
+            .collect();
+        match exact.as_slice() {
             [id] => Some(*id),
             _ => None,
         }

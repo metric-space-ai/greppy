@@ -231,3 +231,28 @@ fn standard_library_receivers_do_not_bind_to_project_types_of_that_name() {
     assert!(out.contains(&own), "missing {own}; got:\n{out}");
     assert!(!out.contains("src/fs.rs"), "{out}");
 }
+
+#[test]
+fn who_calls_finds_associated_function_calls_imported_from_another_package() {
+    let (repo, store) = indexed("workspace-assoc");
+    // `app/src/lib.rs` imports `use wj_dock::{Dock, Stream};` and calls
+    // `Dock::open(..)`: only `wj-dock`'s `Dock::open` gets the caller, not
+    // the same-named `Dock::open` in `other` or the root package.
+    let out = who_calls(&repo, &store, "engine/dock/src/lib.rs::Dock::open");
+    let row = format!(
+        "app/src/lib.rs:{}  start",
+        line_of(APP_LIB_RS, "workspace-open")
+    );
+    assert!(out.contains(&row), "missing {row}; got:\n{out}");
+
+    let out = who_calls(&repo, &store, "other/src/lib.rs::Dock::open");
+    assert!(
+        !out.contains("app/src"),
+        "unimported package's Dock::open must not get the call; got:\n{out}"
+    );
+    let out = who_calls(&repo, &store, "src/dock.rs::Dock::open");
+    assert!(
+        !out.contains("app/src"),
+        "root package's Dock::open must not get the call; got:\n{out}"
+    );
+}
