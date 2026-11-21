@@ -4,6 +4,38 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-11-21
+
+### Index and queries in daily use
+
+- A read command (who-calls, callees, impact, graph-locate, search-symbol,
+  brief, where-am-i, search, context) never hangs and starts no heavy work on
+  a large repository (more than `GREPPY_AUTO_INDEX_MAX_FILES`, default 2 000
+  files; `GREPPY_AUTO_INDEX=1` lifts the limit). Without an index it answers
+  at once with `no_index` (exit 75) and names `greppy index .`; with a stale
+  index it answers from the published one and says so (`stale_served`, a
+  warning). Small repositories still index on first use; a read waits at
+  most `GREPPY_QUERY_WAIT_SECS` (20) and leaves the work running. Symbol
+  edits still wait for a current graph.
+- `greppy index` builds the code graph only; `--with-embeddings` builds the
+  embeddings as well, in the same command. No background job outlives it.
+- The first index of a large repository from its sources runs under the
+  host's build gate when one is configured; refreshing an index, or starting
+  from another clone's, does not wait.
+- A fresh clone that starts from another clone's index no longer rebuilds
+  every Rust edge: 38 s instead of 322 s on a 21 960-file workspace.
+- `impact --json` no longer loads the summary model; one command asks for at
+  most 12 new summaries (`GREPPY_SUMMARIES_PER_COMMAND`). Detached index jobs
+  and the model daemons run at lower priority.
+
+### Navigation
+
+- `greppy isolate <file:line|symbol>… [--json]`: the symbol at a place, its
+  callers, what reaches it, what it calls and what it reaches, in one call.
+- A call of an associated function of a type imported from another package
+  of the workspace (`use wj_dock::{Dock, ..}; Dock::open(..)`) binds to that
+  package's definition when the workspace has more than one type of the name.
+
 ## [0.4.7] — 2026-11-20
 
 ### Navigation
