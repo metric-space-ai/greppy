@@ -2244,10 +2244,26 @@ fn cargo_item_mentions_anyhow(item: &toml_edit::Item) -> bool {
     })
 }
 
+/// `(project, file)` pairs whose `anyhow` dependency is the real crate.
+type ProvenAnyhowFiles = std::collections::HashSet<(String, String)>;
+
 fn rust_anyhow_context(
     store: &Store,
     only_project: Option<&str>,
-) -> Result<(std::collections::HashSet<(String, String)>, String)> {
+) -> Result<(ProvenAnyhowFiles, String)> {
+    let (allowed, binding, _) = rust_anyhow_bindings(store, only_project)?;
+    Ok((allowed, binding))
+}
+
+/// The files whose `anyhow` factories are proven, the binding of the Cargo
+/// documents that proof rests on, and the binding as older indexes recorded
+/// it. The binding names each manifest by its place in the checkout, so two
+/// clones of one repository agree on it; the older form named it by absolute
+/// path, which made the index of every other clone look unrepaired.
+fn rust_anyhow_bindings(
+    store: &Store,
+    only_project: Option<&str>,
+) -> Result<(ProvenAnyhowFiles, String, String)> {
     let projects = {
         let mut stmt = store
             .conn()
@@ -2263,6 +2279,10 @@ fn rust_anyhow_context(
     };
     let mut documents = std::collections::BTreeMap::<String, String>::new();
     let mut allowed = std::collections::HashSet::new();
+    let roots = projects
+        .iter()
+        .map(|(project, root)| (project.clone(), std::path::PathBuf::from(root)))
+        .collect::<Vec<_>>();
     for (project, root) in projects
         .into_iter()
         .filter(|(project, _)| only_project.is_none_or(|selected| selected == project.as_str()))
@@ -2467,9 +2487,28 @@ fn rust_anyhow_context(
             state.map(|state| state.sha256).unwrap_or_default(),
         );
     }
-    let encoded = serde_json::to_vec(&documents)
-        .map_err(|error| greppy_core::Error::Store(format!("Cargo identity encoding: {error}")))?;
-    Ok((allowed, file_state::sha256_hex(&encoded)))
+    let binding_of = |documents: &std::collections::BTreeMap<String, String>| {
+        serde_json::to_vec(documents)
+            .map(|encoded| file_state::sha256_hex(&encoded))
+            .map_err(|error| greppy_core::Error::Store(format!("Cargo identity encoding: {error}")))
+    };
+    let located = documents
+        .iter()
+        .map(|(name, text)| {
+            let in_checkout = roots
+                .iter()
+                .filter_map(|(project, root)| {
+                    let path = Path::new(name).strip_prefix(root).ok()?;
+                    Some((root.as_os_str().len(), project, path))
+                })
+                .max_by_key(|(depth, _, _)| *depth)
+                .map(|(_, project, path)| {
+                    format!("{project}:{}", path.to_string_lossy().replace('\\', "/"))
+                });
+            (in_checkout.unwrap_or_else(|| name.clone()), text.clone())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    Ok((allowed, binding_of(&located)?, binding_of(&documents)?))
 }
 
 fn anyhow_factory_repair_key(project: &str) -> String {
@@ -2489,12 +2528,16 @@ pub fn anyhow_factory_edges_repaired(store: &Store) -> Result<bool> {
             .map_err(sqlite_err)?
     };
     for project in projects {
-        let (_, expected) = rust_anyhow_context(store, Some(&project))?;
+        let (_, expected, recorded_by_older_indexes) = rust_anyhow_bindings(store, Some(&project))?;
         let present: bool = store
             .conn()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM main.schema_meta WHERE key=?1 AND value=?2)",
-                rusqlite::params![anyhow_factory_repair_key(&project), expected],
+                "SELECT EXISTS(SELECT 1 FROM main.schema_meta WHERE key=?1 AND value IN (?2, ?3))",
+                rusqlite::params![
+                    anyhow_factory_repair_key(&project),
+                    expected,
+                    recorded_by_older_indexes
+                ],
                 |row| row.get(0),
             )
             .map_err(sqlite_err)?;
@@ -16562,6 +16605,48 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             .unwrap()
             .is_empty());
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rust_repair_marker_holds_for_the_same_files_under_another_path() {
+        let repo = setup_repo("anyhow-marker-clone", "pub fn marked() {}\n");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='marker_fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(anyhow_factory_edges_repaired(&store).unwrap());
+
+        // A second clone has the same files somewhere else; its index starts
+        // as a copy of this one with the root rewritten.
+        let clone = repo.with_extension("clone");
+        fs::rename(&repo, &clone).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE projects SET root_path = ?1",
+                [clone.to_string_lossy()],
+            )
+            .unwrap();
+        assert!(
+            anyhow_factory_edges_repaired(&store).unwrap(),
+            "the copied index must not look unrepaired: that rebuilds every Rust edge"
+        );
+
+        // A marker written with absolute paths, as older indexes have it,
+        // still counts for the checkout it was written in.
+        let (_, _, by_absolute_path) = rust_anyhow_bindings(&store, Some("test")).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE main.schema_meta SET value = ?2 WHERE key = ?1",
+                rusqlite::params![anyhow_factory_repair_key("test"), by_absolute_path],
+            )
+            .unwrap();
+        assert!(anyhow_factory_edges_repaired(&store).unwrap());
+        fs::remove_dir_all(clone).unwrap();
     }
 
     #[test]
