@@ -80,6 +80,7 @@ use inference::*;
 mod context_status;
 mod freshness;
 mod index_admission;
+mod isolate;
 mod query_progress;
 mod sibling_seed;
 use freshness::*;
@@ -192,6 +193,16 @@ const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
 const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
+/// Set by `greppy index` without `--with-embeddings` for itself and the index
+/// runs it starts: build the graph, configure no inference.
+pub(crate) const ENV_INDEX_GRAPH_ONLY: &str = "GREPPY_INDEX_GRAPH_ONLY";
+
+/// Whether this index run builds the graph without embeddings: asked for by
+/// the index command, or the automatic first index of a navigation command.
+pub(crate) fn index_builds_graph_only() -> bool {
+    std::env::var_os(ENV_STRUCTURAL_FIRST_USE).is_some()
+        || std::env::var_os(ENV_INDEX_GRAPH_ONLY).is_some()
+}
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
 const AUTOMATIC_INDEX_MAX_WORKERS: usize = 2;
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
@@ -643,6 +654,7 @@ const SUBCOMMANDS: &[&str] = &[
     "fan-in",
     "fan-out",
     "graph-locate",
+    "isolate",
     "path",
     "search",
     "search-symbol",
@@ -2521,6 +2533,7 @@ fn dispatch_subcommand(
                 max_length,
                 device: embedding_device_preference(device, no_gpu)?,
             };
+            lower_own_priority();
             embed_daemon::daemon_main(socket, cfg, prewarm)
         }
         #[cfg(any(unix, windows))]
@@ -2537,6 +2550,7 @@ fn dispatch_subcommand(
                 tokenizer: std::path::PathBuf::from(tokenizer),
                 device: qwen_summary_device_preference()?,
             };
+            lower_own_priority();
             summarize_daemon::daemon_main(socket, cfg, prewarm)
         }
         Command::Index {
@@ -2545,6 +2559,7 @@ fn dispatch_subcommand(
             json,
             diagnostics,
             agent_worktree,
+            with_embeddings,
         } => {
             if diagnostics && !json {
                 return Err(Error::Invalid(
@@ -2581,9 +2596,33 @@ fn dispatch_subcommand(
                     ));
                 }
                 let embedding_args = EmbeddingCliArgs { device, no_gpu };
+                // A plain `greppy index` builds the graph only; the indexer
+                // and the shared-Base build of a linked worktree read the
+                // switch. The embedding job a semantic query starts is this
+                // same command and keeps its own settings.
+                let embedding_job = std::env::var_os("GREPPY_BACKGROUND_KIND").is_some();
+                if with_embeddings {
+                    std::env::remove_var(ENV_INDEX_GRAPH_ONLY);
+                } else if !agent_worktree && !embedding_job {
+                    std::env::set_var(ENV_INDEX_GRAPH_ONLY, "1");
+                }
                 if agent_worktree {
                     dispatch_index_agent_worktree(path.as_deref(), root, embedding_args)
                 } else {
+                    if first_index_from_sources_of_large_repository(path.as_deref(), root)? {
+                        if let Some(code) =
+                            index_admission::rerun_under_gate().map_err(|error| {
+                                Error::io("run the index under the host gate", error)
+                            })?
+                        {
+                            if code == i32::from(EXIT_TEMPFAIL) {
+                                eprintln!(
+                                    "greppy index: the first index of a repository this large is a heavy job and waits for the host's build gate; no index work started. Retry when the host is free."
+                                );
+                            }
+                            return Ok(code);
+                        }
+                    }
                     dispatch_index(path.as_deref(), root, embedding_args)
                 }
             }
@@ -3036,6 +3075,7 @@ fn dispatch_subcommand(
             line,
             json,
         } => dispatch_graph_locate(location.as_deref(), file.as_deref(), line, json, root),
+        Command::Isolate { places, json } => isolate::dispatch_isolate(&places, json, root),
         Command::Path {
             from,
             to,
@@ -4587,7 +4627,72 @@ fn nav_freshness_json_uncached(
     nav_freshness_json_with_policy(store, root, project, true)
 }
 
+/// A drift verdict costs a walk of the whole checkout, and one command asks
+/// for it at several gates. For a few seconds the verdict of the same
+/// published generation is reused; a fresh verdict never is, so a change made
+/// after it is always seen.
+const DRIFT_VERDICT_REUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A command that asks several questions of one index compares the checkout
+/// with it once: every verdict, a fresh one included, holds for the command.
+static REUSE_EVERY_VERDICT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn reuse_freshness_verdicts_for_this_command() {
+    REUSE_EVERY_VERDICT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+type DriftVerdict = (String, std::time::Instant, serde_json::Value);
+
+static DRIFT_VERDICTS: std::sync::Mutex<Vec<DriftVerdict>> = std::sync::Mutex::new(Vec::new());
+
+fn drift_verdict_key(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+) -> Option<String> {
+    let root = resolve_root(root).ok()?;
+    let generation = store
+        .get_workspace_state(root.to_string_lossy().as_ref())
+        .ok()??
+        .graph_generation;
+    let scope = discover_overrides_from_env().ok()?.scope_key();
+    Some(format!(
+        "{}\n{project}\n{scope}\n{generation}",
+        root.display()
+    ))
+}
+
 fn nav_freshness_json_with_policy(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    force_uncached: bool,
+) -> serde_json::Value {
+    let key = drift_verdict_key(store, root, project);
+    let every = REUSE_EVERY_VERDICT.load(std::sync::atomic::Ordering::Relaxed);
+    if let (Some(key), Ok(mut verdicts)) = (key.as_ref(), DRIFT_VERDICTS.lock()) {
+        verdicts.retain(|(_, taken, _)| every || taken.elapsed() < DRIFT_VERDICT_REUSE);
+        if let Some((_, _, verdict)) = verdicts.iter().find(|(known, _, _)| known == key) {
+            return verdict.clone();
+        }
+    }
+    let step = std::time::Instant::now();
+    let freshness = walked_freshness_json(store, root, project, force_uncached);
+    greppy_core::profile::step("freshness: compare the checkout with the index", step);
+    // Changed files, not a fingerprint that only needs its metadata renewed.
+    let drifted = freshness.get("state").and_then(serde_json::Value::as_str) == Some("drift")
+        && freshness
+            .get("stale_file_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|files| files > 0);
+    if let (true, Some(key), Ok(mut verdicts)) = (drifted || every, key, DRIFT_VERDICTS.lock()) {
+        verdicts.push((key, std::time::Instant::now(), freshness.clone()));
+    }
+    freshness
+}
+
+fn walked_freshness_json(
     store: &greppy_store::Store,
     root: Option<&str>,
     project: &str,
@@ -4807,10 +4912,116 @@ fn auto_reindex_enabled() -> bool {
     }
 }
 
-/// Compatibility hook for older footer rendering. Production query paths
-/// never serve stale indexed rows, so this is always false.
+/// A read command indexes or refreshes only a small repository by itself.
+/// On a larger one that is minutes of work for the whole host, so the read
+/// answers with what there is and names `greppy index`.
+const ENV_AUTO_INDEX_MAX_FILES: &str = "GREPPY_AUTO_INDEX_MAX_FILES";
+const DEFAULT_AUTO_INDEX_MAX_FILES: usize = 2_000;
+/// Lifts the size limit: reads index and refresh a repository of any size.
+const ENV_AUTO_INDEX: &str = "GREPPY_AUTO_INDEX";
+
+/// Above this many files a repository is large: index work on it is minutes
+/// for the whole host.
+fn large_repository_files() -> usize {
+    std::env::var(ENV_AUTO_INDEX_MAX_FILES)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_AUTO_INDEX_MAX_FILES)
+}
+
+/// How large a repository a read indexes by itself; `None`: any.
+fn auto_index_file_limit() -> Option<usize> {
+    let lifted = std::env::var(ENV_AUTO_INDEX).is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        )
+    });
+    (!lifted).then(large_repository_files)
+}
+
+/// Whether index work on a checkout of `files` files is left to `greppy
+/// index`: a read on a large repository leaves it, a symbol edit never does.
+pub(crate) fn read_leaves_index_work(files: usize) -> bool {
+    !freshness::waits_for_the_whole_index()
+        && auto_index_file_limit().is_some_and(|limit| files > limit)
+}
+
+/// Whether this command may index or refresh a checkout of `files` files as
+/// a side effect. A symbol edit always may: it cannot plan on a stale graph.
+pub(crate) fn may_index_by_itself(files: impl FnOnce() -> usize) -> bool {
+    auto_reindex_enabled()
+        && (freshness::waits_for_the_whole_index()
+            || auto_index_file_limit().is_none_or(|limit| files() <= limit))
+}
+
+/// The heavy job the host gate exists for: a repository too large for a read
+/// to index by itself, with no published index and no other clone's index to
+/// start from. Refreshing an index, or starting from a sibling's, is bounded
+/// work and runs at once.
+fn first_index_from_sources_of_large_repository(
+    path: Option<&str>,
+    root: Option<&str>,
+) -> Result<bool> {
+    if std::env::var_os("GREPPY_BACKGROUND_JOB").is_some() {
+        return Ok(false);
+    }
+    let (_, root) = indexing::index_target_and_root(path, root)?;
+    let published = sibling_seed::has_published_graph(&workspace_locator::store_path(&root), &root);
+    Ok(!published
+        && !sibling_seed::available(&root)
+        && checkout_file_count(&root) > large_repository_files())
+}
+
+/// How many files the checkout tracks, counted only as far as the limit
+/// matters: Git's own list where there is one, the walk otherwise.
+pub(crate) fn checkout_file_count(root: &std::path::Path) -> usize {
+    use std::io::Read as _;
+    let limit = large_repository_files();
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut git| {
+            let mut files = 0usize;
+            let mut chunk = [0u8; 64 * 1024];
+            let mut out = git.stdout.take()?;
+            while files <= limit {
+                match out.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => files += chunk[..read].iter().filter(|byte| **byte == 0).count(),
+                }
+            }
+            let complete = files <= limit;
+            if !complete {
+                let _ = git.kill();
+            }
+            let listed = git.wait().is_ok_and(|status| status.success()) || !complete;
+            (listed && files > 0).then_some(files)
+        });
+    listed.unwrap_or_else(|| {
+        discover_overrides_from_env()
+            .ok()
+            .and_then(|overrides| {
+                greppy_discover::walk_with_policy_and_overrides(
+                    root,
+                    &greppy_discover::SkipPolicy::walk_default(),
+                    &overrides,
+                )
+                .ok()
+            })
+            .map_or(0, |entries| entries.len())
+    })
+}
+
+/// Whether this command answers from an index that is not current.
 fn serving_stale() -> bool {
-    false
+    freshness::stale_answer_note().is_some()
 }
 
 /// `allow_auto_reindex = false` for a surface that cannot guarantee its
@@ -5165,6 +5376,11 @@ pub(crate) fn background_job_retained_marker(job_path: &std::path::Path) -> std:
     job_path.with_extension("retained")
 }
 
+/// Keep the background job `pid` of `job_path` running after its last waiter.
+pub(crate) fn retain_background_job(job_path: &std::path::Path, pid: u64) -> bool {
+    std::fs::write(background_job_retained_marker(job_path), pid.to_string()).is_ok()
+}
+
 fn background_job_retained(job_path: &std::path::Path, expected_pid: u32) -> bool {
     std::fs::read_to_string(background_job_retained_marker(job_path))
         .is_ok_and(|pid| pid.trim() == expected_pid.to_string())
@@ -5199,6 +5415,41 @@ fn finish_background_demand_monitor(
         let _ = write_background_job(job_path, &job);
     }
     std::process::exit(exit_code);
+}
+
+/// Background work (a detached index job, a model daemon) yields the CPU to
+/// whatever runs in the foreground. A priority is only ever lowered.
+fn lower_own_priority() {
+    #[cfg(unix)]
+    {
+        const PRIO_PROCESS: std::ffi::c_int = 0;
+        const BACKGROUND_NICE: std::ffi::c_int = 10;
+        unsafe extern "C" {
+            fn getpriority(which: std::ffi::c_int, who: u32) -> std::ffi::c_int;
+            fn setpriority(
+                which: std::ffi::c_int,
+                who: u32,
+                priority: std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+        // SAFETY: both calls read or change only this process's scheduling
+        // priority and take no pointers.
+        unsafe {
+            if getpriority(PRIO_PROCESS, 0) < BACKGROUND_NICE {
+                let _ = setpriority(PRIO_PROCESS, 0, BACKGROUND_NICE);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
+        };
+        // SAFETY: the pseudo handle of the current process is always valid.
+        unsafe {
+            let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        }
+    }
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -5521,6 +5772,9 @@ impl BackgroundJobGuard {
         let delegated_path =
             std::env::var_os(ENV_DELEGATED_BACKGROUND_JOB).map(std::path::PathBuf::from);
         let detached = direct_path.is_some();
+        if detached {
+            lower_own_priority();
+        }
         let delegated = direct_path.is_none() && delegated_path.is_some();
         let path = direct_path.or(delegated_path);
         let demand_terminal = std::sync::Arc::new(std::sync::Mutex::new(false));
@@ -7083,6 +7337,9 @@ fn summarize_source_cached(
             return Some(bullets);
         }
     }
+    if !summary_inference_allowed() {
+        return None;
+    }
     let inference_source = cap_summary_inference_source(source);
     let bullets = match summarize_daemon::summarize_source_via_daemon(
         cfg,
@@ -7104,6 +7361,29 @@ fn summarize_source_cached(
         let _ = cache.put(&cache_key, &hash, &bullets);
     }
     Some(bullets)
+}
+
+/// One command asks the summary model for at most this many new summaries.
+/// A purpose line is a convenience; an `impact` tree over a few hundred
+/// definitions otherwise keeps the model busy for many minutes. Summaries
+/// already in a cache are not counted, so a repeated command shows more.
+const ENV_SUMMARIES_PER_COMMAND: &str = "GREPPY_SUMMARIES_PER_COMMAND";
+const DEFAULT_SUMMARIES_PER_COMMAND: usize = 12;
+
+fn summaries_per_command() -> usize {
+    std::env::var(ENV_SUMMARIES_PER_COMMAND)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SUMMARIES_PER_COMMAND)
+}
+
+fn summary_inference_allowed() -> bool {
+    // The unit tests of this crate share one process; none of them is a command.
+    if cfg!(test) {
+        return true;
+    }
+    static ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < summaries_per_command()
 }
 
 /// Preserve a representative head and tail for very large single-line data
@@ -7132,6 +7412,9 @@ fn cap_summary_inference_source(source: &str) -> String {
 /// Deterministic nav commands must never hold a summary model in memory.
 #[cfg(any(unix, windows))]
 pub(crate) fn prewarm_summary_daemon() {
+    if summaries_per_command() == 0 {
+        return;
+    }
     if let Ok(Some(cfg)) = qwen_summary_config_optional() {
         summarize_daemon::prewarm_from_env(&cfg);
     }
@@ -12134,6 +12417,7 @@ fn command_requests_json(command: Option<&Command>) -> bool {
         | Some(Command::FanIn { json, .. })
         | Some(Command::FanOut { json, .. })
         | Some(Command::GraphLocate { json, .. })
+        | Some(Command::Isolate { json, .. })
         | Some(Command::Path { json, .. })
         | Some(Command::SearchPattern { json, .. })
         | Some(Command::SearchSymbol { json, .. })
@@ -12219,6 +12503,20 @@ fn print_multi_unresolved_receivers(page: &UnresolvedReceiverPage, start: usize)
     if page.truncated {
         println!("… {} unresolved receivers omitted", page.omitted.max(1));
     }
+}
+
+/// Run a command's own dispatch and take the JSON it printed, instead of
+/// letting it reach the output: a command composed of other commands reads
+/// their answers this way.
+pub(crate) fn captured_json(run: impl FnOnce() -> Result<i32>) -> Result<(i32, serde_json::Value)> {
+    let outer = OUTPUT_CAPTURE.with(|capture| capture.borrow_mut().replace(Vec::new()));
+    let outcome = run();
+    let printed = OUTPUT_CAPTURE
+        .with(|capture| std::mem::replace(&mut *capture.borrow_mut(), outer))
+        .unwrap_or_default();
+    let code = outcome?;
+    let said = serde_json::from_slice(&printed).unwrap_or(serde_json::Value::Null);
+    Ok((code, said))
 }
 
 fn begin_output_capture() {
@@ -12667,11 +12965,29 @@ fn compact_read_json(value: &mut serde_json::Value) {
     *value = serde_json::Value::Object(compact);
 }
 
+/// An answer from an index that is not current says so in a field a program
+/// can test, whatever the command, beside any other warning it carries.
+fn mark_stale_answer(value: &mut serde_json::Value) {
+    let (Some(note), Some(object)) = (freshness::stale_answer_note(), value.as_object_mut()) else {
+        return;
+    };
+    object.insert("stale_served".into(), true.into());
+    let warning = match object.get("warning").and_then(serde_json::Value::as_str) {
+        Some(other) if !other.contains(&note) => format!("{note}; {other}"),
+        _ => note,
+    };
+    object.insert("warning".into(), warning.into());
+}
+
 fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    mark_stale_answer(&mut value);
     // File reads already emit a compact typed payload. Preserve their command,
     // file content and continuation/handle metadata across every JSON spelling.
-    if value.get("command").and_then(serde_json::Value::as_str) == Some("read-file") {
+    if matches!(
+        value.get("command").and_then(serde_json::Value::as_str),
+        Some("read-file" | "isolate")
+    ) {
         let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
         rendered.push(b'\n');
         return Some(rendered);
@@ -12680,7 +12996,7 @@ fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
     // typed failure and exact root/store recovery even without --diagnostics.
     if matches!(
         value.get("status").and_then(serde_json::Value::as_str),
-        Some("preparation_deferred" | "expand_handle_not_found")
+        Some("preparation_deferred" | "no_index" | "index_building" | "expand_handle_not_found")
     ) {
         let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
         rendered.push(b'\n');
@@ -12751,6 +13067,8 @@ fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
             object.remove("truncated");
         }
     }
+    // Compaction keeps only the fields it knows; mark again on what it kept.
+    mark_stale_answer(&mut value);
     let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
     rendered.push(b'\n');
     Some(rendered)
@@ -12762,7 +13080,7 @@ fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> 
     // Never manufacture an exact empty answer from its absent result rows.
     if matches!(
         value.get("status").and_then(serde_json::Value::as_str),
-        Some("preparation_deferred" | "expand_handle_not_found")
+        Some("preparation_deferred" | "no_index" | "index_building" | "expand_handle_not_found")
     ) {
         return Some(bytes.to_vec());
     }
@@ -13047,7 +13365,8 @@ fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
 /// hint before returning `Err`; the summary line here may then repeat the
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
-    let preparation_json = command_requests_json(cli.command.as_ref());
+    let preparation_json = command_requests_json(cli.command.as_ref())
+        || matches!(cli.command, Some(Command::WhereAmI { json: true }));
     let _web_output_budget = match cli.command.as_ref() {
         Some(Command::Web { .. }) => Some(web::human_output_budget(cli.max_bytes)),
         _ => None,
@@ -13060,27 +13379,41 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
     let code = match dispatch(cli) {
         Ok(code) => code.clamp(0, 255) as u8,
         Err(Error::AdmissionDeferred { root, detail }) if preparation_json => {
-            let diagnostics = index_status_command_for_root(&root);
             println!(
                 "{}",
-                serde_json::json!({
-                    "status": "preparation_deferred",
-                    "fresh": false,
-                    "complete": false,
-                    "freshness": {
-                        "state": "failed",
-                        "fresh": false,
-                        "root_path": root,
-                        "preparation_failure_kind": "admission_deferred",
-                        "preparation_error": detail,
-                        "diagnostics_command": diagnostics,
-                    },
-                    "next": {
-                        "action": "retry_original_command",
-                        "message": "Retry the original command when host capacity is available; no index work started and no query results were served.",
-                        "diagnostics_command": diagnostics,
-                    },
-                })
+                unprepared_index_json(
+                    &root,
+                    &detail,
+                    "preparation_deferred",
+                    "admission_deferred",
+                    "Retry the original command when host capacity is available; no index work started and no query results were served.",
+                )
+            );
+            EXIT_TEMPFAIL
+        }
+        Err(Error::NoIndex { root, detail }) if preparation_json => {
+            println!(
+                "{}",
+                unprepared_index_json(
+                    &root,
+                    &detail,
+                    "no_index",
+                    "no_index",
+                    "Run `greppy index .` in this checkout, then repeat the command; no index work started and no query results were served.",
+                )
+            );
+            EXIT_TEMPFAIL
+        }
+        Err(Error::IndexBuilding { root, detail }) if preparation_json => {
+            println!(
+                "{}",
+                unprepared_index_json(
+                    &root,
+                    &detail,
+                    "index_building",
+                    "still_building",
+                    "Retry the original command; the index is being built in the background and no query results were served.",
+                )
             );
             EXIT_TEMPFAIL
         }
@@ -13100,11 +13433,51 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
     code
 }
 
+/// What a `--json` caller reads when the command could not answer because
+/// the index is not ready: `index.published` says whether one exists at all.
+fn unprepared_index_json(
+    root: &std::path::Path,
+    detail: &str,
+    status: &str,
+    failure_kind: &str,
+    next: &str,
+) -> serde_json::Value {
+    let diagnostics = index_status_command_for_root(root);
+    let published = freshness::published_graph_generation(root).unwrap_or(0) > 0;
+    let state = match failure_kind {
+        "no_index" => "cold",
+        "still_building" => "refreshing",
+        _ => "failed",
+    };
+    serde_json::json!({
+        "status": status,
+        "fresh": false,
+        "complete": false,
+        "index": { "published": published },
+        "freshness": {
+            "state": state,
+            "fresh": false,
+            "root_path": root,
+            "preparation_failure_kind": failure_kind,
+            "preparation_error": detail,
+            "diagnostics_command": diagnostics,
+        },
+        "next": {
+            "action": "retry_original_command",
+            "message": next,
+            "diagnostics_command": diagnostics,
+        },
+    })
+}
+
 fn error_exit_code(error: &Error) -> u8 {
     match error {
         Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
         Error::Invalid(_) => EXIT_USAGE,
-        Error::Lock(_) | Error::AdmissionDeferred { .. } => EXIT_TEMPFAIL,
+        Error::Lock(_)
+        | Error::AdmissionDeferred { .. }
+        | Error::IndexBuilding { .. }
+        | Error::NoIndex { .. } => EXIT_TEMPFAIL,
         _ => EXIT_IO,
     }
 }

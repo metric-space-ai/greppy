@@ -332,11 +332,19 @@ fn maybe_reindex_stale_with_capability(
     if !auto_reindex_enabled() || !allow_auto_reindex {
         return Ok(());
     }
+    let effective_root = resolve_root(root)?;
+    // A refresh this command already left running, deferred or to
+    // `greppy index` is not waited for a second time.
+    if unrefreshed(&effective_root).is_some() {
+        return Ok(());
+    }
     let project = project_for(root)?;
     let freshness = nav_freshness_json(store, root, &project);
     if freshness_is_reindexable_stale(&freshness) {
+        if refresh_is_left_to_the_index_command(store, root, &project, &freshness) {
+            return Ok(());
+        }
         if structural_only {
-            let effective_root = resolve_root(root)?;
             if refresh_deferred(wait_for_index_publication(
                 root,
                 &effective_root,
@@ -351,15 +359,14 @@ fn maybe_reindex_stale_with_capability(
         }
         let rebuilt =
             freshness_within_inline_drift_cap(root, &freshness) && try_auto_reindex_inline(root);
-        if !rebuilt {
-            let effective_root = resolve_root(root)?;
-            if refresh_deferred(wait_for_index_publication(
+        if !rebuilt
+            && refresh_deferred(wait_for_index_publication(
                 root,
                 &effective_root,
                 "workspace-drift",
-            ))? {
-                return Ok(());
-            }
+            ))?
+        {
+            return Ok(());
         }
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
@@ -368,36 +375,143 @@ fn maybe_reindex_stale_with_capability(
     Ok(())
 }
 
-/// The refresh this process asked for and host admission deferred (for
-/// example while the system disk is low): queries keep answering from the
-/// published index, saying that it predates the changed files. Only new
-/// index work waits.
-static REFRESH_DEFERRAL: std::sync::Mutex<Vec<(std::path::PathBuf, String)>> =
-    std::sync::Mutex::new(Vec::new());
+/// Why a query answers from a published index that predates changed files.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unrefreshed {
+    /// Host admission deferred the refresh this process asked for.
+    Deferred,
+    /// The refresh is still running after the query's wait.
+    Running,
+    /// A read does not refresh an index of this size: `greppy index` does.
+    LeftToIndexCommand,
+}
 
-fn deferral_for(root: &std::path::Path) -> Option<String> {
-    REFRESH_DEFERRAL
+impl Unrefreshed {
+    fn said(self) -> &'static str {
+        match self {
+            Self::Deferred => "the refresh was deferred",
+            Self::Running => "its refresh is still running",
+            Self::LeftToIndexCommand => "refresh it with `greppy index .`",
+        }
+    }
+
+    fn json_key(self) -> &'static str {
+        match self {
+            Self::Deferred => "refresh_deferred",
+            Self::Running => "refresh_running",
+            Self::LeftToIndexCommand => "refresh_needed",
+        }
+    }
+}
+
+struct UnrefreshedIndex {
+    root: std::path::PathBuf,
+    why: Unrefreshed,
+    detail: String,
+}
+
+static UNREFRESHED: std::sync::Mutex<Vec<UnrefreshedIndex>> = std::sync::Mutex::new(Vec::new());
+
+fn unrefreshed(root: &std::path::Path) -> Option<(Unrefreshed, String)> {
+    UNREFRESHED
         .lock()
         .ok()?
         .iter()
-        .find(|(deferred, _)| deferred == root)
-        .map(|(_, detail)| detail.clone())
+        .find(|index| index.root == root)
+        .map(|index| (index.why, index.detail.clone()))
 }
 
-/// `Ok(true)` when the refresh was deferred by admission (recorded, not an
-/// error); other failures stay errors.
+fn note_unrefreshed(root: std::path::PathBuf, why: Unrefreshed, detail: String) {
+    if let Ok(mut indexes) = UNREFRESHED.lock() {
+        indexes.retain(|index| index.root != root);
+        indexes.push(UnrefreshedIndex { root, why, detail });
+    }
+}
+
+/// `Ok(true)` when the refresh was deferred by admission or goes on without
+/// this query (recorded, not an error); other failures stay errors.
 fn refresh_deferred(outcome: Result<()>) -> Result<bool> {
     match outcome {
-        Ok(()) => Ok(false),
+        Ok(()) => return Ok(false),
         Err(Error::AdmissionDeferred { root, detail }) => {
-            if let Ok(mut deferrals) = REFRESH_DEFERRAL.lock() {
-                deferrals.retain(|(deferred, _)| deferred != &root);
-                deferrals.push((root, detail));
-            }
-            Ok(true)
+            note_unrefreshed(root, Unrefreshed::Deferred, detail);
         }
-        Err(error) => Err(error),
+        Err(Error::IndexBuilding { root, detail }) => {
+            note_unrefreshed(root, Unrefreshed::Running, detail);
+        }
+        Err(error) => return Err(error),
     }
+    Ok(true)
+}
+
+/// A read refreshes only a small index by itself (`may_index_by_itself`).
+/// For a larger one it records that the refresh is left to `greppy index`
+/// and returns `true`: the query then answers from what is published.
+fn refresh_is_left_to_the_index_command(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    freshness: &serde_json::Value,
+) -> bool {
+    if !auto_reindex_enabled() {
+        return false;
+    }
+    // The checkout as the freshness check just walked it; a linked
+    // worktree's own store holds only its changed files.
+    let files = freshness
+        .get("total_inventory")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(
+            || {
+                store
+                    .file_count(project)
+                    .map_or(0, |files| files.max(0) as usize)
+            },
+            |files| files as usize,
+        );
+    if crate::may_index_by_itself(|| files) {
+        return false;
+    }
+    let detail = format!("a read command does not refresh an index of {files} files");
+    announce_stale_answer(freshness, Unrefreshed::LeftToIndexCommand, &detail);
+    if let Ok(root) = resolve_root(root) {
+        note_unrefreshed(root, Unrefreshed::LeftToIndexCommand, detail);
+    }
+    true
+}
+
+static STALE_ANSWER_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Say once per command that its answer comes from an index that is not
+/// current; the JSON answer carries the same note (`stale_answer_note`).
+pub(crate) fn announce_stale_note(note: String) {
+    let Ok(mut said) = STALE_ANSWER_NOTE.lock() else {
+        return;
+    };
+    if said.is_none() {
+        eprintln!("greppy: {note}");
+        *said = Some(note);
+    }
+}
+
+fn announce_stale_answer(freshness: &serde_json::Value, why: Unrefreshed, detail: &str) {
+    let files = freshness
+        .get("stale_file_count")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(
+            || "changed files".to_string(),
+            |n| format!("{n} changed files"),
+        );
+    announce_stale_note(format!(
+        "answering from the existing index, which predates {files}; {}: {detail}",
+        why.said()
+    ));
+}
+
+/// What this command said on stderr when it answered from an index that
+/// predates changed files; `None` when its answer is current.
+pub(crate) fn stale_answer_note() -> Option<String> {
+    STALE_ANSWER_NOTE.lock().ok()?.clone()
 }
 
 /// Serve the published index after a deferred refresh of this workspace: it
@@ -408,9 +522,15 @@ fn refresh_deferred(outcome: Result<()>) -> Result<bool> {
 fn serve_after_deferred_refresh(
     root: Option<&str>,
     freshness: &serde_json::Value,
+    writer_active: bool,
 ) -> Option<serde_json::Value> {
     let effective_root = resolve_root(root).ok()?;
-    let detail = deferral_for(&effective_root)?;
+    let (why, detail) = unrefreshed(&effective_root)?;
+    // A query answers beside a writer only when it knows what that writer
+    // is: the refresh it left running, or someone's own `greppy index`.
+    if writer_active && why == Unrefreshed::Deferred {
+        return None;
+    }
     let deferred_failure = freshness.get("state").and_then(serde_json::Value::as_str)
         == Some("failed")
         && freshness
@@ -423,20 +543,11 @@ fn serve_after_deferred_refresh(
     if published_graph_generation(&effective_root).unwrap_or(0) == 0 {
         return None;
     }
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    let changed = freshness
-        .get("stale_file_count")
-        .and_then(serde_json::Value::as_u64);
-    WARNED.call_once(|| {
-        let files = changed.map_or_else(|| "changed files".to_string(), |n| format!("{n} changed files"));
-        eprintln!(
-            "greppy: answering from the existing index, which predates {files}; the refresh was deferred: {detail}"
-        );
-    });
+    announce_stale_answer(freshness, why, &detail);
     let mut served = freshness.clone();
     if let Some(map) = served.as_object_mut() {
         map.insert("served_stale".into(), serde_json::json!(true));
-        map.insert("refresh_deferred".into(), serde_json::json!(detail));
+        map.insert(why.json_key().into(), serde_json::json!(detail));
     }
     Some(served)
 }
@@ -549,10 +660,11 @@ pub(crate) fn freshness_serve_decision_with_policy(
     if freshness_json_is_fresh(&freshness) {
         return FreshnessServe::Fresh(freshness);
     }
-    if !writer_active {
-        if let Some(served) = serve_after_deferred_refresh(root, &freshness) {
-            return FreshnessServe::Fresh(served);
-        }
+    if allow_auto_reindex && freshness_is_reindexable_stale(&freshness) {
+        refresh_is_left_to_the_index_command(store, root, project, &freshness);
+    }
+    if let Some(served) = serve_after_deferred_refresh(root, &freshness, writer_active) {
+        return FreshnessServe::Fresh(served);
     }
     if writer_active {
         return FreshnessServe::Refuse(refresh_state_for_query(root, freshness, true));
@@ -863,26 +975,12 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // (Query commands only — the grep passthrough path never reaches here,
     // so the byte-exact passthrough contract is untouched.)
     if !path.exists() {
-        if auto_reindex_enabled() {
-            wait_for_first_use_index(root, &effective_root)?;
-            // First publication can establish a linked-worktree Base binding.
-            // Re-enter the normal open path so that binding is attached before
-            // freshness is checked; a bare Delta otherwise looks stale and
-            // starts a second index for the same unchanged workspace.
-            return open_default_store(root);
-        } else {
-            let shown_root = root.unwrap_or(".");
-            eprintln!(
-                "greppy: no index for {} — run `greppy index {}` first",
-                effective_root.display(),
-                shown_root
-            );
-            return Err(Error::Invalid(format!(
-                "no index for {}; run `greppy index {}` first",
-                effective_root.display(),
-                shown_root
-            )));
-        }
+        wait_for_first_use_index(root, &effective_root)?;
+        // First publication can establish a linked-worktree Base binding.
+        // Re-enter the normal open path so that binding is attached before
+        // freshness is checked; a bare Delta otherwise looks stale and
+        // starts a second index for the same unchanged workspace.
+        return open_default_store(root);
     }
     // Query commands are READ-ONLY: open read-only so they skip both
     // `migrate()` and the O(db-size) `integrity_check` that a read-write open
@@ -894,10 +992,9 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // Command-output packs can create a database before any graph is published.
     // Its existence alone is not a completed first index. Bootstrap the graph
     // exactly as for a missing database instead of serving false empty results.
-    if auto_reindex_enabled()
-        && store
-            .get_workspace_state(effective_root.to_string_lossy().as_ref())?
-            .is_none()
+    if store
+        .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+        .is_none()
     {
         drop(store);
         wait_for_first_use_index(root, &effective_root)?;
@@ -996,7 +1093,7 @@ fn observe_first_use_index(
     )
 }
 
-fn published_graph_generation(effective_root: &std::path::Path) -> Option<u64> {
+pub(crate) fn published_graph_generation(effective_root: &std::path::Path) -> Option<u64> {
     greppy_store::Store::open_with(
         &workspace_locator::store_path(effective_root),
         greppy_store::OpenOptions::read_only(),
@@ -1015,13 +1112,96 @@ fn publication_advanced(baseline: Option<u64>, published: Option<u64>) -> bool {
     published.is_some() && published != baseline
 }
 
-/// A structural query owns completion of the graph publication it starts. There
-/// is no elapsed-time cutoff: a slow but live extraction remains attached, while
-/// a failed or dead owner terminates immediately with the recorded cause. Process
-/// interruption still cancels the waiting query; the detached indexer keeps its
-/// existing durable contract.
+/// How long a command waits for index work before it answers without it.
+const ENV_INDEX_WAIT_SECS: &str = "GREPPY_QUERY_WAIT_SECS";
+const DEFAULT_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+static WAITS_FOR_THE_WHOLE_INDEX: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A symbol edit takes its reference sites from the graph: it waits until the
+/// index it needs is published, however long that takes.
+pub(crate) fn wait_for_the_whole_index() {
+    WAITS_FOR_THE_WHOLE_INDEX.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn waits_for_the_whole_index() -> bool {
+    WAITS_FOR_THE_WHOLE_INDEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn index_wait_limit() -> Option<std::time::Duration> {
+    if waits_for_the_whole_index() {
+        return None;
+    }
+    let configured = std::env::var(ENV_INDEX_WAIT_SECS)
+        .ok()
+        .and_then(|secs| secs.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
+    Some(configured.unwrap_or(DEFAULT_INDEX_WAIT))
+}
+
+/// Keep the index work running without this waiter and say what it is doing.
+/// A job this process started has to record its pid first: until then only
+/// this waiter keeps it alive, so there is nothing to leave yet. A writer
+/// without a job record is another command's own index run.
+fn leave_index_work_running(
+    launch: &BackgroundJobLaunch,
+    job: Option<&serde_json::Value>,
+    waited: std::time::Duration,
+) -> Option<String> {
+    let pid = job
+        .and_then(|job| job.get("pid"))
+        .and_then(serde_json::Value::as_u64);
+    let work = match (pid, launch) {
+        (Some(pid), _) => {
+            if !crate::retain_background_job(launch.path(), pid) {
+                return None;
+            }
+            let state = job
+                .and_then(|job| job.get("state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("running");
+            format!("{state}, pid {pid}")
+        }
+        (None, BackgroundJobLaunch::Owned { .. }) => return None,
+        (None, BackgroundJobLaunch::Attached { .. }) => "another greppy index run".to_string(),
+    };
+    Some(format!(
+        "not finished after {} s ({work}); the work goes on in the background",
+        waited.as_secs()
+    ))
+}
+
+/// A query waits for the graph publication it starts or joins for a limited
+/// time (`GREPPY_QUERY_WAIT_SECS`), then leaves the work running and returns
+/// `IndexBuilding`. A failed or dead owner ends the wait at once with the
+/// recorded cause. A symbol edit waits to the end.
 fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path) -> Result<()> {
+    if !crate::may_index_by_itself(|| crate::checkout_file_count(effective_root)) {
+        return Err(no_index(effective_root));
+    }
     wait_for_index_publication(root, effective_root, "first-use")
+}
+
+/// The answer of a command that does not build the missing index itself:
+/// an index run of someone else is named, otherwise the command to run.
+fn no_index(effective_root: &std::path::Path) -> Error {
+    let root = effective_root.to_path_buf();
+    if background_job_writer_active(effective_root) {
+        return Error::IndexBuilding {
+            root,
+            detail: "another greppy index run is building it".into(),
+        };
+    }
+    let reason = if auto_reindex_enabled() {
+        "a read command does not build the index of a repository this large"
+    } else {
+        "automatic indexing is turned off"
+    };
+    Error::NoIndex {
+        root,
+        detail: format!("run `greppy index .` in this checkout ({reason})"),
+    }
 }
 
 fn index_publication_failure(effective_root: &std::path::Path, detail: String) -> Error {
@@ -1083,6 +1263,8 @@ pub(crate) fn wait_for_index_publication(
         feature = "store-cow-release-perf"
     ))]
     let mut test_wait_ready = std::env::var_os("GREPPY_TEST_QUERY_PUBLICATION_WAIT_READY");
+    let wait_limit = index_wait_limit();
+    let wait_started = std::time::Instant::now();
     loop {
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(
@@ -1128,6 +1310,29 @@ pub(crate) fn wait_for_index_publication(
                         std::fs::write(ready, "waiting for publication").map_err(|error| {
                             Error::io("write test publication-wait marker", error)
                         })?;
+                    }
+                }
+                let waited = wait_started.elapsed();
+                if wait_limit.is_some_and(|limit| waited >= limit) {
+                    if let Some(detail) = leave_index_work_running(&launch, job.as_ref(), waited) {
+                        detach_publication_wait(launch);
+                        return Err(Error::IndexBuilding {
+                            root: effective_root.to_path_buf(),
+                            detail,
+                        });
+                    }
+                    // Our job has not started any index work: it is still
+                    // waiting for admission. Nothing is lost by ending it.
+                    if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Error::AdmissionDeferred {
+                            root: effective_root.to_path_buf(),
+                            detail: format!(
+                                "the index job waited {} s for host admission without starting; no index work started",
+                                waited.as_secs()
+                            ),
+                        });
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1211,13 +1416,9 @@ fn open_default_store_writer(
     }
     let needs_first_publication = require_existing_index
         && (!path.exists()
-            || (auto_reindex_enabled() && {
-                let store =
-                    greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?;
-                store
-                    .get_workspace_state(effective_root.to_string_lossy().as_ref())?
-                    .is_none()
-            }));
+            || greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?
+                .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+                .is_none());
     if needs_first_publication {
         // Reuse the normal query open to trigger the existing first-use
         // auto-index/error path, then reopen writable for the evidence write.

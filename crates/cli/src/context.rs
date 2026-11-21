@@ -305,6 +305,15 @@ pub(crate) fn context_vector_fallback(
     let generation = current_graph_generation(store, root)?;
     if !embedding_generation_complete(store, project, generation, &cfg.model_id) {
         let root_path = resolve_root(root)?;
+        let files = store
+            .file_count(project)
+            .map_or(0, |files| files.max(0) as usize);
+        if !crate::may_index_by_itself(|| files) {
+            eprintln!(
+                "context: no semantic index for a repository this large; `greppy index . --with-embeddings` builds it"
+            );
+            return Ok(None);
+        }
         let _ = spawn_background_embed(root, &cfg);
         let progress = embedding_progress_value(&root_path, &cfg, generation);
         eprintln!("{}", embedding_progress_text(&progress));

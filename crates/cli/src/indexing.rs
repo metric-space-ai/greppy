@@ -1881,23 +1881,12 @@ pub(crate) fn dispatch_index(
     result
 }
 
-fn dispatch_index_with_progress(
+/// The directory `greppy index [PATH] [--root ROOT]` walks and the
+/// repository root its store is keyed under, both canonical and absolute.
+pub(crate) fn index_target_and_root(
     path: Option<&str>,
     root: Option<&str>,
-    embedding_args: EmbeddingCliArgs<'_>,
-    background_job: &mut BackgroundJobGuard,
-) -> Result<i32> {
-    // RV-006: `--root` overrides the indexed target. When both are
-    // given we still walk `path` (the user's workspace) but key the
-    // store under the canonical `root` so the indexer and the
-    // query commands share one project identity (RV-011).
-    // Defect D9: normalize BOTH paths to canonical absolute form up
-    // front. `greppy index .` used to record whatever the walker
-    // derived from the relative target (falling back to `.` in a
-    // marker-less directory), while later queries looked the workspace
-    // up under an absolute root — the index existed but every lookup
-    // failed. Canonical-absolute at the boundary keeps one spelling
-    // everywhere.
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let target = match path {
         Some(p) => absolutize_path(std::path::Path::new(p)),
         None => std::env::current_dir()
@@ -1916,6 +1905,27 @@ fn dispatch_index_with_progress(
         }
         None => find_repo_root(&target),
     };
+    Ok((target, effective_root))
+}
+
+fn dispatch_index_with_progress(
+    path: Option<&str>,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+    background_job: &mut BackgroundJobGuard,
+) -> Result<i32> {
+    // RV-006: `--root` overrides the indexed target. When both are
+    // given we still walk `path` (the user's workspace) but key the
+    // store under the canonical `root` so the indexer and the
+    // query commands share one project identity (RV-011).
+    // Defect D9: normalize BOTH paths to canonical absolute form up
+    // front. `greppy index .` used to record whatever the walker
+    // derived from the relative target (falling back to `.` in a
+    // marker-less directory), while later queries looked the workspace
+    // up under an absolute root — the index existed but every lookup
+    // failed. Canonical-absolute at the boundary keeps one spelling
+    // everywhere.
+    let (target, effective_root) = index_target_and_root(path, root)?;
     // A linked worktree root is identified by its `.git` file, not by the
     // spelling of its absolute path. Windows can expose the same mounted
     // directory once as a verbatim long path and once through an 8.3 alias;
@@ -2000,8 +2010,7 @@ fn dispatch_index_with_progress(
     // a cold workspace. Publish the complete structural snapshot first; a
     // later semantic command uses the normal background embedding path for
     // this generation. Explicit `greppy index` keeps its existing policy.
-    let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
-    let embedding_config = if structural_first_use {
+    let embedding_config = if crate::index_builds_graph_only() {
         None
     } else {
         #[cfg(debug_assertions)]
@@ -2189,14 +2198,16 @@ fn dispatch_index_with_progress(
             std::process::id()
         );
     }
-    let is_background = background_job.is_background();
     let snapshot = match index_atomic_snapshot_from(
         &store_path,
         &target,
         &project,
         embedding_config.as_ref(),
         &index_options,
-        !is_background,
+        // Embeddings are configured only when asked for (`--with-embeddings`
+        // or a semantic query's job): they are built now, not left to a job
+        // that outlives the command.
+        false,
         if background_job.has_progress_sink() {
             Some(&mut *background_job)
         } else {

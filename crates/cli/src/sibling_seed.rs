@@ -49,6 +49,15 @@ pub(crate) fn for_first_index(root: &Path) -> Option<SiblingSeed> {
     (workspace_locator::project_identity(root) == seed.project).then_some(seed)
 }
 
+/// Whether another clone's index could start this checkout's first index,
+/// without adopting its project name.
+pub(crate) fn available(root: &Path) -> bool {
+    find(root).is_some_and(|seed| {
+        std::env::var_os(greppy_core::PROJECT_IDENTITY_ENV).is_none()
+            || workspace_locator::project_identity(root) == seed.project
+    })
+}
+
 fn find(root: &Path) -> Option<SiblingSeed> {
     if std::env::var(ENV_SIBLING_SEED).ok().as_deref() == Some("0") {
         return None;

@@ -1126,6 +1126,17 @@ pub(crate) fn ensure_persisted_single_store_repaired(
     if rust_repair_requires_source_refresh(&observed, root, project) {
         return Ok(());
     }
+    // The repair re-resolves every Rust edge: index work a read does not do
+    // by itself on a large repository.
+    let files = observed
+        .file_count(project)
+        .map_or(0, |files| files.max(0) as usize);
+    if crate::read_leaves_index_work(files) {
+        crate::freshness::announce_stale_note(
+            "answering from an index that lacks a graph repair of this greppy version; `greppy index .` makes it".into(),
+        );
+        return Ok(());
+    }
     drop(observed);
     if !crate::index_admission::inline_refresh_is_admitted() {
         return refresh_persisted_graph_under_admission(path, root, None);
@@ -2312,7 +2323,7 @@ fn prepare_base_store_paths(
         .join("graph.db");
     let seeded_summary_cache =
         seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)?;
-    let defer_base_embeddings = structural_first_use;
+    let defer_base_embeddings = structural_first_use || crate::index_builds_graph_only();
     if seeded_summary_cache.is_some() {
         report_base_phase(progress_path, "migrating_base_graph");
     }
@@ -2333,7 +2344,10 @@ fn prepare_base_store_paths(
     if defer_base_embeddings {
         command.env(crate::ENV_STRUCTURAL_FIRST_USE, "1");
     } else {
-        command.env_remove(crate::ENV_STRUCTURAL_FIRST_USE);
+        command
+            .arg("--with-embeddings")
+            .env_remove(crate::ENV_STRUCTURAL_FIRST_USE)
+            .env_remove(crate::ENV_INDEX_GRAPH_ONLY);
     }
     command
         .current_dir(worktree_path)

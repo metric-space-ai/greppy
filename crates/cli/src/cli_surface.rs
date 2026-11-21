@@ -9,6 +9,9 @@ use clap::{Parser, Subcommand};
 
 const EDIT_VERIFY_HELP: &str = "Verification: --verify runs local syntax/build checks, not project tests by default.\nSet GREPPY_VERIFY_TEST_COMMAND to the affected test command to run it through bash-smart\nin the same bounded verification. Example (Unix):\n  GREPPY_VERIFY_TEST_COMMAND='python3 -m unittest discover -s tests' greppy patch --verify\nJSON reports each check scope and tests_status separately; a failed test returns exit 17.";
 
+/// How many hops `impact` follows when `--depth` is not given.
+pub(crate) const IMPACT_DEFAULT_DEPTH: usize = 6;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "greppy",
@@ -112,6 +115,12 @@ pub enum Command {
         /// persistent failure is reported and uses the private-Store fallback.
         #[arg(long)]
         agent_worktree: bool,
+        /// Also build the semantic index (embeddings) now. Without it the
+        /// command builds the code graph, which is all navigation needs, and
+        /// starts no model work; `greppy search` builds the semantic index
+        /// when it is first asked.
+        #[arg(long, conflicts_with = "agent_worktree")]
+        with_embeddings: bool,
     },
     /// The repository at one glance: layout, languages, entry points, test roots.
     WhereAmI {
@@ -200,7 +209,7 @@ pub enum Command {
         #[arg(long)]
         edge: Option<String>,
         /// Maximum transitive hop distance.
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = IMPACT_DEFAULT_DEPTH)]
         depth: usize,
         /// Print every reached node (lift the default NAV_LIMIT cap) so the
         /// full transitive set is inspectable without a second query.
@@ -636,6 +645,18 @@ pub enum Command {
         #[arg(long)]
         line: Option<i64>,
         /// Emit machine-readable JSON with freshness/provider metadata.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Everything around a place in one call: the symbol at `file:line` (or
+    /// the named symbol), its direct callers, everything that reaches it,
+    /// what it calls and what it reaches.
+    Isolate {
+        /// `file:line`, or a symbol as `who-calls` takes it. Several are
+        /// answered one after another.
+        #[arg(required = true)]
+        places: Vec<String>,
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },

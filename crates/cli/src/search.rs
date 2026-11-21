@@ -1663,8 +1663,9 @@ pub(crate) fn dispatch_semantic(
         prefixes.clear();
     }
 
-    // Stale/unknown snapshots are never served. Semantic search is always
-    // vector-backed on current main, so auto-refresh is allowed only when the
+    // A stale snapshot is served only as the freshness decision allows (a
+    // refresh left to `greppy index` or deferred), and then marked. Semantic
+    // search is vector-backed, so auto-refresh is allowed only when the
     // embedding model can be rebuilt in the same atomic snapshot.
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
     let mut store = open_default_store_query_writer(root)?;
@@ -1704,7 +1705,7 @@ pub(crate) fn dispatch_semantic(
     {
         let generation = current_graph_generation(&store, root)?;
         let candidate_limit = vector_exact_candidate_limit()?;
-        if !freshness_json_is_fresh(&freshness) {
+        if matches!(decision, FreshnessServe::Refuse(_)) {
             if let Ok(root_path) = resolve_root(root) {
                 crate::context_status::invalidate(&root_path);
                 crate::context_status::restricted(
@@ -2108,11 +2109,7 @@ fn wait_for_embedding_publication(
                 if let Some(pid) =
                     job_pid.filter(|_| progress_started.elapsed() >= SEMANTIC_FOREGROUND_WAIT)
                 {
-                    let retained = std::fs::write(
-                        crate::background_job_retained_marker(launch.path()),
-                        pid.to_string(),
-                    );
-                    if retained.is_ok() {
+                    if crate::retain_background_job(launch.path(), pid) {
                         return Ok(EmbeddingWait::Building(progress.unwrap_or_else(|| {
                             embedding_progress_value(effective_root, cfg, requested_generation)
                         })));

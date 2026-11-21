@@ -45,6 +45,7 @@ pub(crate) fn dispatch_edit_inner(
         &command,
         EditCommand::Replace { .. } | EditCommand::Delete { .. } | EditCommand::Rename { .. }
     ) {
+        crate::freshness::wait_for_the_whole_index();
         let mut store = open_default_store_query_writer(root)?;
         maybe_reindex_stale(&mut store, root)?;
         let project = project_for(root)?;
