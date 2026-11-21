@@ -312,10 +312,10 @@ pub fn process_value(value: i32) -> i32 { apply_limit(value) }
 pub fn normalize_score(value: i32) -> i32 { value.max(0) }
 RS
 
-"$BIN" --root "$REPO_EMBED" index "$REPO_EMBED" >"$WORK/out/index-embed.txt"
+"$BIN" --root "$REPO_EMBED" index --with-embeddings "$REPO_EMBED" >"$WORK/out/index-embed.txt"
 grep -Eq 'embedded [1-9][0-9]* code spans' "$WORK/out/index-embed.txt" \
   || fail "index left repo-embed without embedded spans: $(tail -1 "$WORK/out/index-embed.txt")"
-"$BIN" --root "$REPO_BRIEF" index "$REPO_BRIEF" >"$WORK/out/index-brief.txt"
+"$BIN" --root "$REPO_BRIEF" index --with-embeddings "$REPO_BRIEF" >"$WORK/out/index-brief.txt"
 grep -Eq 'embedded [1-9][0-9]* code spans' "$WORK/out/index-brief.txt" \
   || fail "index left repo-brief without embedded spans: $(tail -1 "$WORK/out/index-brief.txt")"
 
